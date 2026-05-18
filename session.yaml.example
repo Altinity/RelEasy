@@ -79,6 +79,10 @@ features:
 #                 prompt for every PR matched by this entry. Keep it
 #                 short and high-signal — the model already gets the
 #                 source PR body and diff.
+#     mode: auto|backport|forward_port — port-direction override.
+#                 `auto` (default) runs the ladder; `backport` unlocks
+#                 bucket-0 (drop optional missing-prereq surfaces);
+#                 `forward_port` keeps the MISSING_PREREQS flow.
 #
 # exclude_labels — drop any PR carrying at least one of these labels,
 #   even if it matched a by_labels entry.
@@ -182,11 +186,19 @@ features:
 #       #                       # "append" adds newly-listed PRs onto the
 #       #                       # existing branch tip without rebuilding.
 #       # sort: merged_at       # default "listed"
+#       # mode: backport       # override port direction (see by_labels.mode).
 #       # depends_on:           # other unit IDs (group ids, pr-<N>) that
 #       #   - pr-100            # must be `merged` in target before this
 #       #   - prereq-group      # group is processed. `releasy run` skips
 #       #                       # the dependent and marks it `blocked`
 #       #                       # until the parent merges upstream.
+#
+#   # Source-PR labels that flip the detection ladder to forward-port
+#   # (case-insensitive). Use this when your team tags earlier-branch
+#   # PRs being pulled forward into a newer branch in the same repo.
+#   forward_port_labels:
+#     - port-antalya
+#     - port-stable-26
 #
 #   # Optional: override the deps overlay path. The default is
 #   # `<session-stem>.deps.yaml` (e.g. `antalya-26.3.session.deps.yaml`)

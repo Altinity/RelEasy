@@ -26,7 +26,7 @@ from typing import Literal
 
 import yaml
 
-from releasy.config import Config, state_file_path
+from releasy.config import Config, PortMode, state_file_path
 
 BranchStatus = Literal[
     "needs_review",
@@ -110,6 +110,15 @@ class FeatureState:
     # for this entry — either AI never ran, or Claude didn't report a
     # cost. Synced to the GitHub Project board's "AI Cost" number field.
     ai_cost_usd: float | None = None
+    # Set iff the verifier returned NEEDS_ATTENTION; drives verify_label.
+    verify_needs_attention: bool = False
+    # Set once the findings comment was posted, to prevent re-post on
+    # ``releasy continue`` re-runs (label is idempotent, comment isn't).
+    verify_comment_posted: bool = False
+    # Frozen at unit-build time so ``releasy refresh`` honours per-source
+    # mode overrides without re-running the detection ladder. ``None``
+    # for pre-existing state entries — refresh falls back to the ladder.
+    mode: PortMode | None = None
     # For partially-applied groups: 0-based index of the cherry-pick step that
     # failed conflict resolution, and how many earlier picks were committed.
     failed_step_index: int | None = None
@@ -221,6 +230,13 @@ def _parse_features(raw_features: dict) -> dict[str, FeatureState]:
             ai_resolved=fraw.get("ai_resolved", False),
             ai_iterations=fraw.get("ai_iterations"),
             ai_cost_usd=fraw.get("ai_cost_usd"),
+            verify_needs_attention=bool(
+                fraw.get("verify_needs_attention", False)
+            ),
+            verify_comment_posted=bool(
+                fraw.get("verify_comment_posted", False)
+            ),
+            mode=fraw.get("mode"),
             failed_step_index=fraw.get("failed_step_index"),
             partial_pr_count=fraw.get("partial_pr_count"),
             missing_prereq_prs=fraw.get("missing_prereq_prs", []) or [],
@@ -328,6 +344,12 @@ def save_state(state: PipelineState, config: Config) -> None:
             entry["ai_iterations"] = fs.ai_iterations
         if fs.ai_cost_usd is not None:
             entry["ai_cost_usd"] = float(fs.ai_cost_usd)
+        if fs.verify_needs_attention:
+            entry["verify_needs_attention"] = True
+        if fs.verify_comment_posted:
+            entry["verify_comment_posted"] = True
+        if fs.mode:
+            entry["mode"] = fs.mode
         if fs.failed_step_index is not None:
             entry["failed_step_index"] = fs.failed_step_index
         if fs.partial_pr_count is not None:

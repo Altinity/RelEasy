@@ -17,7 +17,9 @@ from pathlib import Path
 
 from releasy.termlog import console
 
-from releasy.config import Config, FeatureConfig, PRGroupConfig, PRSourceConfig
+from releasy.config import (
+    Config, FeatureConfig, PortMode, PRGroupConfig, PRSourceConfig,
+)
 from releasy.git_ops import (
     OperationResult,
     abort_in_progress_op,
@@ -178,6 +180,11 @@ class FeatureUnit:
     # keeps downstream code able to distinguish "AI ran but produced no
     # cost data" (None) from "AI ran and the bill was 0.0".
     ai_cost_usd_total: float | None = None
+    # Post-resolve verifier outcome (only set when verify_resolution is on).
+    verify_needs_attention: bool = False
+    verify_findings: list[str] = field(default_factory=list)
+    # Detected from the primary PR; groups are assumed homogeneous.
+    mode: PortMode = "forward_port"
     # Cached AI-synthesized CHANGELOG entry for multi-PR groups. Filled
     # by :func:`_maybe_synthesize_changelog` once per run and read by
     # :func:`_build_changelog_block`. ``None`` means "use the source
@@ -275,6 +282,37 @@ def parse_only(only: str | None) -> OnlyFilter | None:
     return OnlyFilter(raw=only, pr_ref=None, name=only)
 
 
+def _detect_port_mode(
+    config: Config,
+    pr: PRInfo,
+    *,
+    explicit_mode: str = "auto",
+) -> PortMode:
+    """Detection ladder: explicit override → forward_port_labels →
+    cross-origin → upstream-configured → forward_port default.
+    """
+    if explicit_mode in ("backport", "forward_port"):
+        return explicit_mode
+
+    if config.session is not None:
+        fp_labels_lower = {
+            l.lower() for l in config.session.pr_sources.forward_port_labels
+        }
+        if fp_labels_lower:
+            pr_labels_lower = {(l or "").lower() for l in (pr.labels or [])}
+            if fp_labels_lower & pr_labels_lower:
+                return "forward_port"
+
+    origin_slug = get_origin_repo_slug(config)
+    if origin_slug and pr.repo_slug != origin_slug:
+        return "backport"
+
+    if config.upstream is not None:
+        return "backport"
+
+    return "forward_port"
+
+
 def _singleton_feature_id(pr: PRInfo, origin_slug: str | None) -> str:
     """Branch / state ID for a single-PR port.
 
@@ -336,6 +374,7 @@ def _build_singleton_units(
             if_exists=src.if_exists,
             title_prefix=src.description,
             ai_context=unit_ai_context,
+            mode=_detect_port_mode(config, pr, explicit_mode=src.mode),
         ))
     return units
 
@@ -426,6 +465,9 @@ def _build_group_units(
             ai_context=group.ai_context,
             per_pr_ai_context=dict(group.pr_ai_contexts),
             depends_on=list(group.depends_on),
+            mode=_detect_port_mode(
+                config, group_prs[0], explicit_mode=group.mode,
+            ),
         ))
     return units, claimed
 
@@ -1494,6 +1536,13 @@ def _ensure_conflict_labels(config: Config) -> None:
         config.ai_resolve.auto_prereq_label_color,
         "Combined PR includes auto-added prerequisite PR(s)",
     )
+    if config.ai_resolve.verify_resolution:
+        ensure_label(
+            config,
+            config.ai_resolve.verify_label,
+            config.ai_resolve.verify_label_color,
+            "Post-resolve audit flagged the AI's resolution for human review",
+        )
 
 
 def _display_project(project: str | None) -> str:
@@ -2022,26 +2071,10 @@ def _unit_body(
     conflict_files: list[str] | None = None,
     auto_prereq_urls: list[str] | None = None,
     auto_prereq_trail: list[dict] | None = None,
+    dropped_items: list[str] | None = None,
 ) -> str:
-    """Build the PR body listing constituent PRs.
-
-    Origin-repo PRs are referenced as ``#N`` so GitHub auto-links them in
-    the destination (origin) repo. PRs from any other repo are referenced
-    as ``owner/repo#N`` — GitHub also auto-links those cross-repo refs.
-
-    When ``needs_intervention`` is True, prepends a banner explaining that
-    the branch holds the first ``failed_index`` cherry-picks of a group
-    and that the PR at position ``failed_index`` could not be resolved
-    automatically. The banner lists the conflicted files from the failed
-    step (if known) and notes that any later PRs in the group were not
-    attempted.
-
-    When ``auto_prereq_urls`` is non-empty, prepends a notice that the
-    combined PR auto-included prerequisite PR(s) discovered by Claude
-    during conflict resolution (auto-recovery mode). The trail (if
-    provided) is rendered as a chain so reviewers can see the discovery
-    order.
-    """
+    """Build the PR body. Optional banners cover the partial-group
+    intervention case, auto-ported prerequisites, and dropped scope."""
     lines: list[str] = []
     if needs_intervention:
         applied = failed_index if failed_index is not None else 0
@@ -2072,6 +2105,16 @@ def _unit_body(
             "PR ready for review."
         )
         lines.append("")  # blank separator before the rest
+
+    if dropped_items:
+        lines.append(
+            "> **Dropped from this backport:** the AI dropped these "
+            "surfaces rather than pulling in a missing prerequisite. "
+            "Reviewers: confirm each is genuinely optional."
+        )
+        for item in dropped_items:
+            lines.append(f"> - {item}")
+        lines.append("")
 
     if auto_prereq_urls:
         lines.append(
@@ -2248,6 +2291,40 @@ def _read_source_pr_trailers(
                     break
         urls.append(url)
     return urls, len(shas)
+
+
+def _collect_dropped_trailers(
+    repo_path: Path, base_ref: str, branch: str,
+) -> list[str]:
+    """Return ``Dropped:`` trailer values in commit order, de-duplicated."""
+    rev_list = run_git(
+        ["rev-list", "--reverse", f"{base_ref}..{branch}"],
+        repo_path, check=False,
+    )
+    if rev_list.returncode != 0:
+        return []
+    shas = [s for s in rev_list.stdout.split() if s]
+
+    seen: set[str] = set()
+    values: list[str] = []
+    for sha in shas:
+        out = run_git(
+            [
+                "log", "-1",
+                "--format=%(trailers:key=Dropped,unfold=true,valueonly=true)",
+                sha,
+            ],
+            repo_path, check=False,
+        )
+        if out.returncode != 0:
+            continue
+        for line in out.stdout.splitlines():
+            value = line.strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            values.append(value)
+    return values
 
 
 @dataclass
@@ -3295,6 +3372,7 @@ def _ensure_pr_for_existing_remote_branch(
         # (False).
         fs = FeatureState(
             status=_success_status(pr_url), branch_name=new_branch,
+            mode=unit.mode,
             **_unit_pr_meta(unit),
         )
         state.features[unit.feature_id] = fs
@@ -3348,6 +3426,7 @@ def _finish_clean_unit(
     """
     ai_used = unit.ai_resolved_count > 0
     has_auto_prereqs = bool(dynamic_prereq_urls)
+    verify_flagged = unit.verify_needs_attention
 
     if config.push:
         _push(config, repo_path, new_branch)
@@ -3365,6 +3444,9 @@ def _finish_clean_unit(
         fs.ai_iterations = unit.ai_iterations_total or None
     if unit.ai_cost_usd_total is not None:
         fs.ai_cost_usd = unit.ai_cost_usd_total
+    if verify_flagged:
+        fs.verify_needs_attention = True
+    fs.mode = unit.mode
     if has_auto_prereqs:
         fs.dynamic_prereq_urls = list(dynamic_prereq_urls or [])
         fs.prereq_trail = list(prereq_trail or [])
@@ -3377,6 +3459,8 @@ def _finish_clean_unit(
     # so reviewers see the full declared group, not the prior subset.
     appended_to_existing = bool(unit.applied_pr_urls)
 
+    dropped_items = _collect_dropped_trailers(repo_path, onto, new_branch)
+
     if config.push and config.pr_policy.auto_pr:
         # Title format is identical regardless of AI involvement; the
         # `ai-resolved` label (applied below) is what marks it.
@@ -3387,8 +3471,12 @@ def _finish_clean_unit(
                 unit, get_origin_repo_slug(config),
                 auto_prereq_urls=dynamic_prereq_urls,
                 auto_prereq_trail=prereq_trail,
+                dropped_items=dropped_items,
             ),
-            force_update=was_failed_prev or has_auto_prereqs or appended_to_existing,
+            force_update=(
+                was_failed_prev or has_auto_prereqs
+                or appended_to_existing or bool(dropped_items)
+            ),
         )
         _log_pr_action(outcome, rebase_pr_url)
         if rebase_pr_url:
@@ -3400,6 +3488,15 @@ def _finish_clean_unit(
                 _apply_ai_label_to_pr(config, rebase_pr_url)
             if has_auto_prereqs:
                 _apply_auto_prereq_label_to_pr(config, rebase_pr_url)
+            if verify_flagged:
+                _apply_verify_label_to_pr(config, rebase_pr_url)
+                fs_for_unit = state.features[unit.feature_id]
+                if not fs_for_unit.verify_comment_posted:
+                    posted = _post_verify_findings_comment(
+                        config, rebase_pr_url, list(unit.verify_findings),
+                    )
+                    if posted:
+                        fs_for_unit.verify_comment_posted = True
             if was_failed_prev:
                 relabelled = _reconcile_recovered_pr(config, rebase_pr_url)
                 # The previous failed run flagged this PR for human
@@ -3408,7 +3505,7 @@ def _finish_clean_unit(
                 # in state, and the `ai-resolved` label on the PR.
                 if relabelled and not state.features[unit.feature_id].ai_resolved:
                     state.features[unit.feature_id].ai_resolved = True
-    elif config.push and (ai_used or has_auto_prereqs):
+    elif config.push and (ai_used or has_auto_prereqs or verify_flagged):
         # Branch pushed but pr_policy.auto_pr disabled — try to label any
         # pre-existing PR for this branch.
         existing = find_pr_for_branch(config, new_branch, base_branch)
@@ -3427,6 +3524,17 @@ def _finish_clean_unit(
                 _apply_auto_prereq_label_to_pr(
                     config, existing.url, pr_number=existing.number,
                 )
+            if verify_flagged:
+                _apply_verify_label_to_pr(
+                    config, existing.url, pr_number=existing.number,
+                )
+                fs_for_unit = state.features[unit.feature_id]
+                if not fs_for_unit.verify_comment_posted:
+                    posted = _post_verify_findings_comment(
+                        config, existing.url, list(unit.verify_findings),
+                    )
+                    if posted:
+                        fs_for_unit.verify_comment_posted = True
             state.features[unit.feature_id].rebase_pr_url = existing.url
             state.features[unit.feature_id].status = "needs_review"
             if was_failed_prev:
@@ -3698,6 +3806,80 @@ def _apply_auto_prereq_label_to_pr(
     if pr_number is None:
         return
     add_label_to_pr(config, pr_number, config.ai_resolve.auto_prereq_label)
+
+
+def _apply_verify_label_to_pr(
+    config: Config, pr_url: str, pr_number: int | None = None,
+) -> None:
+    """Best-effort: apply ``verify_label`` to a PR the verifier flagged."""
+    if pr_number is None:
+        pr_number = _pr_number_from_url(pr_url)
+    if pr_number is None:
+        return
+    ok = add_label_to_pr(config, pr_number, config.ai_resolve.verify_label)
+    if ok:
+        console.print(
+            f"    [yellow]🔎[/yellow] Labelled PR with "
+            f"[yellow]{config.ai_resolve.verify_label}[/yellow] "
+            "[dim](verifier flagged the resolution)[/dim]"
+        )
+
+
+def _post_verify_findings_comment(
+    config: Config, pr_url: str, findings: list[str],
+) -> bool:
+    """Post verifier findings as a top-level PR comment. Returns True on
+    successful post — caller persists that to suppress duplicates."""
+    if not findings:
+        return False
+
+    body_lines = [
+        "## RelEasy post-resolve verifier — needs attention",
+        "",
+        "The automated audit of the AI-resolved cherry-pick(s) on this "
+        "PR raised one or more concerns. **No changes were rolled back** "
+        "— please review the points below and either dismiss them as "
+        "false positives or push corrections.",
+        "",
+    ]
+    body_lines.extend(findings)
+    body = "\n".join(body_lines).rstrip() + "\n"
+
+    from releasy.config import get_github_token
+
+    token = get_github_token()
+    if not token:
+        console.print(
+            "    [yellow]![/yellow] RELEASY_GITHUB_TOKEN not set — skipping "
+            "verifier-findings comment"
+        )
+        return False
+    parsed = parse_pr_url(pr_url)
+    if parsed is None:
+        console.print(
+            f"    [yellow]![/yellow] Could not parse PR URL for verifier "
+            f"comment: {pr_url!r}"
+        )
+        return False
+    owner, repo, number = parsed
+    try:
+        from github import Github
+
+        gh = Github(token)
+        ghrepo = gh.get_repo(f"{owner}/{repo}")
+        pr = ghrepo.get_pull(number)
+        ic = pr.create_issue_comment(body)
+        console.print(
+            f"    [yellow]💬[/yellow] Verifier findings posted: "
+            f"[link={ic.html_url}]comment[/link]"
+        )
+        return True
+    except Exception as exc:
+        console.print(
+            f"    [yellow]![/yellow] Could not post verifier-findings "
+            f"comment: {exc}"
+        )
+        return False
 
 
 def _ensure_upstream_remote(config: Config, repo_path: Path) -> None:
@@ -4222,6 +4404,9 @@ def _handle_unresolved_conflict(
 
     if pushed and config.pr_policy.auto_pr:
         title = _unit_title(unit, config.project, base_branch)
+        dropped_items = _collect_dropped_trailers(
+            repo_path, base_ref, new_branch,
+        )
         body = _unit_body(
             unit,
             origin_slug,
@@ -4229,6 +4414,7 @@ def _handle_unresolved_conflict(
             failed_index=applied,
             failed_pr=failed_pr,
             conflict_files=conflict_files,
+            dropped_items=dropped_items,
         )
         # On a retry of a previously-failed unit a draft PR may already
         # exist for this branch — `create_pull_request` would 422 in that
@@ -4260,6 +4446,10 @@ def _handle_unresolved_conflict(
             _apply_session_labels_to_pr(
                 config, rebase_pr_url, pr_number=existing.number,
             )
+            if unit.verify_needs_attention:
+                _apply_verify_label_to_pr(
+                    config, rebase_pr_url, pr_number=existing.number,
+                )
         else:
             rebase_pr_url = create_pull_request(
                 config, new_branch, base_branch, title, body,
@@ -4274,11 +4464,29 @@ def _handle_unresolved_conflict(
                 )
                 _apply_releasy_label_to_pr(config, rebase_pr_url)
                 _apply_session_labels_to_pr(config, rebase_pr_url)
+                if unit.verify_needs_attention:
+                    _apply_verify_label_to_pr(config, rebase_pr_url)
             else:
                 console.print(
                     "    [yellow]![/yellow] Could not open draft PR for "
                     f"[cyan]{new_branch}[/cyan] (see warnings above)"
                 )
+
+    # Carry the prior verify_comment_posted across the FeatureState
+    # rebuild below so re-runs don't stack duplicate comments.
+    prior_fs = state.features.get(unit.feature_id)
+    verify_comment_posted = bool(
+        prior_fs and prior_fs.verify_comment_posted
+    )
+    if (
+        unit.verify_needs_attention
+        and rebase_pr_url
+        and not verify_comment_posted
+    ):
+        if _post_verify_findings_comment(
+            config, rebase_pr_url, list(unit.verify_findings),
+        ):
+            verify_comment_posted = True
 
     fs = FeatureState(
         status="conflict",
@@ -4288,6 +4496,9 @@ def _handle_unresolved_conflict(
         failed_step_index=applied,
         partial_pr_count=applied,
         ai_cost_usd=unit.ai_cost_usd_total,
+        verify_needs_attention=unit.verify_needs_attention,
+        verify_comment_posted=verify_comment_posted,
+        mode=unit.mode,
         dynamic_prereq_urls=list(dynamic_prereq_urls or []),
         prereq_trail=list(prereq_trail or []),
         prereq_discovery_depth=prereq_discovery_depth,
@@ -4369,6 +4580,7 @@ def _try_ai_resolve_step(
         split_mode=pre_resolve_sha is not None,
         pre_resolve_sha=pre_resolve_sha,
         start_sha=start_sha,
+        mode=unit.mode,
     )
 
     result = attempt_ai_resolve(config, repo_path, ctx)
@@ -4410,7 +4622,91 @@ def _try_ai_resolve_step(
     console.print(
         f"    [green]✓[/green] AI resolved #{pr.number}{iters}{cost}"
     )
+
+    if config.ai_resolve.verify_resolution and result.new_head and start_sha:
+        _run_verify_pass(
+            config, repo_path, unit, new_branch, base_branch, pr,
+            conflict_files=conflict_files,
+            start_sha=start_sha,
+            new_head=result.new_head,
+        )
+
     return _AIStepOutcome(handled=True)
+
+
+def _run_verify_pass(
+    config: Config,
+    repo_path: Path,
+    unit: FeatureUnit,
+    new_branch: str,
+    base_branch: str,
+    pr: PRInfo,
+    *,
+    conflict_files: list[str],
+    start_sha: str,
+    new_head: str,
+) -> None:
+    """Run the advisory verifier; mutate ``unit`` in place, never raise."""
+    from releasy.ai_resolve import VerifyContext, verify_ai_resolution
+
+    ctx = VerifyContext(
+        port_branch=new_branch,
+        base_branch=base_branch,
+        source_pr=pr,
+        start_sha=start_sha,
+        new_head=new_head,
+        conflict_files=conflict_files,
+        user_context=_combine_user_context(unit, pr),
+        mode=unit.mode,
+    )
+
+    vr = verify_ai_resolution(config, repo_path, ctx)
+
+    if vr.cost_usd is not None:
+        unit.ai_cost_usd_total = (
+            (unit.ai_cost_usd_total or 0.0) + vr.cost_usd
+        )
+
+    cost_note = (
+        f" [dim](cost: ${vr.cost_usd:.4f})[/dim]"
+        if vr.cost_usd is not None else ""
+    )
+
+    if not vr.success:
+        console.print(
+            f"    [yellow]⚠[/yellow] Verifier did not produce a verdict "
+            f"for #{pr.number}: {vr.error}{cost_note} "
+            "[dim](treating as advisory — port proceeds)[/dim]"
+        )
+        return
+
+    if vr.verdict == "ok":
+        console.print(
+            f"    [green]✓[/green] Verifier: resolution of #{pr.number} "
+            f"looks in scope{cost_note}"
+        )
+        if vr.summary:
+            console.print(f"      [dim]{vr.summary}[/dim]")
+        return
+
+    # needs_attention
+    unit.verify_needs_attention = True
+    header = f"#{pr.number}"
+    if vr.summary:
+        unit.verify_findings.append(f"**{header} — {vr.summary}**")
+    else:
+        unit.verify_findings.append(f"**{header}**")
+    for finding in vr.findings:
+        unit.verify_findings.append(f"- {finding}")
+    # blank-line separator between PR blocks in the eventual PR comment
+    unit.verify_findings.append("")
+
+    console.print(
+        f"    [yellow]⚠[/yellow] Verifier flagged #{pr.number}: "
+        f"{vr.summary or 'see findings'}{cost_note}"
+    )
+    for finding in vr.findings:
+        console.print(f"      [yellow]•[/yellow] {finding}")
 
 
 @dataclass

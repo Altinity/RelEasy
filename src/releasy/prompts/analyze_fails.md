@@ -17,48 +17,35 @@ The repository at `{cwd}` is already prepared:
   `{failed_tests_file}`. It is the **ground truth** for what was
   failing on CI; refer to it when re-running tests.
 
-> **NOTE:** This is a narrowly-scoped job. Your task is to triage the
-> failures, fix the ones **caused by this PR's diff**, and report the
-> rest. RelEasy owns pushing the branch. **Do not push, do not merge,
-> do not close the PR, do not reopen it, do not change its base, do
-> not change its title or body.**
+> **NOTE:** Triage failures, fix only the ones **caused by this PR's
+> diff**, report the rest. RelEasy pushes. Do not push, merge, close,
+> reopen, change base / title / body.
 >
-> **The single hard scoping rule: only fix tests this PR broke.**
-> If a test is failing for any reason that isn't traceable to this
-> PR's diff — flaking on master, infrastructure issue, pre-existing
-> bug, environment problem — *report it and move on*. Do **not**
-> touch the code. The flaky-elsewhere annotation on each failure is
-> your strongest signal here: if a test is failing on multiple
-> unrelated PRs, that's near-conclusive evidence the failure is not
-> this PR's fault. Editing test code or production code to "fix" an
-> unrelated flake corrupts an honest CI signal — the operator can't
-> tell whether the test was actually broken by this PR or by your
-> patch. Don't do it.
+> **Hard scoping rule: only fix tests this PR broke.** Flaking on
+> master, infra issues, pre-existing bugs, environment problems →
+> *report and move on*; never edit code for them. The
+> flaky-elsewhere annotation is near-conclusive evidence the failure
+> isn't this PR's fault. "Fixing" unrelated flakes corrupts the CI
+> signal that lets a human tell "this PR broke X" apart from "X was
+> already broken".
 
 ---
 
 ## Why bundling matters: fix once, re-test all
 
-Many tests in CI fail for the **same root cause** — one regression
-in production code can flip dozens of tests red at once. The expected
-shape of this work is therefore iterative:
+Many failures share one root cause — one regression can flip dozens
+of tests red. The work is iterative:
 
 1. Skim **every** failure to spot common signatures.
-2. Pick the **highest-leverage** root cause first (the one that, if
-   fixed, plausibly resolves the most failing tests).
-3. Make the smallest possible change that addresses that root cause.
+2. Pick the highest-leverage root cause first (fixes the most tests).
+3. Smallest possible change.
 4. Build.
-5. Re-run **the entire still-failing list** in one go (one runner
-   invocation with all the names) — this is much cheaper than running
-   each test alone.
-6. See what passes now. The set of failures has shrunk.
-7. Repeat 2–6 with what remains.
+5. Re-run **the entire still-failing list** in ONE runner invocation.
+6. Repeat 2–5 with what remains.
 
-Do **not** investigate every failure individually before fixing
-anything. Do **not** run tests one at a time when you can run them in
-a batch. Do **not** re-run tests that have already passed in a
-previous iteration unless you have a specific reason to suspect
-regression.
+Do NOT investigate every failure individually before fixing anything.
+Do NOT run tests one at a time. Do NOT re-run tests that already
+passed.
 
 ---
 
@@ -81,265 +68,167 @@ is at [{target_url}]({target_url}).
 
 ## The single most important rule: linear history
 
-You may **only** append new commits to `{pr_branch}`. Every commit
-that was on `{pr_branch}` before you started must still be there, in
-the same order, pointing at the same trees, when you are done.
+You may **only** append new commits to `{pr_branch}`. Existing commits
+must remain in place, in order, pointing at the same trees.
 
-Concretely:
+- **Allowed:** `git add`, `git commit -m '…'`, `git revert <sha>`.
+- **Forbidden:** `--amend`, `--fixup`/`--squash`, `git rebase`,
+  `git reset`, `git cherry-pick`, `git merge`, `git filter-branch`,
+  `git replace`, `git update-ref`, `git push` (RelEasy pushes),
+  `git branch -D`/`-M`, `git checkout <other>`.
 
-- **Allowed:** `git add`, `git commit -m '…'`, `git revert <sha>`,
-  `git revert --no-edit <sha>`.
-- **Forbidden, no exceptions:**
-  - `git commit --amend`
-  - `git commit --fixup` / `--squash`
-  - `git rebase` (any form)
-  - `git reset` (any form — `--soft`, `--mixed`, `--hard`, `--keep`)
-  - `git cherry-pick`
-  - `git merge`
-  - `git filter-branch`, `git replace`, `git update-ref`
-  - `git push` in any form (RelEasy pushes)
-  - `git push --force` / `-f` / `--force-with-lease`
-  - `git branch -D`, `git branch -M`, `git checkout <other-branch>`
-
-If you need to retract a previous change, use `git revert <sha>`
-(creates a new forward commit).
+To retract, use `git revert <sha>` (new forward commit).
 
 ---
 
 ## Scoping rule: only fix what THIS PR broke
 
-You are only allowed to edit code for failures **caused by this PR's
-diff**. Concretely, a fix is in scope if and only if it satisfies at
-least one of the following:
+A fix is in scope iff:
 
-1. **A test exercises code this PR changed**, and the test is now
-   failing because the new behaviour disagrees with the old assertion.
-   Fix is either updating the assertion (the new behaviour is correct
-   and intentional) or fixing the production code (the new behaviour
-   is a regression).
-2. **A mechanical compiler cascade** — your in-scope change renamed a
-   symbol / changed a signature / added a required argument, and call
-   sites the compiler forces you to update fall in scope too.
-3. **A test was added by this PR** and it doesn't pass. Same options
-   as (1).
+1. **The test exercises code this PR changed** and now fails because
+   new behaviour disagrees with the old assertion. Fix is either
+   updating the assertion or fixing the production regression.
+2. **Mechanical compiler cascade** — your in-scope change renamed a
+   symbol / changed a signature / added a required argument; updating
+   call sites the compiler forces is in scope.
+3. **A test added by this PR** doesn't pass. Same options as (1).
 
-Anything else is **out of scope and you must not edit code for it**:
+Out of scope (NEVER edit code for these):
 
-- A test that was failing on master before this PR existed.
-- A test failing on multiple unrelated PRs (see the flaky-elsewhere
-  annotation on each failure block — that's the canonical signal).
-- An infrastructure / environment issue surfacing in a test (docker
-  image pull, network flake, disk full, etc.).
-- A pre-existing bug the test happens to catch but that this PR
-  didn't introduce.
-- Lints, style nits, or unrelated code smells you noticed while
-  investigating.
+- failing on master before this PR existed
+- failing on multiple unrelated PRs (flaky-elsewhere annotation)
+- infrastructure / environment issue (docker, network, disk)
+- pre-existing bug the test happens to catch
+- lints / style nits / unrelated smells
 
-For each out-of-scope failure, **report it** in the final summary
-with the reason — that's what the operator wants. Do not "fix" it in
-code; doing so corrupts the very signal that lets a human tell
-"this PR broke X" apart from "X was already broken".
+Report out-of-scope failures in the final summary with a reason.
 
 When in doubt: if you can't write a one-sentence "this PR broke this
-test because <X in the diff>" justification, the failure is out of
-scope.
+test because <X in the diff>", it's out of scope.
 
 ---
 
 ## Task — execute these steps in order, without asking for confirmation
 
-### Step 1 — Triage the whole list against the diff
-
-First, run:
+### Step 1 — Triage every failure against the diff
 
 ```bash
 git diff {base_branch}..HEAD --stat
 ```
 
-so you have the shape of what this PR changed in your head. Then read
-every failure block and classify each as exactly one of:
+Classify each failure as:
 
-- **CAUSED-BY-THIS-PR** — you can name a specific area of the diff
-  above that plausibly explains the failure. Carry into Step 2 as a
-  candidate to fix.
-- **NOT-THIS-PR** — failing for a reason unrelated to the diff. The
-  flaky-elsewhere annotation is the strongest signal: if the test is
-  also failing on multiple unrelated tracked PRs, that's
-  near-conclusive evidence it's a master-side flake or
-  infrastructure issue. **You will not edit any code for these** —
-  they go straight into the final summary as `[unrelated]` with a
-  one-line reason and you move on.
-- **CAN'T-TELL** — the failure mode is ambiguous and you genuinely
-  can't decide without running it. Reproduce it once (no fix yet) to
-  resolve into one of the two buckets above. If still genuinely
-  ambiguous after that, classify as `NOT-THIS-PR` — the rule "no
-  edits without a clear causal link to the diff" wins ties.
+- **CAUSED-BY-THIS-PR** — a specific area of the diff plausibly
+  explains it. Carry into Step 2.
+- **NOT-THIS-PR** — unrelated. Flaky-elsewhere is the strongest
+  signal. Goes to the final summary as `[unrelated]`; no code change.
+- **CAN'T-TELL** — ambiguous; reproduce once to resolve. Still
+  ambiguous → `NOT-THIS-PR` (ties go to "don't edit").
 
-Skim, don't read every byte. The goal here is "what's the cheapest
-batch of code changes that knocks the most failures out **that this
-PR actually caused**".
+Skim, don't read every byte.
 
 ### Step 2 — Pick the highest-leverage fix
 
-Group your **CAUSED-BY-THIS-PR** failures by likely root cause. Pick
-the group that:
-
-- contains the largest number of failures, AND
-- has the clearest, smallest fix.
-
-If there's a tie or you can't tell, just start with the first
-CAUSED-BY-THIS-PR test alphabetically — momentum matters more than
-optimality here.
-
-**`NOT-THIS-PR` failures never feed into this step.** They were
-already triaged out and are not candidates for code changes.
+Group CAUSED-BY-THIS-PR failures by likely root cause. Pick the
+group with the most failures AND the smallest clear fix. On a tie,
+take the first alphabetically. NOT-THIS-PR failures never feed in.
 
 ### Step 3 — Inspect, fix, build
 
-Open only the files implicated by the chosen root cause. Use `Read`,
-`Grep`, and read-only `git` (`git log`, `git show`,
-`git diff {base_branch}..HEAD`).
+Open only files implicated by the chosen root cause. Use `Read`,
+`Grep`, read-only `git`. Smallest possible change.
 
-Make the smallest possible change.
-
-If you changed compiled code, run the build wrapper:
+If you changed compiled code:
 
 ```bash
 bash {build_script}
 ```
 
-Rules for this step:
+Rules:
 
-- Use the line above verbatim — no subshells, no `&&`, no `bash -c …`.
-- Do not redirect its output anywhere; it already tees into `{build_log}`.
-- Do not read `{build_log}` when the build succeeded.
-- When the build fails, start with `tail -n 200 {build_log}` and
-  double the size as needed. Do **not** `Read` the whole log.
-- If the build itself is broken in a way you can fix in this scope,
-  fix it and commit. If not, exit with `UNRESOLVED`.
+- Verbatim line. No subshells, no `&&`, no `bash -c`. No redirection
+  — it already tees into `{build_log}`.
+- On success: don't read the log.
+- On failure: `tail -n 200 {build_log}`, double as needed. Never
+  `Read` the whole log.
+- Fix-and-commit the breakage if in scope; otherwise `UNRESOLVED`.
 
-### Step 4 — Re-run the still-failing CAUSED-BY-THIS-PR tests at once
-
-Clean per-test temporary state first so a prior run doesn't poison
-this one:
+### Step 4 — Re-run still-failing CAUSED-BY-THIS-PR tests in a batch
 
 ```bash
 rm -rf ci/tmp
 ```
 
-Then invoke the runner with **every CAUSED-BY-THIS-PR test that was
-still failing as of the start of this iteration** (not one at a
-time). Do **not** re-run NOT-THIS-PR failures — they're not part of
-this work, re-running them just burns time and might tempt you into
-"fixing" a master flake. The runner section above tells you the
-exact command shape — substitute your shrinking test list each
-iteration.
+Then invoke the runner with EVERY CAUSED-BY-THIS-PR test still
+failing — not one at a time, not the NOT-THIS-PR set.
 
-Read the output. Three buckets:
+Three outcome buckets:
 
-- **Now passing** — strike them off mentally; do not re-run them.
-- **Still failing the same way** — needs more work; carry into next
-  iteration.
-- **Failing in a NEW way** — your fix caused regression in this test;
-  it just moved from "broken in the original way" to "broken in a
-  different way". Treat this as a real bug in your fix and either
-  refine it or `git revert` your last commit.
+- **Now passing** — strike off; don't re-run.
+- **Same failure** — carry to the next iteration.
+- **NEW failure shape** — your fix regressed this test. Refine or
+  `git revert` your last commit.
 
 ### Step 5 — Commit only when something changed
 
-If your code changes shrank the failing set (or fully resolved it),
-commit them with a message that names the failures the commit
-addresses and the PR URL:
+If your changes shrank the failing set, commit:
 
 ```bash
 git add <paths>
-git commit -m "Fix CI: <one-line summary of root cause>
+git commit -m "Fix CI: <root cause one-liner>
 
 Addresses {failure_count} failing test(s) in {shard_context} on
-{pr_url}. After this fix the still-failing set shrank from N → M."
+{pr_url}. Still-failing set shrank from N → M."
 ```
 
-If your changes did **not** shrink the failing set (the build worked
-but the tests still all fail the same way), revert the commit you
-just authored with `git revert --no-edit <sha>` and try a different
-hypothesis. Do not stack speculative commits.
+If the set didn't shrink, `git revert --no-edit <sha>` your commit
+and try a different hypothesis. Do not stack speculative commits.
 
 ### Step 6 — Iterate
 
-Repeat steps 2–5 with whatever is still failing. You may iterate at
-most **{max_iterations}** build attempts in total across this shard.
-If you exhaust the budget, stop and report what you did manage to fix
-plus what's left.
+Repeat 2–5 on what's still failing. Max **{max_iterations}** build
+attempts across the shard. On exhaustion, report what you fixed.
 
 ### Step 7 — Wrap up and narrate
-
-After your last commit (or after deciding nothing more is fixable),
-run:
 
 ```bash
 git status --porcelain
 ```
 
-It must produce no output. If it does, stage and commit whatever you
-left behind (new commit, not amend).
+Must produce no output. Then list every failing test (verbatim name)
+with one label and a one-line reason:
 
-Then print a final human-readable summary to stdout — list every
-failing test from the input set (use the names verbatim) with one of
-these labels and a one-line reason:
+- `[fixed]` — caused by this PR; now passing.
+- `[unrelated]` — NOT caused by this PR; *no code change*. Reason
+  briefly (e.g. "also failing on PR #1689, #1701 — master flake").
+- `[remaining]` — caused by this PR but couldn't fix in budget.
+- `[skipped]` — never investigated (be honest — out-of-budget on a
+  CAUSED-BY-THIS-PR failure is `[skipped]`, not `[unrelated]`).
 
-- `[fixed]` — caused by this PR; now passing in your last re-run.
-- `[unrelated]` — NOT caused by this PR; *no code change made*. Give
-  the reason briefly (e.g. "also failing on PR #1689 and #1701 —
-  master flake", "pytest collection error from missing docker image —
-  infra issue", "test was already failing on master before this PR
-  branched").
-- `[remaining]` — caused by this PR but you couldn't fix it within
-  the iteration budget. Note what you tried.
-- `[skipped]` — never investigated (be honest about this — if you
-  ran out of budget before getting to a CAUSED-BY-THIS-PR failure,
-  it's `[skipped]` not `[unrelated]`).
+End with **exactly one** of:
 
-End with **exactly one** of these final lines (and nothing else on
-that line):
+- `DONE` — every test is `[fixed]` or `[unrelated]`.
+- `PARTIAL` — some `[fixed]`, some `[remaining]`/`[skipped]`.
+- `UNRELATED` — entire input is `[unrelated]`, no code changes.
+- `UNRESOLVED` — couldn't make any progress (build broken, every
+  fix regressed). No commits or all reverted.
 
-- `DONE` — every test in the input list is now `[fixed]` or
-  `[unrelated]`.
-- `PARTIAL` — at least one test is `[fixed]`, but some are
-  `[remaining]` or `[skipped]`.
-- `UNRELATED` — the entire input list is `[unrelated]` and you made
-  no code changes (this is the "this whole shard is master flake"
-  outcome).
-- `UNRESOLVED` — you tried but couldn't make any progress at all
-  (build broken, every fix attempt regressed, etc.). No commits, or
-  committed work that you've now reverted.
-
-A `PARTIAL` outcome with real progress is **fine** — that's the
-common case for tricky shards. RelEasy will record what was fixed and
-the human reviewer takes it from there.
+`PARTIAL` is fine — common for tricky shards.
 
 ---
 
 ## Hard rules (non-negotiable)
 
-- You are only allowed to touch `{pr_branch}`. Never check out, push,
-  delete, or rename any other branch. `git checkout <file>` to
-  restore individual paths is fine.
-- **Never push.** RelEasy pushes after you finish.
-- **Never rewrite history** — see the dedicated section above.
-- Do not merge `{base_branch}` (or anything else) into `{pr_branch}`.
-- Do not run any destructive / history-changing `gh` subcommand.
-  Read-only `gh pr view` / `gh pr diff` is fine.
-- Stay in scope: investigate ONLY the listed failures. No
-  while-you're-in-here cleanup.
-- **No code changes for failures not caused by this PR.** A test
-  failing on master, on multiple unrelated PRs, or for an
-  infrastructure reason is reported as `[unrelated]` — never patched.
-  If you can't write a one-sentence "this PR broke this test because
-  <X in the diff>" justification for an edit, do not make the edit.
-- Never use compound Bash commands (`&&`, `||`, `;`, `(...)`,
-  `{ ... }`, `bash -c '…'`). One simple command per Bash call.
-- Re-run the BATCH of remaining failures, not one test at a time. The
-  whole point of this shard-level investigation is to amortise the
-  build cost across many tests.
-- On exit, your final line of output must be exactly `DONE`,
-  `PARTIAL`, `UNRELATED`, or `UNRESOLVED`.
+- Only `{pr_branch}` may be touched. No other branch checkout/push/
+  delete/rename. (`git checkout <file>` to restore paths is fine.)
+- Never push. Never rewrite history (see linear-history section).
+- Never merge `{base_branch}` into `{pr_branch}`.
+- No mutating `gh` subcommands. Read-only `gh pr view`/`pr diff` fine.
+- Stay in scope: ONLY the listed failures. No drive-by cleanup.
+- No code changes for failures not caused by this PR — report as
+  `[unrelated]`. If you can't write a one-sentence "this PR broke
+  this test because <X>", do not edit.
+- No compound Bash (`&&`, `||`, `;`, `(...)`, `bash -c`). One command
+  per call.
+- Re-run remaining failures as a BATCH, not one by one.
+- Final line: exactly `DONE`, `PARTIAL`, `UNRELATED`, or `UNRESOLVED`.

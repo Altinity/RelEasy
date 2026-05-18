@@ -50,7 +50,9 @@ if TYPE_CHECKING:
 from releasy.termlog import console
 
 from releasy.ai_resolve import AIResolveContext, attempt_ai_resolve
-from releasy.config import Config, get_github_token, lookup_pr_ai_context
+from releasy.config import (
+    Config, PortMode, get_github_token, lookup_pr_ai_context,
+)
 from releasy.git_ops import (
     fetch_remote,
     get_conflict_files,
@@ -394,6 +396,7 @@ def run_merge_resolve(
     ai_active: bool,
     remote: str | None = None,
     force_merge: bool = False,
+    feature_mode: PortMode | None = None,
 ) -> MergeResolveOutcome:
     """Drive merge + (optional) AI resolve for ONE PR branch.
 
@@ -543,6 +546,15 @@ def run_merge_resolve(
             error="AI resolver disabled",
         )
 
+    # Honour the unit-build-time mode when persisted; fall back to the
+    # ladder for entries from before FeatureState.mode existed.
+    from releasy.pipeline import _detect_port_mode
+    if feature_mode in ("backport", "forward_port"):
+        resolved_mode = feature_mode
+    else:
+        resolved_mode = _detect_port_mode(
+            config, source_pr, explicit_mode="auto",
+        )
     ctx = AIResolveContext(
         port_branch=head_branch,
         base_branch=base_branch,
@@ -554,6 +566,7 @@ def run_merge_resolve(
         user_context=lookup_pr_ai_context(
             config.pr_sources, source_pr.url,
         ),
+        mode=resolved_mode,
     )
 
     result = attempt_ai_resolve(config, repo_path, ctx)
@@ -674,6 +687,7 @@ def _process_one(
         ai_active=ai_active,
         remote=remote,
         force_merge=force_merge,
+        feature_mode=fs.mode,
     )
 
     # Cost is billed even when the resolve failed — accumulate before

@@ -1,34 +1,27 @@
 # Claude skill: resolve a RelEasy port cherry-pick conflict (split-commit mode)
 
-You are an autonomous agent resolving the conflict markers left behind by
-a `git cherry-pick` in `{repo_slug}`.
+You are an autonomous agent resolving a `git cherry-pick` conflict in
+`{repo_slug}`.
 
-The repository at `{cwd}` is already prepared for you:
+The repository at `{cwd}` is already prepared:
 
 - Current branch: `{port_branch}` (already checked out).
-- The cherry-pick has **already been concluded** by RelEasy as a stand-alone
-  commit at `HEAD` whose tree still contains the literal `<<<<<<<` /
-  `=======` / `>>>>>>>` conflict markers. There is **no** cherry-pick,
-  merge, or rebase in progress — `git status` is clean.
-- The target base branch is `{base_branch}` (exists on origin).
-- The port is of source PR [{source_pr_url}]({source_pr_url}) — "{source_pr_title}".
-- The exact commit being cherry-picked has SHA `{source_pr_merge_sha}` (a
-  merge commit; `git cherry-pick -m 1` was replaying its first-parent diff).
+- The cherry-pick was **already concluded** as a stand-alone commit at
+  HEAD holding the conflict markers verbatim. SHA `{pre_resolve_sha}`.
+  **Do not amend, reset, or rewrite it.** No cherry-pick / merge /
+  rebase is in progress — `git status` is clean.
+- Your job: make a **new commit on top** that removes the markers and
+  contains the actual resolution. The port branch then shows conflict
+  and fix as separate diffs in `git log`.
+- Target base branch: `{base_branch}` (exists on origin).
+- Source PR: [{source_pr_url}]({source_pr_url}) — "{source_pr_title}".
+- Cherry-picked commit SHA: `{source_pr_merge_sha}` (merge commit;
+  `git cherry-pick -m 1` was replaying its first-parent diff).
 
-> **Why this layout?** The "with conflicts" commit and the resolution
-> commit live side by side in the port branch's history so a reviewer
-> can read `git log -p` and see, in order: (1) what the cherry-pick
-> mechanically produced (markers and all), and (2) the exact diff that
-> turned that into compileable code. **Do not amend, squash, reorder,
-> reword, or otherwise touch the "with conflicts" commit at HEAD.** Your
-> contribution is one new commit on top of it.
-
-> **NOTE:** This is one step of a larger pipeline. Your job ends after
-> the conflict is resolved, the build succeeds, and the resolution has
-> been committed locally as a *new* commit on top of the existing "with
-> conflicts" commit. RelEasy itself owns pushing the branch, opening the
-> pull request, and applying labels. **Do not push, do not open a PR, do
-> not run `gh pr ...` to mutate anything.**
+> **NOTE:** One step of a larger pipeline. Done when the resolution
+> compiles and a NEW commit on top of `{pre_resolve_sha}` exists.
+> RelEasy pushes / opens the PR / labels. **Do not push, do not run
+> `gh pr ...` mutations.**
 
 ## Conflicted files
 
@@ -43,99 +36,144 @@ The repository at `{cwd}` is already prepared for you:
 ## The single most important rule
 
 **The source PR's diff is the only authoritative list of what this port
-*wants* to add or change.** For every contested line you keep — on
-either side of any conflict marker, and for any modification you make
-outside the markers — you must be able to put it in exactly one of two
-buckets:
+*wants* to add or change.** Every contested line you keep — on either
+side of any marker, or any modification outside the markers — must fit
+exactly one bucket:
 
-1. **In the source PR's diff.** The common case. `git show` /
-   `gh pr diff` shows the line as added or modified by source PR
-   `#{source_pr_number}`. Keep it.
-2. **A minimal mechanical adaptation forced by the base branch.** The
-   source PR depended on something — a function signature, a type name,
-   an import path, a struct layout, a helper's location — that
-   `{base_branch}` has since changed. To make the port's intent compile
-   and run on the new base, you have to translate the call site / type
-   reference / import to the new shape. This is allowed, **but only when
-   you can name the specific change on `{base_branch}` that forces it**
-   (see the fill-in-the-blank test in Step 4).
+1. **In the source PR's diff.** `git show` / `gh pr diff` shows it as
+   added/modified by `#{source_pr_number}`. Keep verbatim.
+2. **Minimal mechanical adaptation forced by `{base_branch}`.** The
+   source PR depended on a signature / type / import / layout /
+   helper-location that `{base_branch}` has since changed; you have to
+   translate to the new shape. Allowed ONLY when you can name the
+   specific change on `{base_branch}` that forces it (Step 4 has the
+   fill-in-the-blank test).
 
 Anything outside those two buckets is out of scope, full stop.
 
-In the past, this prompt said vague things like "preserve the intent of
-the source PR" and "read the surrounding code to understand the merge
-context". That wording produced bad PRs where Claude pulled in code from
-*other* PRs that happened to be sitting in the same hunks (uncommented
-unrelated settings, added `ProfileEvents` from cache work, added test
-functions for unrelated features, etc.). **Do not do that.** Your bar
-for keeping a bucket-1 line is "I am ≥99% sure this exact line is in
-source PR `#{source_pr_number}`'s diff." Your bar for keeping a
-bucket-2 line is "I can name the specific base-branch change that
-forces it, and my adaptation is the minimal one that satisfies it."
-Anything that can't meet either bar does not belong in your resolution.
+Bar for bucket 1: ≥99% sure this line is in source PR
+`#{source_pr_number}`'s diff. Bar for bucket 2: you can name the
+specific base-branch change that forces it AND your adaptation is the
+minimal one. "Preserve intent" and "match surrounding style" do NOT
+meet either bar — they're how unrelated code from other PRs leaks in.
+
+---
+
+## Port direction: `{port_direction}`
+
+Source PR labels: `{source_pr_labels}`
+
+**This run was classified as `{port_direction}` by RelEasy.** The
+two modes have different rules for what to do when the source PR
+depends on functionality that doesn't exist on `{base_branch}`:
+
+- **`backport`** — porting newer-upstream work into our fork's
+  older branch. The dependency probably represents a feature
+  `{base_branch}` was never going to ship. **Bucket 0 (drop) is
+  available**: see below.
+- **`forward_port`** — porting our fork's older branch work into a
+  newer place in the same repo. The dependency was almost certainly
+  ours to begin with and just hasn't been ported yet. **Stay with
+  the MISSING_PREREQS flow.** No bucket 0.
+
+If the classification looks wrong given the source PR's labels and
+context, mention it in your final narration so the operator can
+correct the session config — but execute the classification as given.
+
+### Bucket 0 (DROP) — backport mode only
+
+In `backport` mode, if part of the source PR's diff depends on
+functionality not on `{base_branch}`, AND that part can be removed
+without breaking the rest of the port or any existing `{base_branch}`
+code, **drop it**. Do not import a 5000-line prereq PR to satisfy a
+50-line optional feature gate.
+
+Bucket 0 applies when ALL hold:
+
+1. The dependent code is an **isolated surface** in the source PR's
+   diff (feature flag, optional integration, code path behind a
+   default-off setting, `if (feature_x_enabled) { … }` block).
+2. **Dropping it leaves the rest of the source PR's intent intact.**
+3. **No existing `{base_branch}` callers depend on the dropped
+   surface.** Grep for the dropped symbol on `{base_branch}` first.
+
+When you take this path:
+
+- Cleanly remove ALL of the dropped surface (declarations, call
+  sites, registry entries, build hooks) so nothing dangles.
+- Add one `Dropped:` **git trailer** per dropped surface to your
+  **resolution commit message** (the new commit on top of
+  `{pre_resolve_sha}` — NOT the "with conflicts" commit). **Trailers
+  MUST sit at the end of the message body, preceded by a blank
+  line** — that's what git's trailer convention requires; RelEasy
+  reads them with `git log --format='%(trailers:key=Dropped,...)'`
+  and a trailer in the middle of the body will NOT be picked up.
+  Concrete example:
+
+  ```
+  Resolve conflicts in cherry-pick of #{source_pr_number}
+
+  Adapted the renamed `Foo::serialize` call site for {base_branch}.
+
+  Dropped: arrow-flight integration — depends on PR #91170 not yet on {base_branch}
+  Dropped: experimental v2 settings UI — depends on PR #91180 not yet on {base_branch}
+  ```
+
+  Multiple drops → multiple `Dropped:` lines, each on its own line,
+  no blank lines between them. RelEasy parses these and surfaces
+  them in the rebase PR body.
+- Mention each drop briefly in your final stdout narration.
+
+When you cannot drop cleanly (the dependency is the source PR's
+primary feature, or dropping would gut the port), fall through to the
+missing-prereq flow and report `MISSING_PREREQS`.
+
+In `forward_port` mode, bucket 0 is **disabled**. Do not drop
+source-PR functionality; report `MISSING_PREREQS` as before.
 
 ---
 
 ## Special case: `src/Core/SettingsChangesHistory.cpp`
 
-When resolving a cherry-pick (or any conflict) that touches this file:
+When the cherry-pick adds settings that already exist on "ours" as
+commented-out lines for the same key:
 
-1. **Incoming change adds settings** that already appear on the current branch **as commented-out lines** (same setting / same logical entry).
-
-2. **Do not** keep both: the new uncommented lines from the cherry-pick **and** the old commented block. That duplicates or contradicts history.
-
-3. **Do** prefer the existing commented lines: **uncomment them in place** by removing the `//` (and any leading whitespace introduced by the comment) from the *existing* line, and align their content with what the cherry-picked commit intended (same keys, same semantics). Then **drop** the redundant duplicate lines from the cherry-pick side of the conflict.
-
-4. **Uncomment in place — never duplicate.** "Uncomment" means edit the existing commented line so the `//` is gone. It does **not** mean "leave the `// ...` line where it is and add an uncommented copy below it." If after your resolution the file contains both:
-
-   ```cpp
-   // {"foo", true, true, "..."},
-   {"foo", true, true, "..."},
-   ```
-
-   you have done it wrong. Delete the `//`-prefixed line; only the uncommented one should remain. The same applies if the commented and uncommented copies are not adjacent — search the hunk (and any nearby hunks the cherry-pick touched) for a `// {"<same_key>", ...}` twin and remove it.
-
-**Summary:** commented-out settings for the same keys → **uncomment the existing line in place (no duplicate copy left behind) and reconcile**, do not **append** the cherry-pick's additions blindly.
+- Do NOT keep both the new uncommented row and the old `// ...` row.
+- DO uncomment the existing `// ...` row **in place** (remove `//` and
+  any leading whitespace), align its content with the cherry-pick's
+  intent (same key, same semantics), then drop the cherry-pick's
+  duplicate.
+- "Uncomment in place" means edit the existing line. It does NOT mean
+  leave the `// ...` and add an uncommented copy below. If your
+  resolution leaves both `// {"foo", ...}` and `{"foo", ...}` for the
+  same key (adjacent OR not — search nearby hunks for the twin),
+  you've done it wrong. Delete the `//` row.
 
 ---
 
 ## Recognising a missing-prerequisite conflict
 
-Sometimes what looks like a conflict is actually the source PR depending
-on earlier work that has not yet been ported to `{base_branch}`. The
-pattern feels different from a normal divergence: rather than two
-branches independently editing the same lines, you find that "theirs"
-is *built on top of* something that simply does not exist on our side
-at all — a foundation that was never laid.
+Sometimes "theirs" is built on top of a foundation that does not exist
+on `{base_branch}` at all. Signals (use judgment, not a checklist):
 
-Signals that may warrant investigation (not a checklist — use judgment):
-- "theirs" calls a function, uses a type, or includes a header that you
-  cannot locate anywhere in `{base_branch}` or the current working tree.
-- The merge-base version of the file had none of the surrounding context
-  that "theirs" is extending.
-- Trying to apply bucket-1 doesn't make sense because the required
-  scaffolding is missing, not just different.
-- The conflict marker shows "ours" with a completely different structure
-  in the same region, not a line-level divergence.
+- "theirs" calls a function / uses a type / includes a header you
+  cannot locate anywhere in `{base_branch}` or the working tree.
+- The merge-base of the file had none of the context "theirs" extends.
+- Bucket-1 doesn't make sense — scaffolding is missing, not different.
+- "ours" has a completely different structure in the conflict region,
+  not just a line-level divergence.
 
-When you suspect this, investigate before touching the conflict.
-
-**Special case — the conflicted file does not exist on `{base_branch}` at
-all.** This is the strongest signal of a missing prereq, and it has a
-direct query: ask the *source PR's branch* who introduced the file.
+**Special case — the conflicted file doesn't exist on `{base_branch}`.**
+Strongest signal. Ask the source PR's branch who introduced it:
 
 ```bash
-git log --oneline {source_pr_merge_sha} -- <file>
 git log --oneline --diff-filter=A {source_pr_merge_sha} -- <file>
 ```
 
-The `--diff-filter=A` form gives you the introducing commit. If that
-commit is a GitHub merge commit (`Merge pull request #NNN ...`), the
-prereq PR number is right there. Run this **before** falling back to
-`git log -S` identifier searches; it is more direct.
+If the introducing commit is a GitHub merge (`Merge pull request #NNN`),
+the prereq PR number is right there. Run this BEFORE `git log -S`.
 
-For the harder case (file exists on `{base_branch}` but a specific
-*symbol* it uses doesn't), use:
+For the harder case (file exists, specific symbol doesn't):
 
 ```bash
 git log -S '<identifier>' --oneline {origin_remote_name}/{origin_branch} -- <file>
@@ -143,453 +181,272 @@ git log -S '<identifier>' --oneline {origin_remote_name}/{origin_branch} -- <fil
 
 {upstream_fetch_section}
 
-GitHub merge commits embed the PR number in their message
-(`Merge pull request #NNN` or `(#NNN)`). Extract the number and form
-the PR URL from the repo slug.
+**Before declaring missing — confirm it's not just renamed.** A symbol
+absent under one name may exist under another, possibly split across
+files (parallel backport, upstream refactor reaching `{base_branch}`
+via a different path).
 
-**Before declaring it missing — confirm the foundation is actually
-absent, not just renamed.** A symbol that does not appear under its
-old name on `{base_branch}` may still exist there under a different
-name, with a different signature, or split across different files.
-This happens when the same upstream change reached `{base_branch}`
-and the source PR's branch through different paths (for example, a
-parallel backport with rewording, or an upstream refactor that landed
-on `{base_branch}` but not on the branch where the source PR was
-authored).
-
-Cross-check the candidate prereq PR before reporting it:
+Cross-check the candidate before reporting:
 
 ```bash
 gh pr diff <candidate_prereq_url>
-```
-
-Read what that PR introduces (function names, types, headers, file
-locations). For each notable addition, search `{base_branch}` for the
-*concept*, not just the literal name:
-
-```bash
-git grep -n '<concept_keyword>' -- <expected_file_or_dir>
+git grep -n '<concept_keyword>' -- <expected_dir>
 git log --oneline {base_branch} -- <expected_file>
 ```
 
-**The bar for "equivalent on `{base_branch}`" is high.** Name overlap
-is not equivalence. Before concluding the prereq already landed under
-a different shape, check that **the specific symbols the source PR's
-diff touches** are present on `{base_branch}`:
+**The equivalence bar is high.** Name overlap ≠ equivalence. Confirm
+the *specific symbols* the source PR's diff touches are on `{base_branch}`:
 
-- Same class/type that the source PR modifies? (Not just a class with a
-  similar name — the *same* class, possibly renamed.)
-- Same cached type / same function signatures the source PR's added
-  code calls into?
-- Would the source PR's `+` lines, with at most a token-level rename,
-  compile against the `{base_branch}` version?
+- same class / type (possibly renamed) the source PR modifies
+- same signatures the source PR's added code calls
+- source PR's `+` lines compile against `{base_branch}` with at most a
+  token-level rename
 
-If the answer to any of these is "no — `{base_branch}` has a *different*
-abstraction in the same area" (different cached type, different key
-type, different layer of the stack, etc.), that's a **parallel module**,
-not a renamed prereq. The prereq is still missing. Two caches in the
-same directory caching different things at different layers do not
-substitute for each other.
+A *different* abstraction on `{base_branch}` in the same area
+(different cached type, different stack layer) is a **parallel module**,
+not a renamed prereq — the prereq is still missing.
 
-When uncertain, prefer reporting `MISSING_PREREQS` over `UNRESOLVED`:
-the human reviewer can override a false-positive prereq, but a false-
-negative `UNRESOLVED` strands the PR and every later PR in the group.
+When uncertain, prefer `MISSING_PREREQS` over `UNRESOLVED`: a false
+positive is overridden by the human; a false-negative `UNRESOLVED`
+strands every later PR in the group.
 
-Only when the foundation is *genuinely* on `{base_branch}` — same
-abstraction, same API surface that the source PR's diff depends on,
-just possibly renamed or moved — proceed with bucket-2 adaptation
-instead of reporting `MISSING_PREREQS`.
+When the foundation IS genuinely on `{base_branch}` (just renamed /
+moved), proceed with a bucket-2 adaptation.
 
-Otherwise, report:
+Otherwise:
 
 ```
 MISSING_PREREQS: <url1> <url2>
-REASON: <one line explaining the dependency, AND why the equivalent is not already on {base_branch}>
+REASON: <dependency in one line, AND why the equivalent is not already on {base_branch}>
 ```
 
-Then output `UNRESOLVED` and exit without staging anything. (No new
-commit needs to be made — the "with conflicts" commit at HEAD stays put
-and RelEasy will reset it on its own.)
-
-If investigation turns up nothing clear, or if the conflict turns out
-to be a normal divergence after all, just proceed with the standard
-resolution steps. The investigation is never mandatory — it is a tool
-to reach for when the conflict shape suggests a deeper dependency
-problem.
+Then `UNRESOLVED` and exit without staging. **Do not make a resolution
+commit when reporting `MISSING_PREREQS`** — RelEasy resets to
+`{pre_resolve_sha}` itself.
 
 ### Worked example of a false-positive prereq
 
-The source PR (authored on a 25.8-style branch) calls
-`foo_v2(ctx, out)`. Cherry-picking onto `{base_branch}` (a 26.3-style
-branch) produces a conflict because `foo_v2` is not defined.
+Source PR calls `foo_v2(ctx, out)`. Cherry-pick onto `{base_branch}`
+fails because `foo_v2` isn't defined. `git log -S 'foo_v2'` finds
+backport PR #1234 introducing it on 25.8.
 
-```bash
-git log -S 'foo_v2' --oneline {origin_remote_name}/{origin_branch} -- <file>
-```
-
-finds a backport PR #1234 that introduced `foo_v2` in 25.8.
-
-Before reporting #1234 as missing, run `gh pr diff #1234` and check
-`{base_branch}`:
-
-```bash
-git grep -n 'foo' -- src/Foo/
-git log --oneline {base_branch} -- src/Foo/Foo.cpp
-```
-
-If `{base_branch}` has `foo(ctx, out)` (the upstream original of which
-`foo_v2` was a 25.8-flavoured rewording), the right action is **not**
-to port #1234 — it would conflict with `foo` that's already there.
-The right action is a bucket-2 adaptation: rename `foo_v2(...)` to
-`foo(...)` in the conflict resolution and proceed normally.
+`gh pr diff #1234` + `git grep 'foo' -- src/Foo/` on `{base_branch}`
+shows it has `foo(ctx, out)` — the upstream original `foo_v2` was a
+25.8 rewording of. Don't port #1234. Bucket-2 adaptation: rename
+`foo_v2(...)` → `foo(...)` in the resolution.
 
 ---
 
-## Task — execute these steps in order, without asking for confirmation
+## Task — execute these steps in order
 
-### Step 1 — Establish ground truth (the source PR's actual diff)
+### Step 1 — Establish ground truth (the source PR's diff)
 
-Before touching any file, get the exact diff the cherry-pick was trying
-to apply. Use **both** of these so you can cross-check:
+Authoritative source view (what `git cherry-pick -m 1` was replaying):
 
-1. The local first-parent diff of the merge commit (this is literally
-   what `git cherry-pick -m 1` was replaying):
+```bash
+git show -m --first-parent --no-color {source_pr_merge_sha}
+```
 
-   ```bash
-   git show -m --first-parent --no-color {source_pr_merge_sha}
-   ```
+Cross-check via GitHub (local wins if they differ, but a divergence
+warrants a look):
 
-2. The diff GitHub shows on the source PR (used as a cross-check; if it
-   differs from `git show`, the local one wins, but a divergence is a
-   strong signal that something weird is going on — investigate):
+```bash
+gh pr diff {source_pr_url}
+```
 
-   ```bash
-   gh pr diff {source_pr_url}
-   ```
-
-For each conflicted file `<file>` you may also narrow down with:
+Per-file narrow:
 
 ```bash
 git show -m --first-parent --no-color {source_pr_merge_sha} -- <file>
 ```
 
-You may also need to inspect the current `{base_branch}` shape around a
-conflicted file to justify a bucket-2 mechanical adaptation. The
-"pre-cherry-pick" state of the file (what was on the branch *before* the
-conflicting commit landed — equivalent to the classic "ours") is
-`HEAD~1:<file>`:
+To justify bucket-2 adaptations, inspect the pre-cherry-pick shape —
+the parent of the "with conflicts" commit:
 
 ```bash
-git show HEAD~1:<file>
-git blame HEAD~1 -- <file>
+git show {pre_resolve_sha}^:<file>
+git blame {pre_resolve_sha}^ -- <file>
 git log --no-color --follow --oneline {base_branch} -- <file>
 ```
 
-Read these diffs carefully. The source PR's diff defines what the port
-*wants* to do; the `HEAD~1` shape of the file is the only legitimate
-source of bucket-2 adaptations. Anything not explainable by one of the
-two is out of scope.
+### Step 2 — Inspect the "with conflicts" commit
 
-### Step 2 — Inspect the conflict markers committed at HEAD
-
-The "with conflicts" commit at HEAD has the conflict markers literally
-stored in the file content. Inspect them with the working-tree files
-themselves (the markers are in there as text):
+The markers live in tracked files, committed verbatim into
+`{pre_resolve_sha}`. The working tree matches that commit (no in-progress
+merge state):
 
 ```bash
-git status                       # must be clean (no in-progress operation)
-git log -1 --stat                # confirms HEAD is the "with conflicts" commit
-git log -1 --format=%B           # full message of the "with conflicts" commit
+git log -1 --stat {pre_resolve_sha}
+git show {pre_resolve_sha} -- <file>
 ```
 
-For each conflicted file, the commit at HEAD shows you both sides:
+In a cherry-pick:
 
-```bash
-git diff HEAD~1 HEAD -- <file>     # what the cherry-pick produced (markers and all)
-cat <file>                          # the file as it sits in your working tree
-```
-
-Inside each `<<<<<<< ours` / `======= ` / `>>>>>>> theirs` block:
-
-- **"ours"** is the pre-cherry-pick state (i.e. `{base_branch}` plus
-  whatever earlier commits this port already applied). Treat it as the
-  truth for everything *outside* the source PR's scope.
-- **"theirs"** is the commit that was being applied — but a merge
-  commit's first-parent diff can include code from *other* PRs that the
-  original branch had bundled in. **Lines from "theirs" that are not in
-  the source PR's diff are noise.** Drop them.
+- **"ours"** = parent of `{pre_resolve_sha}` (`{base_branch}` + earlier
+  picks already applied). Truth for everything OUTSIDE the source PR's
+  scope.
+- **"theirs"** = the cherry-picked commit — but a merge commit's
+  first-parent diff can carry code from OTHER PRs the source branch
+  bundled in. **Lines in "theirs" not in the source PR's diff are
+  noise. Drop them.**
 
 ### Step 3 — Resolve each conflict, hunk by hunk
 
-For every `<<<<<<< ... ======= ... >>>>>>>` block in each conflicted
-file:
+For every `<<<<<<< ... ======= ... >>>>>>>` block in the working tree:
 
-1. Identify each *line* on the "theirs" side that differs from "ours".
-2. For each such line, check whether it appears as an addition (or
-   modification) in the source PR's diff from Step 1.
-   - **In the diff → keep it (bucket 1).** Use it verbatim where you
-     can. If it references a symbol/signature/type that `{base_branch}`
-     has since changed, replace just the affected token(s) with the
-     new shape — that token-level swap is the bucket-2 adaptation, see
-     point 3.
-   - **Not in the diff → drop it by default.** Keep "ours". Do not
-     invent a reason why the line "should" be here. The exact failure
-     mode from PR #1663 was uncommenting whole blocks of
-     `SettingsChangesHistory` entries that the source PR never touched,
-     just because they happened to sit next to a real change. Don't.
-3. **Bucket-2 adaptations: when going outside the source PR's diff is
-   actually OK.** You may keep or write a line that is *not* in the
-   source PR's diff if **all** of the following are true:
-   1. The line is the minimal mechanical translation of a real change
-      from the source PR's diff into the shape `{base_branch}` now
-      expects (a renamed call, an added required argument, a relocated
-      type, a moved import, a struct field that was split into two,
-      etc.).
-   2. You can point to the specific symbol or recent commit on
-      `{base_branch}` (visible either in the `HEAD~1:<file>` shape from
-      Step 1 or in the `git log --follow --oneline {base_branch} -- <file>`
-      output from Step 1) that forces the change.
-   3. The translation does not add new behavior, new logging, new
-      error handling, new tests, or new helpers. If satisfying (1)
-      requires a small new helper, **stop and exit `UNRESOLVED`** —
-      that's beyond mechanical translation and the human reviewer
-      should decide.
-   When you take this path, mention it briefly in your final stdout
-   narration before `DONE` (e.g. *"Adapted call to `Foo::serialize` for
-   the renamed-on-`{base_branch}` signature `Foo::serialize(ctx, out)`"*).
-4. **Remove every conflict marker.** No `<<<<<<<`, `=======`, or
-   `>>>>>>>` line may survive into your resolution. The whole point of
-   the new commit is to delete them and replace each conflicted region
-   with the chosen text.
-5. If the conflict is in a comment, doc-string, or generated table of
-   the kind that grows with every PR (e.g. `SettingsChangesHistory`,
-   `ProfileEvents`, changelog tables): **only** keep the rows the source
-   PR itself adds. The bucket-2 carve-out does **not** apply to these
-   append-only registries — re-adding "missing" rows from other PRs is
-   exactly what bucket-2 is *not* about. **And for
-   `SettingsChangesHistory.cpp` specifically:** if a row the source PR
-   adds already exists on `ours` as a `// ...` commented-out line for
-   the *same key*, uncomment that existing line in place and drop the
-   cherry-pick's duplicate — see the "Special case" section above.
-   Never leave both a `// {"foo", ...}` and a `{"foo", ...}` for the
-   same key in the file.
+1. For each line "theirs" adds vs "ours", check the source PR's diff:
+   - **In the diff → keep (bucket 1).** Verbatim. If it references a
+     symbol `{base_branch}` has renamed/moved/re-signatured, swap just
+     the affected tokens (token swap IS the bucket-2 adaptation).
+   - **Not in the diff → drop (keep "ours").** Don't invent a reason.
+     PR #1663 regression: blocks of `SettingsChangesHistory` rows the
+     source PR never touched got uncommented because they sat next to
+     a real change. Don't.
+2. **Bucket-2 adaptation is OK when ALL of:**
+   1. minimal mechanical translation of a real change from the source
+      PR's diff into `{base_branch}`'s current shape (renamed call,
+      added required arg, moved import, split struct field, …);
+   2. you can point to the specific symbol/commit on `{base_branch}`
+      (visible in parent of `{pre_resolve_sha}` or in
+      `git log --follow --oneline {base_branch} -- <file>`) that
+      forces it;
+   3. no new behaviour, logging, error handling, tests, or helpers.
+      Need a new helper? → `UNRESOLVED`.
+
+   Mention each bucket-2 path briefly in your final narration (e.g.
+   *"Adapted `Foo::serialize` to renamed signature on {base_branch}"*).
+3. **Append-only registries** (`SettingsChangesHistory`, `ProfileEvents`,
+   changelog tables): keep ONLY the rows the source PR adds. Bucket-2
+   does NOT apply. For `SettingsChangesHistory.cpp`: if a source-PR
+   row exists on "ours" as `// ...` for the same key, uncomment in
+   place and drop the cherry-pick's duplicate (Special case above).
+   Never leave both `// {"foo", ...}` and `{"foo", ...}` for the same
+   key.
 
 ### Hard prohibitions
 
-- **No inventions.** Do not add functions, methods, classes, settings,
-  profile events, metrics, error codes, integration tests, doc lines, or
-  imports unless they either (a) appear *verbatim* in the diff from
-  Step 1, or (b) are the smallest possible bucket-2 mechanical
-  adaptation forced by the current `{base_branch}` shape. This carve-out
-  does **not** apply to append-only registries like
-  `SettingsChangesHistory` or `ProfileEvents`.
-- **No copying from other refs.** Do not `git show <other-sha>`,
-  `git log <other-branch>`, or read other branches/tags to figure out
-  "what should be there". The only refs that matter are
-  `{source_pr_merge_sha}`, `{port_branch}` (specifically `HEAD` and
-  `HEAD~1`), and `{base_branch}`.
-  *Exception — prerequisite detection only*: `git log -S <identifier>`
-  on `{origin_remote_name}/{origin_branch}` (and on the upstream remote
-  if configured) is allowed **solely to identify which PR introduced a
-  missing foundation**, when you judge the conflict may be a
-  missing-prerequisite situation (see "Recognising a
-  missing-prerequisite conflict" above). This never licenses reading or
-  copying code from those refs — only extracting a commit reference to
-  report back via `MISSING_PREREQS:`.
-- **Never amend, reword, or otherwise touch the "with conflicts" commit
-  at HEAD.** It is your input, not your output. Do not run
-  `git commit --amend`, `git rebase -i`, `git reset --soft HEAD~`,
-  `git reset --hard`, or any other history rewrite. Your contribution is
-  one new commit on top of HEAD.
-- **No `git add -A`.** Stage only the files you actually edited to
-  resolve the conflicts (and any file you had to touch to make them
-  compile after resolving the conflict).
-- **No fixing unrelated lints / refactors / typos** noticed along the
-  way. They are the next reviewer's problem, not this PR's.
+- **Never amend / reset / rewrite `{pre_resolve_sha}`.** Your
+  resolution is a FRESH commit on top. Running `git commit --amend`
+  before your resolution commit exists would amend
+  `{pre_resolve_sha}` — wrong.
+- **No inventions.** No new functions / classes / settings / metrics /
+  errors / tests / imports unless they (a) appear verbatim in the
+  source PR diff or (b) are minimal bucket-2 translations. Append-only
+  registries get NO bucket-2 carve-out.
+- **No reading other refs.** Only `{source_pr_merge_sha}`,
+  `{port_branch}`, `{pre_resolve_sha}`, `{base_branch}` matter.
+  *Exception:* `git log -S <identifier>` on
+  `{origin_remote_name}/{origin_branch}` (and upstream if configured)
+  is allowed **solely** to identify a missing-prereq PR. Never copy
+  code from those refs.
+- **No `git add -A`.** Stage only files you touched.
+- **No drive-by lint / refactor / typo fixes.**
 
 ### Step 4 — Verify scope before committing
 
-After you have edited the conflicted files but BEFORE running
-`git commit`:
+Before `git commit`:
 
 ```bash
-git diff -- <file>            # the changes you're about to stage in <file>
+git diff -- <file>
 ```
 
-Read each `+` line in your output and classify it into one of the two
-allowed buckets from "The single most important rule":
+Classify each `+` line into bucket 1 or bucket 2:
 
-- **Bucket 1 — in the source PR diff?** Run (or recall) `git show -m
-  --first-parent {source_pr_merge_sha}` and confirm the line appears as
-  an addition or modification there. Keep it.
-- **Bucket 2 — minimal mechanical adaptation?** Try to fill in this
-  sentence out loud:
+- **Bucket 1?** Line appears as added/modified in
+  `git show -m --first-parent {source_pr_merge_sha}`. Keep.
+- **Bucket 2?** You can fill in:
 
-  > "I had to write this line because commit `<sha>` (or symbol
-  > `<name>`) on `{base_branch}` `<renamed | moved | changed the
-  > signature of | split | removed>` `<exact thing>`, which broke the
-  > source PR's assumption that `<exact assumption>`. The change I made
-  > is the minimal translation: just `<token swap | extra arg | new
-  > include path | …>`."
+  > "Line needed because commit `<sha>` (or symbol `<name>`) on
+  > `{base_branch}` `<renamed | moved | re-signatured | split | removed>`
+  > `<exact thing>`, breaking the source PR's assumption that
+  > `<exact assumption>`. Minimal translation: `<token swap | extra
+  > arg | new include path | …>`."
 
-  You should be able to point to the specific symbol in the
-  `HEAD~1:<file>` shape, or to a recent commit in the
-  `git log --follow --oneline {base_branch} -- <file>` output from
-  Step 1. Vague answers ("the API looks different now", "to match
-  surrounding style", "it seems consistent with X") do **not** count —
-  those are the rationalisations that produced the PR #1663 regression.
-- **Neither bucket → remove the line and redo the resolution.** This
-  check is the single line of defense against the PR #1663 failure
-  mode. If removing the line breaks the build in Step 6, that's
-  evidence you misidentified bucket 2 — re-examine, find the named
-  base-branch change, and try again.
+  Vague answers ("API looks different", "matches style", "seems
+  consistent") DO NOT count — those produced the PR #1663 regression.
+- **Neither bucket → remove the line.** If removing it breaks the
+  build, you misidentified bucket 2: name the base-branch cause or
+  drop the line.
 
-Also confirm that **no `<<<<<<<` / `=======` / `>>>>>>>` markers remain
-in your `git diff`** — every conflict region must be fully replaced.
+If you can't decide a hunk, or bucket-2 would need more than a token
+swap → `UNRESOLVED`. **Do not commit anything when exiting
+`UNRESOLVED`** — RelEasy resets to `{pre_resolve_sha}`.
 
-If after this check you genuinely cannot decide between two reasonable
-resolutions of a hunk, or a bucket-2 adaptation would require more than
-a token-level change, stop, print a single line `UNRESOLVED` and exit.
-A clean abort is much better than an over-eager guess.
-
-### Step 5 — Stage and commit the resolution as a NEW commit
+### Step 5 — Make the resolution commit (NEW commit, not amend)
 
 ```bash
 git add <file> <file> ...
-git commit -m "Resolve cherry-pick conflicts for #{source_pr_number}"
+git commit -m "Resolve conflicts in cherry-pick of #{source_pr_number}"
 ```
 
-Do **not** use `git commit --amend`. Do **not** use `git cherry-pick
---continue` (there is no cherry-pick in progress). The output you are
-producing is a brand-new commit whose parent is the "with conflicts"
-commit currently at HEAD.
+After this: `git log -1` shows your fresh commit; `git log -1 HEAD~1`
+still shows `{pre_resolve_sha}`. If `--amend` ever reports
+`{pre_resolve_sha}` as the just-amended commit, you've violated the
+hard rule — exit `UNRESOLVED`.
 
-After this step the port branch's history (most-recent first) reads:
-
-```
-<your new commit>      ← the resolution
-<HEAD before you ran>  ← the cherry-pick with conflict markers
-... earlier commits ...
-```
-
-A reviewer running `git log -p` will see the conflict markers appear
-and disappear in successive commits, which is exactly the diff trail
-this layout is designed to produce.
-
-### Step 6 — Build to verify the resolution compiles
-
-RelEasy has written a wrapper script at `{build_script}` containing the
-exact build commands configured for this project (essentially:
-`{build_command}`). It internally tees full output to `{build_log}`.
-
-Run the build with **exactly this single Bash command** — no subshells,
-no `&&`, no `;`, no `bash -c '…'`:
+### Step 6 — Build
 
 ```bash
 bash {build_script}
 ```
 
-Rules for this step:
-- Use the line above verbatim. Do not invent your own `cmake` / `ninja`
-  invocations, do not chain extra commands with `&&` or `;`, do not wrap
-  it in `(...)` or `bash -c '…'`. Claude's Bash tool will reject any of
-  those.
-- Do not redirect output to other files. The script already tees into
-  `{build_log}`.
+Rules:
 
-How to inspect `{build_log}` efficiently:
-- **If the build succeeded** (`bash {build_script}` exited 0): do NOT
-  read the log. Move on to Step 7. There is no useful information in a
-  green log.
-- **If the build failed**: the failure cause is at the **end** of the
-  log. Do NOT use the **Read** tool on the whole file — it is routinely
-  >25k tokens and the call will be rejected.
-  - Start with `tail -n 200 {build_log}` via Bash. That almost always
-    contains the first compiler error and the `FAILED:` / `ninja: build
-    stopped` lines.
-  - If 200 lines isn't enough, double it: `tail -n 400`, then `-n 800`,
-    etc.
-  - Use Grep with `pattern: "error:"` or `pattern: "^FAILED:"` only as a
-    fallback when tail-doubling has not surfaced the cause within ~2k
-    lines (e.g. failure happens mid-build and is buried under later
-    output).
-  - Only fall back to **Read** with explicit `offset` / `limit` when you
-    already know the line range you want (e.g. from a Grep hit).
-- Fix the offending code — but the same scope rule still applies. Your
-  fix must remain inside the source PR's diff plus minimal mechanical
-  adaptations forced by `{base_branch}`. Do not "fix" the build by
-  pulling in code from other PRs.
-- Stage and amend **your resolution commit only** (the one you just
-  created in Step 5 — it is the current HEAD):
-  ```bash
-  git add -u
-  git commit --amend --no-edit
-  ```
-  The "with conflicts" commit is now `HEAD~1` and must remain
-  untouched. Never run `git commit --amend` while HEAD is still pointing
-  at the "with conflicts" commit (i.e. before Step 5 has completed).
-- Rerun the EXACT same single command `bash {build_script}` (it
-  overwrites the log, which is fine).
-- You may iterate at most **{max_iterations}** build attempts in total.
+- Verbatim line. No subshells, no `&&`, no `bash -c`. No `cmake` /
+  `ninja` / `make` directly. No output redirection — it already tees
+  into `{build_log}`.
+- On success: do not read the log.
+- On failure: cause is at the END of the log.
+  - Start `tail -n 200 {build_log}`; double as needed.
+  - `Grep "error:"` / `"^FAILED:"` as fallback if tail hasn't surfaced
+    the cause within ~2k lines.
+  - Never `Read` the whole log (>25k tokens, rejected).
+- Same scope rule on fixes: bucket-1 or bucket-2 only. Don't "fix" the
+  build by pulling code from other PRs.
+- Amend your **resolution commit only** — HEAD must be your Step-5
+  commit, NOT `{pre_resolve_sha}`. Confirm with
+  `git log -1 --format=%H` before `--amend`. Amending the "with
+  conflicts" commit is a hard rule violation → `UNRESOLVED`.
+- `git add -u && git commit --amend --no-edit`, then rerun
+  `bash {build_script}`.
+- Max **{max_iterations}** build attempts.
 
 ### Step 7 — Final clean-tree check
 
 ```bash
 git status --porcelain
-```
-
-It must produce no output. If it does, repeat Step 4's scope check on
-whatever's left, then stage and amend your resolution commit
-(`git add -u && git commit --amend --no-edit`).
-
-Also confirm the layout you're handing back:
-
-```bash
 git log --oneline -2
 ```
 
-The first line should be your resolution commit; the second should be
-the "Cherry-pick … with unresolved conflict markers" commit RelEasy
-created. If `git log --oneline -2` shows only one commit (or your
-commit is the only one above the base branch), you must have
-inadvertently amended or reset the "with conflicts" commit — that
-violates the layout contract. Print `UNRESOLVED` and exit; RelEasy will
-reset and let a human take over.
+`git status` must be empty. `git log` must show your resolution commit
+on top with `{pre_resolve_sha}` as its parent.
+
+If something's unstaged, repeat Step 4's scope check, then
+`git add -u && git commit --amend --no-edit`. If `HEAD~1` is no longer
+`{pre_resolve_sha}` (you somehow swallowed it), `UNRESOLVED` — RelEasy
+resets.
 
 ---
 
 ## Hard rules (non-negotiable)
 
-- You are only allowed to touch branch `{port_branch}`. Never check out,
-  push, or delete any other branch.
-- **Never push.** Never run `git push`, `gh pr create`, `gh pr edit`, or
-  any other command that mutates the remote. RelEasy will push and open
-  the PR after you finish. (Read-only `gh` commands like
-  `gh pr diff {source_pr_url}` are fine and encouraged.)
+- Only `{port_branch}` may be touched. No other branch checkout/push/
+  delete.
+- **Never amend or rewrite `{pre_resolve_sha}`.** After you finish,
+  `HEAD~1` must still be `{pre_resolve_sha}` exactly.
+- Never push, never `gh pr create / edit / merge`. RelEasy pushes.
+  Read-only `gh pr diff` etc. is fine.
 - Never force-push to `{base_branch}` or any protected branch.
-- **Never amend, reword, or rewrite the "with conflicts" commit at
-  HEAD.** It is RelEasy's input to your work. The only commit you may
-  amend is the resolution commit you create in Step 5 (and only after
-  you've created it).
-- Never amend or rewrite commits that already exist on
-  `origin/{base_branch}`.
-- Do not run `git reset --hard`, `git reset --soft HEAD~`, or anything
-  that rewinds past HEAD's parent. Do not run `git rebase` for any
-  reason.
-- Never write log files yourself; the only build log is `{build_log}`,
-  produced by the wrapper script — you only ever read it.
-- Never invoke `cmake`, `ninja`, `make`, or `bash` directly with custom
-  arguments. The only allowed build invocation is the single command
-  `bash {build_script}`.
-- Never use compound Bash commands (`&&`, `||`, `;`, `(...)`,
-  `{ ... }`, `bash -c '…'`). Claude's Bash tool refuses them. Run one
-  simple command per Bash call.
-- If after **{max_iterations}** build attempts the build still fails,
-  stop, print a single line `BUILD FAILED` and exit.
-- If you cannot resolve a hunk with ≥99% confidence that every kept
-  line falls into one of the two allowed buckets — (1) source PR
-  `#{source_pr_number}`'s diff, or (2) a named, minimal, token-level
-  mechanical adaptation forced by a specific change on `{base_branch}`
-  since the source PR was written — stop, print a single line
-  `UNRESOLVED` and exit. Do not guess.
-- On success, your final line of output must be `DONE`.
+- Never amend commits already on `origin/{base_branch}`.
+- Never `git reset --hard` against a remote ref or against
+  `{pre_resolve_sha}`.
+- Only read `{build_log}`. Never write logs.
+- Only allowed build invocation: `bash {build_script}`. No direct
+  `cmake`/`ninja`/`make`.
+- No compound Bash (`&&`, `||`, `;`, `(...)`, `bash -c`). One command
+  per call.
+- After **{max_iterations}** failed builds: `BUILD FAILED` and exit.
+  Don't keep amending — RelEasy rolls back.
+- If you cannot resolve a hunk with ≥99% confidence every kept line
+  is bucket-1 or named-bucket-2: `UNRESOLVED` (no resolution commit).
+- On success, final line must be `DONE`.

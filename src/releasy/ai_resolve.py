@@ -22,7 +22,7 @@ from typing import Literal
 
 from releasy.termlog import console
 
-from releasy.config import Config
+from releasy.config import Config, PortMode
 from releasy.git_ops import (
     is_operation_in_progress,
     run_git,
@@ -77,6 +77,9 @@ class AIResolveContext:
     # ran. Used in split-mode postcondition checks: a successful resolve
     # must add at least one new commit on top of this SHA.
     pre_resolve_sha: str | None = None
+    # Backport unlocks bucket-0 (drop optional missing-prereq surfaces);
+    # forward-port keeps the MISSING_PREREQS-only flow.
+    mode: PortMode = "forward_port"
 
 
 @dataclass
@@ -309,6 +312,18 @@ def _render_prompt(config: Config, repo_path: Path, ctx: AIResolveContext) -> st
         # the resolution lives in a new commit on top. Empty for non-split
         # invocations so the placeholder collapses cleanly.
         "pre_resolve_sha": ctx.pre_resolve_sha or "",
+        # Port direction. Either ``"backport"`` or ``"forward_port"``.
+        # Drives the "Port direction" section in the resolver prompt:
+        # backport-mode templates activate bucket-0; forward-port-mode
+        # templates keep the original MISSING_PREREQS-only flow.
+        "port_direction": ctx.mode,
+        # Comma-separated list of source PR labels for the model to
+        # sanity-check the detected ``port_direction``. Empty when no
+        # labels were fetched (still acceptable — the ladder doesn't
+        # require labels to commit to a mode).
+        "source_pr_labels": ", ".join(
+            l for l in (ctx.source_pr.labels or []) if l
+        ),
     }
 
     def _replace(match: re.Match[str]) -> str:
@@ -1143,3 +1158,248 @@ def attempt_ai_resolve(
         run_git(["reset", "--hard", ctx.start_sha], repo_path, check=False)
 
     return result
+
+
+# Post-resolve verification (advisory): a read-only second Claude pass
+# that diffs the landed resolution against the source PR. Findings drive
+# a label + PR comment; never rolls back.
+
+# Read-only allowlist; Edit/Write would defeat the audit's purpose.
+_VERIFY_ALLOWED_TOOLS = (
+    "Read", "Glob", "Grep",
+    "Bash(git:*)", "Bash(gh:*)",
+    "Bash(ls:*)", "Bash(cat:*)", "Bash(head:*)", "Bash(tail:*)",
+    "Bash(rg:*)", "Bash(wc:*)",
+)
+
+
+VerifyVerdict = Literal["ok", "needs_attention", "unknown"]
+
+
+@dataclass
+class VerifyContext:
+    port_branch: str
+    base_branch: str
+    source_pr: PRInfo
+    # The AI's work lives in start_sha..new_head (1 or 2 commits).
+    start_sha: str
+    new_head: str
+    conflict_files: list[str] = field(default_factory=list)
+    user_context: str = ""
+    mode: PortMode = "forward_port"
+
+
+@dataclass
+class VerifyResult:
+    # ``success`` is True iff the verifier RAN cleanly (any verdict);
+    # False = timeout / exit-code error / malformed transcript.
+    success: bool
+    verdict: VerifyVerdict = "unknown"
+    summary: str = ""
+    findings: list[str] = field(default_factory=list)
+    error: str | None = None
+    timed_out: bool = False
+    cost_usd: float | None = None
+
+
+def _resolve_verify_prompt_path(config: Config) -> Path:
+    raw = config.ai_resolve.verify_prompt_file
+    p = Path(raw)
+    if not p.is_absolute():
+        p = (config.repo_dir / p).resolve()
+    return p
+
+
+def _render_verify_prompt(config: Config, repo_path: Path, ctx: VerifyContext) -> str:
+    prompt_path = _resolve_verify_prompt_path(config)
+    if not prompt_path.exists():
+        raise FileNotFoundError(
+            f"Verifier prompt template not found: {prompt_path}. "
+            "Set ai_resolve.verify_prompt_file in config."
+        )
+
+    template = prompt_path.read_text(encoding="utf-8")
+
+    from releasy.github_ops import get_origin_repo_slug
+    repo_slug = get_origin_repo_slug(config) or "<unknown>"
+
+    conflict_files_md = "\n".join(f"- `{f}`" for f in ctx.conflict_files) or "- (none)"
+
+    body = (ctx.source_pr.body or "").strip()
+    if not body:
+        body = "_(empty)_"
+    elif len(body) > 4000:
+        body = body[:4000] + "\n\n_(truncated)_"
+
+    source_pr_merge_sha = (
+        ctx.source_pr.merge_commit_sha or ctx.source_pr.head_sha or ""
+    )
+
+    user_context_text = (ctx.user_context or "").strip()
+    if user_context_text:
+        user_context_section = (
+            "\n## User-supplied context (from session.yaml)\n\n"
+            "> The operator attached this note to this PR / group when "
+            "configuring the run. Treat it as a hint about the resolver's "
+            "intent, not a license to relax the in-scope rule.\n\n"
+            f"{user_context_text}\n"
+        )
+    else:
+        user_context_section = ""
+
+    placeholders = {
+        "repo_slug": repo_slug,
+        "cwd": str(repo_path),
+        "port_branch": ctx.port_branch,
+        "base_branch": ctx.base_branch,
+        "source_pr_url": ctx.source_pr.url,
+        "source_pr_title": ctx.source_pr.title,
+        "source_pr_number": str(ctx.source_pr.number),
+        "source_pr_body": body,
+        "source_pr_merge_sha": source_pr_merge_sha,
+        "start_sha": ctx.start_sha,
+        "new_head": ctx.new_head,
+        "conflict_files": conflict_files_md,
+        "user_context_section": user_context_section,
+        "port_direction": ctx.mode,
+        "source_pr_labels": ", ".join(
+            l for l in (ctx.source_pr.labels or []) if l
+        ),
+    }
+
+    def _replace(match: re.Match[str]) -> str:
+        key = match.group(1)
+        return placeholders.get(key, match.group(0))
+
+    return re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", _replace, template)
+
+
+# Match each verdict line; last occurrence wins so mid-run rephrasings
+# can't pin us to a stale answer.
+_VERIFY_VERDICT_RE = re.compile(
+    r"^\s*VERDICT\s*:\s*(OK|NEEDS_ATTENTION)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_VERIFY_SUMMARY_RE = re.compile(
+    r"^\s*SUMMARY\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE,
+)
+_VERIFY_END_RE = re.compile(r"^\s*END_VERIFY\s*$", re.IGNORECASE | re.MULTILINE)
+
+
+def _parse_verify_output(output: str) -> tuple[VerifyVerdict, str, list[str]]:
+    """Parse VERDICT / SUMMARY / FINDINGS from a transcript.
+
+    Returns ``("unknown", "", [])`` on a malformed transcript so the
+    caller can downgrade to advisory-only.
+    """
+    text = _extract_assistant_text(output)
+
+    verdict: VerifyVerdict = "unknown"
+    verdict_matches = list(_VERIFY_VERDICT_RE.finditer(text))
+    if verdict_matches:
+        raw = verdict_matches[-1].group(1).strip().upper()
+        if raw == "OK":
+            verdict = "ok"
+        elif raw == "NEEDS_ATTENTION":
+            verdict = "needs_attention"
+
+    summary = ""
+    summary_matches = list(_VERIFY_SUMMARY_RE.finditer(text))
+    if summary_matches:
+        summary = summary_matches[-1].group(1).strip()
+
+    findings: list[str] = []
+    # Scan the last FINDINGS: block before END_VERIFY (or EOF).
+    findings_block = ""
+    findings_idx = text.lower().rfind("findings:")
+    if findings_idx >= 0:
+        tail = text[findings_idx + len("findings:"):]
+        end_match = _VERIFY_END_RE.search(tail)
+        findings_block = tail[: end_match.start()] if end_match else tail
+    for line in findings_block.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        for prefix in ("- ", "* ", "• "):
+            if line.startswith(prefix):
+                line = line[len(prefix):].strip()
+                break
+        else:
+            m = re.match(r"^\d+\.\s+(.+)$", line)
+            if m:
+                line = m.group(1).strip()
+            else:
+                # First non-bullet line ends the block (stops capturing
+                # trailing narration as findings).
+                break
+        if not line or line.lower() == "(none)":
+            continue
+        findings.append(line)
+
+    return verdict, summary, findings
+
+
+def verify_ai_resolution(
+    config: Config, repo_path: Path, ctx: VerifyContext,
+) -> VerifyResult:
+    """Run the advisory verifier; never mutates the repo or remote."""
+    if shutil.which(config.ai_resolve.command) is None:
+        return VerifyResult(
+            success=False,
+            error=f"'{config.ai_resolve.command}' not found on PATH",
+        )
+
+    try:
+        prompt = _render_verify_prompt(config, repo_path, ctx)
+    except FileNotFoundError as exc:
+        return VerifyResult(success=False, error=str(exc))
+
+    argv = [
+        config.ai_resolve.command,
+        "-p", prompt,
+        "--output-format", "stream-json",
+        "--verbose",
+        "--allowedTools", ",".join(_VERIFY_ALLOWED_TOOLS),
+    ]
+    argv += list(config.ai_resolve.extra_args)
+
+    console.print(
+        "    [magenta]\U0001f50e verifying AI resolution "
+        f"(timeout {config.ai_resolve.verify_timeout_seconds}s, read-only)[/magenta]"
+    )
+
+    try:
+        exit_code, output, timed_out = _spawn_claude(
+            argv, repo_path, config.ai_resolve.verify_timeout_seconds,
+        )
+    except KeyboardInterrupt:
+        raise
+
+    cost = _extract_cost_usd(output)
+
+    if timed_out:
+        return VerifyResult(
+            success=False, timed_out=True, cost_usd=cost,
+            error=f"verifier timed out after {config.ai_resolve.verify_timeout_seconds}s",
+        )
+
+    if exit_code != 0:
+        transient = _find_transient_api_error(output)
+        suffix = f" ({transient})" if transient else ""
+        return VerifyResult(
+            success=False, cost_usd=cost,
+            error=f"verifier exited with code {exit_code}{suffix}",
+        )
+
+    verdict, summary, findings = _parse_verify_output(output)
+    if verdict == "unknown":
+        return VerifyResult(
+            success=False, cost_usd=cost, verdict=verdict,
+            summary=summary, findings=findings,
+            error="verifier did not emit a parsable VERDICT line",
+        )
+
+    return VerifyResult(
+        success=True, verdict=verdict, summary=summary,
+        findings=findings, cost_usd=cost,
+    )

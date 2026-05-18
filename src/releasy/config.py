@@ -137,6 +137,11 @@ class FeatureConfig:
 
 _VALID_IF_EXISTS = ("skip", "recreate", "append")
 _VALID_GROUP_SORT = ("listed", "merged_at")
+# Config accepts all three; post-detection only the last two survive.
+_VALID_PORT_MODES = ("auto", "backport", "forward_port")
+
+from typing import Literal  # noqa: E402
+PortMode = Literal["backport", "forward_port"]
 
 
 @dataclass
@@ -154,6 +159,9 @@ class PRSourceConfig:
     # for every PR matched by this label entry. Keep it short and
     # high-signal: the model already gets the source PR body and diff.
     ai_context: str = ""
+    # ``auto`` (default) | ``backport`` | ``forward_port``. See
+    # ``_detect_port_mode``. Explicit values bypass the ladder.
+    mode: str = "auto"
 
 
 @dataclass
@@ -200,6 +208,8 @@ class PRGroupConfig:
     # it to identify entries it owns and may rewrite. Hand-written groups
     # have ``auto_discovered: false`` and are never touched.
     auto_discovered: bool = False
+    # See ``PRSourceConfig.mode``.
+    mode: str = "auto"
 
 
 @dataclass
@@ -266,6 +276,9 @@ class PRSourcesConfig:
     # URL exactly as listed in the session file. Surfaced to the AI
     # conflict resolver alongside any unit-level ``ai_context``.
     include_pr_contexts: dict[str, str] = field(default_factory=dict)
+    # Labels that mark a source PR as a forward-port (case-insensitive).
+    # When matched, ``_detect_port_mode`` returns ``forward_port``.
+    forward_port_labels: list[str] = field(default_factory=list)
 
 
 def _default_assignee_dev_options() -> list[str]:
@@ -617,6 +630,14 @@ class AIResolveConfig:
     # Lets reviewers know the PR's scope was recursively expanded.
     auto_prereq_label: str = "auto-prereq-added"
     auto_prereq_label_color: str = "0E8A16"
+    # Advisory second AI pass auditing the resolution against the source
+    # PR. Roughly doubles AI cost on conflicted PRs. Findings drive
+    # ``verify_label`` + a PR comment; never rolls back.
+    verify_resolution: bool = False
+    verify_prompt_file: str = "prompts/verify_resolution.md"
+    verify_timeout_seconds: int = 1800  # read-only, no build
+    verify_label: str = "ai-needs-verify"
+    verify_label_color: str = "FBCA04"
     extra_args: list[str] = field(default_factory=list)
     # How many times to re-invoke claude when the Anthropic streaming
     # API drops the turn with a transient error ("Stream idle timeout",
@@ -1106,6 +1127,13 @@ def load_config(config_path: Path | None = None) -> Config:
         auto_prereq_label_color=ai_raw.get(
             "auto_prereq_label_color", "0E8A16",
         ),
+        verify_resolution=bool(ai_raw.get("verify_resolution", False)),
+        verify_prompt_file=ai_raw.get(
+            "verify_prompt_file", "prompts/verify_resolution.md",
+        ),
+        verify_timeout_seconds=int(ai_raw.get("verify_timeout_seconds", 1800)),
+        verify_label=ai_raw.get("verify_label", "ai-needs-verify"),
+        verify_label_color=ai_raw.get("verify_label_color", "FBCA04"),
         extra_args=ai_raw.get("extra_args", []) or [],
         api_retries=int(ai_raw.get("api_retries", 3)),
         api_retry_backoff_seconds=int(ai_raw.get("api_retry_backoff_seconds", 15)),
@@ -1346,6 +1374,16 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         ai_data["auto_prereq_label"] = ai.auto_prereq_label
     if ai.auto_prereq_label_color != ai_defaults.auto_prereq_label_color:
         ai_data["auto_prereq_label_color"] = ai.auto_prereq_label_color
+    if ai.verify_resolution != ai_defaults.verify_resolution:
+        ai_data["verify_resolution"] = ai.verify_resolution
+    if ai.verify_prompt_file != ai_defaults.verify_prompt_file:
+        ai_data["verify_prompt_file"] = ai.verify_prompt_file
+    if ai.verify_timeout_seconds != ai_defaults.verify_timeout_seconds:
+        ai_data["verify_timeout_seconds"] = ai.verify_timeout_seconds
+    if ai.verify_label != ai_defaults.verify_label:
+        ai_data["verify_label"] = ai.verify_label
+    if ai.verify_label_color != ai_defaults.verify_label_color:
+        ai_data["verify_label_color"] = ai.verify_label_color
     if ai.extra_args:
         ai_data["extra_args"] = ai.extra_args
     if ai.api_retries != ai_defaults.api_retries:
@@ -1650,6 +1688,12 @@ def load_session(
                 f"pr_sources.by_labels[labels={raw_labels!r}].auto_pr is no "
                 "longer supported. Use pr_policy.auto_pr in config.yaml."
             )
+        entry_mode = entry.get("mode", "auto")
+        if entry_mode not in _VALID_PORT_MODES:
+            raise ValueError(
+                f"pr_sources.by_labels[].mode must be one of "
+                f"{_VALID_PORT_MODES}, got {entry_mode!r}"
+            )
         by_labels.append(
             PRSourceConfig(
                 labels=raw_labels,
@@ -1657,6 +1701,7 @@ def load_session(
                 merged_only=entry.get("merged_only", False),
                 if_exists=entry_if_exists,
                 ai_context=(entry.get("ai_context") or "").strip(),
+                mode=entry_mode,
             )
         )
 
@@ -1719,6 +1764,12 @@ def load_session(
                 f"reserved for the sidecar overlay file. Remove the flag, or "
                 f"move the entry into the deps_file sidecar."
             )
+        group_mode = entry.get("mode", "auto")
+        if group_mode not in _VALID_PORT_MODES:
+            raise ValueError(
+                f"{source_label}: groups[{gid!r}].mode must be one of "
+                f"{_VALID_PORT_MODES}, got {group_mode!r}"
+            )
         return PRGroupConfig(
             id=gid,
             prs=prs_list,
@@ -1729,6 +1780,7 @@ def load_session(
             pr_ai_contexts=pr_ai_contexts,
             depends_on=depends_on,
             auto_discovered=auto_flag,
+            mode=group_mode,
         )
 
     for entry in ps_raw.get("groups", []) or []:
@@ -1813,6 +1865,17 @@ def load_session(
         where="pr_sources.include_prs",
     )
 
+    fp_labels_raw = ps_raw.get("forward_port_labels", []) or []
+    if isinstance(fp_labels_raw, str):
+        fp_labels_raw = [fp_labels_raw]
+    if not isinstance(fp_labels_raw, list) or not all(
+        isinstance(x, str) for x in fp_labels_raw
+    ):
+        raise ValueError(
+            "pr_sources.forward_port_labels must be a list of strings"
+        )
+    forward_port_labels = [l.strip() for l in fp_labels_raw if l.strip()]
+
     pr_sources = PRSourcesConfig(
         by_labels=by_labels,
         exclude_labels=ps_raw.get("exclude_labels", []) or [],
@@ -1823,6 +1886,7 @@ def load_session(
         groups=groups,
         include_pr_contexts=include_pr_contexts,
         deps_file=deps_file_value,
+        forward_port_labels=forward_port_labels,
     )
 
     if config.sequential and groups:
@@ -2063,6 +2127,7 @@ def save_session(session: SessionConfig, path: Path | None = None) -> None:
                     "merged_only": entry.merged_only or None,
                     "if_exists": entry.if_exists,
                     "ai_context": entry.ai_context or None,
+                    "mode": entry.mode if entry.mode != "auto" else None,
                 }.items()
                 if v is not None
             }
@@ -2096,6 +2161,7 @@ def save_session(session: SessionConfig, path: Path | None = None) -> None:
                     "if_exists": g.if_exists,
                     "sort": g.sort if g.sort != "listed" else None,
                     "ai_context": g.ai_context or None,
+                    "mode": g.mode if g.mode != "auto" else None,
                     "prs": _dump_pr_url_list(g.prs, g.pr_ai_contexts),
                     "depends_on": g.depends_on or None,
                 }.items()
@@ -2103,6 +2169,8 @@ def save_session(session: SessionConfig, path: Path | None = None) -> None:
             }
             for g in main_groups
         ]
+    if ps.forward_port_labels:
+        ps_data["forward_port_labels"] = list(ps.forward_port_labels)
     if ps_data:
         data["pr_sources"] = ps_data
 

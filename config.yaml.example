@@ -282,6 +282,14 @@ notifications:
 #   # `max_iterations`.
 #   api_retries: 3
 #   api_retry_backoff_seconds: 15
+#   # Post-resolve verifier: a read-only second AI pass auditing the
+#   # resolution. Findings → `verify_label` + PR comment. Never rolls
+#   # back. Roughly doubles AI cost on conflicted PRs.
+#   verify_resolution: false
+#   verify_prompt_file: prompts/verify_resolution.md
+#   verify_timeout_seconds: 1800        # read-only, no build
+#   verify_label: ai-needs-verify
+#   verify_label_color: "FBCA04"
 
 # ── AI changelog entry synthesis (Claude) ────────────────────────────
 # Optional. When enabled, multi-PR groups get a single user-facing
