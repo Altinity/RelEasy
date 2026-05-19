@@ -91,25 +91,37 @@ For each `+` line in `git diff {start_sha}..{new_head}`:
   Faithful. Move on.
 - **Bucket 2?** You can fill in:
   > *"Source PR adds `X`; `{base_branch}` has
-  > `<renamed | moved | split | re-signatured>` `<name>`, so it became
-  > `<resolver's version>`."*
-  And the translation is minimal — no new helpers / branches / error
-  handling / logging. Move on.
+  > `<renamed | moved | split | re-signatured | type-wrapped | parallel-module>`
+  > `<name>`, so it became `<resolver's version>`."*
+
+  In `forward_port` mode the translation must be minimal — no new
+  helpers / branches / error handling / logging. In `backport` mode
+  the resolver has **adaptation latitude**: type-wrapper unboxing,
+  parallel-module routing, small adapter shims (~10–30 LOC), and
+  light local base-branch refactor (≤ ~20 LOC) are in scope as long
+  as each adaptation is named (`Adapted:` trailer or narration) and
+  the total adaptation across the port is ≲ 50 LOC. Move on.
 - **Neither → finding.**
 
 Suspicious patterns (historically bad — flag them):
 
-- New function / method / class / template not in the source PR diff.
+- New function / method / class / template not in the source PR diff
+  AND not a named bucket-2 adapter shim in backport mode.
 - New log lines / metrics / `ProfileEvents` / error codes the source
   PR didn't add.
 - Rows in append-only registries (`SettingsChangesHistory`,
   `ProfileEvents`, changelog tables) for keys the source PR didn't
   touch.
-- New comments / TODOs / "fix later" notes the source PR didn't write.
+- New comments / TODOs / "fix later" notes the source PR didn't
+  write (a single one-line `// adapter for #NNN` next to a shim is
+  fine in backport mode).
 - Imports added that aren't needed by any kept bucket-1/2 line.
 - Removals from `{base_branch}` code that the source PR didn't remove
-  (no corresponding `-` line in the source PR diff).
+  AND aren't a named bucket-2 light-refactor.
 - New tests / fixtures / test files the source PR didn't add.
+- Adaptation cost (count `+` lines that are NOT bucket-1) clearly
+  exceeding ~50 LOC — at that scale the resolver is reinventing the
+  prereq instead of adapting; should have reported `MISSING_PREREQS`.
 
 Normal — do NOT flag:
 
@@ -119,6 +131,10 @@ Normal — do NOT flag:
   with a named cause.
 - Hunks where the source PR adds N lines and the port adds N lines,
   just relocated as context shifted.
+- **Backport mode only:** named adapter shims, type-wrapper
+  unboxing at call sites, parallel-module routing, and light
+  base-branch refactor — provided each has either an `Adapted:`
+  trailer or a one-line narration mention.
 - The intermediate "with conflicts" commit in split-commit mode —
   the net diff already cancels its markers out.
 
@@ -134,13 +150,26 @@ produced this diff). For each such adaptation:
 3. Is the substitute genuinely equivalent, or a superficially-named
    look-alike from a parallel module / different stack layer?
 
+In `forward_port` mode any parallel-module substitution is a finding
+(strict equivalence required).
+
+In `backport` mode parallel-module routing IS acceptable when:
+   * the parallel module covers the source PR's intent (does the same
+     thing, just structured differently — inline call vs extracted
+     executor, raw `String` vs typed wrapper, etc.);
+   * the routing change is named (`Adapted:` trailer or narration);
+   * the total adaptation across the port stays within budget
+     (≲ 50 LOC, no new top-level abstractions, no re-implementing the
+     source PR's feature).
+
 If a real missing prereq was mis-classified as bucket-2, **flag it**:
 name the symbol(s) and explain why the `{base_branch}` substitute
 isn't equivalent. This is one of the most valuable things this audit
 catches.
 
 If the resolver took the right call (genuine equivalent, just renamed/
-moved), say so explicitly — gives reviewers confidence.
+moved — or in backport mode, a valid parallel-module adaptation), say
+so explicitly — gives reviewers confidence.
 
 ## Step 4 — Audit scope (other-file edits)
 
@@ -199,6 +228,47 @@ satisfy it.
 **In `forward_port` mode:** any `Dropped:` trailer at all is itself a
 finding — bucket-0 was disabled, the resolver shouldn't have
 produced any.
+
+## Step 6 — Audit `Adapted:` trailers (backport mode only — skip in forward-port)
+
+List the `Adapted:` trailers the resolver wrote:
+
+```bash
+git log --format='%H %(trailers:key=Adapted,unfold=true,valueonly=true)' {start_sha}..{new_head}
+```
+
+For each `Adapted:` value, audit:
+
+1. **What gap on `{base_branch}` did it bridge?** The trailer should
+   name a concrete shape difference (renamed helper, typed wrapper
+   vs raw primitive, inline call vs extracted executor, …) — not
+   vague ("API differs", "matches style").
+2. **Is the adaptation minimal for the gap?** Type-wrapper unboxing
+   should touch only call sites; parallel-module routing should
+   replace the call, not duplicate the logic; a shim should be
+   ≤ ~30 LOC and named for what it does.
+3. **Is the adaptation local to the conflicted area?** Spreading
+   adapter shims into unrelated files is out-of-scope.
+4. **Total budget.** Sum the LOC of all `Adapted:` changes — exceeding
+   ~50 LOC means the resolver should have reported `MISSING_PREREQS`
+   instead. Flag.
+
+Flag an adaptation when ANY of:
+
+- the trailer doesn't name a concrete base-branch shape difference;
+- the change exceeds the minimal-for-the-gap test (e.g. a 200-LOC
+  "shim" that re-implements the source PR's actual feature);
+- it touches files / abstractions unrelated to the conflict region;
+- it introduces new top-level abstractions, files, tests, metrics,
+  or settings beyond what the source PR adds.
+
+Also flag missing `Adapted:` trailers: if the port contains
+non-trivial bucket-2 work (shim functions, parallel-module routing,
+type-wrapper unboxing) with no corresponding trailer or narration
+mention, the resolver hid the adaptation from the audit trail.
+
+**In `forward_port` mode:** any `Adapted:` trailer at all is itself
+a finding — backport-mode latitude doesn't apply.
 
 ---
 

@@ -130,12 +130,97 @@ When you take this path, you MUST:
   before `DONE`.
 
 When you CANNOT drop cleanly (the dependency is the source PR's
-*primary* feature, or dropping it would gut the port), fall through
-to the missing-prereq flow below and report `MISSING_PREREQS`. The
-human reviewer will decide expand-scope vs abandon.
+*primary* feature, or dropping it would gut the port), **try
+adapting before reporting `MISSING_PREREQS`** — see the next
+section.
 
 In `forward_port` mode, bucket 0 is **disabled**. Do not drop
 source-PR functionality; report `MISSING_PREREQS` as before.
+
+### Bucket 2 latitude in backport mode
+
+Default bucket 2 is "minimal mechanical translation" — fine for
+forward-ports where every base-branch shape was once ours. For
+**backports**, that bar is too conservative. Newer upstream work
+routinely sits on refactors, type wrappers, and helper splits that
+older fork branches never received. Demanding the full prereq
+chain be ported first is often the wrong call: porting one upstream
+refactor PR to satisfy a 50-line feature port is exactly the
+yak-shaving spiral backports are supposed to avoid.
+
+In `backport` mode, bucket 2 includes (in addition to the default
+rename / signature-swap / moved-import translations):
+
+- **Type-wrapper unboxing.** If "theirs" passes around a typed
+  wrapper (`IcebergPathFromMetadata`, `StorageID`,
+  `WrappedFoo`, …) and `{base_branch}` carries the underlying
+  primitive (`String`, raw fields, …) or has an equivalent untyped
+  accessor, unbox at the use sites — pass the primitive, inline the
+  obvious member accessors, drop the wrapper's destructor /
+  serialize ceremony. The reverse (wrap a primitive
+  `{base_branch}` returns into the source PR's expected wrapper at
+  the call site) is also fair game when the wrapper is a thin shell.
+- **Parallel-module adaptation.** When `{base_branch}` has a
+  *parallel module* — same intent, different shape — route the
+  source PR's call to it. Example: source PR calls
+  `executeExpireSnapshots(ctx)` from a newly-extracted executor
+  file; `{base_branch}` has the same logic inlined as
+  `Iceberg::expireSnapshots(ctx)` in `IcebergMetadata.cpp`. Adapt
+  the source PR's call to the inline version. Don't port the
+  refactor PR. If the parallel module needs one extra parameter or
+  return-value tweak to do the job, add it locally — that's
+  adaptation, not invention.
+- **Small adapter shims (~10–30 LOC).** A short local helper —
+  inline `static auto resolve(const String & path) { return path; }`,
+  a thin wrapper struct that exposes the fields the source PR's
+  call sites read, a free function that bridges two signatures —
+  is allowed when the alternative is importing a 500-line prereq
+  PR. The shim lives in the file that needs it, named for what it
+  does, with a one-line comment pointing at the source PR it
+  enables.
+- **Light base-branch refactor (≤ ~20 LOC, local).** If the source
+  PR's diff would be correct on master but for a slightly different
+  helper signature on `{base_branch}`, you may tweak the
+  base-branch helper (rename, add optional arg, expose a member,
+  split a method) **iff** the tweak is local to the conflicted area
+  and small. Anything bigger is a real missing prereq.
+
+Per non-trivial adaptation, add an `Adapted:` git trailer to the
+resolution commit so the reviewer can audit:
+
+```
+Resolve conflicts in cherry-pick of #{source_pr_number}
+
+Adapted: IcebergPathFromMetadata unboxed to String — antalya-26.3 carries raw paths
+Adapted: executeRemoveOrphanFiles call routed to inline Iceberg::removeOrphanFiles equivalent
+```
+
+`Adapted:` trailers follow the same git-trailer rules as `Dropped:`
+(end-of-message, blank line before the block, one per line).
+
+Hard limits even in `backport` mode:
+
+- **No new top-level abstractions, new files, new test files, new
+  metrics, new settings** beyond what the source PR itself
+  introduces. Shims live inside files you were going to touch anyway.
+- **No re-implementing the source PR's actual feature** in a
+  different way. Adaptation translates *call sites and types*; it
+  doesn't rewrite the feature logic.
+- **No drive-by lint / refactor / typo fixes** outside the
+  conflicted region. Light refactor is allowed only where it
+  enables the port.
+- **Total adaptation budget ≈ 50 LOC** across the whole port. If
+  you're approaching that, you're reinventing the prereq — stop and
+  report `MISSING_PREREQS`.
+- `forward_port` mode keeps the strict default (≤ token-swap
+  bucket 2). The latitude above is **backport-only**.
+
+`MISSING_PREREQS` is the **last resort**, not the first instinct.
+In backport mode, before reporting it, you must be able to say: "I
+considered adapting via type-unboxing / parallel-module routing /
+shim / local refactor, and adapting would exceed ~50 LOC OR require
+re-implementing the source PR's feature OR depend on a base-branch
+API contract that other callers rely on."
 
 ---
 
@@ -211,12 +296,25 @@ the *specific symbols* the source PR's diff touches are on `{base_branch}`:
   at most a token-level rename
 
 If `{base_branch}` has a *different* abstraction in the same area
-(different cached type, different layer of the stack, etc.), it's a
-**parallel module**, not a renamed prereq — the prereq is still missing.
+(different cached type, different layer of the stack, etc.):
+- In `forward_port` mode it's a **parallel module**, not a renamed
+  prereq — the prereq is still missing.
+- In `backport` mode, parallel-module adaptation is in scope (see
+  "Bucket 2 latitude in backport mode" above). Try to route the
+  source PR's call to the parallel module — that's the expected
+  resolution for the common "newer upstream refactor not backported
+  yet" case. Only fall through to `MISSING_PREREQS` if the
+  adaptation cost exceeds the ~50 LOC budget or would require
+  re-implementing the source PR's feature.
 
-When uncertain, prefer `MISSING_PREREQS` over `UNRESOLVED`: a false
-positive is overridden by the human; a false-negative `UNRESOLVED`
-strands every later PR in the group.
+When uncertain in `forward_port` mode, prefer `MISSING_PREREQS` over
+`UNRESOLVED`: a false positive is overridden by the human; a
+false-negative `UNRESOLVED` strands every later PR in the group.
+
+In `backport` mode the priority order is **adapt → drop → prereq**.
+Try adapting first; if adaptation would exceed the budget or break
+non-local callers, try dropping a feature-flagged surface; only
+then report `MISSING_PREREQS`.
 
 When the foundation IS genuinely on `{base_branch}` (just renamed /
 moved), proceed with a bucket-2 adaptation instead.
@@ -309,16 +407,27 @@ For every `<<<<<<< ... ======= ... >>>>>>>` block:
      source PR never touched got uncommented because they sat next to
      a real change. Don't.
 2. **Bucket-2 adaptation is OK when ALL of:**
-   1. minimal mechanical translation of a real change from the source
-      PR's diff into `{base_branch}`'s current shape (renamed call,
-      added required arg, moved import, split struct field, …);
+   1. translation of a real change from the source PR's diff into
+      `{base_branch}`'s current shape (renamed call, added required
+      arg, moved import, split struct field, type-wrapper unboxing,
+      parallel-module routing, …);
    2. you can point to the specific symbol/commit on `{base_branch}`
       that forces it;
-   3. no new behaviour, logging, error handling, tests, or helpers.
-      Need a new helper to make it work? → `UNRESOLVED`.
+   3. **In `forward_port` mode:** no new behaviour, logging, error
+      handling, tests, or helpers. Need a new helper to make it work?
+      → `UNRESOLVED`.
+
+      **In `backport` mode:** small adapter shims and light
+      base-branch refactor are allowed within the ≤ ~50 LOC
+      adaptation budget (see "Bucket 2 latitude in backport mode"
+      above). No new top-level abstractions / files / tests / metrics
+      / settings beyond the source PR's own additions; no
+      re-implementing the source PR's feature.
 
    Mention each bucket-2 path briefly in your final narration (e.g.
    *"Adapted `Foo::serialize` to renamed signature on {base_branch}"*).
+   For non-trivial adaptations in backport mode, also add an
+   `Adapted:` git trailer to the commit message.
 3. **Append-only registries** (`SettingsChangesHistory`, `ProfileEvents`,
    changelog tables, etc.): keep ONLY the rows the source PR adds.
    Bucket-2 does NOT apply — re-adding "missing" rows from other PRs
