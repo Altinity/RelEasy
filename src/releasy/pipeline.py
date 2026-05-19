@@ -864,19 +864,28 @@ def _refresh_all_superseded_status_from_github(
 ) -> int:
     """Mark entries whose source PRs were cherry-picked elsewhere.
 
-    For each non-terminal tracked feature, resolve every source PR's
-    merge_commit_sha and look it up in two corpora:
+    Two flavours of evidence, both surfaced via the same scans of
+    target-branch git history and open PRs targeting the same base:
 
-    * The target branch's recent git history (for already-merged
-      supersedes) — local ``git log`` scan, cheap after a fetch.
-    * Open PRs targeting the same base branch (for in-flight
-      supersedes) — single batched GraphQL fetch of every open PR's
-      commit messages. Our own rebase PRs are excluded so they don't
-      mark themselves.
+    * **Cherry-picks the same source** — another PR's commit cites the
+      upstream source PR's ``merge_commit_sha``. For groups, every
+      source URL must have its merge SHA cited.
 
-    For groups (multiple source PRs), every source must be cited
-    somewhere; partial matches don't promote since the rest of the group
-    still needs porting.
+    * **Cherry-picks FROM our port** — another PR's commit cites one of
+      OUR port branch's new commit SHAs (the ones we added via
+      ``cherry-pick -x``). Any single port-commit match is enough to
+      mark the feature superseded; this case typically arises when
+      someone took our branch as a starting point. Cheap to fingerprint
+      via ``git rev-list <remote>/<branch> ^<remote>/<base>``.
+
+    ``closed`` entries are included on purpose: a closed rebase PR is
+    often closed *because* a parallel port landed. Promoting closed →
+    superseded gives a more informative terminal state AND blocks the
+    ``recreate_closed_prs`` opt-back-in (superseded is unconditionally
+    terminal).
+
+    Our own rebase PRs are excluded from the open-PR scan so they
+    don't mark themselves.
 
     Gated by ``pr_policy.detect_superseded`` (default on). Returns the
     number of features promoted to ``superseded`` on this pass.
@@ -884,7 +893,9 @@ def _refresh_all_superseded_status_from_github(
     if not config.pr_policy.detect_superseded:
         return 0
 
-    refreshable = {"branch_created", "needs_review", "conflict", "blocked"}
+    refreshable = {
+        "branch_created", "needs_review", "conflict", "blocked", "closed",
+    }
     feature_sources: dict[str, list[str]] = {}
     for fid, fs in state.features.items():
         if fs.status not in refreshable:
@@ -909,7 +920,35 @@ def _refresh_all_superseded_status_from_github(
         info = fetch_pr_by_url(config, url, include_closed=True)
         if info and info.merge_commit_sha:
             source_sha[url] = info.merge_commit_sha.lower()
-    if not source_sha:
+
+    remote = config.origin.remote_name
+    base_ref = f"{remote}/{base_branch}"
+
+    # Fingerprint our port branches' new commits — anything someone
+    # could cherry-pick FROM us. ``rev-list <branch> ^<base> -n 100``
+    # is bounded and post-fetch cheap; missing branches just skip.
+    port_shas_by_feature: dict[str, list[str]] = {}
+    all_port_shas: set[str] = set()
+    for fid in feature_sources:
+        fs = state.features.get(fid)
+        if fs is None or not fs.branch_name:
+            continue
+        branch_ref = f"{remote}/{fs.branch_name}"
+        result = run_git(
+            ["rev-list", branch_ref, f"^{base_ref}", "-n", "100"],
+            repo_path, check=False,
+        )
+        if result.returncode != 0:
+            continue
+        shas = [
+            line.strip().lower()
+            for line in result.stdout.splitlines() if line.strip()
+        ]
+        if shas:
+            port_shas_by_feature[fid] = shas
+            all_port_shas.update(shas)
+
+    if not source_sha and not all_port_shas:
         return 0
 
     our_rebase_pr_urls = {
@@ -917,18 +956,44 @@ def _refresh_all_superseded_status_from_github(
         if fs.rebase_pr_url
     }
 
-    remote = config.origin.remote_name
-    base_ref = f"{remote}/{base_branch}"
-    source_shas = set(source_sha.values())
+    fingerprints = set(source_sha.values()) | all_port_shas
     cited_on_target = _scan_target_for_cherry_picks(
-        repo_path, base_ref, source_shas,
+        repo_path, base_ref, fingerprints,
     )
     cited_in_open = _scan_open_prs_for_cherry_picks(
-        config, base_branch, source_shas, our_rebase_pr_urls,
+        config, base_branch, fingerprints, our_rebase_pr_urls,
     )
+
+    def _evidence_for(sha: str) -> tuple[str, str] | None:
+        if sha in cited_in_open:
+            return ("open PR", cited_in_open[sha])
+        if sha in cited_on_target:
+            return ("commit", cited_on_target[sha][:12])
+        return None
 
     changed = 0
     for fid, urls in feature_sources.items():
+        # First check: any of OUR port commits cited elsewhere.
+        # A single hit is enough — "they cherry-picked from us".
+        port_evidence: tuple[str, str] | None = None
+        for sha in port_shas_by_feature.get(fid, []):
+            port_evidence = _evidence_for(sha)
+            if port_evidence:
+                break
+
+        if port_evidence:
+            fs = state.features[fid]
+            fs.status = "superseded"
+            fs.conflict_files = []
+            fs.failed_step_index = None
+            fs.partial_pr_count = None
+            where, ref = port_evidence
+            fs.skip_reason = f"superseded by {where} {ref}"
+            changed += 1
+            continue
+
+        # Fallback: every source merge SHA must be cited elsewhere.
+        # Groups need all sources covered before the group is retired.
         evidence: list[tuple[str, str]] = []
         all_cited = True
         for url in urls:
@@ -936,13 +1001,11 @@ def _refresh_all_superseded_status_from_github(
             if not sha:
                 all_cited = False
                 break
-            if sha in cited_in_open:
-                evidence.append(("open PR", cited_in_open[sha]))
-            elif sha in cited_on_target:
-                evidence.append(("commit", cited_on_target[sha][:12]))
-            else:
+            ev = _evidence_for(sha)
+            if ev is None:
                 all_cited = False
                 break
+            evidence.append(ev)
         if not (all_cited and evidence):
             continue
         fs = state.features[fid]
@@ -1338,7 +1401,7 @@ def run_pipeline(
                 ("fresh-port",                  "would fresh-port"),
                 ("rebuild-from-base",           "would rebuild from base (retry-failed)"),
                 ("append",                      "would append to existing branch"),
-                ("refresh-existing-pr",         "would refresh existing rebase PR"),
+                ("skip-existing-pr",            "skip — open rebase PR (use `releasy refresh`)"),
                 ("open-pr-for-existing-branch", "would open PR for already-pushed branch"),
                 ("record-existing-branch-state","would record state for existing branch"),
                 ("blocked-by-deps",             "blocked by unmet deps (no action)"),
@@ -2658,153 +2721,6 @@ def _next_free_renumbered_port_branch(
         n += 1
 
 
-def _refresh_existing_pr_unit(
-    config: Config,
-    repo_path: Path,
-    state: PipelineState,
-    unit: FeatureUnit,
-    prev_state: FeatureState,
-    new_branch: str,
-    base_branch: str,
-    remote: str,
-    ai_active: bool,
-    force_merge: bool,
-) -> None:
-    """Update an existing rebase PR's branch by merging target — never rebuild.
-
-    Once a unit has an open rebase PR on origin, ``releasy run`` stops
-    treating ``if_exists: recreate`` as "rebuild the branch from base"
-    and instead runs the same merge-target-into-PR-branch flow that
-    ``releasy refresh`` uses: leave the PR alone when the merge is
-    clean, AI-resolve and (non-force) push when it conflicts. Force
-    pushes that would clobber the PR's history are off the table here.
-
-    ``force_merge=True`` (the ``--merge-target`` flag) flips the
-    no-conflict path to "push the merge commit anyway", so a single
-    invocation can ingest the latest target tip into every PR branch.
-    """
-    from releasy.refresh import (
-        _record_conflict,
-        _synthesise_source_pr,
-        run_merge_resolve,
-    )
-
-    label = (
-        f"group {unit.group_id} ({len(unit.prs)} PRs)"
-        if unit.is_group
-        else (
-            f"PR #{unit.primary_pr().number}: "
-            f"{unit.primary_pr().title}"
-        )
-    )
-    rebase_label = (
-        prev_state.rebase_pr_url.rsplit("/", 1)[-1]
-        if prev_state.rebase_pr_url else "?"
-    )
-    note = " [dim](--merge-target)[/dim]" if force_merge else ""
-    console.print(
-        f"\n  [cyan]{new_branch}[/cyan]  "
-        f"[dim](rebase PR #{rebase_label} exists — merging "
-        f"{remote}/{base_branch} into branch{note}; "
-        "skipping cherry-pick rebuild)[/dim]"
-    )
-
-    if config.dry_run:
-        tail = (
-            " (always-push --merge-target)"
-            if force_merge
-            else " (push only if conflicts AI-resolved)"
-        )
-        console.print(
-            f"    [magenta]dry-run:[/magenta] would merge "
-            f"[cyan]{remote}/{base_branch}[/cyan] into "
-            f"[cyan]{new_branch}[/cyan]{tail}"
-        )
-        if prev_state.rebase_pr_url:
-            console.print(
-                f"    [dim]· rebase PR: "
-                f"[link={prev_state.rebase_pr_url}]"
-                f"{prev_state.rebase_pr_url}[/link][/dim]"
-            )
-        primary = unit.primary_pr()
-        if primary and primary.url:
-            extra = (
-                f" (+{len(unit.prs) - 1} more)"
-                if unit.is_group else ""
-            )
-            console.print(
-                f"    [dim]· source PR: "
-                f"[link={primary.url}]{primary.url}[/link]{extra}[/dim]"
-            )
-        _dry_record(state, "refresh-existing-pr")
-        return
-
-    source_pr = _synthesise_source_pr(prev_state)
-    if source_pr is None:
-        # We have a rebase_pr_url but the FeatureState has no source PR
-        # context (pr_url unset). Without it the AI resolver prompt has
-        # nothing to ground on; flag conflict if AI resolution would
-        # have been needed, but for a clean merge we can still proceed
-        # without a source_pr — fall through to a synthetic placeholder
-        # PRInfo so run_merge_resolve doesn't crash.
-        primary = unit.primary_pr()
-        source_pr = PRInfo(
-            number=primary.number,
-            title=primary.title,
-            body=primary.body,
-            state="merged",
-            merge_commit_sha=primary.merge_commit_sha,
-            head_sha=primary.head_sha,
-            url=primary.url,
-            repo_slug=primary.repo_slug,
-        )
-
-    outcome = run_merge_resolve(
-        config, repo_path,
-        head_branch=new_branch,
-        base_branch=base_branch,
-        source_pr=source_pr,
-        rebase_pr_url=prev_state.rebase_pr_url,
-        ai_active=ai_active,
-        remote=remote,
-        force_merge=force_merge,
-    )
-
-    fs = prev_state
-
-    if outcome.ai_cost_usd is not None:
-        prior = fs.ai_cost_usd or 0.0
-        fs.ai_cost_usd = prior + outcome.ai_cost_usd
-
-    if outcome.status == "clean":
-        if fs.status == "conflict" and fs.conflict_files:
-            fs.conflict_files = []
-            _persist_state(config, state)
-        return
-
-    if outcome.status == "skipped":
-        if outcome.ai_cost_usd is not None:
-            _persist_state(config, state)
-        return
-
-    if outcome.status == "conflict":
-        _record_conflict(config, state, fs, outcome.conflict_files)
-        return
-
-    # outcome.status == "resolved"
-    fs.conflict_files = []
-    if fs.status == "conflict":
-        fs.status = "needs_review"
-        fs.failed_step_index = None
-        fs.partial_pr_count = None
-    if outcome.ai_used:
-        fs.ai_resolved = True
-        if outcome.ai_iterations:
-            prior = fs.ai_iterations or 0
-            fs.ai_iterations = prior + outcome.ai_iterations
-    _persist_state(config, state)
-
-
 def _process_feature_unit(
     config: Config,
     repo_path: Path,
@@ -2942,13 +2858,15 @@ def _process_feature_unit(
     on_remote = remote_branch_exists(repo_path, new_branch, remote)
     on_local = local_branch_exists(repo_path, new_branch)
 
-    # --- Existing rebase PR → never rebuild from base ---
-    # Once a unit has an open rebase PR on origin, ``if_exists: recreate``
-    # stops meaning "rebuild from base"; we instead run the same
-    # merge-target-into-branch flow ``releasy refresh`` uses, preserving
-    # the PR's history. ``if_exists: append`` is the only setting that
-    # still touches the existing branch — the user explicitly asked to
-    # cherry-pick new PRs on top, which append handles below.
+    # --- Existing rebase PR → leave it alone in ``releasy run`` ---
+    # ``run`` is the "port new PRs" command; once a unit has an open
+    # rebase PR on origin, the merge-target-into-branch dance belongs
+    # to ``releasy refresh`` (the maintenance command). Doing it here
+    # would touch a PR the user didn't ask us to revisit — even when
+    # there's nothing to do (PR is clean, target hasn't moved). The
+    # only exception is ``if_exists: append``: the user explicitly
+    # asked to cherry-pick new sources onto the existing branch, so
+    # we fall through to the append handler below.
     if (
         on_remote
         and prev_state is not None
@@ -2956,10 +2874,12 @@ def _process_feature_unit(
         and unit.if_exists != "append"
         and not prev_was_closed
     ):
-        _refresh_existing_pr_unit(
-            config, repo_path, state, unit, prev_state, new_branch,
-            base_branch, remote, ai_active, force_merge,
+        console.print(
+            f"\n    [dim]{new_branch} ({label}) — rebase PR already "
+            f"open ({prev_state.rebase_pr_url}); leaving as-is. "
+            "Use [cyan]releasy refresh[/cyan] to merge target in.[/dim]"
         )
+        _dry_record(state, "skip-existing-pr")
         return "continue"
 
     # --- if_exists: append ---
