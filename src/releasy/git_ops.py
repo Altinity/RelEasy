@@ -629,13 +629,40 @@ def append_commit_trailer(repo_path: Path, key: str, value: str) -> bool:
     return result.returncode == 0
 
 
+def _stage_unmerged_paths(repo_path: Path) -> None:
+    """Stage exactly the conflict-marked files from an in-progress cherry-pick.
+
+    Never use ``git add --all`` / ``git add -A`` here: working trees of
+    real C++ repos accumulate scratch outside ``.gitignore`` (ClickHouse
+    leaves server runtime data under ``tmp/server_data*``, build
+    pipelines spit out generated headers, \u2026). Sweeping everything into
+    the cherry-pick commit produces multi-hundred-thousand-LOC PRs.
+    Bug seen 2026-05-19 on Altinity/ClickHouse#1812: 696 K additions
+    across 19 K files because tmp/ was tracked-and-modified at the time.
+
+    The clean parts of the cherry-pick are already staged by git
+    automatically \u2014 we only need to stage the unmerged paths whose
+    textual content is the conflict markers themselves.
+    """
+    result = run_git(
+        ["diff", "--name-only", "--diff-filter=U"],
+        repo_path, check=False,
+    )
+    if result.returncode != 0:
+        return
+    paths = [p for p in result.stdout.splitlines() if p.strip()]
+    if not paths:
+        return
+    run_git(["add", "--"] + paths, repo_path, check=False)
+
+
 def commit_conflict_markers(repo_path: Path) -> bool:
-    """Stage all files (including conflict markers) and commit as WIP.
+    """Stage conflict-marker files and commit as WIP.
 
     Call this after a failed cherry-pick with abort_on_conflict=False.
-    Returns True if the commit succeeded.
+    Stages only unmerged paths \u2014 see :func:`_stage_unmerged_paths`.
     """
-    run_git(["add", "--all"], repo_path, check=False)
+    _stage_unmerged_paths(repo_path)
     result = run_git(
         ["commit", "--no-edit", "-m",
          "WIP: unresolved conflict markers \u2014 needs manual resolution"],
@@ -650,18 +677,18 @@ def commit_cherry_pick_conflict_as_is(
 ) -> tuple[bool, str | None]:
     """Conclude an in-progress cherry-pick with conflict markers as-is.
 
-    Stages every file in the working tree (including the unmerged ones,
-    whose textual content is the conflict markers verbatim) and creates a
-    commit. The original cherry-pick commit message that git prepared in
-    ``.git/MERGE_MSG`` is preserved as the body, with a header line that
-    flags the commit as carrying unresolved markers \u2014 so a human reading
-    the port branch's ``git log`` can immediately tell that the next
-    commit is the conflict resolution.
+    Stages exactly the unmerged paths (their textual content is the
+    conflict markers verbatim) and creates a commit. The original
+    cherry-pick commit message that git prepared in ``.git/MERGE_MSG``
+    is preserved as the body, with a header line that flags the commit
+    as carrying unresolved markers \u2014 so a human reading the port
+    branch's ``git log`` can immediately tell that the next commit is
+    the conflict resolution.
 
     Returns ``(success, head_sha_or_None)``. On success ``head_sha`` is
     the SHA of the new commit (the one with the markers).
     """
-    run_git(["add", "--all"], repo_path, check=False)
+    _stage_unmerged_paths(repo_path)
 
     msg_file = repo_path / ".git" / "MERGE_MSG"
     original_msg = ""
