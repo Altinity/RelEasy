@@ -130,7 +130,8 @@ Options live in `config.yaml` unless marked **(session)**.
 | `pr_policy.auto_pr` | Open a PR for every pushed port branch. Needs `push: true`. | `true` |
 | `pr_policy.if_exists` | What to do with an existing port branch: `skip` (leave it) / `recreate` (rebuild from base — only if no rebase PR open yet) / `append` (cherry-pick declared PRs not yet on the branch). | `skip` |
 | `pr_policy.retry_failed` | Revisit `conflict` entries per their `if_exists`. Override per-run with `--retry-failed`/`--no-retry-failed`. | `true` |
-| `pr_policy.recreate_closed_prs` | If a rebase PR is closed (not merged), allocate `<canonical>-1`, `-2`, … and open a fresh one. | `false` |
+| `pr_policy.recreate_closed_prs` | If a rebase PR is closed (not merged), allocate `<canonical>-1`, `-2`, … and open a fresh one. The closed entry stays terminal until this flag opts it back in. | `false` |
+| `pr_policy.detect_superseded` | Each refresh / run sweeps the target branch's recent git log AND open PRs targeting the same base for `(cherry picked from commit <sha>)` footers citing any tracked entry's source PR. Matches mark the entry `superseded` — terminal, no more retries. | `true` |
 | `pr_sources.by_labels[].labels` **(session)** | Labels a PR must have (AND). | — |
 | `pr_sources.by_labels[].merged_only` **(session)** | Only merged PRs. | `false` |
 | `pr_sources.by_labels[].if_exists` **(session)** | Override `pr_policy.if_exists`. | inherits |

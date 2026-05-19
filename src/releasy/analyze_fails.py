@@ -155,7 +155,7 @@ def _tracked_pr_urls(
         url = fs.rebase_pr_url
         if not url or url in seen:
             continue
-        if fs.status in ("merged", "skipped"):
+        if fs.status in ("merged", "skipped", "closed", "superseded"):
             continue
         if only is not None and not only.matches_state(fid, fs):
             continue

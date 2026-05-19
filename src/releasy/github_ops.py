@@ -680,39 +680,6 @@ def fetch_pr_comments(
         return [], f"Unexpected error fetching {slug}#{number} comments: {exc}"
 
 
-def rebase_pr_was_closed_without_merge(config: Config, pr_url: str) -> bool:
-    """True when the port / rebase PR exists on GitHub but is closed unmerged.
-
-    Used with ``pr_policy.recreate_closed_prs`` to open a fresh port branch
-    (``<canonical>-1``, ``-2``, …) after the previous rebase PR was closed.
-    Returns ``False`` when the PR is open, merged, the URL is invalid, or the
-    lookup fails (missing token, network error) — callers treat unknown as
-    "do not renumber".
-    """
-    info = fetch_pr_by_url(config, pr_url, include_closed=True)
-    return info is not None and info.state == "closed"
-
-
-def is_pr_merged(config: Config, pr_url: str) -> bool | None:
-    """Has the PR at ``pr_url`` been merged?
-
-    Returns:
-      * ``True``  — PR is merged into its base branch.
-      * ``False`` — PR exists but is still open (or closed without merging).
-      * ``None``  — couldn't determine state (network failure, missing
-                    token, malformed URL). The caller should treat
-                    ``None`` as "do not advance" rather than as an
-                    implicit "not merged".
-    """
-    parsed = parse_pr_url(pr_url)
-    if parsed is None:
-        return None
-    info = fetch_pr_by_url(config, pr_url)
-    if info is None:
-        return None
-    return info.state == "merged"
-
-
 def pr_ref_label(pr_slug: str, number: int, origin_slug: str | None) -> str:
     """Format a PR reference as ``#N`` for origin and ``owner/repo#N`` otherwise."""
     if origin_slug and pr_slug == origin_slug:
@@ -1151,6 +1118,90 @@ def find_latest_pr_for_branch(
     except Exception as exc:
         log.warning("Unexpected error looking up PR history for branch %s: %s", head_branch, exc)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Supersede detection helpers
+# ---------------------------------------------------------------------------
+
+
+# Standard footer left by ``git cherry-pick -x`` — always a full 40-char SHA.
+CHERRY_PICK_FROM_RE = re.compile(
+    r"\(cherry picked from commit ([0-9a-f]{40})\)",
+    re.IGNORECASE,
+)
+
+
+def fetch_open_prs_with_commits_to_base(
+    config: Config, base_branch: str,
+) -> list[tuple[str, list[str]]]:
+    """Open PRs on origin targeting ``base_branch`` + each PR's commit messages.
+
+    Single GraphQL round-trip (paginated by 50 PRs / 250 commits per page)
+    instead of the N+1 of ``get_pulls`` + per-PR ``get_commits``. Used by
+    the supersede sweep, which scans commit messages for ``(cherry picked
+    from commit <sha>)`` footers.
+
+    Returns ``[(pr_html_url, [commit_msg, ...]), ...]``. Empty on missing
+    token / API failure — supersede detection is best-effort.
+    """
+    slug = get_origin_repo_slug(config)
+    if not slug:
+        return []
+    owner, _, name = slug.partition("/")
+    if not owner or not name:
+        return []
+
+    query = """
+    query($owner: String!, $name: String!, $base: String!, $after: String) {
+      repository(owner: $owner, name: $name) {
+        pullRequests(
+          first: 50,
+          states: OPEN,
+          baseRefName: $base,
+          after: $after
+        ) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            url
+            commits(first: 250) {
+              nodes { commit { message } }
+            }
+          }
+        }
+      }
+    }
+    """
+    out: list[tuple[str, list[str]]] = []
+    cursor: str | None = None
+    while True:
+        data = _gql(query, {
+            "owner": owner, "name": name,
+            "base": base_branch, "after": cursor,
+        })
+        if not data:
+            return out
+        try:
+            page = data["repository"]["pullRequests"]
+        except (KeyError, TypeError):
+            return out
+        for pr_node in page.get("nodes") or []:
+            url = pr_node.get("url") or ""
+            commit_nodes = (
+                ((pr_node.get("commits") or {}).get("nodes")) or []
+            )
+            msgs = [
+                (cn.get("commit") or {}).get("message") or ""
+                for cn in commit_nodes
+            ]
+            if url:
+                out.append((url, msgs))
+        page_info = page.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            return out
+        cursor = page_info.get("endCursor")
+        if not cursor:
+            return out
 
 
 # ---------------------------------------------------------------------------
@@ -1922,6 +1973,8 @@ STATUS_OPTIONS = [
     "Conflict",
     "Skipped",
     "Merged",
+    "Closed",
+    "Superseded",
 ]
 
 STATUS_COLORS = {
@@ -1930,6 +1983,8 @@ STATUS_COLORS = {
     "Conflict": "RED",
     "Skipped": "YELLOW",
     "Merged": "GREEN",
+    "Closed": "GRAY",
+    "Superseded": "GRAY",
 }
 
 
@@ -2239,6 +2294,8 @@ STATUS_MAP = {
     "conflict": "Conflict",
     "skipped": "Skipped",
     "merged": "Merged",
+    "closed": "Closed",
+    "superseded": "Superseded",
     # Legacy aliases — state.load_state() already migrates these on read,
     # but keep the mapping in case a raw status string slips through.
     "ok": "Needs Review",

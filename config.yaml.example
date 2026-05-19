@@ -217,6 +217,14 @@ target_branch: antalya-26.3
 #     # (not merged), allocate `<canonical>-1`, `-2`, … for the port branch
 #     # name and cherry-pick + open a fresh PR. Off by default: a closed
 #     # rebase PR just leaves the branch skipped on subsequent runs.
+#   detect_superseded: true
+#     # When true (default), the refresh / run sweeps scan the target
+#     # branch's recent git history AND open PRs targeting the same base
+#     # for `(cherry picked from commit <sha>)` footers citing any of our
+#     # tracked entries' source PRs. Matches mark the local entry as
+#     # `status: superseded` — no further cherry-pick attempts, no
+#     # monitoring. Disable to keep the old behaviour (releasy keeps
+#     # refreshing its own port regardless of parallel work).
 
 # ── PR sources and features ─────────────────────────────────────────
 # These live in the session file, not here. Look for

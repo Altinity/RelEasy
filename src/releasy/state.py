@@ -35,6 +35,21 @@ BranchStatus = Literal[
     "skipped",
     "merged",
     "blocked",
+    # Terminal: rebase PR was closed without merging on GitHub. Detected by
+    # the refresh / run merge-status sweep; treated like ``skipped`` for the
+    # refresh loop (no work, no monitoring) but kept distinct in the status
+    # output and the project board so the user can see WHY it's terminal.
+    # ``pr_policy.recreate_closed_prs`` is the only thing that lets a
+    # ``closed`` entry get a new chance — via a renumbered port branch.
+    "closed",
+    # Terminal: another PR (open or merged) targeting the same base branch
+    # has already cherry-picked the entry's source PR(s) — there is no
+    # remaining work to do. Detected by the supersede sweep, which walks
+    # the target branch's recent history (for merged supersedes) and open
+    # PRs (for in-flight supersedes) for ``(cherry picked from commit
+    # <sha>)`` footers citing our source SHAs. Like ``closed``, this is
+    # gated by ``pr_policy.detect_superseded``.
+    "superseded",
 ]
 PipelinePhase = Literal["init", "ports_done"]
 
@@ -47,6 +62,8 @@ STATUS_DISPLAY_ORDER: tuple[str, ...] = (
     "branch_created",
     "needs_review",
     "skipped",
+    "closed",
+    "superseded",
     "merged",
 )
 

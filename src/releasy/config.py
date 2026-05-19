@@ -226,6 +226,14 @@ class PRPolicyConfig:
     auto_pr: bool = True
     retry_failed: bool = True
     recreate_closed_prs: bool = False
+    # Detect tracked entries whose source PRs were already cherry-picked
+    # by some OTHER PR (open or merged) targeting the same base branch,
+    # and mark them ``status="superseded"`` so refresh / run stop wasting
+    # work on them. Scans target-branch git history for ``(cherry picked
+    # from commit <sha>)`` footers and walks open PRs targeting the same
+    # base. Default on; disable when you want the old behaviour (releasy
+    # keeps refreshing its own port regardless of parallel work).
+    detect_superseded: bool = True
 
 
 @dataclass
@@ -979,6 +987,7 @@ def load_config(config_path: Path | None = None) -> Config:
         auto_pr=bool(pp_raw.get("auto_pr", True)),
         retry_failed=bool(pp_raw.get("retry_failed", True)),
         recreate_closed_prs=bool(pp_raw.get("recreate_closed_prs", False)),
+        detect_superseded=bool(pp_raw.get("detect_superseded", True)),
     )
 
     notif_raw = raw.get("notifications", {}) or {}
@@ -1318,6 +1327,8 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         pp_data["retry_failed"] = pp.retry_failed
     if pp.recreate_closed_prs != pp_defaults.recreate_closed_prs:
         pp_data["recreate_closed_prs"] = pp.recreate_closed_prs
+    if pp.detect_superseded != pp_defaults.detect_superseded:
+        pp_data["detect_superseded"] = pp.detect_superseded
     if pp_data:
         data["pr_policy"] = pp_data
 

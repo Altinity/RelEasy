@@ -257,6 +257,10 @@ def refresh_tracked_prs(
     # command runs on a schedule, while ``releasy run`` only runs when
     # the user wants to port more work.
     _refresh_all_merge_status_from_github(config, state)
+    from releasy.pipeline import _refresh_all_superseded_status_from_github
+    _refresh_all_superseded_status_from_github(
+        config, state, repo_path, base_branch,
+    )
     _apply_merged_labels(config, state)
     _persist(config, state)
 
@@ -266,12 +270,37 @@ def refresh_tracked_prs(
     )
 
     candidates: list[tuple[str, FeatureState]] = []
+    closed_count = 0
+    superseded_count = 0
     for fid, fs in state.features.items():
         if fs.status in ("skipped", "merged"):
+            continue
+        if fs.status == "closed":
+            # Out of scope: rebase PR was closed without merging. The
+            # pre-loop ``_refresh_all_merge_status_from_github`` call
+            # already promoted this entry; don't touch it on this or
+            # any future refresh. See state.BranchStatus docstring.
+            closed_count += 1
+            continue
+        if fs.status == "superseded":
+            # Out of scope: another PR already cherry-picks the source.
+            # Promoted by the supersede sweep — no further refresh work.
+            superseded_count += 1
             continue
         if not fs.branch_name or not fs.rebase_pr_url:
             continue
         candidates.append((fid, fs))
+
+    if closed_count:
+        console.print(
+            f"  [dim]Skipping {closed_count} entry/ies whose rebase PR "
+            "was closed without merging.[/dim]"
+        )
+    if superseded_count:
+        console.print(
+            f"  [dim]Skipping {superseded_count} entry/ies superseded by "
+            "another PR targeting the same base.[/dim]"
+        )
 
     if only is not None:
         before = len(candidates)

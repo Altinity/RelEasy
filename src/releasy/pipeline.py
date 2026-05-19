@@ -44,16 +44,16 @@ from releasy.git_ops import (
     update_submodules,
 )
 from releasy.github_ops import (
+    CHERRY_PICK_FROM_RE,
     PRInfo,
     add_label_to_pr,
     create_pull_request,
     ensure_label,
+    fetch_open_prs_with_commits_to_base,
     fetch_pr_by_number,
     fetch_pr_by_url,
     find_pr_for_branch,
-    rebase_pr_was_closed_without_merge,
     get_origin_repo_slug,
-    is_pr_merged,
     mark_pr_ready_for_review,
     parse_pr_url,
     pr_has_label,
@@ -750,31 +750,216 @@ def _unmet_deps(unit: FeatureUnit, state: PipelineState) -> list[str]:
 def _refresh_all_merge_status_from_github(
     config: Config, state: PipelineState,
 ) -> int:
-    """Promote any feature with an outstanding rebase PR to ``merged``
-    when GitHub now reports it as merged.
+    """Promote / demote tracked features based on what GitHub says.
+
+    For every feature whose status is still in-flight and that has a
+    ``rebase_pr_url``, do one PR fetch and apply the terminal state:
+
+    * GitHub reports merged → ``status = "merged"``.
+    * GitHub reports closed-unmerged → ``status = "closed"`` with a
+      ``skip_reason`` so ``releasy status`` explains WHY the entry is
+      terminal. Closed entries are then ignored by the refresh loop and
+      by ``releasy run``; only ``pr_policy.recreate_closed_prs`` re-enters
+      them — via a renumbered port branch in ``_process_feature_unit``.
+    * Still open → no change.
 
     Broader than :func:`_refresh_dep_states_from_github`: that one only
     refreshes deps referenced by units in the current run; this one
-    refreshes every tracked feature, so post-merge bookkeeping (the
+    walks every tracked feature so post-merge bookkeeping (the
     ``merged_label`` sweep) doesn't miss merges that landed on PRs
     nobody depends on.
 
-    Returns the number of features promoted in this pass.
+    Returns the number of features whose status changed in this pass
+    (merged + newly-closed combined).
     """
     refreshable = {"branch_created", "conflict", "needs_review"}
-    promoted = 0
+    changed = 0
     for fid, fs in state.features.items():
         if fs.status not in refreshable or not fs.rebase_pr_url:
             continue
-        merged = is_pr_merged(config, fs.rebase_pr_url)
-        if not merged:
+        info = fetch_pr_by_url(config, fs.rebase_pr_url, include_closed=True)
+        if info is None:
             continue
-        fs.status = "merged"
+        if info.state == "merged":
+            fs.status = "merged"
+            fs.conflict_files = []
+            fs.failed_step_index = None
+            fs.partial_pr_count = None
+            changed += 1
+        elif info.state == "closed":
+            fs.status = "closed"
+            fs.conflict_files = []
+            fs.failed_step_index = None
+            fs.partial_pr_count = None
+            fs.skip_reason = "rebase PR closed without merging"
+            changed += 1
+    return changed
+
+
+def _scan_target_for_cherry_picks(
+    repo_path: Path, base_ref: str, source_shas: set[str],
+) -> dict[str, str]:
+    """Map ``{source_sha: citing_commit_sha}`` for cherry-pick footers on target.
+
+    Walks the last 2 000 commits on ``base_ref`` (cheap after a fetch) and
+    parses ``(cherry picked from commit <sha>)`` footers — `git cherry-pick
+    -x` always cites the full 40-char SHA, so set membership is exact.
+    First match wins (commits are in reverse-chrono order).
+    """
+    if not source_shas:
+        return {}
+    result = run_git(
+        ["log", base_ref, "-n", "2000", "--format=%H%x1f%B%x1e"],
+        repo_path, check=False,
+    )
+    if result.returncode != 0 or not result.stdout:
+        return {}
+    out: dict[str, str] = {}
+    for record in result.stdout.split("\x1e"):
+        record = record.strip()
+        if not record:
+            continue
+        citing_sha, _, body = record.partition("\x1f")
+        for m in CHERRY_PICK_FROM_RE.finditer(body):
+            cited = m.group(1).lower()
+            if cited in source_shas and cited not in out:
+                out[cited] = citing_sha
+        if len(out) == len(source_shas):
+            break
+    return out
+
+
+def _scan_open_prs_for_cherry_picks(
+    config: Config, base_branch: str,
+    source_shas: set[str], exclude_pr_urls: set[str],
+) -> dict[str, str]:
+    """Map ``{source_sha: superseding_pr_url}`` for open PRs on ``base_branch``.
+
+    Single batched GraphQL fetch of every open PR's commit messages
+    targeting the same base (paginated 50 PRs at a time, 250 commits per
+    PR). PRs in ``exclude_pr_urls`` (typically our own rebase PRs) are
+    skipped so we don't self-supersede.
+    """
+    if not source_shas:
+        return {}
+    out: dict[str, str] = {}
+    for pr_url, msgs in fetch_open_prs_with_commits_to_base(
+        config, base_branch,
+    ):
+        if pr_url in exclude_pr_urls:
+            continue
+        for msg in msgs:
+            for m in CHERRY_PICK_FROM_RE.finditer(msg):
+                cited = m.group(1).lower()
+                if cited in source_shas and cited not in out:
+                    out[cited] = pr_url
+        if len(out) == len(source_shas):
+            break
+    return out
+
+
+def _refresh_all_superseded_status_from_github(
+    config: Config, state: PipelineState,
+    repo_path: Path, base_branch: str,
+) -> int:
+    """Mark entries whose source PRs were cherry-picked elsewhere.
+
+    For each non-terminal tracked feature, resolve every source PR's
+    merge_commit_sha and look it up in two corpora:
+
+    * The target branch's recent git history (for already-merged
+      supersedes) — local ``git log`` scan, cheap after a fetch.
+    * Open PRs targeting the same base branch (for in-flight
+      supersedes) — single batched GraphQL fetch of every open PR's
+      commit messages. Our own rebase PRs are excluded so they don't
+      mark themselves.
+
+    For groups (multiple source PRs), every source must be cited
+    somewhere; partial matches don't promote since the rest of the group
+    still needs porting.
+
+    Gated by ``pr_policy.detect_superseded`` (default on). Returns the
+    number of features promoted to ``superseded`` on this pass.
+    """
+    if not config.pr_policy.detect_superseded:
+        return 0
+
+    refreshable = {"branch_created", "needs_review", "conflict", "blocked"}
+    feature_sources: dict[str, list[str]] = {}
+    for fid, fs in state.features.items():
+        if fs.status not in refreshable:
+            continue
+        urls = list(fs.pr_urls) if fs.pr_urls else (
+            [fs.pr_url] if fs.pr_url else []
+        )
+        if urls:
+            feature_sources[fid] = urls
+
+    if not feature_sources:
+        return 0
+
+    # Resolve each source URL to its merge_commit_sha. Sources that
+    # aren't merged on origin can't be matched against cherry-pick
+    # footers (those cite the merged commit), so we simply drop them.
+    all_source_urls: set[str] = set()
+    for urls in feature_sources.values():
+        all_source_urls.update(urls)
+    source_sha: dict[str, str] = {}
+    for url in all_source_urls:
+        info = fetch_pr_by_url(config, url, include_closed=True)
+        if info and info.merge_commit_sha:
+            source_sha[url] = info.merge_commit_sha.lower()
+    if not source_sha:
+        return 0
+
+    our_rebase_pr_urls = {
+        fs.rebase_pr_url for fs in state.features.values()
+        if fs.rebase_pr_url
+    }
+
+    remote = config.origin.remote_name
+    base_ref = f"{remote}/{base_branch}"
+    source_shas = set(source_sha.values())
+    cited_on_target = _scan_target_for_cherry_picks(
+        repo_path, base_ref, source_shas,
+    )
+    cited_in_open = _scan_open_prs_for_cherry_picks(
+        config, base_branch, source_shas, our_rebase_pr_urls,
+    )
+
+    changed = 0
+    for fid, urls in feature_sources.items():
+        evidence: list[tuple[str, str]] = []
+        all_cited = True
+        for url in urls:
+            sha = source_sha.get(url)
+            if not sha:
+                all_cited = False
+                break
+            if sha in cited_in_open:
+                evidence.append(("open PR", cited_in_open[sha]))
+            elif sha in cited_on_target:
+                evidence.append(("commit", cited_on_target[sha][:12]))
+            else:
+                all_cited = False
+                break
+        if not (all_cited and evidence):
+            continue
+        fs = state.features[fid]
+        fs.status = "superseded"
         fs.conflict_files = []
         fs.failed_step_index = None
         fs.partial_pr_count = None
-        promoted += 1
-    return promoted
+        if len(evidence) == 1:
+            where, ref = evidence[0]
+            fs.skip_reason = f"superseded by {where} {ref}"
+        else:
+            fs.skip_reason = (
+                "superseded ("
+                + ", ".join(f"{w} {r}" for w, r in evidence) + ")"
+            )
+        changed += 1
+    return changed
 
 
 def _source_pr_urls(fs: FeatureState) -> list[str]:
@@ -889,12 +1074,22 @@ def _refresh_dep_states_from_github(
             continue
         if not dep_fs.rebase_pr_url:
             continue
-        merged = is_pr_merged(config, dep_fs.rebase_pr_url)
-        if merged:
+        info = fetch_pr_by_url(
+            config, dep_fs.rebase_pr_url, include_closed=True,
+        )
+        if info is None:
+            continue
+        if info.state == "merged":
             dep_fs.status = "merged"
             dep_fs.conflict_files = []
             dep_fs.failed_step_index = None
             dep_fs.partial_pr_count = None
+        elif info.state == "closed":
+            dep_fs.status = "closed"
+            dep_fs.conflict_files = []
+            dep_fs.failed_step_index = None
+            dep_fs.partial_pr_count = None
+            dep_fs.skip_reason = "rebase PR closed without merging"
 
 
 # ---------------------------------------------------------------------------
@@ -1060,6 +1255,9 @@ def run_pipeline(
     # Cheap when ``merged_label`` is unset (the call is still useful to
     # keep the state file's ``status`` accurate for ``releasy status``).
     _refresh_all_merge_status_from_github(config, state)
+    _refresh_all_superseded_status_from_github(
+        config, state, repo_path, base_branch,
+    )
     _apply_merged_labels(config, state)
     _persist_state(config, state)
 
@@ -1073,8 +1271,18 @@ def run_pipeline(
         # (user opted out). Without this, a re-run after `releasy project pull`
         # or after the merged-status sweep promoted a unit would re-cherry-
         # pick source PRs whose port is already merged.
+        #
+        # ``closed`` is also terminal — the rebase PR was closed without
+        # merging — but ``pr_policy.recreate_closed_prs`` opts back in: the
+        # renumbered-branch path in ``_process_feature_unit`` re-attempts
+        # the port on ``<canonical>-1`` / ``-2`` / … . Without that flag,
+        # closed entries stay terminal so we don't waste a cherry-pick on
+        # a PR the user (or someone else) already decided against.
         prev_fs = state.features.get(unit.feature_id)
-        if prev_fs is not None and prev_fs.status in ("merged", "skipped"):
+        terminal = {"merged", "skipped", "superseded"}
+        if not config.pr_policy.recreate_closed_prs:
+            terminal.add("closed")
+        if prev_fs is not None and prev_fs.status in terminal:
             primary = unit.primary_pr()
             origin_slug = get_origin_repo_slug(config)
             ref = pr_ref_label(primary.repo_slug, primary.number, origin_slug)
@@ -1093,7 +1301,10 @@ def run_pipeline(
                         f"[link={prev_fs.rebase_pr_url}]"
                         f"{prev_fs.rebase_pr_url}[/link][/dim]"
                     )
-                if prev_fs.status == "skipped" and prev_fs.skip_reason:
+                if (
+                    prev_fs.status in ("skipped", "closed", "superseded")
+                    and prev_fs.skip_reason
+                ):
                     console.print(
                         f"    [dim]· reason: {prev_fs.skip_reason}[/dim]"
                     )
@@ -1134,6 +1345,8 @@ def run_pipeline(
                 ("skip-conflict-retry-off",     "skip — prior conflict, retry-off"),
                 ("skip-merged",                 "skip — already merged"),
                 ("skip-skipped",                "skip — user-marked skipped"),
+                ("skip-closed",                 "skip — rebase PR closed unmerged"),
+                ("skip-superseded",             "skip — superseded by another PR"),
             ]
             for code, label in order:
                 if counts.get(code):
@@ -1330,6 +1543,9 @@ def run_sequential(
     # Pick up ports that merged externally since the last run so the
     # ``merged_label`` sweep below has accurate state to work from.
     _refresh_all_merge_status_from_github(config, state)
+    _refresh_all_superseded_status_from_github(
+        config, state, repo_path, base_branch,
+    )
     _apply_merged_labels(config, state)
     _persist_state(config, state)
 
@@ -1346,7 +1562,10 @@ def run_sequential(
         primary = unit.primary_pr()
         ref = pr_ref_label(primary.repo_slug, primary.number, origin_slug)
 
-        if fs is not None and fs.status in ("merged", "skipped"):
+        seq_terminal = {"merged", "skipped", "superseded"}
+        if not config.pr_policy.recreate_closed_prs:
+            seq_terminal.add("closed")
+        if fs is not None and fs.status in seq_terminal:
             console.print(
                 f"  [dim]{unit.feature_id} ({ref}) — {fs.status}, skipping[/dim]"
             )
@@ -1394,15 +1613,28 @@ def run_sequential(
                 f"\n  Checking in-flight PR for [cyan]{unit.feature_id}[/cyan] "
                 f"({ref}): [link={fs.rebase_pr_url}]{fs.rebase_pr_url}[/link]"
             )
-            merged = is_pr_merged(config, fs.rebase_pr_url)
-            if merged is None:
+            info = fetch_pr_by_url(
+                config, fs.rebase_pr_url, include_closed=True,
+            )
+            if info is None:
                 console.print(
                     f"\n[red]✗[/red] Could not determine merge state of "
                     f"[link={fs.rebase_pr_url}]{fs.rebase_pr_url}[/link]. "
                     "Check RELEASY_GITHUB_TOKEN / network and retry."
                 )
                 raise SystemExit(1)
-            if not merged:
+            if info.state == "closed":
+                console.print(
+                    f"\n[red]✗[/red] Rebase PR "
+                    f"[link={fs.rebase_pr_url}]{fs.rebase_pr_url}[/link] was "
+                    "[red]closed without merging[/red]."
+                )
+                console.print(
+                    "  Sequential mode cannot advance past a closed PR. "
+                    "Re-open and merge it, or remove the entry, then re-run."
+                )
+                raise SystemExit(1)
+            if info.state != "merged":
                 console.print(
                     f"\n[red]✗[/red] Rebase PR "
                     f"[link={fs.rebase_pr_url}]{fs.rebase_pr_url}[/link] is "
@@ -2685,15 +2917,18 @@ def _process_feature_unit(
             "([cyan]if_exists: recreate[/cyan] + [cyan]retry_failed: true[/cyan])"
         )
 
+    # The merge-status sweep at the top of every run / refresh / continue
+    # has already promoted closed-on-GitHub PRs to ``status="closed"``,
+    # so the local status IS the source of truth here — no GitHub call.
+    prev_was_closed = (
+        prev_state is not None and prev_state.status == "closed"
+    )
+
     new_branch = canonical_branch
     if (
         config.pr_policy.recreate_closed_prs
         and not force_retry
-        and prev_state
-        and prev_state.rebase_pr_url
-        and rebase_pr_was_closed_without_merge(
-            config, prev_state.rebase_pr_url,
-        )
+        and prev_was_closed
     ):
         new_branch = _next_free_renumbered_port_branch(
             repo_path, remote, canonical_branch,
@@ -2719,9 +2954,7 @@ def _process_feature_unit(
         and prev_state is not None
         and prev_state.rebase_pr_url
         and unit.if_exists != "append"
-        and not rebase_pr_was_closed_without_merge(
-            config, prev_state.rebase_pr_url,
-        )
+        and not prev_was_closed
     ):
         _refresh_existing_pr_unit(
             config, repo_path, state, unit, prev_state, new_branch,
@@ -5032,6 +5265,9 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
     # is the natural place to reconcile, so apply the merged_label sweep
     # here as well.
     _refresh_all_merge_status_from_github(config, state)
+    _refresh_all_superseded_status_from_github(
+        config, state, repo_path, base_branch,
+    )
     _apply_merged_labels(config, state)
     _persist_state(config, state)
 
@@ -5042,6 +5278,16 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
 
         if fs.status == "skipped":
             console.print(f"{header} — [dim]skipped[/dim]")
+            continue
+
+        if fs.status == "closed":
+            reason = fs.skip_reason or "rebase PR closed without merging"
+            console.print(f"{header} — [dim]closed: {reason}[/dim]")
+            continue
+
+        if fs.status == "superseded":
+            reason = fs.skip_reason or "another PR cherry-picks the source"
+            console.print(f"{header} — [dim]superseded: {reason}[/dim]")
             continue
 
         # AI-gave-up flavour of conflict (partial group / dropped
@@ -5498,7 +5744,8 @@ def print_status(config: Config) -> None:
     section_styles = {
         "needs_review": "blue", "branch_created": "yellow",
         "conflict": "red", "skipped": "yellow",
-        "blocked": "yellow",
+        "blocked": "yellow", "closed": "bright_black",
+        "superseded": "bright_black",
     }
 
     origin_slug = get_origin_repo_slug(config)

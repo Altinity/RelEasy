@@ -17,6 +17,8 @@ STATUS_ICONS: dict[str, str] = {
     "skipped": "\u23ed skipped",
     "merged": "\u2705 merged",
     "blocked": "\u23f8 blocked",
+    "closed": "\u26d4 closed",
+    "superseded": "\u267b superseded",
 }
 
 STATUS_HEADINGS: dict[str, str] = {
@@ -26,4 +28,6 @@ STATUS_HEADINGS: dict[str, str] = {
     "skipped": "Skipped",
     "merged": "Merged \u2014 landed on target branch",
     "blocked": "Blocked \u2014 waiting on depends_on units",
+    "closed": "Closed \u2014 rebase PR closed without merging",
+    "superseded": "Superseded \u2014 another PR already cherry-picks the source",
 }

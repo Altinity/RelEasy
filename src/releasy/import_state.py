@@ -339,9 +339,9 @@ def _derive_status(
        "unknown") maps to ``needs_review`` — if GitHub hasn't computed
        mergeability yet, assume the optimistic path and let ``releasy
        refresh`` re-probe.
-    3. Merged / closed rebase PR → ``needs_review``. We don't have a
-       dedicated terminal "done" state locally, and "needs_review" is
-       the catch-all "port produced a PR, human decides next".
+    3. Merged rebase PR → ``merged``; closed-unmerged rebase PR →
+       ``closed`` (terminal — refresh skips it, run skips it unless
+       ``pr_policy.recreate_closed_prs`` opts back in).
     4. No rebase PR at all → ``branch_created`` (covers the
        ``auto_pr: false`` case where the caller reached us via the
        board-card path).
@@ -356,8 +356,11 @@ def _derive_status(
         if ms == "dirty":
             return "conflict"
         return "needs_review"
-    # Merged, closed, or any unrecognised state: the PR exists, so the
-    # port reached at least "opened" — map to needs_review.
+    if pr_state == "merged":
+        return "merged"
+    if pr_state == "closed":
+        return "closed"
+    # Unrecognised state: be optimistic and surface for human review.
     return "needs_review"
 
 

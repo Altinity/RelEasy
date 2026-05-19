@@ -104,8 +104,12 @@ After conflicts:
 
 **Status semantics:** clean or AI-resolved port with rebase PR open →
 `needs_review`. Pushed branch without PR → `branch_created`. Needs human →
-`conflict`. AI involvement is signalled by `ai_resolved` + the `ai-resolved`
-PR label.
+`conflict`. Rebase PR landed → `merged`. Rebase PR closed without merging
+→ `closed` (terminal — `pr_policy.recreate_closed_prs` lets a fresh
+`<canonical>-1` / `-2` / … attempt opt back in). Another PR on the same
+base already cherry-picks the source(s) → `superseded` (terminal — gated
+by `pr_policy.detect_superseded`). AI involvement is signalled by
+`ai_resolved` + the `ai-resolved` PR label.
 
 For per-PR hints to the resolver, see
 [`ai_context`](configuration.md#per-pr--per-group-ai_context).
