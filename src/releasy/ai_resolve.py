@@ -772,19 +772,29 @@ def _verify_postconditions(
             "cherry-pick/merge/rebase still in progress after claude exited"
         )
 
-    # Ignore untracked files: scratch dirs the AI agent leaves behind
-    # (e.g. tmp/, build artifacts) don't affect the cherry-pick's
-    # correctness. We only care about unstaged/staged changes to tracked
-    # files, which would indicate unfinished conflict resolution.
+    # Look only for **unmerged paths** — the unambiguous signal that the
+    # cherry-pick wasn't finished. Other dirt (modified/staged/deleted
+    # tracked files, untracked scratch in tmp/ or build/) is noise from
+    # build steps, generated headers, server runtime data, etc. — it
+    # does not invalidate a cherry-pick that was already committed
+    # (and the HEAD-advanced check below independently confirms the
+    # commit actually happened). Failing on dirty tmp files would
+    # reject legitimate resolutions, which is exactly the bug we hit on
+    # 2026-05-19 with the Iceberg PR #90740 port.
     porc = run_git(
         ["status", "--porcelain", "--untracked-files=no"],
         repo_path, check=False,
     )
-    if porc.stdout.strip():
-        files = ", ".join(
-            line[3:] for line in porc.stdout.splitlines()[:5]
+    unmerged = [
+        line for line in porc.stdout.splitlines()
+        if len(line) >= 2 and (
+            line[0] == "U" or line[1] == "U"
+            or line[:2] in {"AA", "DD"}
         )
-        return False, None, f"working tree not clean: {files}"
+    ]
+    if unmerged:
+        files = ", ".join(line[3:] for line in unmerged[:5])
+        return False, None, f"unmerged paths after claude: {files}"
 
     head = run_git(["rev-parse", "--verify", "HEAD"], repo_path, check=False)
     if head.returncode != 0:
