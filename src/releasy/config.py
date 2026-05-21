@@ -495,29 +495,44 @@ class AutoAddPrerequisitePRsConfig:
 class ReviewResponseConfig:
     """Claude-driven PR review-response configuration.
 
-    Drives ``releasy address-review`` — an AI pass that reads review
-    feedback left on an open rebase PR and either (a) makes code
+    Drives ``releasy refresh --address-review`` — an AI pass that reads
+    review feedback left on an open rebase PR and either (a) makes code
     changes and commits them, or (b) replies to the thread explaining
     why the comment doesn't translate to a code change. Opportunistically
     stateful: when the PR is tracked in state RelEasy remembers the
     last run's timestamp; otherwise it's pure stateless.
 
-    Comments authored by anyone NOT in ``trusted_reviewers`` (combined
-    with ``--reviewer`` on the CLI) are filtered out **before** the AI
-    sees the prompt, so an untrusted commenter cannot inject
-    instructions into the run. That allowlist is the only safety gate —
-    there is no master ``enabled:`` switch, because invoking the
-    subcommand is itself the explicit opt-in.
+    Comments authored by anyone NOT in ``trusted_reviewers`` are
+    filtered out **before** the AI sees the prompt, so an untrusted
+    commenter cannot inject instructions into the run. That allowlist
+    is the only safety gate — there is no master ``enabled:`` switch,
+    because the ``--address-review`` flag is itself the explicit
+    opt-in.
     """
     command: str = "claude"
     prompt_file: str = "prompts/address_review.md"
     timeout_seconds: int = 7200  # 2h
     max_iterations: int = 15
-    # Allowlist of GitHub logins (compared case-insensitively). The
-    # command refuses to run when both this list and the CLI
-    # ``--reviewer`` flag are empty — there is no "process every
-    # comment" mode, because that is exactly the prompt-injection
-    # surface we're trying to avoid.
+    # GitHub ``author_association`` values whose holders we trust to
+    # feed the AI. Defaults to anyone with a real relationship to the
+    # repo: ``OWNER`` (the user/org owning the repo), ``MEMBER`` (a
+    # member of the repo's owning organisation), ``COLLABORATOR`` (a
+    # user granted explicit repo permissions), and ``CONTRIBUTOR``
+    # (anyone who has previously had a commit merged into the repo —
+    # i.e. a prior code contributor, not a drive-by). GitHub sets this
+    # field server-side; commenters cannot forge it. Tighten the list
+    # to e.g. ``["OWNER", "MEMBER"]`` for stricter repos, or add
+    # ``FIRST_TIME_CONTRIBUTOR`` for community-heavy repos.
+    trusted_associations: list[str] = field(
+        default_factory=lambda: [
+            "OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR",
+        ],
+    )
+    # Extra allowlist of GitHub logins (compared case-insensitively),
+    # additive on top of ``trusted_associations``. Use this to trust a
+    # specific external reviewer that GitHub does not yet record as a
+    # collaborator. Empty list is fine — the association gate handles
+    # the common case on its own.
     trusted_reviewers: list[str] = field(default_factory=list)
     # Whether the AI posts a reply to each comment it classifies as
     # non-actionable (already fixed / out of scope / misunderstanding).
@@ -745,7 +760,7 @@ class Config:
     # session-agnostic commands (``status``, ``where``, ``adopt``) and
     # for stateless flows.
     session: SessionConfig | None = None
-    # Set by ``--stateless`` flows (``address-review --stateless``, the
+    # Set by ``--stateless`` flows (``refresh --stateless``, the
     # cherry-pick entry point). Consumers that would otherwise read /
     # write per-project state skip those calls when this is True. Checked
     # via :func:`is_stateless` so the flag lives in one place.
@@ -1166,11 +1181,28 @@ def load_config(config_path: Path | None = None) -> Config:
             continue
         rr_seen.add(key)
         rr_reviewers.append(stripped)
+    _rr_default_assocs = ["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"]
+    rr_assocs_raw = rr_raw.get("trusted_associations", _rr_default_assocs)
+    if not isinstance(rr_assocs_raw, list) or not all(
+        isinstance(x, str) for x in rr_assocs_raw
+    ):
+        raise ValueError(
+            "review_response.trusted_associations must be a list of strings"
+        )
+    rr_assoc_seen: set[str] = set()
+    rr_assocs: list[str] = []
+    for a in rr_assocs_raw:
+        up = a.strip().upper()
+        if not up or up in rr_assoc_seen:
+            continue
+        rr_assoc_seen.add(up)
+        rr_assocs.append(up)
     review_response = ReviewResponseConfig(
         command=rr_raw.get("command", "claude"),
         prompt_file=rr_raw.get("prompt_file", "prompts/address_review.md"),
         timeout_seconds=int(rr_raw.get("timeout_seconds", 7200)),
         max_iterations=int(rr_raw.get("max_iterations", 15)),
+        trusted_associations=rr_assocs,
         trusted_reviewers=rr_reviewers,
         reply_to_non_addressable=bool(
             rr_raw.get("reply_to_non_addressable", True),
@@ -1444,6 +1476,8 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         rr_data["timeout_seconds"] = rr.timeout_seconds
     if rr.max_iterations != rr_defaults.max_iterations:
         rr_data["max_iterations"] = rr.max_iterations
+    if rr.trusted_associations != rr_defaults.trusted_associations:
+        rr_data["trusted_associations"] = rr.trusted_associations
     if rr.trusted_reviewers:
         rr_data["trusted_reviewers"] = rr.trusted_reviewers
     if rr.reply_to_non_addressable != rr_defaults.reply_to_non_addressable:
@@ -2254,107 +2288,6 @@ def make_stateless_config(
     )
 
 
-def overlay_address_review_overrides(
-    config: Config,
-    *,
-    claude_command: str | None = None,
-    build_command: str | None = None,
-    prompt_file: str | None = None,
-    timeout_seconds: int | None = None,
-    max_iterations: int | None = None,
-    trusted_reviewers: list[str] | None = None,
-    reply_to_non_addressable: bool | None = None,
-    post_summary_comment: bool | None = None,
-    allowed_tools: list[str] | None = None,
-    extra_args: list[str] | None = None,
-) -> None:
-    """Apply CLI overrides on top of a loaded ``Config`` for
-    ``address-review --stateless``.
-
-    Mutates ``config`` in place. ``None`` arguments leave the existing
-    value untouched — CLI flags that the user didn't pass don't clobber
-    whatever was in ``config.yaml``. When a ``--build-command`` is
-    provided, it also flows into ``ai_resolve.build_command`` so the AI
-    wrapper script the review flow materialises matches the override.
-    """
-    rr = config.review_response
-    if claude_command is not None:
-        rr.command = claude_command
-    if prompt_file is not None:
-        rr.prompt_file = prompt_file
-    if timeout_seconds is not None:
-        rr.timeout_seconds = timeout_seconds
-    if max_iterations is not None:
-        rr.max_iterations = max_iterations
-    if trusted_reviewers is not None:
-        rr.trusted_reviewers = list(trusted_reviewers)
-    if reply_to_non_addressable is not None:
-        rr.reply_to_non_addressable = reply_to_non_addressable
-    if post_summary_comment is not None:
-        rr.post_summary_comment = post_summary_comment
-    if allowed_tools is not None:
-        rr.allowed_tools = list(allowed_tools)
-    if extra_args is not None:
-        rr.extra_args = list(extra_args)
-    if build_command is not None:
-        config.ai_resolve.build_command = build_command
-
-
-def build_stateless_address_review_config(
-    *,
-    origin_url: str,
-    work_dir: Path | None = None,
-    claude_command: str = "claude",
-    build_command: str = "",
-    prompt_file: str | None = None,
-    timeout_seconds: int = 7200,
-    max_iterations: int = 15,
-    trusted_reviewers: list[str] | None = None,
-    reply_to_non_addressable: bool = True,
-    post_summary_comment: bool = False,
-    allowed_tools: list[str] | None = None,
-    extra_args: list[str] | None = None,
-) -> Config:
-    """Build an in-memory ``Config`` for ``releasy address-review --stateless``
-    when no ``config.yaml`` is available.
-
-    All knobs come from CLI flags. Prefer :func:`load_config` +
-    :func:`overlay_address_review_overrides` when a config file exists —
-    that path inherits AI settings, trusted_reviewers, notifications, etc.
-    from the project's config.
-    """
-    if prompt_file is None:
-        bundled = (
-            Path(__file__).parent / "prompts" / "address_review.md"
-        ).resolve()
-        prompt_file = str(bundled)
-
-    base = make_stateless_config(
-        origin_url,
-        work_dir=work_dir,
-        push=True,
-        auto_pr=False,
-        ai_enabled=False,
-        ai_command=claude_command,
-        ai_build_command=build_command,
-    )
-    base.review_response = ReviewResponseConfig(
-        command=claude_command,
-        prompt_file=prompt_file,
-        timeout_seconds=timeout_seconds,
-        max_iterations=max_iterations,
-        trusted_reviewers=list(trusted_reviewers or []),
-        reply_to_non_addressable=reply_to_non_addressable,
-        post_summary_comment=post_summary_comment,
-        allowed_tools=(
-            list(allowed_tools) if allowed_tools is not None
-            else _default_allowed_tools()
-        ),
-        extra_args=list(extra_args or []),
-    )
-    return base
-
-
 def overlay_analyze_fails_overrides(
     config: Config,
     *,
@@ -2373,9 +2306,9 @@ def overlay_analyze_fails_overrides(
     """Apply CLI overrides on top of a loaded ``Config`` for ``analyze-fails``.
 
     Mutates ``config`` in place. ``None`` arguments leave the existing
-    value untouched. Like ``overlay_address_review_overrides``, a
-    ``--build-command`` override flows into ``ai_resolve.build_command``
-    so the build wrapper materialised in the work-dir matches.
+    value untouched. A ``--build-command`` override flows into
+    ``ai_resolve.build_command`` so the build wrapper materialised in
+    the work-dir matches.
     """
     af = config.analyze_fails
     if claude_command is not None:
@@ -2461,12 +2394,10 @@ def build_stateless_analyze_fails_config(
 def is_stateless(config: Config) -> bool:
     """True when ``config`` was built for a stateless flow.
 
-    Set by :func:`make_stateless_config`,
-    :func:`build_stateless_address_review_config`, and the
-    ``address-review --stateless`` CLI path (which loads the real
-    ``config.yaml`` and flips this flag so downstream code skips state
-    I/O). Use this in place of raw name/field checks so the policy lives
-    in one place.
+    Set by :func:`make_stateless_config` and the ``refresh --stateless``
+    CLI path (which loads the real ``config.yaml`` and flips this flag
+    so downstream code skips state I/O). Use this in place of raw
+    name/field checks so the policy lives in one place.
     """
     return config.stateless
 

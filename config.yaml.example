@@ -327,37 +327,44 @@ notifications:
 #   max_pr_body_chars: 3000
 
 # ─────────────────────────────────────────────────────────────────────
-# REVIEW RESPONSE (`releasy address-review`)
+# REVIEW RESPONSE (`releasy refresh --address-review`)
 #
 # Reads review comments left on a PR and lets the AI make code
-# changes addressing the feedback. Off by default because it spends
-# Anthropic tokens every call and writes to your PR branch.
+# changes addressing the feedback. Triggered by `refresh
+# --address-review`. Off by default because it spends Anthropic tokens
+# and writes to your PR branch.
 #
-# Runs in two modes:
-#   * Default            — loads this config, takes the project lock,
-#                          records timestamps in state for tracked PRs.
-#   * `--stateless`      — loads this config, but skips session/state/lock.
-#                          CLI flags (--origin / --build-command / ...)
-#                          override anything in config.
+# Trust gate: comments are filtered to "trusted authors" BEFORE the AI
+# sees them — untrusted commenters cannot smuggle instructions into the
+# run. Two additive sources:
 #
-# Every comment is filtered to an explicit allowlist of trusted
-# reviewers BEFORE the AI sees it — untrusted commenters cannot smuggle
-# instructions into the run. The allowlist here is unioned with
-# `--reviewer` on the CLI; if both are empty, the command refuses to
-# run.
+#   * `trusted_associations` (default OWNER, MEMBER, COLLABORATOR,
+#     CONTRIBUTOR) — GitHub's per-comment `author_association` field,
+#     set server-side when the comment is posted. Anyone with a real
+#     relationship to the repo (owner, org member, explicit
+#     collaborator, or a prior code contributor) passes automatically.
+#     Tighten or widen as you like.
+#   * `trusted_reviewers` — extra logins to trust regardless of their
+#     association (e.g. an external reviewer you want to whitelist).
+#
+# Both empty → the run refuses (no trust signal at all).
 #
 # Linear history is a hard rule: the AI only appends commits (it uses
 # `git revert` to retract anything, never amend / rebase / reset).
 # RelEasy pushes with plain `git push` at the end.
 #
 # review_response:
+#   trusted_associations:
+#     - OWNER
+#     - MEMBER
+#     - COLLABORATOR
+#     - CONTRIBUTOR
 #   trusted_reviewers:
 #     - alice
 #     - bob
 #   # Reply in-thread (with a bot footer) on every comment classified as
 #   # non-actionable. Set to false for a silent run that only reports
-#   # via the AI's terminal narration. Override per-invocation with
-#   # --reply / --no-reply.
+#   # via the AI's terminal narration.
 #   reply_to_non_addressable: true
 #   # Optional: post one extra top-level summary comment on the PR
 #   # describing what was done (distinct from per-comment replies).

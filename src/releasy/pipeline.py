@@ -222,17 +222,29 @@ PRRef = tuple[str, str, int]
 
 @dataclass
 class OnlyFilter:
-    """``--only`` filter: scope an action to a single PR (URL) or group/feature ID.
+    """``--only`` / ``--pr`` filter: scope an action to a single PR / group / feature.
 
-    The CLI flag accepts either a GitHub PR URL or a free-form name; the
+    Built from either ``--only <URL|id>`` or ``--pr <URL>``. The
     name is matched against group IDs (``pr_sources.groups[].id``) and
     singleton feature IDs (``pr-<N>``, ``<owner>-<repo>-pr-<N>``). URLs
     are parsed into a ``(owner, repo, number)`` tuple so cross-repo
     sources can't collide with same-numbered origin PRs.
+
+    ``soft`` distinguishes the two CLI sources:
+
+      * ``--only`` (soft=False) — user intent is "I know this exists,
+        run it"; if nothing matches, the command exits non-zero so a
+        typo doesn't fail silently.
+      * ``--pr``   (soft=True)  — user intent is "if this PR is in our
+        scope, act on it; otherwise do nothing"; designed for
+        webhook / cron callers that don't know in advance whether
+        the PR belongs to this project. A no-match exits cleanly with
+        a "not in scope" notice.
     """
     raw: str
     pr_ref: PRRef | None
     name: str | None
+    soft: bool = False
 
     @property
     def label(self) -> str:
@@ -280,6 +292,29 @@ def parse_only(only: str | None) -> OnlyFilter | None:
             "https://github.com/<owner>/<repo>/pull/<N> link."
         )
     return OnlyFilter(raw=only, pr_ref=None, name=only)
+
+
+def parse_pr_url_filter(pr: str | None) -> OnlyFilter | None:
+    """Parse a ``--pr <URL>`` argument into a soft :class:`OnlyFilter`.
+
+    URL-only counterpart to :func:`parse_only`: the user is filtering
+    by PR identity, so we require a real PR URL and never fall through
+    to the name path. ``soft=True`` so no-match exits cleanly — the
+    caller's intent is "act on this PR if you can, otherwise quietly
+    skip", not "fail if it's missing".
+    """
+    if not pr:
+        return None
+    raw = pr.strip()
+    if not raw:
+        return None
+    parsed = parse_pr_url(raw)
+    if parsed is None:
+        raise ValueError(
+            f"--pr={pr!r} is not a GitHub PR URL "
+            "(expected https://github.com/<owner>/<repo>/pull/<N>)."
+        )
+    return OnlyFilter(raw=raw, pr_ref=parsed, name=None, soft=True)
 
 
 def _detect_port_mode(
@@ -1291,11 +1326,22 @@ def run_pipeline(
     if only is not None:
         before = len(units)
         units = [u for u in units if only.matches_unit(u)]
+        flag = "--pr" if only.soft else "--only"
         console.print(
-            f"\n  [dim]--only={only.label}: "
+            f"\n  [dim]{flag}={only.label}: "
             f"kept {len(units)}/{before} discovered unit(s)[/dim]"
         )
         if not units:
+            if only.soft:
+                # ``--pr`` is the "act-if-in-scope" form — a no-match
+                # is the expected outcome for PRs that don't belong to
+                # this session. Exit cleanly so cron / webhook callers
+                # don't have to special-case it.
+                console.print(
+                    f"\n  [dim]--pr={only.label!r} is not in this "
+                    "session's scope — nothing to do.[/dim]"
+                )
+                return load_state(config)
             console.print(
                 f"\n[red]✗[/red] --only={only.label!r} matched no "
                 "discovered units. Check the URL / group id and re-run."
@@ -1592,11 +1638,22 @@ def run_sequential(
     if only is not None:
         before = len(units)
         units = [u for u in units if only.matches_unit(u)]
+        flag = "--pr" if only.soft else "--only"
         console.print(
-            f"\n  [dim]--only={only.label}: "
+            f"\n  [dim]{flag}={only.label}: "
             f"kept {len(units)}/{before} discovered unit(s)[/dim]"
         )
         if not units:
+            if only.soft:
+                # ``--pr`` is the "act-if-in-scope" form — a no-match
+                # is the expected outcome for PRs that don't belong to
+                # this session. Exit cleanly so cron / webhook callers
+                # don't have to special-case it.
+                console.print(
+                    f"\n  [dim]--pr={only.label!r} is not in this "
+                    "session's scope — nothing to do.[/dim]"
+                )
+                return load_state(config)
             console.print(
                 f"\n[red]✗[/red] --only={only.label!r} matched no "
                 "discovered units. Check the URL / group id and re-run."

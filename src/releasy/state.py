@@ -179,13 +179,14 @@ class FeatureState:
     # "config:groups[<id>]"). Drives the "merge unit X first" message;
     # cleared once the unit lands cleanly.
     queued_prereq_units: list[dict] = field(default_factory=list)
-    # ----- ``releasy address-review`` tracking -----
+    # ----- ``refresh --address-review`` tracking -----
     # ISO-8601 UTC timestamp of the most recent successful
-    # ``releasy address-review`` run on this feature's rebase PR. When
-    # present, the next address-review run on the same PR uses it as an
-    # implicit (exclusive) --since default so re-runs only consider
-    # comments posted after the last pass. Opportunistic: stateless
-    # runs (PR not tracked here) simply don't read or write this field.
+    # ``refresh --address-review`` run on this feature's rebase PR.
+    # When present, the next address-review pass on the same PR uses
+    # it as an implicit (exclusive) --since default so re-runs only
+    # consider comments posted after the last pass. Opportunistic:
+    # stateless runs (PR not tracked here) simply don't read or write
+    # this field.
     last_review_addressed_at: str | None = None
     # ----- Sequential-gating state (depends_on) -----
     # When ``status == "blocked"``, the unit IDs this entry is waiting on.

@@ -1,15 +1,19 @@
-"""``releasy address-review`` — let the AI address PR review feedback.
+"""``releasy refresh --address-review`` — let the AI address PR review feedback.
 
 Given a pull-request URL, this module:
 
 1. Fetches every comment GitHub knows about the PR (issue comments,
    inline review comments, review bodies) via the three REST endpoints
-   wrapped in ``github_ops.fetch_pr_comments``.
+   wrapped in ``github_ops.fetch_pr_comments``, then enriches each with
+   GraphQL-only flags (``isMinimized``, ``isResolved``, …) and the PR
+   author's login.
 2. **Filters those comments before the AI ever sees them.** Only
    comments whose author is in the trusted allowlist
-   (``review_response.trusted_reviewers`` in config, unioned with
-   ``--reviewer`` flags) survive. Optionally narrows further with
-   ``--since <iso>``. Empty allowlist → the command refuses to run.
+   (``review_response.trusted_reviewers`` in config) survive — and
+   only when they aren't hidden, aren't already resolved (inline
+   threads) or already-replied-to (top-level by the PR author).
+   Optionally narrows further with ``--since <iso>``. Empty
+   allowlist → the run refuses to start.
 3. Renders a prompt embedding only the surviving comments, inside
    clearly-delimited blocks — so the AI is reading structured data, not
    live PR context.
@@ -21,10 +25,9 @@ Given a pull-request URL, this module:
 6. Plain (non-force) push — races are a user problem, we refuse to
    clobber someone else's work.
 
-Deliberately stateless: the PR does not need to be tracked in the
-project's state file. Re-running is the user's call; there is no
-"already-addressed" bookkeeping. Pair with ``--since`` when you want
-incremental behaviour.
+The PR does not need to be tracked in the project's state file. When
+it IS, ``last_review_addressed_at`` is stamped on success and used as
+an implicit exclusive ``--since`` default on the next run.
 
 Injection-safe by construction: every piece of text Claude sees is
 either (a) configuration / CLI input you control, or (b) the body of a
@@ -75,18 +78,37 @@ from releasy.github_ops import (
 def _build_trusted_set(
     config: Config, cli_reviewers: tuple[str, ...],
 ) -> set[str]:
-    """Union config ``trusted_reviewers`` with CLI ``--reviewer`` flags.
+    """Build the explicit-login allowlist (additive over the association gate).
 
     All logins are lower-cased so the author comparison is
     case-insensitive (GitHub treats logins as case-insensitive at the
     UI level; the API returns whatever casing the user registered
-    with). Empty strings are dropped.
+    with). Empty strings are dropped. May be empty — the
+    ``trusted_associations`` gate handles the common case on its own,
+    so we no longer require this list to be non-empty before the run.
     """
     out: set[str] = set()
     for login in list(config.review_response.trusted_reviewers) + list(cli_reviewers):
         s = (login or "").strip().lower()
         if s:
             out.add(s)
+    return out
+
+
+def _build_trusted_associations(config: Config) -> set[str]:
+    """Normalise the configured trusted ``author_association`` values.
+
+    Returns an upper-cased set of associations whose authors we trust
+    (default: ``{OWNER, MEMBER, COLLABORATOR}``). GitHub sets the
+    field server-side, so it's a tamper-proof "is this person a
+    maintainer of this repo / org?" signal — much sturdier than a
+    hand-maintained login list.
+    """
+    out: set[str] = set()
+    for a in config.review_response.trusted_associations:
+        up = (a or "").strip().upper()
+        if up:
+            out.add(up)
     return out
 
 
@@ -199,22 +221,63 @@ def _resolve_since(
 
 def _filter_comments(
     comments: list[PRComment],
-    trusted: set[str],
+    trusted_logins: set[str],
+    trusted_associations: set[str],
     since: _SinceFilter | None,
+    pr_author: str | None = None,
 ) -> tuple[list[PRComment], dict[str, int]]:
-    """Drop untrusted / too-old comments. Also returns a per-reason count.
+    """Drop untrusted / too-old / hidden / already-answered comments.
 
     Filtering is applied in this order so the stats accurately reflect
     which gate dropped each comment:
-      1. Untrusted author         → ``"untrusted"``
-      2. Older than ``--since``   → ``"too_old"``
-    Comments that survive both gates end up in the returned list.
+
+      1. Untrusted author              → ``"untrusted"``
+         (kept only when the author's ``author_association`` is in
+          ``trusted_associations`` OR their login is in
+          ``trusted_logins``; the two sources combine additively.)
+      2. Older than ``--since``        → ``"too_old"``
+      3. Hidden (minimized / outdated) → ``"hidden"``
+      4. Already addressed             → ``"addressed"``
+         (inline: thread ``isResolved=true``; issue / review-body:
+          a later comment by ``pr_author`` exists)
+
+    The "addressed" gate is the key change for ``refresh
+    --address-review``: we don't want the AI to re-think comments the
+    author already replied to. ``pr_author`` is matched
+    case-insensitively; when empty we skip the issue/review side of the
+    check (treat them as still needing attention) so we never drop a
+    comment based on missing data.
     """
     kept: list[PRComment] = []
-    dropped = {"untrusted": 0, "too_old": 0}
+    dropped = {"untrusted": 0, "too_old": 0, "hidden": 0, "addressed": 0}
+
+    author_lc = (pr_author or "").lower()
+    # Pre-compute "earliest created_at of a PR-author comment AFTER this
+    # one" by scanning once: ascending iteration means once we see a PR
+    # author comment we know every earlier non-author comment is
+    # answered by it. We use ``id`` as a tiebreaker because GitHub
+    # records second-resolution timestamps and bursts can share one.
+    pr_author_marks: list[tuple[str, int]] = []
+    if author_lc:
+        for c in comments:
+            if (c.author or "").lower() == author_lc:
+                pr_author_marks.append((c.created_at or "", c.id))
+
+    def _has_later_pr_author_reply(c: PRComment) -> bool:
+        if not author_lc:
+            return False
+        # A "reply" is any later top-level comment by the PR author.
+        # Comparing on (created_at, id) keeps the ordering stable when
+        # GitHub returns the same timestamp for two adjacent posts.
+        c_key = (c.created_at or "", c.id)
+        return any(mark > c_key for mark in pr_author_marks)
+
     for c in comments:
-        author_lc = (c.author or "").lower()
-        if author_lc not in trusted:
+        is_trusted = (
+            (c.author or "").lower() in trusted_logins
+            or (c.author_association or "").upper() in trusted_associations
+        )
+        if not is_trusted:
             dropped["untrusted"] += 1
             continue
         if since is not None and c.created_at:
@@ -224,6 +287,22 @@ def _filter_comments(
             )
             if not cmp_ok:
                 dropped["too_old"] += 1
+                continue
+        if c.is_minimized:
+            dropped["hidden"] += 1
+            continue
+        if c.kind == "inline":
+            # GitHub's per-thread resolution is the source of truth here:
+            # if a maintainer ticked "Resolve conversation" the AI has
+            # nothing to do.
+            if c.is_resolved is True:
+                dropped["addressed"] += 1
+                continue
+        else:
+            # Top-level discussion has no thread, so we approximate
+            # "answered" as "PR author posted anything after it".
+            if _has_later_pr_author_reply(c):
+                dropped["addressed"] += 1
                 continue
         kept.append(c)
     return kept, dropped
@@ -271,9 +350,9 @@ def _load_tracking_state(
     a reason to fail a stateless-by-design command.
     """
     # ``--stateless`` callers construct a Config via make_stateless_config
-    # / build_stateless_address_review_config specifically to skip
-    # persistence. Honour that here so we don't accidentally read a
-    # stale ``_stateless.state.yaml`` from a previous run.
+    # specifically to skip persistence. Honour that here so we don't
+    # accidentally read a stale ``_stateless.state.yaml`` from a previous
+    # run.
     from releasy.config import is_stateless
     if is_stateless(config):
         return None, None
@@ -527,22 +606,28 @@ def address_review(
     dry_run: bool = False,
     reply_override: bool | None = None,
 ) -> AddressReviewResult:
-    """Drive one ``releasy address-review`` run end-to-end.
+    """Drive one address-review run end-to-end for a single PR.
 
-    Returns an :class:`AddressReviewResult` describing what happened so
-    the CLI can pick an exit code. Never raises; all failure modes
-    collapse into ``success=False`` with a human-readable ``error``.
+    Called by :mod:`releasy.refresh` when ``--address-review`` is set
+    (per-tracked-PR in the multi-PR walk, or once for a single PR via
+    ``refresh --pr <url>``). Returns an :class:`AddressReviewResult`
+    describing what happened so the CLI can pick an exit code. Never
+    raises; all failure modes collapse into ``success=False`` with a
+    human-readable ``error``.
     """
-    trusted = _build_trusted_set(config, cli_reviewers)
-    if not trusted:
+    trusted_logins = _build_trusted_set(config, cli_reviewers)
+    trusted_associations = _build_trusted_associations(config)
+    if not trusted_logins and not trusted_associations:
+        # Both gates empty would feed *every* commenter to the AI —
+        # exactly the injection surface we're trying to avoid. Refuse.
         return AddressReviewResult(
             success=False,
             error=(
-                "No trusted reviewers configured. Set "
-                "review_response.trusted_reviewers in config (a list of "
-                "GitHub logins) and/or pass --reviewer <login> on the "
-                "CLI. RelEasy refuses to process comments without an "
-                "explicit allowlist."
+                "No trust gate configured. Set "
+                "review_response.trusted_associations (defaults to "
+                "OWNER/MEMBER/COLLABORATOR) and/or "
+                "review_response.trusted_reviewers. RelEasy refuses to "
+                "process comments without any trust signal."
             ),
         )
 
@@ -605,9 +690,10 @@ def address_review(
     console.print(
         f"\n[bold]Fetching comments on[/bold] [cyan]{pr_url}[/cyan]…",
     )
-    comments, err = fetch_pr_comments(config, pr_url)
-    if err:
-        return AddressReviewResult(success=False, error=err)
+    fetched = fetch_pr_comments(config, pr_url)
+    if fetched.error:
+        return AddressReviewResult(success=False, error=fetched.error)
+    comments = fetched.comments
 
     try:
         since_filter = (
@@ -618,12 +704,17 @@ def address_review(
     except ValueError as exc:
         return AddressReviewResult(success=False, error=str(exc))
 
-    filtered, dropped = _filter_comments(comments, trusted, since_filter)
+    filtered, dropped = _filter_comments(
+        comments, trusted_logins, trusted_associations, since_filter,
+        pr_author=fetched.pr_author,
+    )
     console.print(
         f"  [dim]{len(comments)} total, "
-        f"{len(filtered)} trusted, "
-        f"{dropped['untrusted']} dropped (untrusted author), "
-        f"{dropped['too_old']} dropped (--since).[/dim]"
+        f"{len(filtered)} actionable, "
+        f"{dropped['untrusted']} untrusted, "
+        f"{dropped['too_old']} too old (--since), "
+        f"{dropped['hidden']} hidden, "
+        f"{dropped['addressed']} already addressed.[/dim]"
     )
     if not filtered:
         console.print("[green]Nothing to address — exiting cleanly.[/green]")

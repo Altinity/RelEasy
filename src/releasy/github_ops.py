@@ -542,6 +542,11 @@ class PRComment:
     emits). ``author`` is the commenter's GitHub login — missing / bot
     authors are represented as an empty string so the trusted-reviewer
     filter simply drops them.
+
+    The last four fields are populated by a follow-up GraphQL fetch
+    (REST doesn't expose ``isResolved`` / ``isMinimized``). They default
+    to "unknown / visible / not part of a thread" so callers that skip
+    the enrichment step still get sensible behaviour.
     """
     id: int
     kind: str
@@ -550,12 +555,37 @@ class PRComment:
     updated_at: str
     url: str
     body: str
+    # GitHub's ``author_association`` for this comment, upper-case
+    # (``OWNER``, ``MEMBER``, ``COLLABORATOR``, ``CONTRIBUTOR``,
+    # ``FIRST_TIME_CONTRIBUTOR``, ``MANNEQUIN``, ``NONE``, ``""``).
+    # Set by GitHub at post time — commenters can't forge it — so it
+    # doubles as a trust signal: "is this person a maintainer of the
+    # repo / org or just a passer-by?"
+    author_association: str = ""
     path: str | None = None
     line: int | None = None
     commit_id: str | None = None
     diff_hunk: str | None = None
     in_reply_to_id: int | None = None
     review_state: str | None = None
+    is_minimized: bool = False
+    is_resolved: bool | None = None  # None when comment isn't on a thread
+    is_outdated: bool = False
+    thread_id: str | None = None
+
+
+@dataclass
+class PRCommentsResult:
+    """Bundle returned by :func:`fetch_pr_comments`.
+
+    ``pr_author`` is the GitHub login of whoever opened the PR — needed
+    by the "no PR-author reply" gate when filtering top-level comments
+    (we drop a comment if the PR author has posted any later comment,
+    treating that as the response).
+    """
+    comments: list[PRComment]
+    pr_author: str
+    error: str | None = None
 
 
 def _safe_iso(value) -> str:  # noqa: ANN001 — PyGithub returns datetime
@@ -579,15 +609,174 @@ def _comment_author_login(obj) -> str:  # noqa: ANN001
     return ""
 
 
+def _author_association(obj) -> str:  # noqa: ANN001
+    """Pull ``author_association`` off a PyGithub comment, upper-cased.
+
+    The value is set by GitHub when the comment is posted and reflects
+    the author's relationship to the repo at that moment — ``OWNER``,
+    ``MEMBER`` (of the repo's org), ``COLLABORATOR``, ``CONTRIBUTOR``,
+    ``FIRST_TIME_CONTRIBUTOR``, ``MANNEQUIN``, or ``NONE``. We
+    upper-case for safety (the docs list upper-case constants but the
+    API has historically returned a few mixed-case variants) and
+    return ``""`` if PyGithub didn't surface the field.
+
+    PyGithub does not expose ``author_association`` as an attribute on
+    :class:`PullRequestReview` even though the REST payload includes
+    it. Fall back to ``raw_data`` so reviews authored by org members
+    don't silently fail the trust gate.
+    """
+    try:
+        v = getattr(obj, "author_association", None)
+        if isinstance(v, str) and v:
+            return v.upper()
+        raw = getattr(obj, "raw_data", None)
+        if isinstance(raw, dict):
+            v2 = raw.get("author_association")
+            if isinstance(v2, str) and v2:
+                return v2.upper()
+    except Exception:  # pragma: no cover
+        pass
+    return ""
+
+
+@dataclass
+class _CommentMeta:
+    """GraphQL-derived metadata for one comment, keyed by REST databaseId.
+
+    Populated by :func:`_fetch_pr_comment_metadata_gql`. ``is_resolved``
+    is ``None`` for comments that aren't part of a review thread (issue
+    comments, review-body comments) since the concept doesn't apply to
+    them.
+    """
+    is_minimized: bool = False
+    is_resolved: bool | None = None
+    is_outdated: bool = False
+    thread_id: str | None = None
+
+
+def _fetch_pr_comment_metadata_gql(
+    slug: str, number: int,
+) -> tuple[dict[int, _CommentMeta], str]:
+    """Pull ``isMinimized`` / ``isResolved`` / ``isOutdated`` + PR author.
+
+    Returns ``({databaseId -> _CommentMeta}, pr_author_login)``. On any
+    GraphQL transport failure (no token, API down, missing repo) we
+    return ``({}, "")`` — callers degrade to "no metadata, no PR-author
+    cross-check", which means the new resolved/no-reply gate doesn't
+    apply but the run doesn't crash either.
+
+    We paginate review threads + issue comments; each thread's inner
+    comments are capped at 100, which is far above any real PR. If
+    you ever see a thread with more comments, GraphQL truncates
+    silently and those extra comments stay with default metadata
+    (``is_minimized=False``, ``is_resolved=None``) — the worst-case
+    failure mode is "consider too many comments", not "miss a
+    minimised one".
+    """
+    out: dict[int, _CommentMeta] = {}
+    pr_author = ""
+    owner, _, repo = slug.partition("/")
+
+    query = """
+    query($owner: String!, $repo: String!, $number: Int!,
+          $threadCursor: String, $issueCursor: String) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $number) {
+          author { login }
+          reviewThreads(first: 50, after: $threadCursor) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              id
+              isResolved
+              isOutdated
+              comments(first: 100) {
+                nodes {
+                  databaseId
+                  isMinimized
+                }
+              }
+            }
+          }
+          comments(first: 100, after: $issueCursor) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              databaseId
+              isMinimized
+            }
+          }
+        }
+      }
+    }
+    """
+
+    thread_cursor: str | None = None
+    issue_cursor: str | None = None
+    while True:
+        data = _gql(query, {
+            "owner": owner,
+            "repo": repo,
+            "number": number,
+            "threadCursor": thread_cursor,
+            "issueCursor": issue_cursor,
+        })
+        if not data:
+            return {}, ""
+        pr = (data.get("repository") or {}).get("pullRequest") or {}
+        if not pr_author:
+            pr_author = ((pr.get("author") or {}).get("login") or "")
+
+        threads = pr.get("reviewThreads") or {}
+        for thread in (threads.get("nodes") or []):
+            tid = thread.get("id")
+            resolved = bool(thread.get("isResolved"))
+            outdated = bool(thread.get("isOutdated"))
+            for tc in ((thread.get("comments") or {}).get("nodes") or []):
+                db_id = tc.get("databaseId")
+                if db_id is None:
+                    continue
+                out[int(db_id)] = _CommentMeta(
+                    is_minimized=bool(tc.get("isMinimized")),
+                    is_resolved=resolved,
+                    is_outdated=outdated,
+                    thread_id=tid,
+                )
+
+        issue_comments = pr.get("comments") or {}
+        for ic in (issue_comments.get("nodes") or []):
+            db_id = ic.get("databaseId")
+            if db_id is None:
+                continue
+            out[int(db_id)] = _CommentMeta(
+                is_minimized=bool(ic.get("isMinimized")),
+            )
+
+        thread_pi = (threads.get("pageInfo") or {})
+        issue_pi = (issue_comments.get("pageInfo") or {})
+        # Advance whichever page still has more; stop when both are done.
+        next_thread = (
+            thread_pi.get("endCursor") if thread_pi.get("hasNextPage")
+            else None
+        )
+        next_issue = (
+            issue_pi.get("endCursor") if issue_pi.get("hasNextPage")
+            else None
+        )
+        if not next_thread and not next_issue:
+            break
+        thread_cursor = next_thread or thread_cursor
+        issue_cursor = next_issue or issue_cursor
+
+    return out, pr_author
+
+
 def fetch_pr_comments(
     config: Config, pr_url: str,
-) -> tuple[list[PRComment], str | None]:
+) -> PRCommentsResult:
     """Fetch every comment on ``pr_url`` from the three GitHub APIs.
 
-    Returns ``(comments, error)``. On any failure (missing token,
-    unparseable URL, GitHub API error) ``comments`` is empty and
-    ``error`` carries a human-readable reason the caller can surface to
-    the user. The three sources are:
+    Returns a :class:`PRCommentsResult` whose ``error`` field is set on
+    any failure (missing token, unparseable URL, GitHub API error); the
+    ``comments`` list is empty in that case. The three sources are:
 
       1. Issue comments (`/issues/<n>/comments`)  — general PR discussion.
       2. Review comments (`/pulls/<n>/comments`)  — inline on diff.
@@ -595,17 +784,32 @@ def fetch_pr_comments(
          non-empty body (pure approvals contribute no text).
 
     Comments are sorted by ``created_at`` (stable) so consumers always
-    see them in the order they were posted. The function is
-    read-only — no filtering by author / time / trust applied here;
-    that's the caller's responsibility.
+    see them in the order they were posted. After the REST pass we run
+    a GraphQL enrichment pass to attach ``is_minimized`` /
+    ``is_resolved`` / ``is_outdated`` / ``thread_id`` — REST simply
+    doesn't expose those fields, but the unresolved / hidden filters
+    in ``releasy refresh --address-review`` need them. GraphQL also
+    yields the PR author's login (returned alongside) used by the
+    "no PR-author reply" gate.
+
+    The function is read-only — no filtering by author / time / trust
+    applied here; that's the caller's responsibility.
     """
     token = get_github_token()
     if not token:
-        return [], "RELEASY_GITHUB_TOKEN not set — cannot fetch PR comments"
+        return PRCommentsResult(
+            comments=[],
+            pr_author="",
+            error="RELEASY_GITHUB_TOKEN not set — cannot fetch PR comments",
+        )
 
     parsed = parse_pr_url(pr_url)
     if parsed is None:
-        return [], f"Could not parse PR URL: {pr_url!r}"
+        return PRCommentsResult(
+            comments=[],
+            pr_author="",
+            error=f"Could not parse PR URL: {pr_url!r}",
+        )
     owner, repo, number = parsed
     slug = f"{owner}/{repo}"
 
@@ -623,6 +827,7 @@ def fetch_pr_comments(
                 id=ic.id,
                 kind="issue",
                 author=_comment_author_login(ic),
+                author_association=_author_association(ic),
                 created_at=_safe_iso(ic.created_at),
                 updated_at=_safe_iso(ic.updated_at),
                 url=ic.html_url,
@@ -638,6 +843,7 @@ def fetch_pr_comments(
                 id=rc.id,
                 kind="inline",
                 author=_comment_author_login(rc),
+                author_association=_author_association(rc),
                 created_at=_safe_iso(rc.created_at),
                 updated_at=_safe_iso(rc.updated_at),
                 url=rc.html_url,
@@ -665,6 +871,7 @@ def fetch_pr_comments(
                 id=rv.id,
                 kind="review",
                 author=_comment_author_login(rv),
+                author_association=_author_association(rv),
                 created_at=created,
                 updated_at=created,
                 url=rv.html_url,
@@ -673,11 +880,30 @@ def fetch_pr_comments(
             ))
 
         out.sort(key=lambda c: (c.created_at, c.id))
-        return out, None
+
+        meta_map, pr_author = _fetch_pr_comment_metadata_gql(slug, number)
+        for c in out:
+            meta = meta_map.get(c.id)
+            if meta is None:
+                continue
+            c.is_minimized = meta.is_minimized
+            c.is_resolved = meta.is_resolved
+            c.is_outdated = meta.is_outdated
+            c.thread_id = meta.thread_id
+
+        return PRCommentsResult(comments=out, pr_author=pr_author)
     except GithubException as exc:
-        return [], f"GitHub API error fetching {slug}#{number} comments: {exc}"
+        return PRCommentsResult(
+            comments=[],
+            pr_author="",
+            error=f"GitHub API error fetching {slug}#{number} comments: {exc}",
+        )
     except Exception as exc:
-        return [], f"Unexpected error fetching {slug}#{number} comments: {exc}"
+        return PRCommentsResult(
+            comments=[],
+            pr_author="",
+            error=f"Unexpected error fetching {slug}#{number} comments: {exc}",
+        )
 
 
 def pr_ref_label(pr_slug: str, number: int, origin_slug: str | None) -> str:

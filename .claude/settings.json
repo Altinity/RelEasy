@@ -29,7 +29,9 @@
       "Bash(python3 -c \"from releasy import pipeline, refresh, cli; print\\('imports ok'\\)\")",
       "Bash(python3 -c \"from releasy.cli import cli; cli.main\\(['run', '--help'], standalone_mode=False\\)\")",
       "Bash(python3 -c \"from releasy.cli import cli; cli.main\\(['refresh', '--help'], standalone_mode=False\\)\")",
-      "Bash(python3 -c \"from releasy import pipeline, refresh, cli; print\\('ok'\\)\")"
+      "Bash(python3 -c \"from releasy import pipeline, refresh, cli; print\\('ok'\\)\")",
+      "Bash(find /home/zvonand -name \"*.session.state*\" 2>/dev/null | head; find /home/zvonand -name \"*antalya-26.3*state*\" 2>/dev/null | head; find /home/zvonand -name \"antalya-26.3*\" 2>/dev/null | head -20)",
+      "Read(//home/zvonand/**)"
     ]
   }
 }

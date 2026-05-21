@@ -129,6 +129,33 @@ git revert --no-edit <sha-of-the-commit-to-undo>
 **How to reply** (only read this section when per-comment replies are
 enabled for this run — otherwise skip to Step 5):
 
+**ALWAYS write the body to a file first, then pass it via
+`--body-file` (`gh pr comment`) or `-F body=@<file>` (`gh api`).**
+Do NOT pass multi-line text inside a `--body "..."` argument: bash
+quoting will mangle newlines, backticks, dollar signs, and emoji, and
+you'll post a broken reply. The two-step pattern works regardless of
+content.
+
+Pick a fresh tempfile per reply (avoid collisions if you reply to
+several comments in one run):
+
+```bash
+mkdir -p .releasy/replies
+cat > .releasy/replies/<comment-id>.md <<'EOF'
+@<reviewer-login> re your comment at <comment-url>:
+
+<one or two short paragraphs; factual, no apologies, no speculation>
+
+---
+🤖 *This reply was posted automatically by `releasy refresh --address-review`.
+If my answer doesn't fit, reply here and a human will pick it up.*
+EOF
+```
+
+The single-quoted `'EOF'` delimiter is important: it disables shell
+expansion inside the heredoc so backticks, `$`, and `!` survive
+verbatim. After writing the file, post it:
+
 - **Inline review comment** (header says `## Comment #N — inline`) —
   reply inside the existing thread so the reviewer sees your answer in
   context. Extract `<owner>` and `<repo>` from the origin repo slug
@@ -138,7 +165,7 @@ enabled for this run — otherwise skip to Step 5):
   ```bash
   gh api --method POST \
     /repos/<owner>/<repo>/pulls/comments/<comment-id>/replies \
-    -f body="<your reply>"
+    -F body=@.releasy/replies/<comment-id>.md
   ```
 
 - **Issue comment** (`## Comment #N — issue`) or **review body**
@@ -147,20 +174,14 @@ enabled for this run — otherwise skip to Step 5):
   reviewer and links back to the original:
 
   ```bash
-  gh pr comment {pr_url} --body "<your reply>"
+  gh pr comment {pr_url} --body-file .releasy/replies/<comment-id>.md
   ```
 
-**Reply body format — use exactly this shape:**
-
-```
-@<reviewer-login> re your comment at <comment-url>:
-
-<one or two short paragraphs; factual, no apologies, no speculation>
-
----
-🤖 *This reply was posted automatically by `releasy address-review`.
-If my answer doesn't fit, reply here and a human will pick it up.*
-```
+`.releasy/replies/*.md` are untracked scratch files — the run's
+postcondition check uses `git status --porcelain
+--untracked-files=no`, so leaving them in the worktree is safe and
+gives a maintainer a paper trail of what you actually said if
+something looks wrong on GitHub. Do **not** `git add` them.
 
 **Rules for replies:**
 
