@@ -31,6 +31,21 @@ The repository at `{cwd}` is already prepared:
 
 ---
 
+## Category-specific prior — read before you triage
+
+The base scoping rule above is universal. Apply it through the lens of
+*how flaky this category is in practice* — different CI shards have
+very different priors on "real failure vs. master-side flake":
+
+{category_prior}
+
+This prior **biases** Step 1 (Triage). It does NOT override the hard
+rule that you only edit code for failures caused by this PR. A
+high-prior shard just means you should look harder before labelling
+something `[unrelated]`.
+
+---
+
 ## Why bundling matters: fix once, re-test all
 
 Many failures share one root cause — one regression can flip dozens

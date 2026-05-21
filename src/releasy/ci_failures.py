@@ -310,16 +310,45 @@ def fetch_report_json(
 
 
 # Statuses that mean "this leaf is broken and worth handing to Claude".
-# We include ``BROKEN`` and ``TIMEOUT`` because they show up in the
-# stateless / integration reports and represent real test breakage even
-# when the umbrella entry is just ``failure``.
+#
+# Grounded in upstream ``ci/praktika/result.py``:
+#
+#   - ``Result.is_failure()`` →  ``FAILED``/``FAIL``/``XPASS``
+#   - ``Result.is_error()``   →  ``ERROR`` (both ``Status`` and ``StatusExtended``)
+#   - ``Result.is_ok()``      →  ``OK``/``SUCCESS``/``SKIPPED``/``BROKEN``/``XFAIL``
+#
+# ``BROKEN`` looks like a failure but isn't: upstream classifies it as
+# OK (``ci/jobs/integration_test_job.py`` actively *downgrades* a FAIL
+# to BROKEN when the test matches the known-broken rules — that's the
+# project's way of muting expected-broken results). Same for ``XFAIL``
+# (expected-failure annotation, also is_ok). ``UNKNOWN`` (set in
+# functional_tests_results.py after a server crash to mute noise) is
+# also deliberately excluded.
+#
+# ``Timeout`` (note: literal mixed case, written by
+# ``functional_tests_results.py`` for the ``Timeout!`` marker) is a
+# real failure — counted in ``failed`` upstream. We upper-case before
+# comparing, so the lookup key is ``TIMEOUT``.
+#
+# ``XPASS`` (pytest "unexpected pass") IS a failure per praktika's
+# ``is_failure()`` — included so integration tests' xpassed leaves
+# don't slip through silently.
 _FAILED_LEAF_STATUSES = frozenset({
     "FAIL",
     "ERROR",
-    "BROKEN",
+    "XPASS",
     "TIMEOUT",
-    "FAILED",
 })
+
+
+# Praktika fasttest reports bundle a runner-level pseudo-leaf named
+# ``clickhouse-test`` alongside the real per-test leaves. Emitted by
+# ``ci/jobs/fast_test.py`` when the ``clickhouse-test`` invocation
+# itself errors out (status=FAIL, info="clickhouse-test error"). It
+# mirrors the umbrella failure rather than carrying independent
+# diagnostic value, so feeding it to Claude would just have it re-run
+# the entire suite. Skipped at extraction time.
+_META_LEAF_NAMES = frozenset({"clickhouse-test"})
 
 
 @dataclass
@@ -352,10 +381,19 @@ def _iter_failed_leaves(
     status is in ``_FAILED_LEAF_STATUSES`` AND it has no ``results`` of
     its own — that filters out aggregate "Tests" failure rows that just
     summarise per-test failures we'd otherwise count twice.
+
+    Praktika meta-leaves listed in :data:`_META_LEAF_NAMES` (e.g.
+    ``clickhouse-test`` in Fast test / Stateless tests reports) are
+    skipped — they mirror the rolled-up status, not an independent
+    failure, so handing them to Claude would only widen the runner
+    invocation pointlessly.
     """
     children = node.get("results") or []
     status = (node.get("status") or "").upper()
+    name = (node.get("name") or "").strip()
     if status in _FAILED_LEAF_STATUSES and not children:
+        if name in _META_LEAF_NAMES:
+            return
         yield node
         return
     for child in children:

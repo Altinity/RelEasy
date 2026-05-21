@@ -127,7 +127,7 @@ class AnalyzeFailsResult:
 # ---------------------------------------------------------------------------
 
 
-def _tracked_pr_urls(
+def tracked_pr_urls(
     state: PipelineState | None,
     only: OnlyFilter | None = None,
 ) -> list[str]:
@@ -162,6 +162,24 @@ def _tracked_pr_urls(
         seen.add(url)
         out.append(url)
     return out
+
+
+def flaky_scan_extra_for(
+    state: PipelineState | None, primary_pr_urls: list[str],
+) -> list[str] | None:
+    """Pick the flaky-elsewhere scan set for a single-PR-scope run.
+
+    The flaky-elsewhere heuristic needs *other* PRs as evidence; if the
+    primary is one specific PR, the scan must reach beyond it. Returns
+    the every-other-tracked-PR list, or ``None`` when state is missing
+    (caller falls back to ``primary_pr_urls`` — which is correct for
+    multi-PR walks where the primary list itself provides enough
+    cross-evidence).
+    """
+    if state is None:
+        return None
+    primary_set = set(primary_pr_urls)
+    return [u for u in tracked_pr_urls(state) if u not in primary_set]
 
 
 def _build_flaky_elsewhere_map(
@@ -200,8 +218,73 @@ def _flaky_key(category: str, test_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Per-shard reproduction commands
+# Per-shard reproduction commands + category-specific priors
 # ---------------------------------------------------------------------------
+
+
+# Each entry is a small markdown block that biases Claude's triage step
+# in favour of (or against) classifying a failure as caused-by-this-PR.
+# The runtime characteristics of each category give different priors:
+#
+#   - Fast test runs inline on every PR against a debug-built binary
+#     against a deterministic set of cheap tests. Flakes are rare —
+#     when something there fails, the prior is overwhelmingly "this
+#     PR broke it", and flaky-elsewhere evidence is more likely
+#     "several rebased PRs share a broken baseline" than "master-side
+#     flake".
+#   - Stateless / Integration tests hit real storage, docker, network
+#     — genuine flakes are common and flaky-elsewhere annotations are
+#     load-bearing UNRELATED evidence.
+#
+# These priors *bias* the triage step; they don't override the
+# scoping rule ("only fix tests this PR broke" still stands). The
+# generic rule applies when a category has no specific entry.
+_CATEGORY_PRIORS: dict[str, str] = {
+    "fasttest": (
+        "**Fast test** runs inline on every PR against a deterministic, "
+        "fast suite. Genuine master-side flakes here are **vanishingly "
+        "rare** — the prior for any Fast test failure is "
+        "**~99% that this PR caused it**.\n\n"
+        "Apply the flaky-elsewhere annotation with extra scepticism in "
+        "this shard: when several tracked rebase PRs all see the same "
+        "Fast test failure, the usual cause is that *all of them share "
+        "the same broken baseline* (e.g. a recently-rebased master or a "
+        "common backport ancestor) — **not** master-side flake. Default "
+        "to CAUSED-BY-THIS-PR unless you can produce a concrete, "
+        "non-PR explanation (infra crash, build broken before your diff, "
+        "the same exact assertion firing on a freshly-rebased master "
+        "branch you actually checked). When in doubt in this shard, "
+        "**investigate and fix**."
+    ),
+    "stateless": (
+        "**Stateless tests** run against real storage backends (S3, "
+        "Azure, replicated DBs) under docker. Flakes from load / docker "
+        "/ network jitter / image races are common. The flaky-elsewhere "
+        "annotation is **strong UNRELATED evidence** here — trust it. "
+        "Default to CAN'T-TELL → NOT-THIS-PR for failures with no "
+        "concrete diff link, especially when corroborated by other "
+        "tracked PRs."
+    ),
+    "integration": (
+        "**Integration tests** bring up multi-node clusters via docker "
+        "and exercise full networking, kafka, replication. Flakes are "
+        "routine (image pulls, port contention, startup races). The "
+        "flaky-elsewhere annotation is **strong UNRELATED evidence** "
+        "here — trust it. Default to CAN'T-TELL → NOT-THIS-PR when the "
+        "diff has no plausible link to the failure surface."
+    ),
+}
+
+
+def _category_prior_section(category: str) -> str:
+    """Render the category-specific scoping prior, or a no-op fallback."""
+    prior = _CATEGORY_PRIORS.get(category)
+    if prior is None:
+        return (
+            f"_(no category-specific prior for {category!r}; apply the "
+            "generic scoping rule above as-is.)_"
+        )
+    return prior
 
 
 # Each entry is a small markdown block telling Claude how to invoke the
@@ -405,6 +488,7 @@ def _render_shard_prompt(
     runner_section = _category_runner_section(
         category, [t.name for t in tests], shard_context,
     )
+    category_prior = _category_prior_section(category)
 
     placeholders = {
         "repo_slug": repo_slug,
@@ -416,6 +500,7 @@ def _render_shard_prompt(
         "shard_context": shard_context,
         "target_url": target_url,
         "test_category": category,
+        "category_prior": category_prior,
         "failure_count": str(len(tests)),
         "failure_blocks": blocks,
         "runner_section": runner_section,
@@ -1181,6 +1266,117 @@ def _post_pr_comment(
         return None, f"create_issue_comment failed: {exc}"
 
 
+def run_analyze_fails_pass(
+    config: Config,
+    state: PipelineState | None,
+    repo_path: Path,
+    pr_urls: list[str],
+    *,
+    push: bool,
+    dry_run: bool,
+    no_flaky_check: bool,
+    post_comment: bool | None,
+    flaky_scan_extra: list[str] | None = None,
+) -> tuple[list[PRRunResult], dict[str, list[str]], list[str], bool]:
+    """Drive analyze-fails over an explicit list of PR URLs.
+
+    Caller is responsible for: project lock, state load, ``_setup_repo``,
+    in-progress-op guard, and (later) state persistence + project sync.
+    Designed so :func:`refresh.refresh_tracked_prs` can fold an
+    analyze-fails phase into a single locked refresh invocation without
+    re-doing any of that bookkeeping.
+
+    Cost is accumulated onto the matching :class:`FeatureState`'s
+    ``ai_cost_usd`` in-place — the caller decides when to persist /
+    sync the project board (refresh already does this at the end of
+    its own pass).
+
+    ``flaky_scan_extra`` is used by single-PR callers (e.g. ``refresh
+    --pr <url> --analyze-fails``) to widen the flaky-elsewhere scan to
+    cover every other tracked PR rather than just the one being
+    analysed. Pass ``None`` to scan the primary list itself.
+
+    Returns ``(runs, flaky_map, flaky_warnings, cost_attributed_any)``.
+    """
+    effective_post_comment = (
+        config.analyze_fails.post_comment_to_pr
+        if post_comment is None else post_comment
+    )
+
+    flaky_map: dict[str, list[str]] = {}
+    flaky_warnings: list[str] = []
+    if not no_flaky_check:
+        if flaky_scan_extra is not None:
+            scan = list(flaky_scan_extra)
+        else:
+            scan = list(pr_urls)
+        if scan:
+            cap = config.analyze_fails.flaky_check_prs
+            scanned = min(len(scan), cap) if cap > 0 else len(scan)
+            console.print(
+                f"\n[dim]Building flaky-elsewhere map across "
+                f"{scanned} tracked PR(s)…[/dim]"
+            )
+            flaky_map, flaky_warnings = _build_flaky_elsewhere_map(
+                config, scan,
+            )
+            console.print(
+                f"[dim]flaky map: {len(flaky_map)} test(s) seen failing "
+                "elsewhere[/dim]"
+            )
+        else:
+            console.print(
+                "[dim]No other tracked PRs — skipping flaky-elsewhere "
+                "assessment.[/dim]"
+            )
+
+    runs: list[PRRunResult] = []
+    cost_attributed_any = False
+    for url in pr_urls:
+        run = _process_pr(
+            config, repo_path, url, flaky_map,
+            push=push and not dry_run, dry_run=dry_run,
+        )
+        runs.append(run)
+        # Accumulate cost on the matching FeatureState so the next
+        # state-save (whoever's driving us) reflects the spend. No-op
+        # for stateless / dry-run / unmatched PRs.
+        if not dry_run and run.cost_usd:
+            fid = _attribute_cost_to_feature(state, run.pr_url, run.cost_usd)
+            if fid:
+                cost_attributed_any = True
+                console.print(
+                    f"  [dim]+${run.cost_usd:.4f} → feature "
+                    f"{fid} ai_cost_usd[/dim]"
+                )
+        if (
+            effective_post_comment
+            and not dry_run
+            and run.outcomes  # something was processed
+        ):
+            curl, cerr = _post_pr_comment(
+                run.pr_url, _format_pr_comment(run),
+            )
+            if curl:
+                run.comment_url = curl
+                console.print(
+                    f"  [green]✓[/green] posted summary comment: "
+                    f"[cyan]{curl}[/cyan]"
+                )
+            elif cerr:
+                console.print(
+                    f"  [yellow]![/yellow] could not post PR comment: "
+                    f"{cerr}"
+                )
+
+    if flaky_warnings:
+        console.print()
+        for w in flaky_warnings:
+            console.print(f"[dim]{w}[/dim]")
+
+    return runs, flaky_map, flaky_warnings, cost_attributed_any
+
+
 def analyze_fails(
     config: Config,
     *,
@@ -1197,6 +1393,11 @@ def analyze_fails(
     ``only`` (optional) restricts the multi-PR walk to a single tracked
     feature (matched by URL or feature / group ID). Mutually exclusive
     with ``pr_url`` at the CLI layer.
+
+    This is the top-level entry point used by the standalone
+    ``releasy analyze-fails`` command. ``refresh --analyze-fails`` calls
+    :func:`run_analyze_fails_pass` directly instead — it already holds
+    the project lock, has state loaded, and the repo prepared.
     """
     if not get_origin_repo_slug(config):
         return AnalyzeFailsResult(
@@ -1230,14 +1431,14 @@ def analyze_fails(
     if pr_url:
         primary_pr_urls = [pr_url]
     else:
-        # Refresh local merge status from GitHub so the _tracked_pr_urls
+        # Refresh local merge status from GitHub so the tracked_pr_urls
         # prefilter doesn't queue a PR that's already been merged
         # externally. Cheap (parallel GETs); skipped on dry-run / no
         # state since there's nothing to update.
         if state is not None and not dry_run:
             from releasy.pipeline import _refresh_all_merge_status_from_github
             _refresh_all_merge_status_from_github(config, state)
-        primary_pr_urls = _tracked_pr_urls(state, only=only)
+        primary_pr_urls = tracked_pr_urls(state, only=only)
         if not primary_pr_urls:
             if only is not None:
                 return AnalyzeFailsResult(
@@ -1259,38 +1460,9 @@ def analyze_fails(
         if cap > 0 and len(primary_pr_urls) > cap:
             primary_pr_urls = primary_pr_urls[:cap]
 
-    flaky_map: dict[str, list[str]] = {}
-    flaky_warnings: list[str] = []
-    if not no_flaky_check:
-        if pr_url:
-            scan = [u for u in _tracked_pr_urls(state) if u != pr_url]
-        elif only is not None:
-            # --only narrowed primary down to a single PR; cross-check
-            # against every OTHER tracked PR so flake signals still pick
-            # up wider patterns rather than just the one we're working on.
-            primary_set = set(primary_pr_urls)
-            scan = [u for u in _tracked_pr_urls(state) if u not in primary_set]
-        else:
-            scan = list(primary_pr_urls)
-        if scan:
-            cap = config.analyze_fails.flaky_check_prs
-            scanned = min(len(scan), cap) if cap > 0 else len(scan)
-            console.print(
-                f"\n[dim]Building flaky-elsewhere map across "
-                f"{scanned} tracked PR(s)…[/dim]"
-            )
-            flaky_map, flaky_warnings = _build_flaky_elsewhere_map(
-                config, scan,
-            )
-            console.print(
-                f"[dim]flaky map: {len(flaky_map)} test(s) seen failing "
-                "elsewhere[/dim]"
-            )
-        else:
-            console.print(
-                "[dim]No other tracked PRs — skipping flaky-elsewhere "
-                "assessment.[/dim]"
-            )
+    flaky_scan_extra: list[str] | None = None
+    if pr_url or only is not None:
+        flaky_scan_extra = flaky_scan_extra_for(state, primary_pr_urls)
 
     initial_base = None
     if primary_pr_urls:
@@ -1320,62 +1492,17 @@ def analyze_fails(
             ),
         )
 
-    effective_post_comment = (
-        config.analyze_fails.post_comment_to_pr
-        if post_comment is None else post_comment
+    runs, flaky_map, _flaky_warnings, cost_attributed_any = (
+        run_analyze_fails_pass(
+            config, state, repo_path, primary_pr_urls,
+            push=push, dry_run=dry_run,
+            no_flaky_check=no_flaky_check,
+            post_comment=post_comment,
+            flaky_scan_extra=flaky_scan_extra,
+        )
     )
 
-    runs: list[PRRunResult] = []
-    cost_attributed_any = False
-    for url in primary_pr_urls:
-        run = _process_pr(
-            config, repo_path, url, flaky_map,
-            push=push and not dry_run, dry_run=dry_run,
-        )
-        runs.append(run)
-        # Accumulate this run's cost into the matching feature's
-        # ``ai_cost_usd`` so the GitHub Project board's AI Cost column
-        # shows total spend (cherry-pick resolution + refresh + this
-        # investigation). No-op for stateless / dry-run / unmatched
-        # PRs.
-        if not dry_run and run.cost_usd:
-            fid = _attribute_cost_to_feature(state, run.pr_url, run.cost_usd)
-            if fid:
-                cost_attributed_any = True
-                console.print(
-                    f"  [dim]+${run.cost_usd:.4f} → feature "
-                    f"{fid} ai_cost_usd[/dim]"
-                )
-        # Post the PR comment AFTER push (or after deciding not to
-        # push) so the comment can truthfully report whether commits
-        # landed on origin. Skipped on dry-run, on shards-only-no-runs,
-        # and when the operator turned the feature off.
-        if (
-            effective_post_comment
-            and not dry_run
-            and run.outcomes  # something was processed
-        ):
-            curl, cerr = _post_pr_comment(
-                run.pr_url, _format_pr_comment(run),
-            )
-            if curl:
-                run.comment_url = curl
-                console.print(
-                    f"  [green]✓[/green] posted summary comment: "
-                    f"[cyan]{curl}[/cyan]"
-                )
-            elif cerr:
-                console.print(
-                    f"  [yellow]![/yellow] could not post PR comment: "
-                    f"{cerr}"
-                )
-
-    if flaky_warnings:
-        console.print()
-        for w in flaky_warnings:
-            console.print(f"[dim]{w}[/dim]")
-
-    _print_summary(runs)
+    print_summary(runs)
 
     if state is not None:
         try:
@@ -1418,7 +1545,7 @@ def analyze_fails(
 # ---------------------------------------------------------------------------
 
 
-def _print_summary(runs: list[PRRunResult]) -> None:
+def print_summary(runs: list[PRRunResult]) -> None:
     if not runs:
         return
     console.print("\n[bold]Summary:[/bold]")

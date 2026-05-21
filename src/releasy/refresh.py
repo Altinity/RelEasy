@@ -168,19 +168,45 @@ def refresh_tracked_prs(
     resolve_conflicts: bool = True,
     only: OnlyFilter | None = None,
     force_merge: bool = False,
+    address_review: bool = False,
+    analyze_fails: bool = False,
+    no_flaky_check: bool = False,
+    post_comment: bool | None = None,
 ) -> bool:
-    """Walk tracked PRs, merge target into each, AI-resolve any conflicts.
+    """Walk tracked PRs and run the requested maintenance passes.
 
     Strictly a maintenance / refresh pass: never opens new PRs, never
     creates new branches, never discovers new PR sources. Only
     operates on entries already present in ``state.features``.
 
+    Status sync (merged / superseded / labels) always runs. The three
+    branch-mutating passes are opt-in:
+
+      * ``force_merge`` (``--merge-target``) — merge the latest target
+        tip into each tracked PR branch, AI-resolve any conflicts, and
+        push the resulting merge commit.
+      * ``analyze_fails`` (``--analyze-fails``) — bundle each PR's
+        failing CI tests per shard and let the AI run the iterative
+        fix-build-rerun loop. Skipped per-PR if the merge step left
+        that PR in ``conflict``.
+      * ``address_review`` (``--address-review``) — fetch trusted
+        review feedback on each tracked PR and let the AI append fix
+        commits. Skipped per-PR if the merge step left that PR in
+        ``conflict`` (the unresolved merge has to be sorted first).
+
+    When more than one is set the phase order inside a single
+    invocation is fixed: ``merge-target → analyze-fails →
+    address-review``. ``analyze-fails`` reads commit statuses tied to
+    the *current* head SHA, so any pass that pushes first would
+    invalidate the CI report it needs to consume.
+
     ``only`` (optional) restricts the walk to a single tracked PR
     (matched by URL — source or rebase) or a single feature / group ID.
 
     See module docstring for the detailed contract. Returns False when
-    one or more PRs ended up in (or stayed in) ``conflict`` status — so
-    the CLI can exit non-zero for shell scripts.
+    one or more PRs ended up in (or stayed in) ``conflict`` status,
+    when an address-review run failed, or when an analyze-fails per-PR
+    run errored — so the CLI can exit non-zero for shell scripts.
     """
     # Late import to avoid a cycle: pipeline imports nothing from here,
     # but it owns the shared repo-setup helper we want to reuse.
@@ -231,19 +257,21 @@ def refresh_tracked_prs(
         return False
 
     ai_active = resolve_conflicts and config.ai_resolve.enabled
-    if ai_active:
-        console.print(
-            f"[dim]AI conflict resolver: enabled "
-            f"(command='{config.ai_resolve.command}', "
-            f"prompt='{config.ai_resolve.merge_prompt_file}', "
-            f"max_iterations={config.ai_resolve.max_iterations})[/dim]"
-        )
-    else:
-        why = (
-            "disabled via --no-resolve-conflicts" if not resolve_conflicts
-            else "disabled in config"
-        )
-        console.print(f"[dim]AI conflict resolver: {why}[/dim]")
+    if force_merge:
+        if ai_active:
+            console.print(
+                f"[dim]AI conflict resolver: enabled "
+                f"(command='{config.ai_resolve.command}', "
+                f"prompt='{config.ai_resolve.merge_prompt_file}', "
+                f"max_iterations={config.ai_resolve.max_iterations})[/dim]"
+            )
+        else:
+            why = (
+                "disabled via --no-resolve-conflicts"
+                if not resolve_conflicts
+                else "disabled in config"
+            )
+            console.print(f"[dim]AI conflict resolver: {why}[/dim]")
 
     if config.dry_run:
         console.print(
@@ -264,10 +292,11 @@ def refresh_tracked_prs(
     _apply_merged_labels(config, state)
     _persist(config, state)
 
-    console.print(
-        f"\n[bold]Phase:[/bold] Merging [cyan]{base_ref}[/cyan] "
-        f"into tracked PR branches"
-    )
+    if force_merge:
+        console.print(
+            f"\n[bold]Phase:[/bold] Merging [cyan]{base_ref}[/cyan] "
+            f"into tracked PR branches"
+        )
 
     candidates: list[tuple[str, FeatureState]] = []
     closed_count = 0
@@ -362,27 +391,86 @@ def refresh_tracked_prs(
             )
 
     any_unresolved = False
-    for fid, fs in candidates:
-        outcome = _process_one(
-            config, repo_path, state, fid, fs, base_branch, base_ref,
-            remote, ai_active, force_merge=force_merge,
-        )
-        if outcome == "conflict":
-            any_unresolved = True
-        # _process_one already persisted state/board on every meaningful
-        # transition; nothing to do here.
+    in_conflict: set[str] = set()
+    if force_merge:
+        for fid, fs in candidates:
+            outcome = _process_one(
+                config, repo_path, state, fid, fs, base_branch, base_ref,
+                remote, ai_active, force_merge=force_merge,
+            )
+            if outcome == "conflict":
+                any_unresolved = True
+                in_conflict.add(fid)
+            # _process_one already persisted state/board on every
+            # meaningful transition; nothing to do here.
 
-    console.print(
-        f"\n[bold]PR-conflict pass complete.[/bold] "
-        f"{len(candidates)} tracked PR(s) inspected."
-    )
-    if any_unresolved:
         console.print(
-            "[yellow]Some PRs are still in conflict — see above. Resolve "
-            "them on GitHub (or locally + push), then re-run.[/yellow]"
+            f"\n[bold]Merge pass complete.[/bold] "
+            f"{len(candidates)} tracked PR(s) inspected."
         )
-        return False
-    return True
+        if any_unresolved:
+            console.print(
+                "[yellow]Some PRs are still in conflict — see above. "
+                "Resolve them on GitHub (or locally + push), then "
+                "re-run.[/yellow]"
+            )
+
+    any_analyze_failed = False
+    if analyze_fails:
+        from releasy.analyze_fails import print_summary, run_analyze_fails_pass
+
+        af_pr_urls = [
+            fs.rebase_pr_url for fid, fs in candidates
+            if fid not in in_conflict and fs.rebase_pr_url
+        ]
+        skipped = len(candidates) - len(af_pr_urls)
+        console.print(
+            f"\n[bold]Phase:[/bold] Analyzing failed CI on "
+            f"{len(af_pr_urls)} tracked PR(s)"
+            + (
+                f" [dim]({skipped} skipped — left in conflict by the "
+                "merge phase)[/dim]"
+                if skipped else ""
+            )
+        )
+        if af_pr_urls:
+            runs, _flaky_map, _flaky_warnings, cost_attributed_any = (
+                run_analyze_fails_pass(
+                    config, state, repo_path, af_pr_urls,
+                    push=not config.dry_run,
+                    dry_run=config.dry_run,
+                    no_flaky_check=no_flaky_check,
+                    post_comment=post_comment,
+                )
+            )
+            print_summary(runs)
+            if any(r.error is not None for r in runs):
+                any_analyze_failed = True
+            if cost_attributed_any:
+                _persist(config, state)
+
+    any_address_failed = False
+    if address_review:
+        console.print(
+            f"\n[bold]Phase:[/bold] Addressing review feedback "
+            f"on {len(candidates)} tracked PR(s)"
+        )
+        for fid, fs in candidates:
+            if fid in in_conflict:
+                # Don't ask the AI to act on top of unresolved conflicts;
+                # the head ref isn't in a coherent state for it.
+                console.print(
+                    f"\n  [dim]Skipping {fs.rebase_pr_url} — merge "
+                    "ended in conflict; resolve that first.[/dim]"
+                )
+                continue
+            ok = _address_review_one(config, fs, work_dir)
+            if not ok:
+                any_address_failed = True
+
+    return not (
+        any_unresolved or any_address_failed or any_analyze_failed
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +492,14 @@ class MergeResolveOutcome:
     involvement) from a conflict the AI resolver fixed: both end up as
     ``status="resolved"``, but only the latter should bump
     ``ai_resolved`` / ``ai_iterations`` on the FeatureState.
+
+    .. note::
+        Calling this helper at all implies the caller has opted in to
+        merging (e.g. via ``releasy refresh --merge-target`` or the
+        URL-driven path). Refresh no longer attempts a merge by
+        default — bare ``refresh`` is status-sync only. ``force_merge``
+        controls whether a *clean* merge still produces a push (it
+        does, since the user explicitly asked for the merge).
     """
     status: str  # "clean" | "resolved" | "conflict" | "skipped"
     conflict_files: list[str] = field(default_factory=list)
@@ -784,7 +880,117 @@ def _record_conflict(
 
 
 # ---------------------------------------------------------------------------
-# URL-driven entry point (``releasy resolve-conflicts --pr <url>``)
+# ``--address-review`` per-PR worker
+# ---------------------------------------------------------------------------
+
+
+def _address_review_one(
+    config: Config, fs: FeatureState, work_dir: Path | None,
+) -> bool:
+    """Address review on a single tracked PR.
+
+    Thin wrapper around :func:`releasy.review_response.address_review`:
+    decides whether to invoke it (skip merged / closed / superseded /
+    untracked entries), prints a per-PR banner, and translates the
+    result into a bool the multi-PR loop can aggregate.
+    """
+    if not fs.rebase_pr_url:
+        return True
+    # No early bail on empty trusted_reviewers: trust now also flows
+    # from author_association (OWNER / MEMBER / COLLABORATOR by
+    # default). address_review() itself refuses if BOTH gates are
+    # empty, so the user still gets a clear error when they actively
+    # disable both.
+    return _address_review_for_pr_url(config, fs.rebase_pr_url, work_dir)
+
+
+def _address_review_for_pr_url(
+    config: Config, pr_url: str, work_dir: Path | None,
+) -> bool:
+    """Drive :func:`address_review` for one PR, printing a banner first.
+
+    Shared by the tracked-state loop and the URL-driven entry point so
+    both surface the same per-PR header and failure handling. Returns
+    True on success (including "nothing to address") and False on any
+    error — caller turns that into an exit code.
+    """
+    from releasy.review_response import address_review
+
+    console.print(
+        f"\n  [bold]address-review[/bold] [cyan]{pr_url}[/cyan]"
+    )
+    result = address_review(
+        config,
+        pr_url,
+        work_dir=work_dir,
+        dry_run=getattr(config, "dry_run", False),
+    )
+    if not result.success:
+        if result.error:
+            console.print(f"    [red]✗[/red] {result.error}")
+        else:
+            console.print(
+                "    [red]✗[/red] address-review failed (see above)"
+            )
+        return False
+    return True
+
+
+def _analyze_fails_for_pr_url(
+    config: Config, pr_url: str, repo_path: Path,
+    *, no_flaky_check: bool, post_comment: bool | None,
+) -> bool:
+    """Run the analyze-fails pass against a single PR URL.
+
+    Mirrors :func:`_address_review_for_pr_url` for the URL-driven
+    refresh path. Reuses the already-prepared ``repo_path`` so we don't
+    re-clone / re-fetch, and folds any incurred Anthropic cost into the
+    matching tracked feature's ``ai_cost_usd`` when state exists.
+
+    Returns True on success (including "no failing CI to act on") and
+    False when the per-PR run errored — caller turns that into an
+    exit code.
+    """
+    from releasy.analyze_fails import (
+        flaky_scan_extra_for,
+        print_summary,
+        run_analyze_fails_pass,
+    )
+
+    state: PipelineState | None = None
+    if not getattr(config, "stateless", False):
+        try:
+            state = load_state(config)
+        except Exception as exc:
+            console.print(
+                f"    [yellow]![/yellow] state file unreadable ({exc}); "
+                "running analyze-fails without flaky-elsewhere assessment"
+            )
+            state = None
+
+    console.print(
+        f"\n  [bold]analyze-fails[/bold] [cyan]{pr_url}[/cyan]"
+    )
+    runs, _flaky_map, _flaky_warnings, cost_attributed_any = (
+        run_analyze_fails_pass(
+            config, state, repo_path, [pr_url],
+            push=not getattr(config, "dry_run", False),
+            dry_run=getattr(config, "dry_run", False),
+            no_flaky_check=no_flaky_check,
+            post_comment=post_comment,
+            flaky_scan_extra=flaky_scan_extra_for(state, [pr_url]),
+        )
+    )
+    print_summary(runs)
+
+    if state is not None and cost_attributed_any:
+        _persist(config, state)
+
+    return all(r.error is None for r in runs)
+
+
+# ---------------------------------------------------------------------------
+# URL-driven entry point (``releasy refresh --pr <url>``)
 # ---------------------------------------------------------------------------
 
 
@@ -901,21 +1107,36 @@ def resolve_conflicts_for_pr(
     *,
     resolve_conflicts: bool = True,
     force_merge: bool = False,
+    address_review: bool = False,
+    analyze_fails: bool = False,
+    no_flaky_check: bool = False,
+    post_comment: bool | None = None,
 ) -> bool:
-    """Drive ``releasy resolve-conflicts --pr <url>`` end-to-end.
+    """Drive ``releasy refresh --pr <url>`` end-to-end.
 
     Looks up the PR's head/base refs from GitHub, sets up the work
-    repo, and runs the same merge + AI-resolve + push loop as
-    ``releasy refresh`` — but for one PR identified by URL rather than
-    by walking the state file.
+    repo, and runs the requested maintenance passes for one PR
+    identified by URL (rather than walking every tracked PR in state):
+
+      * ``force_merge`` — merge target + AI-resolve + push.
+      * ``analyze_fails`` — investigate failed CI on the PR (skipped
+        if the merge step left the PR in ``conflict``).
+      * ``address_review`` — run the address-review flow against the
+        PR (skipped if the merge step left the PR in ``conflict``).
+
+    Phase order when multiple flags are set:
+    ``merge-target → analyze-fails → address-review``. ``analyze-fails``
+    needs a CI report tied to the *current* head SHA; running
+    ``address-review`` first would push commits that invalidate it.
 
     When ``config.stateless`` is False and the PR matches a tracked
     rebase PR, the corresponding :class:`FeatureState` is updated as
     if the PR had been picked up by ``refresh``. Otherwise no state is
     touched.
 
-    Returns False on any unresolved conflict (or hard failure) so the
-    CLI can pick a non-zero exit code.
+    Returns False on any unresolved conflict, address-review failure,
+    analyze-fails per-PR error, or hard error so the CLI can pick a
+    non-zero exit code.
     """
     from releasy.pipeline import _setup_repo
 
@@ -936,6 +1157,21 @@ def resolve_conflicts_for_pr(
             "matches."
         )
         return False
+
+    # In-scope check: in stateful mode, ``--pr`` should only act on
+    # PRs RelEasy itself tracks (source-or-rebase). A URL that doesn't
+    # match any tracked entry is silently skipped so cron / webhook
+    # callers can fire blindly without erroring on out-of-scope PRs.
+    # ``--stateless`` bypasses this so the operator can still target
+    # arbitrary PRs from the same project's config.
+    if not getattr(config, "stateless", False):
+        if not _pr_url_in_state_scope(config, pr_url):
+            console.print(
+                f"[dim]--pr={pr_url} is not in this project's tracked "
+                "scope (no FeatureState matches its source or rebase "
+                "URL) — nothing to do.[/dim]"
+            )
+            return True
 
     rebase_pr = fetch_pr_by_url(config, pr_url, include_closed=True)
     if rebase_pr is None:
@@ -983,19 +1219,20 @@ def resolve_conflicts_for_pr(
         return False
 
     ai_active = resolve_conflicts and config.ai_resolve.enabled
-    if ai_active:
-        console.print(
-            f"[dim]AI conflict resolver: enabled "
-            f"(command='{config.ai_resolve.command}', "
-            f"prompt='{config.ai_resolve.merge_prompt_file}', "
-            f"max_iterations={config.ai_resolve.max_iterations})[/dim]"
-        )
-    else:
-        why = (
-            "disabled via --no-resolve-conflicts" if not resolve_conflicts
-            else "disabled in config"
-        )
-        console.print(f"[dim]AI conflict resolver: {why}[/dim]")
+    if force_merge:
+        if ai_active:
+            console.print(
+                f"[dim]AI conflict resolver: enabled "
+                f"(command='{config.ai_resolve.command}', "
+                f"prompt='{config.ai_resolve.merge_prompt_file}', "
+                f"max_iterations={config.ai_resolve.max_iterations})[/dim]"
+            )
+        else:
+            why = (
+                "disabled via --no-resolve-conflicts"
+                if not resolve_conflicts else "disabled in config"
+            )
+            console.print(f"[dim]AI conflict resolver: {why}[/dim]")
 
     if config.dry_run:
         console.print(
@@ -1028,44 +1265,107 @@ def resolve_conflicts_for_pr(
                 "to do[/dim]"
             )
 
-    source_pr = _resolve_source_pr(config, rebase_pr)
+    merge_outcome: MergeResolveOutcome | None = None
+    if force_merge:
+        source_pr = _resolve_source_pr(config, rebase_pr)
 
-    console.print(
-        f"\n[bold]Phase:[/bold] Merging "
-        f"[cyan]{remote}/{base_ref_branch}[/cyan] into "
-        f"[cyan]{head_ref}[/cyan]"
-    )
-    console.print(
-        f"  [dim](rebase PR #{rebase_pr.number} → source "
-        f"{source_pr.url})[/dim]"
-    )
-
-    outcome = run_merge_resolve(
-        config, repo_path,
-        head_branch=head_ref,
-        base_branch=base_ref_branch,
-        source_pr=source_pr,
-        rebase_pr_url=rebase_pr.url,
-        ai_active=ai_active,
-        remote=remote,
-        force_merge=force_merge,
-    )
-
-    # Optional state sync: if a state file is around AND a tracked
-    # FeatureState's rebase_pr_url matches, fold the outcome into it
-    # so the project board / status views stay coherent.
-    _maybe_update_tracked_state(config, rebase_pr.url, outcome)
-
-    if outcome.status == "conflict":
         console.print(
-            "[yellow]PR is still in conflict — resolve it on GitHub "
-            "(or locally + push), then re-run.[/yellow]"
+            f"\n[bold]Phase:[/bold] Merging "
+            f"[cyan]{remote}/{base_ref_branch}[/cyan] into "
+            f"[cyan]{head_ref}[/cyan]"
         )
-        return False
-    if outcome.status == "skipped" and outcome.error:
-        console.print(f"[yellow]Skipped: {outcome.error}[/yellow]")
-        return False
+        console.print(
+            f"  [dim](rebase PR #{rebase_pr.number} → source "
+            f"{source_pr.url})[/dim]"
+        )
+
+        merge_outcome = run_merge_resolve(
+            config, repo_path,
+            head_branch=head_ref,
+            base_branch=base_ref_branch,
+            source_pr=source_pr,
+            rebase_pr_url=rebase_pr.url,
+            ai_active=ai_active,
+            remote=remote,
+            force_merge=force_merge,
+        )
+
+        # Optional state sync: if a state file is around AND a tracked
+        # FeatureState's rebase_pr_url matches, fold the outcome into it
+        # so the project board / status views stay coherent.
+        _maybe_update_tracked_state(config, rebase_pr.url, merge_outcome)
+
+    merge_left_conflict = (
+        merge_outcome is not None and merge_outcome.status == "conflict"
+    )
+
+    if analyze_fails:
+        if merge_left_conflict:
+            console.print(
+                "\n[dim]Skipping analyze-fails — merge ended in "
+                "conflict; resolve that first.[/dim]"
+            )
+        else:
+            af_ok = _analyze_fails_for_pr_url(
+                config, pr_url, repo_path,
+                no_flaky_check=no_flaky_check,
+                post_comment=post_comment,
+            )
+            if not af_ok:
+                return False
+
+    if address_review:
+        if merge_left_conflict:
+            console.print(
+                "\n[dim]Skipping address-review — merge ended in "
+                "conflict; resolve that first.[/dim]"
+            )
+        else:
+            ar_ok = _address_review_for_pr_url(config, pr_url, work_dir)
+            if not ar_ok:
+                return False
+
+    if merge_outcome is not None:
+        if merge_outcome.status == "conflict":
+            console.print(
+                "[yellow]PR is still in conflict — resolve it on GitHub "
+                "(or locally + push), then re-run.[/yellow]"
+            )
+            return False
+        if merge_outcome.status == "skipped" and merge_outcome.error:
+            console.print(f"[yellow]Skipped: {merge_outcome.error}[/yellow]")
+            return False
     return True
+
+
+def _pr_url_in_state_scope(config: Config, pr_url: str) -> bool:
+    """True when ``pr_url`` matches any tracked entry's source or rebase URL.
+
+    Compared on ``(owner, repo, number)`` so cosmetic differences
+    (trailing slash, fragment, ``.git`` suffix) don't break the match.
+    Used by ``refresh --pr`` to scope-gate the URL-driven flow:
+    out-of-scope URLs are silently no-op'd in stateful mode rather
+    than triggering a full GitHub fetch + repo setup.
+
+    Failing state load is treated as "not in scope" — the same safe
+    fallback applies to a missing / corrupt state file.
+    """
+    target = parse_pr_url(pr_url)
+    if target is None:
+        return False
+    try:
+        state = load_state(config)
+    except Exception:  # pragma: no cover — bad state file
+        return False
+    if not state.features:
+        return False
+    for fs in state.features.values():
+        for url in (fs.rebase_pr_url, fs.pr_url, *fs.pr_urls):
+            if not url:
+                continue
+            if parse_pr_url(url) == target:
+                return True
+    return False
 
 
 def _maybe_update_tracked_state(

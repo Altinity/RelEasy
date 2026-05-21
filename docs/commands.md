@@ -14,7 +14,6 @@ config they read, see [configuration.md](configuration.md).
   [`refresh`](#releasy-refresh) ·
   [`discover-deps`](#releasy-discover-deps) ·
   [`analyze-fails`](#releasy-analyze-fails) ·
-  [`address-review`](#releasy-address-review) ·
   [`continue`](#releasy-continue) ·
   [Sequential mode](#sequential-mode) ·
   [`skip`](#releasy-skip) ·
@@ -42,30 +41,36 @@ config they read, see [configuration.md](configuration.md).
 
 ## At a glance: which command does what
 
-| | `run` | `continue` | `refresh` | `address-review` | `analyze-fails` |
-|--|:-----:|:----------:|:---------:|:----------------:|:---------------:|
-| Discovers new PRs | ✅ | — | — | — | — |
-| Creates new port branches | ✅ | — | — | — | — |
-| Opens new rebase PRs | ✅ new | ✅ missed | — | — | — |
-| AI-resolves cherry-pick conflicts | ✅ | — | — | — | — |
-| AI-resolves merge conflicts (target moved on) | — | — | ✅ | — | — |
-| AI-addresses reviewer comments | — | — | — | ✅ | — |
-| AI-investigates failing CI | — | — | — | — | ✅ |
-| Iterates state entries | only skip / ensure-PR | ✅ all | ✅ all tracked | — (stateless on `--pr`) | ✅ all tracked |
-| Mutates work-dir | ✅ cherry-picks | ✅ push only | ✅ merges | ✅ commits | ✅ commits |
-| Pushes to origin | ✅ | ✅ | ✅ (merges only) | ✅ (plain) | ✅ (plain) |
+| | `run` | `continue` | `refresh` | `refresh --merge-target` | `refresh --analyze-fails` | `refresh --address-review` | `analyze-fails` |
+|--|:-----:|:----------:|:---------:|:------------------------:|:-------------------------:|:--------------------------:|:---------------:|
+| Discovers new PRs | ✅ | — | — | — | — | — | — |
+| Creates new port branches | ✅ | — | — | — | — | — | — |
+| Opens new rebase PRs | ✅ new | ✅ missed | — | — | — | — | — |
+| AI-resolves cherry-pick conflicts | ✅ | — | — | — | — | — | — |
+| AI-resolves merge conflicts (target moved on) | — | — | — | ✅ | — | — | — |
+| AI-investigates failing CI | — | — | — | — | ✅ | — | ✅ |
+| AI-addresses reviewer comments | — | — | — | — | — | ✅ | — |
+| Refreshes merged/superseded state | — | — | ✅ | ✅ | ✅ | ✅ | — |
+| Iterates state entries | only skip / ensure-PR | ✅ all | ✅ all tracked | ✅ all tracked | ✅ all tracked | ✅ all tracked | ✅ all tracked |
+| Mutates work-dir | ✅ cherry-picks | ✅ push only | — | ✅ merges | ✅ commits | ✅ commits | ✅ commits |
+| Pushes to origin | ✅ | ✅ | — | ✅ (merges only) | ✅ (plain) | ✅ (plain) | ✅ (plain) |
 
 One-liners:
 
 - **`run`** — *do new work.* Discover, cherry-pick, push, open PRs.
 - **`continue`** — *I fixed something by hand; reconcile state.* Push/open
   what's pending. No git ops beyond push + status checks.
-- **`refresh`** — *keep open PRs current with the moved-on base.* Merge
-  target in, AI-resolve conflicts.
+- **`refresh`** — *re-sync status across tracked PRs* (merged-from-upstream
+  sweep, supersede detection, label reconciliation). With
+  `--merge-target` it also merges target in and AI-resolves conflicts;
+  with `--analyze-fails` it triages failing CI; with `--address-review`
+  it lets the AI act on reviewer feedback. The three flags compose;
+  inside one invocation they run in the fixed order
+  *merge-target → analyze-fails → address-review*.
 - **`analyze-fails`** — *CI is red; let AI triage.* Iterative per-shard
-  fix loop.
-- **`address-review`** — *reviewer left comments; let AI apply them.*
-  Stateless, linear history only.
+  fix loop. Also available as `refresh --analyze-fails` when you want
+  to bundle it with the other refresh passes under one lock and one
+  status-sync.
 
 > **Why both `run` and `continue`?** `run` only acts on PRs it's
 > cherry-picking right now. If you fix a conflict by hand on a branch
@@ -103,7 +108,7 @@ releasy run [--onto <ver>] [--work-dir <path>]
             [--resolve-conflicts | --no-resolve-conflicts]
             [--retry-failed | --no-retry-failed]
             [--merge-target | --no-merge-target]
-            [--only <url-or-id>]
+            [--only <url-or-id> | --pr <URL>]
 ```
 
 | Option | Description | Default |
@@ -113,41 +118,98 @@ releasy run [--onto <ver>] [--work-dir <path>]
 | `--resolve-conflicts` / `--no-resolve-conflicts` | Kill-switch for AI resolver. AI runs only if both this and `ai_resolve.enabled` are true. | on |
 | `--retry-failed` / `--no-retry-failed` | Re-attempt entries in `conflict` status. No-PR-yet: rebuild from base (only when `if_exists: recreate`). PR open: merge-target flow (PR always preserved). | `pr_policy.retry_failed` |
 | `--merge-target` / `--no-merge-target` | Push a merge commit on PRs even without conflicts. Never force-pushes. | off |
-| `--only <url-or-id>` | Single PR URL **or** group/singleton id. Drops everything else. Non-zero if nothing matches. | — |
+| `--only <url-or-id>` | Single PR URL **or** group/singleton id. Drops everything else. **Non-zero** if nothing matches. Mutex with `--pr`. | — |
+| `--pr <URL>` | Single PR by URL. Exits **cleanly (0)** when the PR isn't in session scope. Use from webhook/cron callers. Mutex with `--only`. | — |
 
-Exit: `1` on any `conflict`, else `0`.
+Exit: `1` on any `conflict` (in scope), else `0`.
 
 ### `releasy refresh`
 
-*Keep tracked PRs current with the target branch.*
+*Maintenance pass over tracked PRs.*
 
-Maintenance pass — **never opens PRs, never discovers, never
-cherry-picks**. For each tracked PR with a rebase PR URL, attempts
-`git merge --no-ff origin/<base>`:
+**Never opens PRs, never discovers, never cherry-picks.** Status sync
+always runs (catch merges/closes upstream, supersede sweep,
+merged-label apply, session-label reconcile). The three branch-mutating
+passes are opt-in via flags — bare `refresh` only re-syncs state.
 
-- **clean** → leave PR alone (or push a merge commit with `--merge-target`)
+**`--merge-target`** — for each tracked PR, merge `origin/<base>`
+into the PR branch via `git merge --no-ff`:
+
+- **clean** → push the merge commit (you opted in)
 - **conflict + AI resolves** → push, restore status, set `ai_resolved`
 - **conflict + AI gives up** → reset local, mark `conflict`
 
-Uses `ai_resolve.merge_prompt_file`. Suitable for cron. Note that
-[`run`](#releasy-run) applies the same flow to PRs with `--merge-target`
-— explicit `refresh` is mainly for cron cadence.
+**`--analyze-fails`** — for each tracked PR, walk failed praktika
+status entries on the PR's head SHA, bundle the failing tests per
+shard, and let Claude run the iterative fix-build-rerun loop. Same
+machinery as the standalone [`analyze-fails`](#releasy-analyze-fails)
+command — see that section for outcome classifications, flaky-elsewhere
+heuristic, and config. Per-PR sub-flags: `--no-flaky-check`,
+`--post-comment` / `--no-post-comment`.
+
+**`--address-review`** — for each tracked PR, fetch comments and let
+the AI append fix commits. Filters compose: trusted-reviewer
+allowlist + `--since` + dropped if hidden (minimized/outdated) +
+kept only when the inline thread is unresolved or the top-level
+comment has no later reply by the PR author. Linear history only —
+append commits, never amend/rebase/force-push. Stateful
+`last_review_addressed_at` stamp drives implicit re-run `--since` on
+tracked PRs.
+
+All three flags compose. Inside one invocation the phase order is
+fixed:
+
+```
+status sync → merge-target → analyze-fails → address-review
+```
+
+PRs left in `conflict` by the merge phase skip both subsequent passes.
+The ordering exists because `analyze-fails` reads commit statuses
+tied to the *current* head SHA — any push that lands first
+(merge-target, address-review) would invalidate the CI report it
+consumes.
+
+Uses `ai_resolve.merge_prompt_file` for conflicts,
+`analyze_fails.prompt_file` for CI triage, and
+`review_response.prompt_file` for review feedback. Suitable for cron.
+Note that [`run`](#releasy-run) also applies the merge flow to PRs
+with its own `--merge-target` — explicit `refresh` is mainly for
+cron cadence, CI triage, and the review pass.
 
 ```bash
-releasy refresh [--work-dir <path>]
+releasy refresh [--pr <URL>]
+                [--work-dir <path>]
                 [--resolve-conflicts | --no-resolve-conflicts]
                 [--merge-target | --no-merge-target]
+                [--analyze-fails | --no-analyze-fails]
+                [--no-flaky-check]
+                [--post-comment | --no-post-comment]
+                [--address-review | --no-address-review]
                 [--only <url-or-id>]
+                [--dry-run]
+                [--stateless ...]
 ```
 
 | Option | Description | Default |
 |--------|-------------|---------|
+| `--pr <URL>` | Operate on one PR by URL. **Stateful mode** silently exits (0) when the URL isn't tracked in this session. **Stateless mode** (`--stateless`) acts on any PR. Required with `--stateless`. | walk every tracked PR |
 | `--work-dir <path>` | Working dir. | config / cwd |
-| `--resolve-conflicts` / `--no-resolve-conflicts` | Toggle AI resolver. | on |
-| `--merge-target` / `--no-merge-target` | Push a merge commit even on clean merges. Never force-pushes. | off |
+| `--resolve-conflicts` / `--no-resolve-conflicts` | Toggle AI resolver (only meaningful with `--merge-target`). | on |
+| `--merge-target` / `--no-merge-target` | Merge `origin/<base>` into PR branches + push. | off |
+| `--analyze-fails` / `--no-analyze-fails` | Run the AI CI-triage pass on each in-scope PR. | off |
+| `--no-flaky-check` | (with `--analyze-fails`) skip flaky-elsewhere cross-check. | off |
+| `--post-comment` / `--no-post-comment` | (with `--analyze-fails`) post per-PR summary comment. | `analyze_fails.post_comment_to_pr` |
+| `--address-review` / `--no-address-review` | Run the AI review-feedback pass. Requires `review_response.trusted_reviewers` non-empty. | off |
 | `--only <url-or-id>` | Single tracked PR (URL — source or rebase) or feature/group id. | — |
+| `--dry-run` | No writes anywhere; print intended actions. | off |
+| `--stateless` | Skip session/state. Requires `--pr`. | off |
 
-Exit: `1` on any `conflict`, else `0`.
+Stateless-only overrides: `--origin`, `--build-command`,
+`--claude-command`, `--prompt-file`, `--timeout`, `--max-iterations`.
+Rejected without `--stateless`.
+
+Exit: `1` if any PR ended up in `conflict`, any address-review run
+failed, or any analyze-fails per-PR run errored — else `0`.
 
 ### `releasy discover-deps`
 
@@ -220,6 +282,12 @@ Exit: `0` regardless of conflicts found — read-only diagnostic.
 
 *Investigate red CI on a PR (or every tracked PR).*
 
+> Also available as **[`refresh --analyze-fails`](#releasy-refresh)** — same
+> per-shard fix loop, runs alongside `--merge-target` / `--address-review`
+> under a single project lock. Prefer the refresh form when you want a
+> bundled cron pass; reach for standalone `analyze-fails` when CI triage
+> is the only thing you're doing.
+
 Walks failed commit-status entries on the PR's head SHA whose `target_url`
 points at the praktika JSON viewer (GitHub-Actions job logs are
 deliberately ignored). Per failed shard, bundles all failures into a
@@ -284,79 +352,8 @@ analyze_fails:
 Exit: `1` on any per-PR failure (fetch / push race / non-linear history);
 `0` otherwise even if everything is `UNRELATED`.
 
-> **Linear history only** — same as
-> [`address-review`](#releasy-address-review). Append commits only. To
-> retract: `git revert <sha>`.
-
-### `releasy address-review`
-
-*Apply reviewer comments via AI.*
-
-Fetches every comment on the PR, filters to trusted-reviewer logins, asks
-Claude to append fixes. Fully stateless — the PR doesn't need to be in
-state.yaml.
-
-**Allowlist required.** Either `review_response.trusted_reviewers` or
-`--reviewer <login>` (or both — they add). Both empty → command refuses.
-The two sources add together; `--reviewer` is authoritative on its own.
-
-**Injection-safe:** untrusted comments are dropped at fetch time, before
-the prompt is built.
-
-**Linear history only.** Append commits only — no amend, no rebase, no
-`reset --hard`, no force-push. Retracting: `git revert <sha>`.
-
-**Stateful re-runs:** when `--pr` matches a rebase PR RelEasy tracks, a
-successful run stamps `last_review_addressed_at`; the next run uses it as
-implicit (exclusive) `--since`. Stateless PRs: pass `--since` explicitly.
-
-**Per comment, AI does:**
-
-- **Actionable** → edit + commit. Message references the comment URL.
-- **Non-actionable** (already fixed / OOS / misunderstanding) → in-thread
-  reply with a `🤖 *Generated by releasy address-review*` footer.
-- **Truly out of scope** → declines; surfaces in narration.
-
-```bash
-releasy address-review --pr <URL>
-                       [--reviewer <login>]...
-                       [--since <URL|ISO8601>]
-                       [--reply | --no-reply]
-                       [--work-dir <path>]
-                       [--dry-run]
-                       [--stateless ...]
-```
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--pr <URL>` (required) | PR on origin. Head branch must live on origin (no fork PRs). | — |
-| `--reviewer <login>` (repeatable) | Login allowlist; adds to config. Case-insensitive. | `[]` |
-| `--since <URL\|ISO8601>` | Comment URL → strictly after; ISO timestamp → at or after. | auto from state, else all |
-| `--reply` / `--no-reply` | Post in-thread reply on non-actionable comments. | `review_response.reply_to_non_addressable` |
-| `--work-dir <path>` | Working dir. | config / cwd |
-| `--dry-run` | Fetch + print filtered comment list, exit. | off |
-| `--stateless` | Skip session/state. `config.yaml` still loaded if present. Synthesizes config from CLI if absent. | off |
-
-Stateless-only overrides: `--origin`, `--build-command`, `--claude-command`,
-`--prompt-file`, `--timeout`, `--max-iterations`, `--post-summary-comment`.
-Rejected without `--stateless`.
-
-```bash
-# Inside a project dir — config picks up AI settings + reviewers.
-releasy address-review --stateless \
-  --pr https://github.com/Altinity/ClickHouse/pull/1687 \
-  --reviewer ianton-ru
-
-# Pure CLI — no config at all:
-releasy address-review --stateless \
-  --pr https://github.com/Altinity/ClickHouse/pull/1687 \
-  --reviewer ianton-ru \
-  --work-dir ~/work/ClickHouse \
-  --build-command "cd build && ninja"
-```
-
-Exit: `1` on any failure (missing allowlist, AI failed, push race,
-non-linear history); `0` on success or when no trusted comments.
+> **Linear history only** — same as `refresh --address-review`. Append
+> commits only. To retract: `git revert <sha>`.
 
 ### `releasy continue`
 

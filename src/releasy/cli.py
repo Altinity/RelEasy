@@ -238,6 +238,16 @@ def cli(
          "nothing matches.",
 )
 @click.option(
+    "--pr",
+    "pr_url",
+    default=None,
+    help="Restrict this run to a single PR by URL. Like --only with a "
+         "URL, but exits cleanly (no-op) when the PR isn't in this "
+         "session's scope. Use this from webhook/cron callers that "
+         "don't know in advance whether the PR belongs to this "
+         "project. Mutually exclusive with --only.",
+)
+@click.option(
     "--merge-target/--no-merge-target",
     "merge_target",
     default=False,
@@ -268,14 +278,23 @@ def run(
     resolve_conflicts: bool,
     retry_failed: bool | None,
     only: str | None,
+    pr_url: str | None,
     merge_target: bool,
     dry_run: bool,
 ) -> None:
     """Discover and port new PRs onto the base branch (cherry-pick + open PR)."""
-    from releasy.pipeline import parse_only, run_pipeline, run_sequential
+    from releasy.pipeline import (
+        parse_only, parse_pr_url_filter, run_pipeline, run_sequential,
+    )
+
+    if only is not None and pr_url is not None:
+        raise click.UsageError(
+            "--only and --pr are mutually exclusive: --only fails on "
+            "no-match while --pr exits cleanly. Pick one."
+        )
 
     try:
-        only_filter = parse_only(only)
+        only_filter = parse_only(only) or parse_pr_url_filter(pr_url)
     except ValueError as e:
         raise click.UsageError(str(e))
 
@@ -312,9 +331,19 @@ def run(
             force_merge=merge_target,
         )
 
-        has_conflicts = any(
-            fs.status == "conflict" for fs in state.features.values()
-        )
+        # Scope the conflict-exit check to whatever the user filtered on
+        # — otherwise --only / --pr on a single unit could exit non-zero
+        # because of an unrelated stale conflict in state.
+        if only_filter is not None:
+            has_conflicts = any(
+                fs.status == "conflict"
+                for fid, fs in state.features.items()
+                if only_filter.matches_state(fid, fs)
+            )
+        else:
+            has_conflicts = any(
+                fs.status == "conflict" for fs in state.features.values()
+            )
         if has_conflicts:
             raise SystemExit(1)
 
@@ -872,7 +901,9 @@ def _print_discovery_summary(report) -> None:  # noqa: ANN001 — DiscoveryRepor
 
 
 @cli.command(
-    short_help="Resolve target-branch conflicts on a PR (or every tracked PR).",
+    short_help=(
+        "Sync status; optionally merge / analyze CI / address review."
+    ),
 )
 @click.option(
     "--pr",
@@ -970,11 +1001,57 @@ def _print_discovery_summary(report) -> None:  # noqa: ANN001 — DiscoveryRepor
     "--merge-target/--no-merge-target",
     "merge_target",
     default=False,
-    help="Push a merge commit of the latest target tip into the PR "
-         "branch even when there are no conflicts. Without this, "
-         "RelEasy only touches the PR's branch when target conflicts "
-         "with it (and AI resolves them). Never force-pushes — only "
-         "fast-forward / merge-commit pushes. Default: off.",
+    help="Merge the latest target branch into each in-scope PR's "
+         "branch (with AI-resolved conflicts) and push. Without this, "
+         "refresh only runs status-sync — no branch is touched. Never "
+         "force-pushes; only fast-forward / merge-commit pushes. "
+         "Default: off.",
+)
+@click.option(
+    "--address-review/--no-address-review",
+    "address_review_flag",
+    default=False,
+    help="Address review feedback on each in-scope PR via the AI. "
+         "Trust gate: by default keeps comments whose "
+         "author_association is OWNER/MEMBER/COLLABORATOR/CONTRIBUTOR "
+         "(configurable via review_response.trusted_associations); "
+         "review_response.trusted_reviewers adds extra logins. "
+         "Comments are then further narrowed by --since + drop hidden "
+         "(minimized/outdated) + keep only inline comments on "
+         "unresolved threads OR top-level comments with no later "
+         "PR-author reply. Combine with --merge-target to merge first, "
+         "then address review; PRs in conflict are skipped. "
+         "Default: off.",
+)
+@click.option(
+    "--analyze-fails/--no-analyze-fails",
+    "analyze_fails_flag",
+    default=False,
+    help="Investigate failed CI on each in-scope PR via the AI: walks "
+         "failed praktika status entries on the PR head, bundles the "
+         "failing tests per shard, and lets Claude run the iterative "
+         "fix-build-rerun loop. Combine with --merge-target / "
+         "--address-review; phase order in one run is merge-target → "
+         "analyze-fails → address-review (analyze-fails needs a "
+         "non-stale CI report against the current head SHA; "
+         "address-review's commits would invalidate it). PRs left in "
+         "conflict by --merge-target are skipped. Default: off.",
+)
+@click.option(
+    "--no-flaky-check",
+    "no_flaky_check",
+    is_flag=True,
+    default=False,
+    help="(--analyze-fails only) Skip the flaky-elsewhere assessment "
+         "that cross-references failures against other tracked PRs.",
+)
+@click.option(
+    "--post-comment/--no-post-comment",
+    "post_comment_flag",
+    default=None,
+    help="(--analyze-fails only) Post a top-level summary comment on "
+         "each processed PR. Defaults to the "
+         "`analyze_fails.post_comment_to_pr` config value.",
 )
 @click.option(
     "--dry-run",
@@ -1000,9 +1077,13 @@ def refresh(
     max_iterations_cli: int | None,
     only: str | None,
     merge_target: bool,
+    address_review_flag: bool,
+    analyze_fails_flag: bool,
+    no_flaky_check: bool,
+    post_comment_flag: bool | None,
     dry_run: bool,
 ) -> None:
-    """Merge target branch into a PR (or every tracked PR), AI-resolve conflicts.
+    """Maintenance pass over tracked PRs (or one PR by URL).
 
     Three modes:
 
@@ -1018,22 +1099,30 @@ def refresh(
                                    config is built from the stateless flags.
 
     Strictly a maintenance pass — never opens new PRs, never creates
-    new branches, never discovers new PR sources. For each in-scope PR:
-    fetch the latest target + PR branch, attempt ``git merge --no-ff
-    origin/<base>`` into the PR branch, and:
+    new branches, never discovers new PR sources. Status sync (catch
+    PRs merged externally, supersede sweep, merged-label apply,
+    session-label reconciliation) ALWAYS runs.
+
+    The three branch-mutating passes are opt-in:
 
     \b
-    - clean merge: leave the PR alone (use GitHub's *Update branch* if
-      you want a fresh merge commit pushed),
-    - conflict + AI resolves it: push the resolved merge commit (plain
-      push — never force; status preserved, ``ai_resolved`` flag set
-      when state is tracked),
-    - conflict + AI gives up / disabled: abort the merge, hard-reset
-      the local branch back to its original tip, mark the entry as
-      ``conflict`` (stateful modes only).
+    - ``--merge-target``    — merge ``origin/<base>`` into each PR
+      branch and AI-resolve any conflicts, then push.
+    - ``--analyze-fails``   — bundle each PR's failing CI tests per
+      shard and let the AI run the iterative fix-build-rerun loop.
+    - ``--address-review``  — fetch trusted review feedback, drop
+      hidden / addressed comments, and let the AI add fix commits.
 
-    Exit code is 1 if any PR ended up in conflict status, 0 otherwise —
-    suitable for cron / CI loops.
+    When more than one is set the phases run in a fixed order:
+    ``merge-target → analyze-fails → address-review``. PRs left in
+    conflict by ``--merge-target`` skip both subsequent passes.
+    Rationale: ``analyze-fails`` reads commit statuses tied to the
+    *current* head SHA, so any push that lands first (merge-target,
+    address-review) would invalidate the CI report it needs.
+
+    Exit code is 1 if any PR ended up in conflict, any address-review
+    run failed, or any analyze-fails per-PR run errored — 0 otherwise.
+    Suitable for cron / CI loops.
     """
     from releasy.pipeline import parse_only
     from releasy.refresh import (
@@ -1169,6 +1258,10 @@ def refresh(
         if not resolve_conflicts_for_pr(
             config, pr_url, wd, resolve_conflicts=ai_resolve_flag,
             force_merge=merge_target,
+            address_review=address_review_flag,
+            analyze_fails=analyze_fails_flag,
+            no_flaky_check=no_flaky_check,
+            post_comment=post_comment_flag,
         ):
             raise SystemExit(1)
         return
@@ -1183,6 +1276,10 @@ def refresh(
             if not refresh_tracked_prs(
                 config, wd, resolve_conflicts=ai_resolve_flag,
                 only=only_filter, force_merge=merge_target,
+                address_review=address_review_flag,
+                analyze_fails=analyze_fails_flag,
+                no_flaky_check=no_flaky_check,
+                post_comment=post_comment_flag,
             ):
                 raise SystemExit(1)
         return
@@ -1192,332 +1289,11 @@ def refresh(
         if not resolve_conflicts_for_pr(
             config, pr_url, wd, resolve_conflicts=ai_resolve_flag,
             force_merge=merge_target,
+            address_review=address_review_flag,
+            analyze_fails=analyze_fails_flag,
+            no_flaky_check=no_flaky_check,
+            post_comment=post_comment_flag,
         ):
-            raise SystemExit(1)
-
-
-@cli.command(
-    name="address-review",
-    short_help="AI-address reviewer feedback on a PR (stateless).",
-)
-@click.option(
-    "--pr",
-    "pr_url",
-    required=True,
-    help="GitHub URL of the PR to address. Must live on the project's "
-         "configured origin (the head branch has to be on origin so we "
-         "can push to it).",
-)
-@click.option(
-    "--reviewer",
-    "cli_reviewers",
-    multiple=True,
-    help="GitHub login (repeatable). ADDS to "
-         "review_response.trusted_reviewers from config — an explicit "
-         "--reviewer entry is authoritative on its own (the login does "
-         "NOT need to appear in the config allowlist first). Only "
-         "comments authored by a login in the resulting set are fed to "
-         "the AI; every other comment is dropped before the prompt is "
-         "rendered. Case-insensitive. The command only refuses to run "
-         "when BOTH this flag and the config list are empty.",
-)
-@click.option(
-    "--since",
-    "since_iso",
-    default=None,
-    help="Only consider comments newer than this reference. Accepts "
-         "two forms: (1) a GitHub comment URL "
-         "(e.g. https://github.com/o/r/pull/123#issuecomment-456, or "
-         "`#discussion_r<id>` / `#pullrequestreview-<id>`) — interpreted "
-         "as 'every comment STRICTLY AFTER this one'; (2) an ISO-8601 "
-         "timestamp (e.g. 2026-04-24T10:00:00Z) — interpreted as "
-         "'comments at or after this moment'. When omitted, RelEasy "
-         "also checks the state file: if this PR matches a tracked "
-         "rebase PR with a prior address-review run, the timestamp "
-         "recorded then is used as an implicit exclusive --since "
-         "default.",
-)
-@click.option(
-    "--work-dir", default=None, help="Working directory for git operations",
-)
-@click.option(
-    "--reply/--no-reply",
-    "reply_to_non_addressable",
-    default=None,
-    help="Post a reply in-thread on every comment the AI classifies as "
-         "non-actionable (already fixed / out of scope / "
-         "misunderstanding). Replies carry a bot footer. When omitted, "
-         "inherits from review_response.reply_to_non_addressable in "
-         "config (default on). Use --no-reply for a silent run that "
-         "only reports via the AI's terminal narration.",
-)
-@click.option(
-    "--dry-run",
-    is_flag=True,
-    default=False,
-    help="Fetch and print the filtered comment list, then exit without "
-         "invoking the AI or pushing anything. Useful to verify your "
-         "reviewer allowlist catches the right people.",
-)
-@click.option(
-    "--stateless",
-    is_flag=True,
-    default=False,
-    help="Skip the session and state files: no per-project lock, no "
-         "ownership check, no state mutations. config.yaml IS still "
-         "loaded (with the usual --config override) so AI settings, "
-         "origin, trusted_reviewers, etc. are inherited from it. The "
-         "--origin / --build-command / --claude-command / --prompt-file "
-         "/ --timeout / --max-iterations / --post-summary-comment "
-         "overrides below apply only with --stateless. When no "
-         "config.yaml is present in cwd (and --config is not passed), "
-         "a synthetic config is built from the flags; --origin defaults "
-         "to the PR's host repo as an https URL in that case.",
-)
-@click.option(
-    "--origin",
-    "origin_url",
-    default=None,
-    help="(stateless only) Origin remote URL to push to. Use this if "
-         "you need an ssh-form URL (e.g. git@github.com:owner/repo.git) "
-         "instead of https. When config.yaml is present its origin is "
-         "used unless this flag overrides.",
-)
-@click.option(
-    "--build-command",
-    "build_command_cli",
-    default=None,
-    help="(stateless only) Shell command the AI may run inside the "
-         "repo to verify its changes compile. Written into "
-         ".releasy/build.sh. Empty means 'no build — AI skips "
-         "verification'. Overrides ai_resolve.build_command in config.",
-)
-@click.option(
-    "--claude-command",
-    "claude_command",
-    default=None,
-    help="(stateless only) Executable used to invoke Claude. "
-         "Overrides review_response.command in config.",
-)
-@click.option(
-    "--prompt-file",
-    "prompt_file_cli",
-    default=None,
-    help="(stateless only) Path to the address-review prompt template. "
-         "Overrides review_response.prompt_file in config. Defaults to "
-         "the prompt bundled with the releasy package.",
-)
-@click.option(
-    "--timeout",
-    "timeout_seconds",
-    type=int,
-    default=None,
-    help="(stateless only) Per-invocation Claude timeout in seconds. "
-         "Overrides review_response.timeout_seconds in config.",
-)
-@click.option(
-    "--max-iterations",
-    "max_iterations_cli",
-    type=int,
-    default=None,
-    help="(stateless only) Hard cap on build attempts per run. "
-         "Overrides review_response.max_iterations in config.",
-)
-@click.option(
-    "--post-summary-comment",
-    "post_summary_comment_cli",
-    is_flag=True,
-    default=False,
-    help="(stateless only) Also post one top-level summary comment on "
-         "the PR when done (distinct from per-comment replies).",
-)
-@click.pass_context
-def address_review_cmd(
-    ctx: click.Context,
-    pr_url: str,
-    cli_reviewers: tuple[str, ...],
-    since_iso: str | None,
-    reply_to_non_addressable: bool | None,
-    work_dir: str | None,
-    dry_run: bool,
-    stateless: bool,
-    origin_url: str | None,
-    build_command_cli: str | None,
-    claude_command: str | None,
-    prompt_file_cli: str | None,
-    timeout_seconds: int | None,
-    max_iterations_cli: int | None,
-    post_summary_comment_cli: bool,
-) -> None:
-    """Let the AI address review feedback on a PR.
-
-    Fetches every comment on the PR (issue comments, inline review
-    comments, review bodies) and **filters them down to comments by
-    trusted reviewers** — the allowlist comes from
-    ``review_response.trusted_reviewers`` in config plus any
-    ``--reviewer`` flags. The AI only ever sees the filtered list, so
-    an untrusted commenter can't smuggle instructions into the run.
-
-    After filtering, the PR's head branch is checked out locally and
-    Claude is asked to address the feedback by appending new commits
-    (history stays linear — no amend, no rebase, no revert-via-reset).
-    Successful runs push the branch with a plain ``git push`` (no
-    force); a race with the PR author aborts without clobbering their
-    work.
-
-    Works on any PR on origin — the PR does not need to be tracked in
-    state. When it **is** tracked (i.e. RelEasy opened this rebase PR
-    itself), successful runs stamp ``last_review_addressed_at`` on the
-    feature; the next invocation uses it as an implicit exclusive
-    --since default so re-runs only pick up new feedback. For
-    untracked PRs, pass ``--since`` explicitly (URL or ISO) when you
-    want incremental behaviour.
-
-    Exit code is 1 on any failure (missing allowlist, Claude failed,
-    push race, non-linear history detected, …); 0 on success or when
-    there were no trusted comments to address.
-    """
-    from releasy.review_response import address_review
-
-    wd = Path(work_dir) if work_dir else None
-
-    # Stateless-only flags — using them without --stateless is a user
-    # error rather than a silent fallback to config, so the intent is
-    # unambiguous on both sides.
-    stateless_only_set: list[str] = []
-    if origin_url is not None:
-        stateless_only_set.append("--origin")
-    if build_command_cli is not None:
-        stateless_only_set.append("--build-command")
-    if claude_command is not None:
-        stateless_only_set.append("--claude-command")
-    if prompt_file_cli is not None:
-        stateless_only_set.append("--prompt-file")
-    if timeout_seconds is not None:
-        stateless_only_set.append("--timeout")
-    if max_iterations_cli is not None:
-        stateless_only_set.append("--max-iterations")
-    if post_summary_comment_cli:
-        stateless_only_set.append("--post-summary-comment")
-
-    if not stateless and stateless_only_set:
-        raise click.UsageError(
-            f"{', '.join(stateless_only_set)} only apply with "
-            "--stateless. Drop the flags, or add --stateless to skip "
-            "the session/state/lock layer."
-        )
-
-    if stateless:
-        from releasy.config import (
-            build_stateless_address_review_config,
-            load_config,
-            overlay_address_review_overrides,
-        )
-        from releasy.github_ops import parse_pr_url, slug_to_https_url
-
-        # Try to load config.yaml via the usual --config resolution; fall
-        # back to a fully synthetic config only when no file is found.
-        config_path = ctx.obj.get("config_path")
-        config: Config | None = None
-        try:
-            config = load_config(
-                Path(config_path) if config_path else None,
-            )
-        except FileNotFoundError:
-            config = None
-        except Exception as e:
-            raise click.ClickException(f"Failed to load config: {e}")
-
-        if config is None:
-            effective_origin = origin_url
-            if not effective_origin:
-                parsed = parse_pr_url(pr_url)
-                if parsed is None:
-                    raise click.ClickException(
-                        f"Could not parse --pr URL: {pr_url!r}"
-                    )
-                owner, repo, _ = parsed
-                effective_origin = slug_to_https_url(f"{owner}/{repo}")
-            config = build_stateless_address_review_config(
-                origin_url=effective_origin,
-                work_dir=wd,
-                claude_command=claude_command or "claude",
-                build_command=build_command_cli or "",
-                prompt_file=prompt_file_cli,
-                timeout_seconds=(
-                    timeout_seconds if timeout_seconds is not None else 7200
-                ),
-                max_iterations=(
-                    max_iterations_cli
-                    if max_iterations_cli is not None else 15
-                ),
-                trusted_reviewers=list(cli_reviewers),
-                reply_to_non_addressable=(
-                    True if reply_to_non_addressable is None
-                    else reply_to_non_addressable
-                ),
-                post_summary_comment=post_summary_comment_cli,
-            )
-        else:
-            # Real config loaded — overlay only the flags the user passed.
-            # Origin override is applied directly on the OriginConfig; the
-            # rest go through the helper.
-            if origin_url:
-                config.origin.remote = origin_url
-            overlay_address_review_overrides(
-                config,
-                claude_command=claude_command,
-                build_command=build_command_cli,
-                prompt_file=prompt_file_cli,
-                timeout_seconds=timeout_seconds,
-                max_iterations=max_iterations_cli,
-                # --reviewer flags ADD to config's trusted_reviewers.
-                trusted_reviewers=(
-                    list(config.review_response.trusted_reviewers)
-                    + list(cli_reviewers)
-                ) if cli_reviewers else None,
-                reply_to_non_addressable=reply_to_non_addressable,
-                post_summary_comment=(
-                    True if post_summary_comment_cli else None
-                ),
-            )
-
-        # Stateless: never load state, never lock, never attach session.
-        config.session = None
-        config.stateless = True
-        config.dry_run = dry_run
-        result = address_review(
-            config,
-            pr_url,
-            cli_reviewers=cli_reviewers,
-            since_iso=since_iso,
-            work_dir=wd,
-            dry_run=dry_run,
-            reply_override=(
-                None if reply_to_non_addressable is None
-                else reply_to_non_addressable
-            ),
-        )
-        if not result.success:
-            if result.error:
-                raise click.ClickException(result.error)
-            raise SystemExit(1)
-        return
-
-    with _locked_config(ctx, session="skip") as config:
-        config.dry_run = dry_run
-        result = address_review(
-            config,
-            pr_url,
-            cli_reviewers=cli_reviewers,
-            since_iso=since_iso,
-            work_dir=wd,
-            dry_run=dry_run,
-            reply_override=reply_to_non_addressable,
-        )
-        if not result.success:
-            if result.error:
-                raise click.ClickException(result.error)
             raise SystemExit(1)
 
 
