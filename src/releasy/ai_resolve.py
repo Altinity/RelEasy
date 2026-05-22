@@ -747,6 +747,85 @@ def _count_iterations(output: str) -> int | None:
     return best
 
 
+# ``src/Core/SettingsChangesHistory.cpp`` is an append-only registry of
+# ClickHouse settings changes. Every conflict-resolve invocation must
+# leave the port branch's diff of this file as a **subset** of the
+# rows the source PR itself added — extra rows are essentially always
+# bad: they're context lines the AI accidentally uncommented or stale
+# entries from "ours" that bracketed a real source-PR edit. The rule
+# is in the prompt (see resolve_conflict.md → "Append-only registries"),
+# but PR #1812 showed prompt-only enforcement isn't reliable, so we
+# also verify mechanically here.
+_SETTINGS_HISTORY_FILE = "src/Core/SettingsChangesHistory.cpp"
+
+# Matches ``+    {"setting_name", ...`` — the canonical row shape of
+# this registry. Captures the setting name. We anchor on ``+`` so we
+# only see additions; deletions and context lines never contribute.
+_SETTINGS_HISTORY_ROW_RE = re.compile(r'^\+\s*\{"([^"]+)"')
+
+
+def _settings_history_added_names(stdout: str) -> set[str]:
+    """Pull setting names out of a unified-diff stdout snippet."""
+    return {
+        m.group(1) for line in stdout.splitlines()
+        if (m := _SETTINGS_HISTORY_ROW_RE.match(line))
+    }
+
+
+def _check_settings_history_whitelist(
+    repo_path: Path, ctx: AIResolveContext, new_head: str,
+) -> tuple[bool, str | None]:
+    """Verify the port's SettingsChangesHistory.cpp adds ⊆ source PR's adds.
+
+    No-op when we can't compute either side (missing start / source SHA,
+    file untouched by the port). On violation, returns a specific error
+    naming the unauthorized setting(s); the caller surfaces it like any
+    other postcondition failure and resets to ``ctx.start_sha``.
+    """
+    source_sha = ctx.source_pr.merge_commit_sha or ctx.source_pr.head_sha
+    if not source_sha or not ctx.start_sha:
+        return True, None
+
+    on_port = run_git(
+        ["diff", "--no-color", f"{ctx.start_sha}..{new_head}",
+         "--", _SETTINGS_HISTORY_FILE],
+        repo_path, check=False,
+    )
+    if on_port.returncode != 0 or not on_port.stdout.strip():
+        return True, None  # file untouched by the port
+
+    added_on_port = _settings_history_added_names(on_port.stdout)
+    if not added_on_port:
+        return True, None
+
+    # ``-m --first-parent`` matches how the prompt itself tells Claude
+    # to read the source PR's diff — see resolve_conflict.md:352.
+    src = run_git(
+        ["show", "-m", "--first-parent", "--no-color", source_sha,
+         "--", _SETTINGS_HISTORY_FILE],
+        repo_path, check=False,
+    )
+    allowed = (
+        _settings_history_added_names(src.stdout) if src.returncode == 0
+        else set()
+    )
+
+    extra = added_on_port - allowed
+    if not extra:
+        return True, None
+
+    sample = ", ".join(sorted(extra)[:5])
+    more = f" (+{len(extra) - 5} more)" if len(extra) > 5 else ""
+    return False, (
+        f"{_SETTINGS_HISTORY_FILE}: {len(extra)} unauthorized setting "
+        f"row(s) added during resolution: {sample}{more} — these names "
+        "are not in the source PR's diff for this file. This registry "
+        "is append-only: only rows the source PR itself adds may land "
+        "in the port. Re-resolve and drop the extras (likely context "
+        "lines from \"ours\" that got swept in alongside a real edit)."
+    )
+
+
 def _verify_postconditions(
     config: Config, repo_path: Path, ctx: AIResolveContext,
 ) -> tuple[bool, str | None, str | None]:
@@ -763,7 +842,10 @@ def _verify_postconditions(
       ``ctx.pre_resolve_sha`` so the resolution lives in its own commit
       on top of the "with conflicts" commit (Claude must not have
       amended that one), and HEAD is not a fixup of HEAD~1 — there
-      really is a separate resolution commit.
+      really is a separate resolution commit,
+    - any additions to ``src/Core/SettingsChangesHistory.cpp`` are a
+      subset of the rows the source PR's own diff adds — see
+      :func:`_check_settings_history_whitelist`.
 
     Returns ``(ok, new_head_sha, error_message)``.
     """
@@ -811,6 +893,10 @@ def _verify_postconditions(
             "no resolution commit on top of the 'with conflicts' commit "
             "— claude did not produce a second commit"
         )
+
+    ok, sh_err = _check_settings_history_whitelist(repo_path, ctx, new_head)
+    if not ok:
+        return False, new_head, sh_err
 
     return True, new_head, None
 
