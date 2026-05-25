@@ -68,7 +68,13 @@ from releasy.github_ops import (
     parse_pr_url,
     sync_project,
 )
-from releasy.state import FeatureState, PipelineState, load_state, save_state
+from releasy.state import (
+    FeatureState,
+    PipelineState,
+    find_feature_by_pr_url,
+    load_state,
+    save_state,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1350,22 +1356,11 @@ def _pr_url_in_state_scope(config: Config, pr_url: str) -> bool:
     Failing state load is treated as "not in scope" — the same safe
     fallback applies to a missing / corrupt state file.
     """
-    target = parse_pr_url(pr_url)
-    if target is None:
-        return False
     try:
         state = load_state(config)
     except Exception:  # pragma: no cover — bad state file
         return False
-    if not state.features:
-        return False
-    for fs in state.features.values():
-        for url in (fs.rebase_pr_url, fs.pr_url, *fs.pr_urls):
-            if not url:
-                continue
-            if parse_pr_url(url) == target:
-                return True
-    return False
+    return find_feature_by_pr_url(state, pr_url) is not None
 
 
 def _maybe_update_tracked_state(

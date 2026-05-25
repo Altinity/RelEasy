@@ -465,3 +465,33 @@ def adopt_ownership(config: Config) -> tuple[Path | None, Path]:
             previous = prev
     save_state(state, config)
     return previous, state_path
+
+
+def find_feature_by_pr_url(
+    state: PipelineState, pr_url: str,
+) -> tuple[str, FeatureState] | None:
+    """Locate the tracked feature whose source or rebase URL matches ``pr_url``.
+
+    Compares on ``(owner, repo, number)`` so cosmetic differences (trailing
+    slash, fragment, ``.git`` suffix) don't break the match. Returns
+    ``(feature_id, FeatureState)`` on hit, ``None`` otherwise.
+
+    Used by ``releasy pr remove`` to find the entry to purge and by
+    ``refresh._pr_url_in_state_scope`` to scope-gate URL-driven flows.
+    The import of ``parse_pr_url`` is deferred — ``github_ops`` already
+    imports this module, so a top-level import here would loop.
+    """
+    from releasy.github_ops import parse_pr_url
+
+    target = parse_pr_url(pr_url)
+    if target is None:
+        return None
+    if not state.features:
+        return None
+    for fid, fs in state.features.items():
+        for url in (fs.rebase_pr_url, fs.pr_url, *fs.pr_urls):
+            if not url:
+                continue
+            if parse_pr_url(url) == target:
+                return (fid, fs)
+    return None

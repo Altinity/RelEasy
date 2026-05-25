@@ -30,6 +30,7 @@ config they read, see [configuration.md](configuration.md).
   [`project pull`](#releasy-project-pull)
 - Release: [`release`](#releasy-release)
 - Features: [`feature *`](#feature-management)
+- PR membership: [`pr *`](#pr-membership)
 
 ## Global options
 
@@ -608,3 +609,27 @@ releasy feature list
 | `disable` | Set `enabled: false`. Requires `--id`. |
 | `remove` | Delete from session. Doesn't touch branches. Requires `--id`. |
 | `list` | Print features grouped by enabled/disabled. |
+
+## PR membership
+
+Add, remove, and list individual PR URLs in the session so you never
+hand-edit `pr_sources.include_prs`, `pr_sources.exclude_prs`, or
+`pr_sources.groups[].prs`. Schema:
+[configuration.md](configuration.md#namesessionyaml-per-effort-source-data).
+
+```bash
+releasy pr add <PR-URL> [--group <id>] [--context <text>]
+releasy pr remove <PR-URL> [--keep-discovery]
+releasy pr list
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| `add` | Append URL to `pr_sources.include_prs` (or `groups[<id>].prs` with `--group`). Validates the URL via the GitHub API, idempotent on re-add, and clears the URL from `exclude_prs` if it was previously excluded. Optional `--context` sets the per-PR `ai_context` note. |
+| `remove` | Drop the URL from every session list (`include_prs`, every group's `prs`, both `ai_context` dicts) and purge the matching `FeatureState`. By default also appends the URL to `exclude_prs` so label-driven discovery doesn't re-add it on the next refresh; pass `--keep-discovery` to skip that step. Refuses if the URL is part of a multi-PR group still in state (groups are atomic — use `releasy clear --branch <branch>` to wipe the whole group). |
+| `list` | Print every URL the session references — top-level `include_prs`, each group's `prs`, and `exclude_prs` — with their `ai_context` notes. |
+
+Exit: `1` on a malformed URL, an unreachable PR, a group id that doesn't
+exist, or any cross-list collision (URL already in `include_prs` when
+adding with `--group`, etc.); `0` otherwise. All mutating subcommands
+take the project lock; `list` is read-only.

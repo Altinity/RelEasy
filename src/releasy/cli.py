@@ -2252,3 +2252,78 @@ def feature_list(ctx: click.Context) -> None:
     list_features(config)
 
 
+# ---------------------------------------------------------------------------
+# PR membership: session-level add/remove without hand-edited YAML.
+# ---------------------------------------------------------------------------
+
+
+@cli.group()
+def pr() -> None:
+    """Add, remove, and list PR membership in the session."""
+
+
+@pr.command(name="add")
+@click.argument("url")
+@click.option(
+    "--group", "group_id", default=None,
+    help="Add to this group's prs list instead of top-level include_prs. "
+         "The group must already exist in the session.",
+)
+@click.option(
+    "--context", "context", default=None,
+    help="Per-PR ai_context note attached to this URL. Surfaced to the "
+         "conflict resolver alongside any unit-level ai_context.",
+)
+@click.pass_context
+def pr_add(
+    ctx: click.Context, url: str, group_id: str | None, context: str | None,
+) -> None:
+    """Add a PR URL to the session.
+
+    Top-level by default (``pr_sources.include_prs``); ``--group <id>``
+    appends to that group's ``prs`` instead. Validates the URL exists via
+    the GitHub API, idempotent on re-add, removes the URL from
+    ``exclude_prs`` if previously excluded.
+    """
+    from releasy.pr_membership import add_pr
+
+    with _locked_config(ctx, session="required") as config:
+        if not add_pr(config, url, group_id=group_id, context=context):
+            raise SystemExit(1)
+
+
+@pr.command(name="remove")
+@click.argument("url")
+@click.option(
+    "--keep-discovery", is_flag=True,
+    help="Don't append the URL to exclude_prs. Without this flag, "
+         "removal adds the URL to exclude_prs so label-driven discovery "
+         "doesn't re-add it on the next refresh.",
+)
+@click.pass_context
+def pr_remove(
+    ctx: click.Context, url: str, keep_discovery: bool,
+) -> None:
+    """Remove a PR URL from session and state.
+
+    Drops the URL from ``include_prs``, every group's ``prs``, and the
+    matching ``FeatureState``. Refuses if the URL is part of a multi-PR
+    group in state (groups are atomic — clear the whole group instead).
+    """
+    from releasy.pr_membership import remove_pr
+
+    with _locked_config(ctx, session="required") as config:
+        if not remove_pr(config, url, keep_discovery=keep_discovery):
+            raise SystemExit(1)
+
+
+@pr.command(name="list")
+@click.pass_context
+def pr_list(ctx: click.Context) -> None:
+    """List every PR URL the session references."""
+    from releasy.pr_membership import list_prs
+
+    config = _load_and_verify(ctx, session="required")
+    list_prs(config)
+
+
