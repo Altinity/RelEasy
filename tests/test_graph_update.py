@@ -269,10 +269,15 @@ class OpenOrUpdateIssue(unittest.TestCase):
     """#12 — recreate when the tracked issue 404s; never recreate on transient."""
 
     def setUp(self):
-        self._update, self._create = d.update_issue, d.create_issue
+        self._update, self._create, self._ensure = (
+            d.update_issue, d.create_issue, d.ensure_label,
+        )
+        d.ensure_label = lambda *a, **k: True  # offline
 
     def tearDown(self):
-        d.update_issue, d.create_issue = self._update, self._create
+        d.update_issue, d.create_issue, d.ensure_label = (
+            self._update, self._create, self._ensure,
+        )
 
     def _cfg(self):
         return Config(name="n", origin=OriginConfig(remote="git@github.com:o/r.git"), project="p")
@@ -296,6 +301,15 @@ class OpenOrUpdateIssue(unittest.TestCase):
         r = report([node("u1", 1)], issue_number=5, issue_url="u")
         self.assertIsNone(d.open_or_update_graph_issue(self._cfg(), r, title="t"))
         self.assertEqual(r.issue_number, 5)  # number preserved for retry
+
+    def test_labels_include_releasy_and_target_branch(self):
+        ensured, used = [], {}
+        d.ensure_label = lambda config, name, *a, **k: ensured.append(name) or True
+        d.create_issue = lambda config, t, b, *, labels=None: used.update(labels=labels) or (1, "u")
+        r = report([node("u1", 1)], base_branch="antalya-26.4")  # default issue_labels=["releasy"]
+        d.open_or_update_graph_issue(self._cfg(), r, title="t")
+        self.assertEqual(used["labels"], ["releasy", "antalya-26.4"])
+        self.assertEqual(set(ensured), {"releasy", "antalya-26.4"})
 
 
 if __name__ == "__main__":

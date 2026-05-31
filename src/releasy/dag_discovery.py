@@ -59,6 +59,7 @@ from releasy.github_ops import (
     PRInfo,
     add_issue_comment,
     create_issue,
+    ensure_label,
     fetch_issue_comments,
     get_origin_repo_slug,
     parse_pr_url,
@@ -2107,9 +2108,14 @@ def open_or_update_graph_issue(
         # res is None → issue was deleted; fall through to recreate.
         report.issue_number = None
         report.issue_url = None
-    result = create_issue(
-        config, title, body, labels=list(config.graph.issue_labels),
-    )
+    # Configured labels + the target-branch name, created if missing.
+    labels: list[str] = []
+    for name in list(config.graph.issue_labels) + [report.base_branch]:
+        if name and name not in labels:
+            labels.append(name)
+    for name in labels:
+        ensure_label(config, name)
+    result = create_issue(config, title, body, labels=labels)
     if result is None:
         return None
     number, url = result

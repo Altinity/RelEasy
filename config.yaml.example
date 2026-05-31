@@ -413,7 +413,7 @@ notifications:
 #   trusted_associations: [OWNER, MEMBER, COLLABORATOR]
 #   # Extra trusted GitHub logins, additive.
 #   trusted_reviewers: [alice]
-#   issue_labels: [releasy-graph]   # labels for the graph issue
+#   issue_labels: [releasy]         # + the target-branch name; created if missing
 #   post_comment: true              # summary comment after each update
 #   apply_exclusions: true          # enforce vetoes via exclude_prs
 #   # command: claude

@@ -6,7 +6,7 @@ config.yaml
 *.session.yaml
 .releasy/
 *.session.deps.yaml
-discover-deps.*
+graph.*.yaml
 
 # Python
 __pycache__/

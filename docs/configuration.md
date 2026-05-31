@@ -143,7 +143,7 @@ Options live in `config.yaml` unless marked **(session)**.
 | `analyze_fails.post_comment_to_pr` | Post summary comment per PR. | `true` |
 | `graph.trusted_associations` | GitHub `author_association` values whose comments `graph update` feeds to Claude. | `["OWNER", "MEMBER", "COLLABORATOR"]` |
 | `graph.trusted_reviewers` | Extra GitHub-login allowlist, additive on top of `trusted_associations` (case-insensitive). | `[]` |
-| `graph.issue_labels` | Labels applied to the graph issue opened by `graph discover --open-issue`. | `["releasy-graph"]` |
+| `graph.issue_labels` | Labels on the graph issue (the target-branch name is always added too; created on origin if missing). | `["releasy"]` |
 | `graph.post_comment` | Post a summary comment on the issue after each `graph update`. | `true` |
 | `graph.apply_exclusions` | Enforce member "don't port" vetoes by adding the PR to the session's `exclude_prs`. | `true` |
 | `graph.prompt_file` | Prompt template for `graph update`. | `prompts/adjust_graph.md` |

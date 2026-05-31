@@ -252,7 +252,7 @@ releasy graph discover [--onto <ver>] [--work-dir <path>]
 |--------|-------|----------|
 | Diagnostic report (always written) | `<config-dir>/graph.<base>.yaml` | `-o <path>` |
 | Deps overlay (consumed by `run`) | `<session-stem>.deps.yaml` | `pr_sources.deps_file:` in session, or `--deps-file <path>`, or `--no-write` to skip |
-| Graph issue (with `--open-issue`) | a new/updated issue on origin | `--issue-title <text>`; labels from `graph.issue_labels` |
+| Graph issue (with `--open-issue`) | a new/updated issue on origin | `--issue-title <text>`; labels = `graph.issue_labels` + target-branch name |
 
 `--no-write` and `--deps-file` are mutually exclusive. So are `-o` and
 `--open-issue` — the tracked report must stay at the default path so

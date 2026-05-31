@@ -566,8 +566,9 @@ class GraphConfig:
     )
     # Extra trusted GitHub logins (case-insensitive), additive.
     trusted_reviewers: list[str] = field(default_factory=list)
-    # Labels for the graph issue (added only if they exist on the repo).
-    issue_labels: list[str] = field(default_factory=lambda: ["releasy-graph"])
+    # Labels for the graph issue; the target-branch name is always added too.
+    # Created on origin if missing (releasy's default purple).
+    issue_labels: list[str] = field(default_factory=lambda: ["releasy"])
     # Post a summary comment on the issue after a successful update.
     post_comment: bool = True
     # Enforce vetoes by adding the PR to exclude_prs (else record-only).
@@ -1261,7 +1262,7 @@ def load_config(config_path: Path | None = None) -> Config:
             continue
         gr_assoc_seen.add(up)
         gr_assocs.append(up)
-    gr_labels_raw = gr_raw.get("issue_labels", ["releasy-graph"])
+    gr_labels_raw = gr_raw.get("issue_labels", ["releasy"])
     if not isinstance(gr_labels_raw, list) or not all(
         isinstance(x, str) for x in gr_labels_raw
     ):
