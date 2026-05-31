@@ -288,6 +288,11 @@ def run_discover_deps(
     warnings_acc: list[str] = []
     candidate_pr_urls = {p.url for cu in candidates for p in cu.prs}
 
+    console.print(
+        f"  [dim]{len(candidates)} candidate unit(s); checking which are "
+        f"already in {base_branch}…[/dim]"
+    )
+
     # --- Detect already-merged units ---
     state = load_state(config)
     state_already = _state_already_in_target(candidates, state)
@@ -309,6 +314,10 @@ def run_discover_deps(
     active_for_traversal = [
         cu for cu in candidates if cu.unit_id not in fully_merged_units
     ]
+    console.print(
+        f"  [dim]{len(fully_merged_units)} already in target · "
+        f"{len(active_for_traversal)} to trial-pick[/dim]"
+    )
 
     # Build pr_url → unit_id and merge_sha → unit_id indices for unit
     # projection in the conflict-mapping step. Filter merge SHAs to those
@@ -358,6 +367,10 @@ def run_discover_deps(
                 reverse=True,
             )
         ]
+        console.print(
+            f"  [dim]trial-picking {len(queue)} unit(s) onto {base_branch} "
+            "(latest first)…[/dim]"
+        )
 
         while queue:
             unit_id, depth = queue.pop(0)
@@ -385,6 +398,7 @@ def run_discover_deps(
                     cu, deps=[], method="depth-cutoff",
                     conflict_files=[],
                 )
+                console.print(f"  [dim]· {unit_id}: depth-cutoff[/dim]")
                 continue
 
             # Cache branch path: when caching is enabled (the default),
@@ -416,6 +430,7 @@ def run_discover_deps(
                     cu, deps=[], method="trial-clean", conflict_files=[],
                     cached=cache_kept,
                 )
+                console.print(f"  [dim]· {unit_id}: clean[/dim]")
                 continue
 
             if outcome.error_message and not outcome.conflict_files:
@@ -429,6 +444,10 @@ def run_discover_deps(
             # OR detached at target_ref already-reset (when --no-write).
             # Either way we can compute the deterministic candidate-deps
             # via ``git log``, which doesn't depend on worktree state.
+            console.print(
+                f"  [dim]· {unit_id}: conflict in {len(outcome.conflict_files)} "
+                "file(s), tracing prerequisites…[/dim]"
+            )
             if merge_containment_cache is None:
                 merge_containment_cache = _build_merge_containment_map(
                     repo_path, target_ref, candidates, warnings_acc,
@@ -521,6 +540,8 @@ def run_discover_deps(
                 conflict_files=outcome.conflict_files,
                 cached=cache_kept,
             )
+            detail = f" → deps: {', '.join(deps)}" if deps else ""
+            console.print(f"  [dim]· {unit_id}: {method}{detail}[/dim]")
             for d in deps:
                 edges.add((unit_id, d))
                 if d not in nodes:
