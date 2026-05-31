@@ -141,6 +141,13 @@ Options live in `config.yaml` unless marked **(session)**.
 | `analyze_fails.flaky_elsewhere_threshold` | Failure seen on this many other PRs ⇒ flagged as master-side flake. `0` disables. | `2` |
 | `analyze_fails.flaky_check_prs` | Cap on PRs scanned for the flaky-elsewhere map. | `12` |
 | `analyze_fails.post_comment_to_pr` | Post summary comment per PR. | `true` |
+| `graph.trusted_associations` | GitHub `author_association` values whose comments `graph update` feeds to Claude. | `["OWNER", "MEMBER", "COLLABORATOR"]` |
+| `graph.trusted_reviewers` | Extra GitHub-login allowlist, additive on top of `trusted_associations` (case-insensitive). | `[]` |
+| `graph.issue_labels` | Labels applied to the graph issue opened by `graph discover --open-issue`. | `["releasy-graph"]` |
+| `graph.post_comment` | Post a summary comment on the issue after each `graph update`. | `true` |
+| `graph.apply_exclusions` | Enforce member "don't port" vetoes by adding the PR to the session's `exclude_prs`. | `true` |
+| `graph.prompt_file` | Prompt template for `graph update`. | `prompts/adjust_graph.md` |
+| `graph.timeout_seconds` | Per-invocation Claude timeout for `graph update`. | `7200` |
 | `pr_policy.auto_pr` | Open a PR for every pushed port branch. Needs `push: true`. | `true` |
 | `pr_policy.if_exists` | What to do with an existing port branch: `skip` (leave it) / `recreate` (rebuild from base — only if no rebase PR open yet) / `append` (cherry-pick declared PRs not yet on the branch). | `skip` |
 | `pr_policy.retry_failed` | Revisit `conflict` entries per their `if_exists`. Override per-run with `--retry-failed`/`--no-retry-failed`. | `true` |

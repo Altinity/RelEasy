@@ -404,6 +404,23 @@ notifications:
 #   # timeout_seconds: 7200
 
 # ─────────────────────────────────────────────────────────────────────
+# DEPENDENCY GRAPH  (`releasy graph discover` / `graph update`)
+#
+# All optional; defaults are sensible.
+# graph:
+#   # author_association values whose comments graph update feeds to Claude
+#   # (GitHub-set, unforgeable). Tighten to ["MEMBER"] for org-only.
+#   trusted_associations: [OWNER, MEMBER, COLLABORATOR]
+#   # Extra trusted GitHub logins, additive.
+#   trusted_reviewers: [alice]
+#   issue_labels: [releasy-graph]   # labels for the graph issue
+#   post_comment: true              # summary comment after each update
+#   apply_exclusions: true          # enforce vetoes via exclude_prs
+#   # command: claude
+#   # prompt_file: prompts/adjust_graph.md
+#   # timeout_seconds: 7200
+
+# ─────────────────────────────────────────────────────────────────────
 # WORKFLOW
 #
 # The base branch must already exist on origin. The pipeline then ports

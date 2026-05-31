@@ -202,7 +202,7 @@ class PRGroupConfig:
     # only runs once every entry in ``depends_on`` has reached
     # ``status: merged`` in target.
     depends_on: list[str] = field(default_factory=list)
-    # Marker set by ``releasy discover-deps``. The CLI uses
+    # Marker set by ``releasy graph discover``. The CLI uses
     # it to identify entries it owns and may rewrite. Hand-written groups
     # have ``auto_discovered: false`` and are never touched.
     auto_discovered: bool = False
@@ -273,7 +273,7 @@ class PRSourcesConfig:
     # hand-curated) ``groups[]`` entries with ``depends_on:`` edges.
     # Loaded by :func:`load_session` and merged into ``groups[]`` in
     # memory; never mutates the main session file. ``releasy
-    # discover-deps`` writes to this path by default (unless
+    # graph discover`` writes to this path by default (unless
     # ``--no-write`` / ``--deps-file <override>`` says otherwise). Relative paths
     # resolve against the session file's directory.
     deps_file: str | None = None
@@ -551,6 +551,31 @@ class ReviewResponseConfig:
 
 
 @dataclass
+class GraphConfig:
+    """Config for ``releasy graph discover`` / ``graph update``.
+
+    Only comments whose ``author_association`` is in ``trusted_associations``
+    (or whose login is in ``trusted_reviewers``) are fed to Claude. Tighten
+    to ``["MEMBER"]`` for strict org membership.
+    """
+    command: str = "claude"
+    prompt_file: str = "prompts/adjust_graph.md"
+    timeout_seconds: int = 7200
+    trusted_associations: list[str] = field(
+        default_factory=lambda: ["OWNER", "MEMBER", "COLLABORATOR"],
+    )
+    # Extra trusted GitHub logins (case-insensitive), additive.
+    trusted_reviewers: list[str] = field(default_factory=list)
+    # Labels for the graph issue (added only if they exist on the repo).
+    issue_labels: list[str] = field(default_factory=lambda: ["releasy-graph"])
+    # Post a summary comment on the issue after a successful update.
+    post_comment: bool = True
+    # Enforce vetoes by adding the PR to exclude_prs (else record-only).
+    apply_exclusions: bool = True
+    extra_args: list[str] = field(default_factory=list)
+
+
+@dataclass
 class AnalyzeFailsConfig:
     """Claude-driven CI-failure investigator configuration.
 
@@ -735,6 +760,7 @@ class Config:
     ai_changelog: AIChangelogConfig = field(default_factory=AIChangelogConfig)
     review_response: ReviewResponseConfig = field(default_factory=ReviewResponseConfig)
     analyze_fails: AnalyzeFailsConfig = field(default_factory=AnalyzeFailsConfig)
+    graph: GraphConfig = field(default_factory=GraphConfig)
     config_path: Path = field(default_factory=lambda: Path.cwd() / "config.yaml")
     work_dir: Path | None = None
     # When set, a copy of all stdout+stderr (Rich, Click, logging, tracebacks)
@@ -1206,6 +1232,52 @@ def load_config(config_path: Path | None = None) -> Config:
         extra_args=af_raw.get("extra_args", []) or [],
     )
 
+    gr_raw = raw.get("graph", {}) or {}
+    gr_reviewers_raw = gr_raw.get("trusted_reviewers", []) or []
+    if not isinstance(gr_reviewers_raw, list) or not all(
+        isinstance(x, str) for x in gr_reviewers_raw
+    ):
+        raise ValueError("graph.trusted_reviewers must be a list of strings")
+    gr_seen: set[str] = set()
+    gr_reviewers: list[str] = []
+    for login in gr_reviewers_raw:
+        stripped = login.strip()
+        key = stripped.lower()
+        if not stripped or key in gr_seen:
+            continue
+        gr_seen.add(key)
+        gr_reviewers.append(stripped)
+    _gr_default_assocs = ["OWNER", "MEMBER", "COLLABORATOR"]
+    gr_assocs_raw = gr_raw.get("trusted_associations", _gr_default_assocs)
+    if not isinstance(gr_assocs_raw, list) or not all(
+        isinstance(x, str) for x in gr_assocs_raw
+    ):
+        raise ValueError("graph.trusted_associations must be a list of strings")
+    gr_assoc_seen: set[str] = set()
+    gr_assocs: list[str] = []
+    for a in gr_assocs_raw:
+        up = a.strip().upper()
+        if not up or up in gr_assoc_seen:
+            continue
+        gr_assoc_seen.add(up)
+        gr_assocs.append(up)
+    gr_labels_raw = gr_raw.get("issue_labels", ["releasy-graph"])
+    if not isinstance(gr_labels_raw, list) or not all(
+        isinstance(x, str) for x in gr_labels_raw
+    ):
+        raise ValueError("graph.issue_labels must be a list of strings")
+    graph = GraphConfig(
+        command=gr_raw.get("command", "claude"),
+        prompt_file=gr_raw.get("prompt_file", "prompts/adjust_graph.md"),
+        timeout_seconds=int(gr_raw.get("timeout_seconds", 7200)),
+        trusted_associations=gr_assocs,
+        trusted_reviewers=gr_reviewers,
+        issue_labels=[s.strip() for s in gr_labels_raw if s.strip()],
+        post_comment=bool(gr_raw.get("post_comment", True)),
+        apply_exclusions=bool(gr_raw.get("apply_exclusions", True)),
+        extra_args=gr_raw.get("extra_args", []) or [],
+    )
+
     raw_work_dir = raw.get("work_dir")
     work_dir = Path(raw_work_dir).resolve() if raw_work_dir else None
 
@@ -1261,6 +1333,7 @@ def load_config(config_path: Path | None = None) -> Config:
         ai_changelog=ai_changelog,
         review_response=review_response,
         analyze_fails=analyze_fails,
+        graph=graph,
         config_path=config_path,
         work_dir=work_dir,
         log_file=log_file,
@@ -1626,7 +1699,7 @@ def resolve_deps_file_path(
       absolute).
     * Otherwise fall back to the convention default
       ``<session-stem>.deps.yaml`` next to the session file. This makes
-      ``releasy discover-deps`` work zero-config: just run it and a
+      ``releasy graph discover`` work zero-config: just run it and a
       deps file appears alongside the session for the loader to pick
       up on the next ``releasy run``.
 
@@ -1855,12 +1928,12 @@ def load_session(
     elif deps_file_value:
         # Explicit override pointed at a missing file — surface that.
         # When ``deps_file`` is unset and the convention default doesn't
-        # exist yet, stay silent: the user just hasn't run discover-deps
+        # exist yet, stay silent: the user just hasn't run graph discover
         # yet, that's the normal "first run" state.
         overlay_warnings.append(
             f"pr_sources.deps_file={deps_file_value!r} → {overlay_path} "
             "does not exist — no overlay loaded (run "
-            "`releasy discover-deps` to create it)"
+            "`releasy graph discover` to create it)"
         )
 
     def _str_list(key: str) -> list[str]:

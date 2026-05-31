@@ -203,7 +203,7 @@ features:
 #
 #   # Optional: override the deps overlay path. The default is
 #   # `<session-stem>.deps.yaml` (e.g. `antalya-26.3.session.deps.yaml`)
-#   # next to this session file — `releasy discover-deps` writes there
+#   # next to this session file — `releasy graph discover` writes there
 #   # by default and the loader picks it up automatically. Set this
 #   # field only if you want the deps file somewhere else. Relative
 #   # paths resolve against this session file's directory.

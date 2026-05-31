@@ -12,7 +12,8 @@ config they read, see [configuration.md](configuration.md).
 - Pipeline:
   [`run`](#releasy-run) ·
   [`refresh`](#releasy-refresh) ·
-  [`discover-deps`](#releasy-discover-deps) ·
+  [`graph discover`](#releasy-graph-discover) ·
+  [`graph update`](#releasy-graph-update) ·
   [`analyze-fails`](#releasy-analyze-fails) ·
   [`continue`](#releasy-continue) ·
   [Sequential mode](#sequential-mode) ·
@@ -85,8 +86,9 @@ One-liners:
 > or rebuilds from base (`recreate`). `continue` preserves your manual
 > fix and just pushes + opens the PR.
 
-[`discover-deps`](#releasy-discover-deps) is a read-only diagnostic
-sibling of `run` — see its section.
+[`graph discover`](#releasy-graph-discover) is a read-only diagnostic
+sibling of `run` — see its section. [`graph update`](#releasy-graph-update)
+refines that graph from issue comments (no git).
 
 The rest ([`skip`](#releasy-skip), [`abort`](#releasy-abort),
 [`status`](#releasy-status), board-sync, release, feature) never touch git
@@ -221,31 +223,40 @@ Rejected without `--stateless`.
 Exit: `1` if any PR ended up in `conflict`, any address-review run
 failed, or any analyze-fails per-PR run errored — else `0`.
 
-### `releasy discover-deps`
+### `releasy graph discover`
 
-*Auto-discover a PR dependency DAG.*
+*Auto-discover a PR dependency DAG (and optionally post it as an issue).*
 
 Trial-cherry-picks every candidate in a scratch worktree, traces conflicts
 to older un-ported PRs touching the same files, emits a YAML grouping +
 writes a deps overlay at `<session-stem>.deps.yaml` that the loader picks
 up on the next [`run`](#releasy-run). Main session is never modified.
 
+With `--open-issue` it also posts the rendered graph (Mermaid DAG +
+porting order + unit list) as a GitHub issue on origin, so the team can
+review and steer it — see [`graph update`](#releasy-graph-update). Re-running
+`--open-issue` updates that same issue rather than opening a duplicate.
+
 Declared `pr_sources.groups[]` are treated as **single super-nodes** —
 discovery never subdivides them.
 
 ```bash
-releasy discover-deps [--onto <ver>] [--work-dir <path>]
-                      [-o <path>] [--deps-file <path> | --no-write]
-                      [--no-ai] [--max-depth <N>] [--limit <N>]
-                      [--include-already-merged]
+releasy graph discover [--onto <ver>] [--work-dir <path>]
+                       [-o <path>] [--deps-file <path> | --no-write]
+                       [--no-ai] [--max-depth <N>] [--limit <N>]
+                       [--include-already-merged]
+                       [--open-issue] [--issue-title <text>]
 ```
 
 | Output | Where | Override |
 |--------|-------|----------|
-| Diagnostic report (always written) | `<config-dir>/discover-deps.<base>.yaml` | `-o <path>` |
+| Diagnostic report (always written) | `<config-dir>/graph.<base>.yaml` | `-o <path>` |
 | Deps overlay (consumed by `run`) | `<session-stem>.deps.yaml` | `pr_sources.deps_file:` in session, or `--deps-file <path>`, or `--no-write` to skip |
+| Graph issue (with `--open-issue`) | a new/updated issue on origin | `--issue-title <text>`; labels from `graph.issue_labels` |
 
-`--no-write` and `--deps-file` are mutually exclusive.
+`--no-write` and `--deps-file` are mutually exclusive. So are `-o` and
+`--open-issue` — the tracked report must stay at the default path so
+`graph update` can find it.
 
 **Hybrid AI flow per conflict:**
 
@@ -278,15 +289,56 @@ dry-run). Re-runs always rewrite cache branches.
   be lost; use `--no-write` or `--deps-file <path>` to redirect.
 - Cycles in `depends_on` (from hand-edits) are rejected at session-load.
 
-**After the target moves:** just re-run `discover-deps`. PRs that landed
+**After the target moves:** just re-run `graph discover`. PRs that landed
 upstream drop out automatically. Summary line:
 
 ```
-discover-deps · base=antalya-26.3 · 24 candidates · 8 already in target
+graph discover · base=antalya-26.3 · 24 candidates · 8 already in target
   refresh: 3 removed [auto-pr-100, ...] · 1 added [auto-pr-300]
 ```
 
 Exit: `0` regardless of conflicts found — read-only diagnostic.
+
+### `releasy graph update`
+
+*Refine the discovered graph from trusted member comments on its issue.*
+
+Feeds new trusted comments on the graph issue (from
+[`graph discover --open-issue`](#releasy-graph-discover)) to Claude with the
+prior graph and rebuilds the graph from the reply. **No git, no trial-picks.**
+
+A member can ask for any change in prose; Claude decides:
+
+- **add** a PR ("also port #2000");
+- **veto** a PR ("don't port #1010") → recorded, and (unless
+  `graph.apply_exclusions: false`) added to `exclude_prs` so
+  [`run`](#releasy-run) skips it;
+- **regroup** into an atomic unit, or **reorder** via `depends_on`.
+
+```bash
+releasy graph update [--onto <ver>] [--since <iso>] [--work-dir <path>]
+                     [--post-comment | --no-post-comment] [--dry-run]
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--onto <ver>` | Base branch; must match the `graph discover` value. | `target_branch` |
+| `--since <iso>` | Only ingest comments after this ISO-8601 timestamp. | stored last-ingest watermark |
+| `--work-dir <path>` | Locate config / report; no git ops run. | config / cwd |
+| `--post-comment` / `--no-post-comment` | Summary comment on the issue after applying. | `graph.post_comment` |
+| `--dry-run` | Show the rebuilt graph + intended session edits; write nothing. | off |
+
+**Trust gate.** Only comments whose `author_association` is in
+`graph.trusted_associations` (default `OWNER, MEMBER, COLLABORATOR`) or whose
+login is in `graph.trusted_reviewers` reach Claude. RelEasy's own comments
+are skipped.
+
+Rewrites the report, deps overlay, and session (`include_prs` /
+`exclude_prs`), and refreshes the issue. Deps here are AI/human-asserted, not
+trial-pick-verified — re-run `graph discover` for verified deps.
+
+Exit: `0` on success or clean no-op; `1` on fetch error, malformed reply,
+dependency cycle, or a session edit that couldn't be applied.
 
 ### `releasy analyze-fails`
 

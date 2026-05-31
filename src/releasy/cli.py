@@ -663,8 +663,20 @@ def status(ctx: click.Context) -> None:
     print_status(config)
 
 
-@cli.command(
-    name="discover-deps",
+@cli.group(name="graph")
+def graph_cmd() -> None:
+    """Discover the PR dependency graph and track it as a GitHub issue.
+
+    ``discover`` runs the git-based trial-pick discovery and can open an
+    issue carrying the graph (``--open-issue``). ``update`` then refines
+    that graph from trusted org-member comments on the issue — no git, no
+    trial-picks — and reconciles the session so the changes take effect on
+    the next ``run``.
+    """
+
+
+@graph_cmd.command(
+    name="discover",
     short_help="Auto-discover a PR dependency DAG from trial cherry-picks.",
 )
 @click.option(
@@ -677,7 +689,7 @@ def status(ctx: click.Context) -> None:
 )
 @click.option(
     "--output", "-o", "output_path", default=None, type=click.Path(),
-    help="Diagnostic report path. Default: <config-dir>/discover-deps.<base>.yaml.",
+    help="Diagnostic report path. Default: <config-dir>/graph.<base>.yaml.",
 )
 @click.option(
     "--deps-file", "deps_file_override", default=None, type=click.Path(),
@@ -709,8 +721,18 @@ def status(ctx: click.Context) -> None:
     "--include-already-merged", is_flag=True, default=False,
     help="Include units already in target as zero-edge nodes in the report.",
 )
+@click.option(
+    "--open-issue/--no-open-issue", default=False,
+    help="Open (or refresh) a GitHub issue on origin carrying the graph. "
+         "Re-running updates the same issue instead of opening a duplicate. "
+         "Members can then comment and `releasy graph update` ingests them.",
+)
+@click.option(
+    "--issue-title", default=None,
+    help="Title for the graph issue (default: 'Port graph for <base>').",
+)
 @click.pass_context
-def discover_deps_cmd(
+def graph_discover_cmd(
     ctx: click.Context,
     onto: str | None,
     work_dir: str | None,
@@ -721,6 +743,8 @@ def discover_deps_cmd(
     max_depth: int,
     pr_limit: int | None,
     include_already_merged: bool,
+    open_issue: bool,
+    issue_title: str | None,
 ) -> None:
     """Auto-discover a PR dependency DAG from trial cherry-picks.
 
@@ -745,6 +769,12 @@ def discover_deps_cmd(
             "--no-write and --deps-file are mutually exclusive: --no-write "
             "skips the overlay entirely, --deps-file requests one at a "
             "specific path. Pick one."
+        )
+    if open_issue and output_path:
+        raise click.UsageError(
+            "--open-issue and -o/--output are mutually exclusive: the "
+            "issue-tracking report must live at the default path so "
+            "`graph update` can find it. Drop -o (or drop --open-issue)."
         )
 
     from releasy.dag_discovery import run_discover_deps
@@ -801,6 +831,8 @@ def discover_deps_cmd(
                 max_depth=max_depth,
                 pr_limit=pr_limit,
                 include_already_merged=include_already_merged,
+                open_issue=open_issue,
+                issue_title=issue_title,
             )
         except (ValueError, RuntimeError) as e:
             raise click.ClickException(str(e))
@@ -823,7 +855,7 @@ def _print_discovery_summary(report) -> None:  # noqa: ANN001 — DiscoveryRepor
     to_pick = report.candidate_unit_count - in_target
 
     click.echo("")
-    click.echo(f"discover-deps · base={report.base_branch}")
+    click.echo(f"graph discover · base={report.base_branch}")
     click.echo(
         f"  candidates: {report.candidate_unit_count} unit(s) "
         f"covering {report.candidate_pr_count} PR(s)"
@@ -900,6 +932,71 @@ def _print_discovery_summary(report) -> None:  # noqa: ANN001 — DiscoveryRepor
             click.echo(f"    • {w}")
         if len(report.warnings) > 10:
             click.echo(f"    … and {len(report.warnings) - 10} more")
+
+
+@graph_cmd.command(
+    name="update",
+    short_help="Refine the graph from trusted member comments on its issue.",
+)
+@click.option(
+    "--onto", default=None,
+    help="Base branch (defaults to config.target_branch). Must match the "
+         "value used for `graph discover`.",
+)
+@click.option(
+    "--since", default=None,
+    help="Only ingest comments created after this ISO-8601 timestamp. "
+         "Default: the last-ingested watermark stored in the report.",
+)
+@click.option(
+    "--work-dir", default=None,
+    help="Working directory (used to locate config/report; no git ops).",
+)
+@click.option(
+    "--post-comment/--no-post-comment", default=None,
+    help="Post a summary comment on the issue after applying changes "
+         "(default: graph.post_comment in config).",
+)
+@click.option(
+    "--dry-run", is_flag=True, default=False,
+    help="Show the rebuilt graph + intended session edits; write nothing.",
+)
+@click.pass_context
+def graph_update_cmd(
+    ctx: click.Context,
+    onto: str | None,
+    since: str | None,
+    work_dir: str | None,
+    post_comment: bool | None,
+    dry_run: bool,
+) -> None:
+    """Refine the saved graph from trusted member comments on its issue.
+
+    Loads the graph written by ``graph discover --open-issue``, feeds Claude
+    the prior graph plus new comments from trusted org members (per
+    ``graph.trusted_associations``), and rebuilds the graph from Claude's
+    reply. No git, no trial-picks. Adds/vetoes are reconciled into the
+    session (``include_prs`` / ``exclude_prs``) so the next ``run`` honors
+    them; the issue body is refreshed in place.
+    """
+    from releasy.dag_discovery import run_graph_update
+
+    with _locked_config(ctx, session="required") as config:
+        if dry_run:
+            config.dry_run = True
+        resolved_post = (
+            config.graph.post_comment if post_comment is None else post_comment
+        )
+        code = run_graph_update(
+            config,
+            onto=onto,
+            since=since,
+            work_dir=Path(work_dir) if work_dir else None,
+            dry_run=dry_run,
+            post_comment=resolved_post,
+        )
+    if code != 0:
+        raise SystemExit(code)
 
 
 @cli.command(

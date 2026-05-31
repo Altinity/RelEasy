@@ -55,7 +55,15 @@ from releasy.git_ops import (
     is_operation_in_progress,
     run_git,
 )
-from releasy.github_ops import PRInfo, get_origin_repo_slug
+from releasy.github_ops import (
+    PRInfo,
+    add_issue_comment,
+    create_issue,
+    fetch_issue_comments,
+    get_origin_repo_slug,
+    parse_pr_url,
+    update_issue,
+)
 from releasy.pipeline import (
     FeatureUnit,
     _SOURCE_PR_URL_RE,
@@ -165,11 +173,24 @@ class DiscoveryReport:
     issue_number: int | None = None
     issue_url: str | None = None
     last_ingested_at: str | None = None
+    # Member-vetoed PRs [{"url","reason"}]; enforced via exclude_prs.
+    excluded: list[dict] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
+
+
+def _resolve_base_branch(config: Config, onto: str | None) -> str:
+    """Base branch shared by discover + update: ``--onto``, else target_branch."""
+    if onto:
+        return config.base_branch_name(onto)
+    if config.target_branch:
+        return config.target_branch
+    raise ValueError(
+        "cannot resolve base branch — pass --onto or set target_branch in config.yaml"
+    )
 
 
 def run_discover_deps(
@@ -183,6 +204,8 @@ def run_discover_deps(
     max_depth: int,
     pr_limit: int | None,
     include_already_merged: bool,
+    open_issue: bool = False,
+    issue_title: str | None = None,
 ) -> DiscoveryReport:
     """Run dep discovery and write the report (and optionally the sidecar).
 
@@ -190,15 +213,7 @@ def run_discover_deps(
     to print a summary; the YAML output(s) are written here as a side effect.
     """
     # --- Resolve target branch + scratch worktree ---
-    if onto:
-        base_branch = config.base_branch_name(onto)
-    elif config.target_branch:
-        base_branch = config.target_branch
-    else:
-        raise ValueError(
-            "graph discover: cannot resolve base branch — pass --onto or set "
-            "target_branch in config.yaml."
-        )
+    base_branch = _resolve_base_branch(config, onto)
 
     wd = config.resolve_work_dir(work_dir)
     repo_path, _ = ensure_work_repo(config, wd)
@@ -606,6 +621,29 @@ def run_discover_deps(
         )
 
     output_path = output_path or _default_report_path(config, base_branch)
+
+    # Open/refresh the issue before the final write so issue_number persists
+    # in the same report; carry a prior issue over to avoid duplicates.
+    if open_issue:
+        if output_path.exists():
+            try:
+                prior = load_report(output_path)
+                report.issue_number = prior.issue_number
+                report.issue_url = prior.issue_url
+                # Preserve ingest watermark + vetoes across a re-discover.
+                report.last_ingested_at = prior.last_ingested_at
+                report.excluded = list(prior.excluded)
+            except (OSError, ValueError):
+                pass
+        title = issue_title or f"Port graph for {base_branch}"
+        if open_or_update_graph_issue(config, report, title=title) is None:
+            warnings_acc.append("failed to open/update the graph issue")
+        else:
+            console.print(
+                f"  [green]✓[/green] graph issue: "
+                f"{report.issue_url or '#' + str(report.issue_number)}"
+            )
+
     _write_report(report, output_path)
 
     return report
@@ -1715,6 +1753,11 @@ def _write_report(report: DiscoveryReport, path: Path) -> None:
         if report.last_ingested_at:
             gi["last_ingested_at"] = report.last_ingested_at
         data["graph_issue"] = gi
+    if report.excluded:
+        data["excluded"] = [
+            {"url": e.get("url", ""), "reason": e.get("reason", "")}
+            for e in report.excluded
+        ]
     if report.skipped_already_in_target:
         data["skipped_already_in_target"] = list(report.skipped_already_in_target)
     if report.refresh_removed or report.refresh_added:
@@ -1777,6 +1820,10 @@ def _write_session_overlay(
     relevant_unit_ids: set[str] = set()
     for c in report.components:
         relevant_unit_ids.update(c.unit_ids)
+    # Keep multi-PR auto groups even without edges (their PRs are atomic).
+    for n in report.nodes:
+        if not n.is_user_group and len(n.pr_urls) > 1:
+            relevant_unit_ids.add(n.unit_id)
     nodes_by_id = {n.unit_id: n for n in report.nodes}
 
     overlay_groups: list[dict] = []
@@ -1876,6 +1923,11 @@ def load_report(path: Path) -> DiscoveryReport:
         issue_number=gi.get("number"),
         issue_url=gi.get("url"),
         last_ingested_at=gi.get("last_ingested_at"),
+        excluded=[
+            {"url": e.get("url", ""), "reason": e.get("reason", "")}
+            for e in (raw.get("excluded", []) or [])
+            if isinstance(e, dict) and e.get("url")
+        ],
     )
 
 
@@ -1901,6 +1953,706 @@ def recompute_components(
     }
     sort_keys = _sort_keys_from_nodes(report.nodes)
     return _components(node_map, edges, sort_keys)
+
+
+# ---------------------------------------------------------------------------
+# Graph issue: render + open/update  (`graph discover --open-issue`)
+# ---------------------------------------------------------------------------
+
+# Marker hidden in the issue body so the issue is self-identifying.
+def _issue_marker(base_branch: str) -> str:
+    return f"<!-- releasy-graph:{base_branch} -->"
+
+
+# Marker on RelEasy's own comments so graph update skips them on ingest.
+_GRAPH_BOT_MARKER = "<!-- releasy-graph-bot -->"
+
+
+def _mermaid_id(index: int) -> str:
+    """Mermaid-safe node id (unit ids may contain ``.`` / ``-`` / ``/``)."""
+    return f"n{index}"
+
+
+def _node_pr_ref(node: DAGNode) -> str:
+    """Short ``#1500`` / ``#1500,#1501`` reference for a node's PRs."""
+    nums: list[str] = []
+    for url in node.pr_urls:
+        m = _PR_NUMBER_RE.search(url)
+        if m:
+            nums.append(f"#{m.group(1)}")
+    return ",".join(nums) if nums else node.unit_id
+
+
+def render_graph_issue_body(report: DiscoveryReport) -> str:
+    """Render a DiscoveryReport as a GitHub issue body (markdown)."""
+    lines: list[str] = [_issue_marker(report.base_branch)]
+    lines.append(f"## Port dependency graph — `{report.base_branch}`")
+    lines.append("")
+    lines.append(
+        f"_Generated by `releasy graph` at {report.generated_at}._"
+    )
+    lines.append("")
+    lines.append(
+        f"**{report.candidate_unit_count} unit(s) across "
+        f"{report.candidate_pr_count} PR(s).** "
+        "An edge `A --> B` means **A depends on B** (port B first)."
+    )
+    lines.append("")
+
+    id_map = {n.unit_id: _mermaid_id(i) for i, n in enumerate(report.nodes)}
+    nodes_by_id = {n.unit_id: n for n in report.nodes}
+
+    # --- Mermaid graph ---
+    lines.append("### Dependency graph")
+    lines.append("")
+    lines.append("```mermaid")
+    lines.append("graph TD")
+    if not report.nodes:
+        lines.append("  empty[\"(no units)\"]")
+    for n in report.nodes:
+        label = f"{n.unit_id} ({_node_pr_ref(n)})".replace('"', "'")
+        lines.append(f'  {id_map[n.unit_id]}["{label}"]')
+    for n in report.nodes:
+        for dep in n.deps:
+            if dep in id_map:
+                lines.append(f"  {id_map[n.unit_id]} --> {id_map[dep]}")
+    lines.append("```")
+    lines.append("")
+
+    # --- Components (porting order) ---
+    if report.components:
+        lines.append("### Components (suggested porting order)")
+        lines.append("")
+        for c in report.components:
+            lines.append(f"**{c.component_id}** — port in this order:")
+            for i, uid in enumerate(c.unit_ids, 1):
+                node = nodes_by_id.get(uid)
+                ref = _node_pr_ref(node) if node else uid
+                title = (node.pr_titles[0] if node and node.pr_titles else "")
+                lines.append(f"{i}. `{uid}` ({ref}) {title}".rstrip())
+            if c.recommend_first:
+                lines.append(
+                    "   _Recommend first: "
+                    + ", ".join(f"`{u}`" for u in c.recommend_first)
+                    + "_"
+                )
+            lines.append("")
+
+    # --- Full unit list ---
+    lines.append("### All units")
+    lines.append("")
+    for n in report.nodes:
+        pr_links = ", ".join(
+            f"[{_pr_short(url)}]({url})" for url in n.pr_urls
+        )
+        title = n.pr_titles[0] if n.pr_titles else ""
+        bits = [f"- `{n.unit_id}` — {pr_links}"]
+        if title:
+            bits.append(f" — {title}")
+        if n.deps:
+            bits.append(
+                " · depends on: " + ", ".join(f"`{d}`" for d in n.deps)
+            )
+        bits.append(f" · _{n.discovery_method}_")
+        lines.append("".join(bits))
+    lines.append("")
+
+    # --- Excluded ---
+    if report.excluded:
+        lines.append("### Excluded (vetoed by members)")
+        lines.append("")
+        for e in report.excluded:
+            url = e.get("url", "")
+            reason = e.get("reason", "") or "(no reason given)"
+            lines.append(f"- [{_pr_short(url)}]({url}) — {reason}")
+        lines.append("")
+
+    # --- Footer ---
+    lines.append("---")
+    lines.append(
+        "Org members can **comment on this issue** to change the graph — "
+        "add or veto PRs, regroup, or set ordering — then run "
+        "`releasy graph update` to apply your feedback."
+    )
+    lines.append("")
+    lines.append(
+        "> Dependencies set by `graph update` are human/AI-asserted, not "
+        "trial-pick-verified. Re-run `releasy graph discover` for "
+        "conflict-verified dependencies."
+    )
+    return "\n".join(lines)
+
+
+def _pr_short(url: str) -> str:
+    """``owner/repo#N`` or ``#N`` short label for a PR URL (fallback: url)."""
+    m = _PR_NUMBER_RE.search(url)
+    return f"#{m.group(1)}" if m else url
+
+
+def open_or_update_graph_issue(
+    config: Config, report: DiscoveryReport, *, title: str,
+) -> tuple[int, str] | None:
+    """Create the graph issue on origin, or update its body if it exists.
+
+    Sets report.issue_number/issue_url on create. Returns (number, url) or
+    None on failure/dry-run.
+    """
+    body = render_graph_issue_body(report)
+    if report.issue_number is not None:
+        res = update_issue(config, report.issue_number, body=body)
+        if res is True:
+            return report.issue_number, (report.issue_url or "")
+        if res is False:
+            return None  # transient failure — keep the number, retry later
+        # res is None → issue was deleted; fall through to recreate.
+        report.issue_number = None
+        report.issue_url = None
+    result = create_issue(
+        config, title, body, labels=list(config.graph.issue_labels),
+    )
+    if result is None:
+        return None
+    number, url = result
+    report.issue_number = number
+    report.issue_url = url
+    return number, url
+
+
+# ---------------------------------------------------------------------------
+# `releasy graph update` — refine the graph from trusted issue comments
+# ---------------------------------------------------------------------------
+
+# A fenced ```yaml block holding the new graph spec Claude returns.
+_GRAPH_SPEC_FENCE_RE = re.compile(
+    r"```(?:ya?ml)?\s*\n(.*?)```", re.DOTALL,
+)
+
+
+def _comment_is_trusted(comment, config: Config) -> bool:  # noqa: ANN001
+    assoc = (comment.author_association or "").upper()
+    if assoc in set(config.graph.trusted_associations):
+        return True
+    login = (comment.author or "").lower()
+    return login in {r.lower() for r in config.graph.trusted_reviewers}
+
+
+def _parse_graph_spec(text: str) -> dict | None:
+    """Parse the fenced YAML graph spec from Claude's reply, or None.
+
+    Scans every fenced block and keeps the last that parses to a mapping
+    with a `units` list (skips leading example/prose fences).
+    """
+    chosen: dict | None = None
+    for block in _GRAPH_SPEC_FENCE_RE.findall(text):
+        try:
+            parsed = yaml.safe_load(block)
+        except yaml.YAMLError:
+            continue
+        if isinstance(parsed, dict) and isinstance(parsed.get("units"), list):
+            chosen = parsed  # keep scanning — last valid block wins
+    return chosen
+
+
+def _render_comments_block(comments: list) -> str:  # noqa: ANN001
+    out: list[str] = []
+    for c in comments:
+        assoc = c.author_association or "?"
+        out.append(
+            f"### Comment by @{c.author or 'unknown'} ({assoc}) "
+            f"at {c.created_at}\n{c.body.strip()}"
+        )
+    return "\n\n".join(out) or "_(none)_"
+
+
+def _render_current_graph_block(report: DiscoveryReport) -> str:
+    out: list[str] = []
+    for n in report.nodes:
+        deps = ", ".join(n.deps) if n.deps else "(none)"
+        prs = ", ".join(n.pr_urls)
+        title = n.pr_titles[0] if n.pr_titles else ""
+        out.append(
+            f"- id: {n.unit_id}\n"
+            f"  prs: [{prs}]\n"
+            f"  depends_on: [{deps}]\n"
+            f"  title: {title}"
+        )
+    if report.excluded:
+        out.append("")
+        out.append("Currently excluded:")
+        for e in report.excluded:
+            out.append(f"- {e.get('url','')} — {e.get('reason','')}")
+    return "\n".join(out) or "_(empty graph)_"
+
+
+def _ask_claude_for_new_graph(
+    config: Config,
+    report: DiscoveryReport,
+    comments: list,  # noqa: ANN001
+    warnings_acc: list[str],
+) -> dict | None:
+    """Render the adjust-graph prompt, run Claude (text-only), parse the
+    spec. Returns the spec mapping or None on any failure."""
+    prompt_path = config.config_path.parent / config.graph.prompt_file
+    if not prompt_path.exists():
+        prompt_path = Path(__file__).parent / "prompts" / "adjust_graph.md"
+    if not prompt_path.exists():
+        warnings_acc.append(
+            "adjust_graph.md prompt template not found; cannot run graph update"
+        )
+        return None
+
+    template = prompt_path.read_text(encoding="utf-8")
+    candidate_pr_list = "\n".join(
+        f"- {url}" for n in report.nodes for url in n.pr_urls
+    ) or "_(none)_"
+    placeholders = {
+        "base_branch": report.base_branch,
+        "current_graph_block": _render_current_graph_block(report),
+        "candidate_pr_list": candidate_pr_list,
+        "comments_block": _render_comments_block(comments),
+    }
+
+    def _replace(match: re.Match[str]) -> str:
+        return placeholders.get(match.group(1), match.group(0))
+
+    rendered = re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", _replace, template)
+
+    res = synthesize_text(
+        config, rendered,
+        label="graph-update",
+        timeout_seconds=config.graph.timeout_seconds,
+        command=config.graph.command,
+    )
+    if not res.success or not res.text:
+        warnings_acc.append(
+            f"Claude graph-update call failed: {res.error or 'no output'}"
+        )
+        return None
+    spec = _parse_graph_spec(res.text)
+    if spec is None:
+        warnings_acc.append(
+            "Claude reply did not contain a parseable YAML graph spec; "
+            "changing nothing"
+        )
+    return spec
+
+
+def _build_report_from_spec(
+    prior: DiscoveryReport,
+    spec: dict,
+    warnings_acc: list[str],
+) -> DiscoveryReport | None:
+    """Build a new DiscoveryReport from Claude's spec + the prior graph.
+
+    Validates URLs/deps, rejects cycles (returns None), recomputes
+    components. No git, no trial-picks.
+    """
+    title_map: dict[str, str] = {}
+    merged_map: dict[str, str | None] = {}
+    # Keep is_user_group for prior user-declared groups (overlay skips them).
+    prior_user_groups = {n.unit_id for n in prior.nodes if n.is_user_group}
+    for n in prior.nodes:
+        for url, t in zip(n.pr_urls, n.pr_titles or []):
+            title_map[url] = t
+        for url in n.pr_urls:
+            merged_map[url] = n.earliest_merged_at
+    prior_urls = set(title_map)
+
+    units = spec.get("units", [])
+    nodes: list[DAGNode] = []
+    seen_ids: set[str] = set()
+    declared_urls: set[str] = set()
+    for u in units:
+        if not isinstance(u, dict) or not u.get("id"):
+            warnings_acc.append(f"graph update: skipping malformed unit {u!r}")
+            continue
+        uid = str(u["id"]).strip()
+        if uid in seen_ids:
+            warnings_acc.append(f"graph update: duplicate unit id {uid!r}; skipping")
+            continue
+        prs: list[str] = []
+        for raw_url in u.get("prs", []) or []:
+            url = str(raw_url).strip()
+            if parse_pr_url(url) is None:
+                warnings_acc.append(
+                    f"graph update: unit {uid!r} has unparseable PR URL "
+                    f"{url!r}; dropping it"
+                )
+                continue
+            if url in declared_urls:
+                warnings_acc.append(
+                    f"graph update: PR {url} assigned to more than one unit; "
+                    f"keeping the first"
+                )
+                continue
+            if url not in prior_urls:
+                warnings_acc.append(
+                    f"graph update: PR {url} is new (not in the prior graph) "
+                    f"— it will be added to the session and ported"
+                )
+            prs.append(url)
+            declared_urls.add(url)
+        if not prs:
+            warnings_acc.append(f"graph update: unit {uid!r} has no valid PRs; skipping")
+            continue
+        deps = [str(d).strip() for d in (u.get("depends_on", []) or [])]
+        nodes.append(DAGNode(
+            unit_id=uid,
+            is_user_group=uid in prior_user_groups,
+            pr_urls=prs,
+            pr_titles=[title_map.get(url, "") for url in prs],
+            earliest_merged_at=min(
+                (merged_map[url] for url in prs if merged_map.get(url)),
+                default=None,
+            ),
+            deps=deps,
+            discovery_method="graph-update",
+            cached=False,
+        ))
+        seen_ids.add(uid)
+
+    if not nodes:
+        warnings_acc.append("graph update: spec produced no units; changing nothing")
+        return None
+
+    # Drop dangling dep references, then reject cycles.
+    valid_ids = {n.unit_id for n in nodes}
+    for n in nodes:
+        kept = [d for d in n.deps if d in valid_ids]
+        for d in n.deps:
+            if d not in valid_ids:
+                warnings_acc.append(
+                    f"graph update: unit {n.unit_id!r} depends on unknown "
+                    f"{d!r}; dropping that edge"
+                )
+        n.deps = kept
+    if _has_cycle(nodes):
+        warnings_acc.append(
+            "graph update: the requested dependencies form a cycle; "
+            "refusing to apply (no changes made)"
+        )
+        return None
+
+    # Exclusions = prior vetoes + this spec's vetoes − any PR now in a unit
+    # (a veto persists unless the PR is re-added, which un-vetoes it).
+    excluded_map: dict[str, str] = {
+        e["url"]: e.get("reason", "")
+        for e in prior.excluded
+        if e.get("url")
+    }
+    raw_exclude = spec.get("exclude") or []
+    if not isinstance(raw_exclude, list):
+        warnings_acc.append(
+            f"graph update: `exclude` is not a list ({type(raw_exclude).__name__}); "
+            "ignoring it (prior vetoes preserved)"
+        )
+        raw_exclude = []
+    for e in raw_exclude:
+        if not isinstance(e, dict):
+            warnings_acc.append(f"graph update: exclude entry is not a mapping ({e!r}); skipping")
+            continue
+        url = str(e.get("url", "")).strip()
+        if not url or parse_pr_url(url) is None:
+            warnings_acc.append(f"graph update: exclude entry has bad URL {e!r}; skipping")
+            continue
+        excluded_map[url] = str(e.get("reason", "")).strip()
+    for url in declared_urls:  # a live unit PR cannot also be excluded
+        excluded_map.pop(url, None)
+    excluded = [{"url": u, "reason": r} for u, r in excluded_map.items()]
+
+    new = DiscoveryReport(
+        base_branch=prior.base_branch,
+        target_sha=prior.target_sha,
+        generated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        candidate_unit_count=len(nodes),
+        candidate_pr_count=sum(len(n.pr_urls) for n in nodes),
+        skipped_already_in_target=list(prior.skipped_already_in_target),
+        nodes=sorted(nodes, key=_node_sort_key),
+        components=[],
+        singletons=[],
+        warnings=[],
+        issue_number=prior.issue_number,
+        issue_url=prior.issue_url,
+        last_ingested_at=prior.last_ingested_at,
+        excluded=excluded,
+    )
+    new.components, new.singletons = recompute_components(new)
+    return new
+
+
+def _has_cycle(nodes: list[DAGNode]) -> bool:
+    """DFS cycle check over the directed dep graph (edge unit -> dep)."""
+    succ = {n.unit_id: list(n.deps) for n in nodes}
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {nid: WHITE for nid in succ}
+
+    def visit(start: str) -> bool:
+        stack = [(start, iter(succ.get(start, [])))]
+        color[start] = GRAY
+        while stack:
+            node, it = stack[-1]
+            advanced = False
+            for nb in it:
+                if nb not in color:
+                    continue
+                if color[nb] == GRAY:
+                    return True
+                if color[nb] == WHITE:
+                    color[nb] = GRAY
+                    stack.append((nb, iter(succ.get(nb, []))))
+                    advanced = True
+                    break
+            if not advanced:
+                color[node] = BLACK
+                stack.pop()
+        return False
+
+    for nid in succ:
+        if color[nid] == WHITE and visit(nid):
+            return True
+    return False
+
+
+def _reconcile_session_user_groups(
+    config: Config, report: DiscoveryReport, warnings_acc: list[str],
+) -> int:
+    """Write member edits to user-declared groups back into session.groups[]
+    (the overlay skips user groups). Returns the count changed; saves if any."""
+    if config.session is None:
+        return 0
+    groups_by_id = {g.id: g for g in config.session.pr_sources.groups}
+    changed = 0
+    for n in report.nodes:
+        if not n.is_user_group:
+            continue
+        g = groups_by_id.get(n.unit_id)
+        if g is None:
+            warnings_acc.append(
+                f"graph update: {n.unit_id!r} is flagged a user group but no "
+                "matching session group exists; its edits were not applied"
+            )
+            continue
+        new_prs = list(n.pr_urls)
+        new_deps = list(n.deps)
+        if g.prs != new_prs or g.depends_on != new_deps:
+            g.prs = new_prs
+            g.depends_on = new_deps
+            changed += 1
+    if changed:
+        from releasy.config import save_session
+        save_session(config.session)
+    return changed
+
+
+def run_graph_update(
+    config: Config,
+    *,
+    onto: str | None,
+    since: str | None,
+    work_dir: Path | None,
+    dry_run: bool,
+    post_comment: bool,
+) -> int:
+    """Refine the saved graph from trusted member comments on its issue.
+
+    No git: rebuilds the graph from Claude's reply, reconciles the session,
+    rewrites report + overlay, refreshes the issue. Returns an exit code.
+    """
+    from releasy.config import resolve_deps_file_path
+    from releasy import pr_membership
+
+    try:
+        base_branch = _resolve_base_branch(config, onto)
+    except ValueError as e:
+        console.print(f"[red]graph update: {e}[/red]")
+        return 1
+    report_path = _default_report_path(config, base_branch)
+    if not report_path.exists():
+        console.print(
+            f"[red]No graph report at {report_path}.[/red] Run "
+            "`releasy graph discover --open-issue` first."
+        )
+        return 1
+    report = load_report(report_path)
+    if report.issue_number is None:
+        console.print(
+            "[red]The saved graph has no issue.[/red] Run "
+            "`releasy graph discover --open-issue` to open one first."
+        )
+        return 1
+
+    res = fetch_issue_comments(config, report.issue_number)
+    if res.error:
+        console.print(f"[red]graph update: {res.error}[/red]")
+        return 1
+
+    cutoff = since if since is not None else report.last_ingested_at
+    ingest: list = []
+    for c in res.comments:
+        if _GRAPH_BOT_MARKER in (c.body or ""):
+            continue  # never ingest our own summary comments
+        if cutoff and c.created_at and c.created_at <= cutoff:
+            continue
+        if not _comment_is_trusted(c, config):
+            continue
+        ingest.append(c)
+
+    if not ingest:
+        console.print(
+            "[green]graph update:[/green] no new trusted comments on issue "
+            f"#{report.issue_number} — nothing to do."
+        )
+        return 0
+
+    console.print(
+        f"  [dim]Feeding {len(ingest)} trusted comment(s) to Claude...[/dim]"
+    )
+    warnings_acc: list[str] = []
+    spec = _ask_claude_for_new_graph(config, report, ingest, warnings_acc)
+    for w in warnings_acc:
+        console.print(f"  [yellow]warning:[/yellow] {w}")
+    if spec is None:
+        return 1
+
+    build_warnings: list[str] = []
+    new_report = _build_report_from_spec(report, spec, build_warnings)
+    for w in build_warnings:
+        console.print(f"  [yellow]warning:[/yellow] {w}")
+    if new_report is None:
+        return 1
+    new_report.warnings = build_warnings
+
+    # Stamp the ingest watermark to the newest comment we folded in.
+    new_report.last_ingested_at = max(c.created_at for c in ingest)
+
+    prior_urls = {url for n in report.nodes for url in n.pr_urls}
+    prior_excluded_urls = {e["url"] for e in report.excluded if e.get("url")}
+    new_urls = {url for n in new_report.nodes for url in n.pr_urls}
+    # User-group PRs go to the session group (below), not include_prs.
+    user_group_urls = {
+        url for n in new_report.nodes if n.is_user_group for url in n.pr_urls
+    }
+    added = sorted(new_urls - prior_urls - user_group_urls)
+    excluded_urls = [e["url"] for e in new_report.excluded]
+    # Only enforce vetoes new this run (prior ones already in exclude_prs).
+    newly_excluded = [u for u in excluded_urls if u not in prior_excluded_urls]
+
+    _print_graph_update_summary(new_report, added, excluded_urls)
+
+    if dry_run:
+        console.print("[dim](--dry-run: no report / overlay / session / issue writes)[/dim]")
+        return 0
+
+    # --- Reconcile the session so `run` honors the changes ---
+    # Honor add_pr/remove_pr False (unreachable PR / token / locked group):
+    # collect failures so we don't claim a change the session never got.
+    failures: list[str] = []
+    for url in added:
+        if not pr_membership.add_pr(config, url):
+            failures.append(f"add {_pr_short(url)}")
+    grp_changed = _reconcile_session_user_groups(
+        config, new_report, new_report.warnings,
+    )
+    if grp_changed:
+        console.print(
+            f"  [green]✓[/green] applied edits to {grp_changed} "
+            "user-declared group(s) in the session"
+        )
+    if config.graph.apply_exclusions:
+        for url in newly_excluded:
+            if not pr_membership.remove_pr(config, url):
+                failures.append(f"veto {_pr_short(url)}")
+    elif newly_excluded:
+        console.print(
+            "[dim]  (graph.apply_exclusions=false — vetoes recorded in the "
+            "graph only, not added to exclude_prs)[/dim]"
+        )
+
+    # --- Persist the new graph (report + overlay) ---
+    _write_report(new_report, report_path)
+    if config.session and config.session.session_path:
+        overlay_path = resolve_deps_file_path(
+            config.session.session_path,
+            config.session.pr_sources.deps_file,
+        )
+        try:
+            _write_session_overlay(new_report, overlay_path)
+        except OSError as e:
+            console.print(f"  [yellow]warning:[/yellow] failed to write overlay: {e}")
+        else:
+            console.print(f"  [green]✓[/green] wrote deps overlay → [cyan]{overlay_path}[/cyan]")
+
+    # --- Refresh the issue + optional summary comment ---
+    if open_or_update_graph_issue(
+        config, new_report, title=f"Port graph for {base_branch}",
+    ) is None:
+        console.print("  [yellow]warning:[/yellow] failed to update the graph issue")
+    else:
+        console.print(f"  [green]✓[/green] updated issue #{new_report.issue_number}")
+
+    if post_comment:
+        summary = _render_update_comment(
+            new_report, added, newly_excluded, len(ingest), failures,
+        )
+        add_issue_comment(config, new_report.issue_number, summary)
+
+    if failures:
+        console.print(
+            f"  [yellow]warning:[/yellow] {len(failures)} session edit(s) did "
+            f"not apply: {', '.join(failures)}. The graph/issue reflect the "
+            "requested change but the session was not fully updated — resolve "
+            "manually (e.g. `releasy pr add/remove`)."
+        )
+        return 1
+    return 0
+
+
+def _print_graph_update_summary(
+    report: DiscoveryReport, added: list[str], excluded: list[str],
+) -> None:
+    console.print("")
+    console.print(f"graph update · base={report.base_branch}")
+    console.print(
+        f"  new graph: {report.candidate_unit_count} unit(s), "
+        f"{report.candidate_pr_count} PR(s), {len(report.components)} component(s)"
+    )
+    if added:
+        console.print(f"  added PRs: {', '.join(_pr_short(u) for u in added)}")
+    if excluded:
+        console.print(f"  vetoed PRs: {', '.join(_pr_short(u) for u in excluded)}")
+
+
+def _render_update_comment(
+    report: DiscoveryReport,
+    added: list[str],
+    newly_excluded: list[str],
+    n_comments: int,
+    failures: list[str] | None = None,
+) -> str:
+    failures = failures or []
+    lines = [
+        _GRAPH_BOT_MARKER,
+        f"🤖 **`releasy graph update`** applied {n_comments} member "
+        "comment(s) and rebuilt the graph.",
+        "",
+        f"- units: {report.candidate_unit_count} · PRs: "
+        f"{report.candidate_pr_count} · components: {len(report.components)}",
+    ]
+    if added:
+        lines.append(f"- added: {', '.join(_pr_short(u) for u in added)}")
+    if newly_excluded:
+        lines.append(
+            f"- vetoed (added to `exclude_prs`): "
+            f"{', '.join(_pr_short(u) for u in newly_excluded)}"
+        )
+    if failures:
+        lines.append(
+            f"- ⚠️ **not applied to the session** ({', '.join(failures)}) — "
+            "needs manual follow-up; the graph above shows the requested state."
+        )
+    lines.append("")
+    lines.append("The graph above has been updated. Comment again to refine further.")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

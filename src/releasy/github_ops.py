@@ -268,6 +268,158 @@ def close_pull_request(
         return False
 
 
+# ---------------------------------------------------------------------------
+# Issue I/O (used by `releasy graph discover --open-issue` / `graph update`)
+# ---------------------------------------------------------------------------
+
+
+def create_issue(
+    config: Config,
+    title: str,
+    body: str,
+    *,
+    labels: list[str] | None = None,
+) -> tuple[int, str] | None:
+    """Create an issue on origin; return (number, html_url) or None.
+
+    Only writes to the configured origin. Labels must already exist on the
+    repo (call ensure_label first). Returns None on failure / dry-run.
+    """
+    if config.dry_run:
+        log.info("[dry-run] would open issue on origin: %r", title)
+        return None
+
+    token = get_github_token()
+    if not token:
+        log.warning("RELEASY_GITHUB_TOKEN not set — cannot create issue")
+        return None
+
+    try:
+        slug = require_origin_repo_slug(config)
+    except ValueError as exc:
+        log.warning("%s", exc)
+        return None
+    _assert_writes_target_origin(config, slug, "create issue")
+
+    try:
+        from github import Github, GithubException
+
+        gh = Github(token)
+        repo = gh.get_repo(slug)
+        issue = repo.create_issue(title=title, body=body)
+        if labels:
+            try:
+                issue.add_to_labels(*labels)
+            except GithubException as exc:
+                log.warning(
+                    "Created issue %s but failed to add labels %s: %s",
+                    issue.html_url, labels, exc,
+                )
+        return issue.number, issue.html_url
+    except GithubException as exc:
+        log.warning("Failed to create issue on %s: %s", slug, exc)
+        return None
+    except Exception as exc:
+        log.warning("Unexpected error creating issue on %s: %s", slug, exc)
+        return None
+
+
+def update_issue(
+    config: Config,
+    issue_number: int,
+    *,
+    title: str | None = None,
+    body: str | None = None,
+) -> bool | None:
+    """Edit an issue's title/body on origin. None args are left alone.
+
+    Returns True on success, False on a transient/other failure, and None
+    when the issue no longer exists (HTTP 404) so the caller can recreate it.
+    """
+    if config.dry_run:
+        log.info("[dry-run] would update issue #%d", issue_number)
+        return True
+
+    token = get_github_token()
+    if not token:
+        log.warning("RELEASY_GITHUB_TOKEN not set — cannot update issue")
+        return False
+
+    try:
+        slug = require_origin_repo_slug(config)
+    except ValueError as exc:
+        log.warning("%s", exc)
+        return False
+    _assert_writes_target_origin(config, slug, f"update issue #{issue_number}")
+
+    kwargs: dict = {}
+    if title is not None:
+        kwargs["title"] = title
+    if body is not None:
+        kwargs["body"] = body
+    if not kwargs:
+        return True
+
+    try:
+        from github import Github, GithubException
+
+        gh = Github(token)
+        repo = gh.get_repo(slug)
+        issue = repo.get_issue(issue_number)
+        issue.edit(**kwargs)
+        return True
+    except GithubException as exc:
+        if getattr(exc, "status", None) == 404:
+            log.warning("Issue %s#%d not found (404)", slug, issue_number)
+            return None
+        log.warning("Failed to update issue %s#%d: %s", slug, issue_number, exc)
+        return False
+    except Exception as exc:
+        log.warning(
+            "Unexpected error updating issue %s#%d: %s", slug, issue_number, exc,
+        )
+        return False
+
+
+def add_issue_comment(config: Config, issue_number: int, body: str) -> bool:
+    """Post a comment on an origin issue. Returns True on success."""
+    if config.dry_run:
+        log.info("[dry-run] would comment on issue #%d", issue_number)
+        return True
+
+    token = get_github_token()
+    if not token:
+        log.warning("RELEASY_GITHUB_TOKEN not set — cannot comment on issue")
+        return False
+
+    try:
+        slug = require_origin_repo_slug(config)
+    except ValueError as exc:
+        log.warning("%s", exc)
+        return False
+    _assert_writes_target_origin(config, slug, f"comment on issue #{issue_number}")
+
+    try:
+        from github import Github, GithubException
+
+        gh = Github(token)
+        repo = gh.get_repo(slug)
+        issue = repo.get_issue(issue_number)
+        issue.create_comment(body)
+        return True
+    except GithubException as exc:
+        log.warning(
+            "Failed to comment on issue %s#%d: %s", slug, issue_number, exc,
+        )
+        return False
+    except Exception as exc:
+        log.warning(
+            "Unexpected error commenting on issue %s#%d: %s",
+            slug, issue_number, exc,
+        )
+        return False
+
+
 def create_draft_release(
     config: Config,
     *,
@@ -903,6 +1055,63 @@ def fetch_pr_comments(
             comments=[],
             pr_author="",
             error=f"Unexpected error fetching {slug}#{number} comments: {exc}",
+        )
+
+
+@dataclass
+class IssueCommentsResult:
+    """Result of :func:`fetch_issue_comments`. ``error`` set on failure."""
+    comments: list[PRComment]
+    error: str | None = None
+
+
+def fetch_issue_comments(
+    config: Config, issue_number: int,
+) -> IssueCommentsResult:
+    """Fetch an origin issue's comments, sorted by created_at. Read-only;
+    no trust/time filtering (the caller does that). Reuses PRComment."""
+    token = get_github_token()
+    if not token:
+        return IssueCommentsResult(
+            comments=[],
+            error="RELEASY_GITHUB_TOKEN not set — cannot fetch issue comments",
+        )
+
+    try:
+        slug = require_origin_repo_slug(config)
+    except ValueError as exc:
+        return IssueCommentsResult(comments=[], error=str(exc))
+
+    try:
+        from github import Github, GithubException
+
+        gh = Github(token)
+        repo = gh.get_repo(slug)
+        issue = repo.get_issue(issue_number)
+
+        out: list[PRComment] = []
+        for ic in issue.get_comments():
+            out.append(PRComment(
+                id=ic.id,
+                kind="issue",
+                author=_comment_author_login(ic),
+                author_association=_author_association(ic),
+                created_at=_safe_iso(ic.created_at),
+                updated_at=_safe_iso(ic.updated_at),
+                url=ic.html_url,
+                body=ic.body or "",
+            ))
+        out.sort(key=lambda c: (c.created_at, c.id))
+        return IssueCommentsResult(comments=out)
+    except GithubException as exc:
+        return IssueCommentsResult(
+            comments=[],
+            error=f"GitHub API error fetching {slug}#{issue_number} comments: {exc}",
+        )
+    except Exception as exc:
+        return IssueCommentsResult(
+            comments=[],
+            error=f"Unexpected error fetching {slug}#{issue_number} comments: {exc}",
         )
 
 
