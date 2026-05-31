@@ -5076,10 +5076,6 @@ def _open_pr_for_resolved(
         if parsed:
             owner, repo, n = parsed
             refs.append(pr_ref_label(f"{owner}/{repo}", n, origin_slug))
-    # Fallback if old state lacks pr_urls but does have pr_numbers (assume origin).
-    if not refs:
-        pr_numbers = fs.pr_numbers or ([fs.pr_number] if fs.pr_number else [])
-        refs = [f"#{n}" for n in pr_numbers if n is not None]
     if refs:
         body_parts.append(f"Cherry-picked from {', '.join(refs)}.")
     if fs.pr_body:

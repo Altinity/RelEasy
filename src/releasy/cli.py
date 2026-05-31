@@ -12,6 +12,7 @@ import click
 from releasy import __version__
 from releasy.config import (
     Config,
+    default_session_stem,
     state_file_path,
     state_root,
     validate_project_name,
@@ -182,7 +183,8 @@ _CLI_CONTEXT_SETTINGS = {"max_content_width": 120}
     default=None,
     help="Path to the session file (features + pr_sources). Overrides "
          "the session_file: key in config.yaml. Defaults to "
-         "<config-dir>/<name>.session.yaml.",
+         "<config-dir>/<target_branch>.session.yaml (or <name> when "
+         "target_branch is unset).",
 )
 @click.pass_context
 def cli(
@@ -2039,10 +2041,12 @@ def new_cmd(
             "packaging bug — please report it."
         )
 
-    # Session file goes next to config.yaml as ``<name>.session.yaml`` —
-    # keep it co-located so users editing config see the session file
-    # right there.
-    session_path = out_path.parent / f"{name_opt}.session.yaml"
+    # Session file goes next to config.yaml, named after the target branch
+    # (the most distinguishing identifier when one dir holds several
+    # efforts) and falling back to the project name. Keep it co-located so
+    # users editing config see the session file right there.
+    session_stem = default_session_stem(name_opt, target_branch)
+    session_path = out_path.parent / f"{session_stem}.session.yaml"
     if session_path.exists():
         raise click.ClickException(
             f"{session_path} already exists. Remove it or pass --out to "

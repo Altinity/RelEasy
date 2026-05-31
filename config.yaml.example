@@ -5,23 +5,27 @@
 #   1. config.yaml            — this file. Origin, target branch, AI
 #                               settings, notifications, pr_policy. Rarely
 #                               edited once a project is set up.
-#   2. <name>.session.yaml    — per-effort source data: the `features:`
+#   2. <target_branch>.session.yaml
+#                             — per-effort source data: the `features:`
 #                               list and `pr_sources:` selectors. Edit this
 #                               between runs as your target work changes.
-#                               Lives next to config.yaml by default; point
+#                               Named after the target branch (falls back to
+#                               <name> when target_branch is unset) and lives
+#                               next to config.yaml by default; point
 #                               elsewhere with `session_file:` below or
 #                               `--session-file` on the CLI.
 #   3. <name>.state.yaml      — runtime progress. Managed by RelEasy; lives
 #                               in ${XDG_STATE_HOME:-~/.local/state}/releasy/.
 #
-# `releasy --stateless` (e.g. `address-review --stateless`) loads THIS file
-# (overridable with `--config`) but skips the session and state files.
+# `--stateless` (e.g. `releasy refresh --address-review --stateless`) loads
+# THIS file (overridable with `--config`) but skips the session and state files.
 
 # ── Project identity (required) ─────────────────────────────────────
 # Unique slug for this project on this machine. Doubles as the filename
-# of the per-project state file and (by default) the session file:
+# of the per-project state file (and the session file when target_branch
+# is unset):
 #   state:   ${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml
-#   session: <dir-of-this-config>/<name>.session.yaml
+#   session: <dir-of-this-config>/<target_branch>.session.yaml
 # Allowed characters: A-Z a-z 0-9 . _ - (1-64 chars). Pick something
 # stable like the target branch you are porting onto. Renaming this
 # orphans the old state file — use `releasy adopt` to rebind state to a
@@ -29,7 +33,9 @@
 name: antalya-26.3
 
 # ── Session file (optional override) ────────────────────────────────
-# By default the session file lives at `<config-dir>/<name>.session.yaml`.
+# By default the session file lives at
+# `<config-dir>/<target_branch>.session.yaml` (falling back to
+# `<name>.session.yaml` when target_branch is unset).
 # Set this to point somewhere else (absolute or relative to this file's
 # directory). The CLI `--session-file <path>` always takes precedence.
 # session_file: sessions/antalya-26.3.session.yaml
@@ -126,6 +132,16 @@ name: antalya-26.3
 origin:
   remote: https://github.com/Altinity/ClickHouse.git
   remote_name: origin
+
+# ── Optional upstream remote (AI prerequisite detection only) ───────
+# Fetch-only remote the AI resolver may `git log -S <symbol>` against to
+# identify which upstream PR introduced a missing foundation. RelEasy
+# NEVER pushes here and never reads code from it for resolution — only
+# commit references. Auto-added to the local clone on demand.
+# upstream:
+#   remote: https://github.com/ClickHouse/ClickHouse.git
+#   remote_name: upstream
+#   branch: master
 
 # ── Project & target branch ────────────────────────────────────────
 # Short project identifier — used to name port branches as
@@ -228,7 +244,7 @@ target_branch: antalya-26.3
 
 # ── PR sources and features ─────────────────────────────────────────
 # These live in the session file, not here. Look for
-# `<name>.session.yaml` next to this config (or wherever `session_file:`
+# `<target_branch>.session.yaml` next to this config (or wherever `session_file:`
 # above points). The session file is where you edit:
 #
 #   * `features:` — the static list of feature branches to rebase.
@@ -271,6 +287,11 @@ notifications:
 #   # prompt_file; the difference is the in-progress operation
 #   # (merge vs cherry-pick) and how to conclude it.
 #   merge_prompt_file: prompts/resolve_merge_conflict.md
+#   # Record the conflict and its resolution as TWO commits (raw
+#   # conflict state, then the fix) for clearer history, using a
+#   # dedicated prompt. Set false for a single squashed resolution.
+#   split_conflict_commit: true
+#   split_prompt_file: prompts/resolve_conflict_split.md
 #   # Hard cap (passed into the prompt) on how many build attempts
 #   # Claude is allowed to make per conflict before giving up.
 #   max_iterations: 5
@@ -290,6 +311,13 @@ notifications:
 #   # `max_iterations`.
 #   api_retries: 3
 #   api_retry_backoff_seconds: 15
+#   # When a conflict is identified as a MISSING PREREQUISITE (an
+#   # upstream PR the target lacks), optionally pull that prerequisite
+#   # PR in automatically before retrying. Accepts a bool (sugar) or
+#   # the mapping below. max_prereq_depth caps the recursive dive.
+#   auto_add_prerequisite_prs:
+#     enabled: false
+#     max_prereq_depth: 7
 #   # Post-resolve verifier: a read-only second AI pass auditing the
 #   # resolution. Findings → `verify_label` + PR comment. Never rolls
 #   # back. Roughly doubles AI cost on conflicted PRs.

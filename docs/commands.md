@@ -17,7 +17,11 @@ config they read, see [configuration.md](configuration.md).
   [`continue`](#releasy-continue) ·
   [Sequential mode](#sequential-mode) ·
   [`skip`](#releasy-skip) ·
-  [`abort`](#releasy-abort)
+  [`abort`](#releasy-abort) ·
+  [`clear`](#releasy-clear)
+- One-off porting:
+  [`cherry-pick`](#releasy-cherry-pick) ·
+  [`rebase`](#releasy-rebase)
 - Inspection: [`status`](#releasy-status)
 - Multi-project:
   [`new`](#releasy-new) ·
@@ -28,7 +32,9 @@ config they read, see [configuration.md](configuration.md).
   [`setup-project`](#releasy-setup-project) ·
   [`project push`](#releasy-project-push) ·
   [`project pull`](#releasy-project-pull)
-- Release: [`release`](#releasy-release)
+- Release:
+  [`release`](#releasy-release) ·
+  [`draft-release`](#releasy-draft-release)
 - Features: [`feature *`](#feature-management)
 - PR membership: [`pr *`](#pr-membership)
 
@@ -37,7 +43,7 @@ config they read, see [configuration.md](configuration.md).
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--config <path>` | Path to `config.yaml` | `./config.yaml` |
-| `--session-file <path>` | Path to session file. Overrides `session_file:` in config. | `<config-dir>/<name>.session.yaml` |
+| `--session-file <path>` | Path to session file. Overrides `session_file:` in config. | `<config-dir>/<target_branch>.session.yaml` (or `<name>` when unset) |
 | `--version` | Print version and exit | — |
 
 ## At a glance: which command does what
@@ -110,6 +116,7 @@ releasy run [--onto <ver>] [--work-dir <path>]
             [--retry-failed | --no-retry-failed]
             [--merge-target | --no-merge-target]
             [--only <url-or-id> | --pr <URL>]
+            [--dry-run]
 ```
 
 | Option | Description | Default |
@@ -121,6 +128,7 @@ releasy run [--onto <ver>] [--work-dir <path>]
 | `--merge-target` / `--no-merge-target` | Push a merge commit on PRs even without conflicts. Never force-pushes. | off |
 | `--only <url-or-id>` | Single PR URL **or** group/singleton id. Drops everything else. **Non-zero** if nothing matches. Mutex with `--pr`. | — |
 | `--pr <URL>` | Single PR by URL. Exits **cleanly (0)** when the PR isn't in session scope. Use from webhook/cron callers. Mutex with `--only`. | — |
+| `--dry-run` | No writes anywhere (state / git / GitHub). Read-only fetches still happen; cannot predict cherry-pick conflicts. | off |
 
 Exit: `1` on any `conflict` (in scope), else `0`.
 
@@ -149,8 +157,9 @@ heuristic, and config. Per-PR sub-flags: `--no-flaky-check`,
 `--post-comment` / `--no-post-comment`.
 
 **`--address-review`** — for each tracked PR, fetch comments and let
-the AI append fix commits. Filters compose: trusted-reviewer
-allowlist + `--since` + dropped if hidden (minimized/outdated) +
+the AI append fix commits. Filters compose: trust gate
+(`trusted_associations` by default, plus any `trusted_reviewers`)
++ `--since` + dropped if hidden (minimized/outdated) +
 kept only when the inline thread is unresolved or the top-level
 comment has no later reply by the PR author. Linear history only —
 append commits, never amend/rebase/force-push. Stateful
@@ -200,7 +209,7 @@ releasy refresh [--pr <URL>]
 | `--analyze-fails` / `--no-analyze-fails` | Run the AI CI-triage pass on each in-scope PR. | off |
 | `--no-flaky-check` | (with `--analyze-fails`) skip flaky-elsewhere cross-check. | off |
 | `--post-comment` / `--no-post-comment` | (with `--analyze-fails`) post per-PR summary comment. | `analyze_fails.post_comment_to_pr` |
-| `--address-review` / `--no-address-review` | Run the AI review-feedback pass. Requires `review_response.trusted_reviewers` non-empty. | off |
+| `--address-review` / `--no-address-review` | Run the AI review-feedback pass. Needs at least one trust source — `review_response.trusted_associations` (defaults to OWNER/MEMBER/COLLABORATOR/CONTRIBUTOR) or `review_response.trusted_reviewers`. Refuses only if both are empty. | off |
 | `--only <url-or-id>` | Single tracked PR (URL — source or rebase) or feature/group id. | — |
 | `--dry-run` | No writes anywhere; print intended actions. | off |
 | `--stateless` | Skip session/state. Requires `--pr`. | off |
@@ -376,12 +385,14 @@ Always finishes with a project-board reconcile.
 
 ```bash
 releasy continue [--branch <branch-or-feature-id>] [--work-dir <path>]
+                 [--dry-run]
 ```
 
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--branch <name>` | Operate on one entry — flip from `conflict` to `needs_review`. | full pass |
 | `--work-dir <path>` | Working dir. | config / cwd |
+| `--dry-run` | Show what would happen — no state writes, pushes, PR opens, or project sync. Read-only GitHub fetches still happen. | off |
 
 Exit: `1` if any conflict remains (full pass) or the branch couldn't be
 marked resolved.
@@ -433,6 +444,97 @@ exactly as they are.
 releasy abort
 ```
 
+### `releasy clear`
+
+*Wipe local-only port artifacts that never reached a PR.*
+
+With an identifier, clears that one feature. Without it, scans state for
+every feature stuck in a damaged local-only state (`conflict` or
+`branch_created` with no rebase PR), lists them, and clears after a
+confirmation prompt. For each: aborts any in-progress
+cherry-pick / merge / rebase, force-deletes the local port branch, and
+drops the state entry so the next `run` starts fresh. **Refuses** any
+feature whose rebase PR is already open — those live on GitHub and are
+out of scope.
+
+```bash
+releasy clear [<identifier>] [--work-dir <path>] [--dry-run] [--yes]
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `<identifier>` | Feature ID / branch / source-PR number / source-PR URL. Omit to sweep all damaged local-only entries. | sweep all |
+| `--work-dir <path>` | Working dir for git ops. | config / cwd |
+| `--dry-run` | Show what would be cleaned; change nothing. | off |
+| `--yes` / `-y` | Skip the confirmation prompt in sweep mode. | off |
+
+## One-off porting
+
+### `releasy cherry-pick`
+
+*One-off cross-repo cherry-pick — no config, no state.*
+
+Cherry-picks a PR (`.../pull/N`, merge commit with `-m 1`), commit
+(`.../commit/<sha>`), or tag from any public GitHub repo onto a fresh
+branch off `--target` in `--origin`; optionally AI-resolves conflicts,
+pushes, and opens a PR back to `--target`. **Persists nothing** — no
+config / state / lock / board. Re-running makes a brand-new branch each
+time (pin it with `--branch-name`).
+
+```bash
+releasy cherry-pick --origin <url> --target <branch> --commit <github-url>
+                    [--branch-name <name>] [--push | --no-push] [--with-pr]
+                    [--resolve-conflicts --build-command <cmd>]
+                    [--claude-command <exe>] [--prompt-file <path>]
+                    [--timeout <s>] [--max-iterations <n>]
+                    [--formatting-example <pr-url>] [--work-dir <path>]
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--origin <url>` (required) | Origin remote (ssh/https) to clone, push to, and open the PR against. | — |
+| `--target <branch>` (required) | Existing origin branch to base the port on / open the PR against. | — |
+| `--commit <url>` (required) | GitHub URL to cherry-pick: PR, commit, or tag; any public repo (incl. forks). | — |
+| `--branch-name <name>` | Port branch name. | `releasy/port/<id>-<6hex>` |
+| `--push` / `--no-push` | Push the branch to origin. | on |
+| `--with-pr` | Open a PR from the branch back to `--target` (implies `--push`; needs `RELEASY_GITHUB_TOKEN`). | off |
+| `--resolve-conflicts` | On conflict, invoke Claude. Requires `--build-command`. | off |
+| `--build-command <cmd>` | Shell command Claude runs to verify the resolution compiles. Required with `--resolve-conflicts`. | — |
+| `--claude-command <exe>` | Claude executable. | `claude` |
+| `--prompt-file <path>` | AI-resolve prompt template. | bundled |
+| `--timeout <s>` | Per-attempt Claude timeout (seconds). | `7200` |
+| `--max-iterations <n>` | Max build attempts per resolve. | `5` |
+| `--formatting-example <pr-url>` | Append that PR's "CI/CD Options" section to the new PR body (needs `--with-pr`). | — |
+| `--work-dir <path>` | Working dir for git ops. | cwd |
+
+### `releasy rebase`
+
+*Re-port an existing rebase PR onto a different target branch.*
+
+For each PR in scope: skips if it already targets `--target`; otherwise
+branches off `origin/<target>`, cherry-picks its commits one at a time
+(AI-resolving conflicts; falls back to a single squashed
+`git merge --squash` if the cherry-pick path won't apply), pushes a fresh
+branch, opens a new PR (referencing `Port of <old PR> onto <target>`),
+and closes the original with a `superseded by <new PR>` comment. With
+`--pr` only that PR; without it, every tracked rebase PR in state.
+**Never mutates the state file** — it's a one-way porter, not a migration.
+
+```bash
+releasy rebase --target <branch> [--pr <url>] [--only <url-or-id>]
+               [--resolve-conflicts | --no-resolve-conflicts]
+               [--work-dir <path>] [--dry-run]
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--target <branch>` (required) | Existing origin branch to rebase onto. | — |
+| `--pr <url>` | The rebase PR to port. Omit to walk every tracked rebase PR. | all tracked |
+| `--only <url-or-id>` | Restrict the walk to one tracked PR (source or rebase URL) or feature / group ID. Mutex with `--pr`; non-zero if no match. | — |
+| `--resolve-conflicts` / `--no-resolve-conflicts` | AI resolver on conflicts (needs `ai_resolve.enabled`). | on |
+| `--work-dir <path>` | Working dir for git ops. | config / cwd |
+| `--dry-run` | No branches / cherry-picks / pushes / PR changes. Read-only fetches still happen. | off |
+
 ## Inspection
 
 ### `releasy status`
@@ -455,7 +557,8 @@ See [concepts.md → Multiple projects](concepts.md#multiple-projects-in-paralle
 
 *Scaffold a fresh project.*
 
-Writes `config.yaml` (at `--out`) + sibling `<name>.session.yaml`. Refuses
+Writes `config.yaml` (at `--out`) + sibling `<target_branch>.session.yaml`
+(falls back to `<name>` when `--target-branch` is omitted). Refuses
 to overwrite. Prints config's absolute path on stdout (everything else on
 stderr) so it composes:
 
@@ -588,11 +691,38 @@ releasy release --base-tag <tag> --name <branch> [--strict] [--include-skipped] 
 | `--include-skipped` | Include `skipped` features. | off |
 | `--work-dir <path>` | Working dir. | config / cwd |
 
+### `releasy draft-release`
+
+*Generate a release changelog from target-branch merge commits.*
+
+Walks first-parent merges in `--from..--to`, extracts the merged origin
+PRs, drops forward-ports, classifies each by its Changelog category, and
+renders Altinity's release-notes markdown. With `-o` writes to disk and
+publishes nothing; without it, creates a **draft** GitHub release on
+origin (tag = `--name`, commitish = `--to`) and prints its URL.
+
+```bash
+releasy draft-release --from <ref> --to <ref> [--name <tag>] [--title <text>]
+                      [-o <file>] [--compared-to-url <url>]
+                      [--docker-image-url <url>] [--work-dir <path>]
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--from <ref>` (required) | Start commit / tag, **non-inclusive** (usually the upstream tag the branch forked from). | — |
+| `--to <ref>` (required) | End commit / tag, inclusive (release-branch tip or the tag being cut). | — |
+| `--name <tag>` | Release tag. Defaults to `--to` when it's a tag; left blank if `--to` is a commit / branch. | — |
+| `--title <text>` | Changelog heading / draft display name. | prettified `--name` |
+| `-o` / `--output <file>` | Write markdown to file instead of creating a draft release. | — |
+| `--compared-to-url <url>` | Override the "as compared to" header link. | auto |
+| `--docker-image-url <url>` | Docker image URL; placeholder `sha256-TBD` if omitted. | — |
+| `--work-dir <path>` | Local clone for walking merges. | config / cwd |
+
 ## Feature management
 
 Manages the static `features:` list in the session file (the dynamic
 counterpart is `pr_sources.*`). Schema:
-[configuration.md](configuration.md#namesessionyaml-per-effort-source-data).
+[configuration.md](configuration.md#target_branchsessionyaml-per-effort-source-data).
 
 ```bash
 releasy feature add --id <id> --source-branch <branch> --description <desc>
@@ -615,7 +745,7 @@ releasy feature list
 Add, remove, and list individual PR URLs in the session so you never
 hand-edit `pr_sources.include_prs`, `pr_sources.exclude_prs`, or
 `pr_sources.groups[].prs`. Schema:
-[configuration.md](configuration.md#namesessionyaml-per-effort-source-data).
+[configuration.md](configuration.md#target_branchsessionyaml-per-effort-source-data).
 
 ```bash
 releasy pr add <PR-URL> [--group <id>] [--context <text>]
@@ -626,7 +756,7 @@ releasy pr list
 | Subcommand | Description |
 |------------|-------------|
 | `add` | Append URL to `pr_sources.include_prs` (or `groups[<id>].prs` with `--group`). Validates the URL via the GitHub API, idempotent on re-add, and clears the URL from `exclude_prs` if it was previously excluded. Optional `--context` sets the per-PR `ai_context` note. |
-| `remove` | Drop the URL from every session list (`include_prs`, every group's `prs`, both `ai_context` dicts) and purge the matching `FeatureState`. By default also appends the URL to `exclude_prs` so label-driven discovery doesn't re-add it on the next refresh; pass `--keep-discovery` to skip that step. Refuses if the URL is part of a multi-PR group still in state (groups are atomic — use `releasy clear --branch <branch>` to wipe the whole group). |
+| `remove` | Drop the URL from every session list (`include_prs`, every group's `prs`, both `ai_context` dicts) and purge the matching `FeatureState`. By default also appends the URL to `exclude_prs` so label-driven discovery doesn't re-add it on the next refresh; pass `--keep-discovery` to skip that step. Refuses if the URL is part of a multi-PR group still in state (groups are atomic — use `releasy clear <identifier>` to wipe the whole group). |
 | `list` | Print every URL the session references — top-level `include_prs`, each group's `prs`, and `exclude_prs` — with their `ai_context` notes. |
 
 Exit: `1` on a malformed URL, an unreachable PR, a group id that doesn't

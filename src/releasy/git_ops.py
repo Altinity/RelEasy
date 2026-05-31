@@ -314,18 +314,6 @@ def find_merge_base(repo_path: Path, ref_a: str, ref_b: str) -> str | None:
     return result.stdout.strip()
 
 
-def get_commit_range(repo_path: Path, base_ref: str, tip_ref: str) -> list[str]:
-    """Return list of commit SHAs in (base_ref..tip_ref]."""
-    result = run_git(
-        ["rev-list", "--reverse", f"{base_ref}..{tip_ref}"],
-        repo_path,
-        check=False,
-    )
-    if result.returncode != 0:
-        return []
-    return [s for s in result.stdout.strip().splitlines() if s]
-
-
 def count_commits(repo_path: Path, base_ref: str, tip_ref: str) -> int:
     result = run_git(
         ["rev-list", "--count", f"{base_ref}..{tip_ref}"],
@@ -354,130 +342,6 @@ def get_conflict_files(repo_path: Path) -> list[str]:
         if line[:2] in ("UU", "AA", "DD"):
             conflicts.append(line[3:].strip())
     return conflicts
-
-
-def cherry_pick_range(
-    repo_path: Path, base_ref: str, tip_ref: str, *, abort_on_conflict: bool = True,
-) -> OperationResult:
-    """Cherry-pick a range of commits (base_ref..tip_ref] onto current branch.
-
-    When abort_on_conflict is False the working tree is left in the
-    conflicted state so the caller can commit the conflict markers.
-    """
-    commits = get_commit_range(repo_path, base_ref, tip_ref)
-    if not commits:
-        return OperationResult(success=True, conflict_files=[])
-
-    result = run_git(
-        ["cherry-pick", f"{base_ref}..{tip_ref}"],
-        repo_path,
-        check=False,
-    )
-    if result.returncode == 0:
-        return OperationResult(success=True, conflict_files=[])
-
-    conflict_files = get_conflict_files(repo_path)
-    if abort_on_conflict:
-        run_git(["cherry-pick", "--abort"], repo_path, check=False)
-    return OperationResult(
-        success=False,
-        conflict_files=conflict_files,
-        error_message=result.stderr.strip() if result.stderr else None,
-    )
-
-
-def rebase_onto(
-    repo_path: Path, onto_ref: str, old_base: str, source_tip: str,
-) -> OperationResult:
-    """Rebase commits (old_base..source_tip] onto onto_ref.
-
-    The current branch should already be checked out before calling this.
-    """
-    result = run_git(
-        ["rebase", "--onto", onto_ref, old_base, source_tip],
-        repo_path,
-        check=False,
-    )
-    if result.returncode == 0:
-        return OperationResult(success=True, conflict_files=[])
-
-    conflict_files = get_conflict_files(repo_path)
-    return OperationResult(
-        success=False,
-        conflict_files=conflict_files,
-        error_message=result.stderr.strip() if result.stderr else None,
-    )
-
-
-def rebase_onto_squash(
-    repo_path: Path,
-    onto_ref: str,
-    old_base: str,
-    source_tip: str,
-    message: str,
-) -> OperationResult:
-    """Rebase commits onto onto_ref, then squash rebased commits into one.
-
-    Keeps rebase semantics (including duplicate dropping) while producing a
-    single resulting commit on top of onto_ref.
-    """
-    result = rebase_onto(repo_path, onto_ref, old_base, source_tip)
-    if not result.success:
-        return result
-
-    n_rebased = count_commits(repo_path, onto_ref, "HEAD")
-    if n_rebased <= 1:
-        return OperationResult(success=True, conflict_files=[])
-
-    run_git(["reset", "--soft", onto_ref], repo_path)
-    commit_result = run_git(["commit", "-m", message], repo_path, check=False)
-    if commit_result.returncode != 0:
-        return OperationResult(
-            success=False,
-            conflict_files=[],
-            error_message=commit_result.stderr.strip() if commit_result.stderr else None,
-        )
-    return OperationResult(success=True, conflict_files=[])
-
-
-def merge_squash_ref(
-    repo_path: Path, source_ref: str, message: str,
-) -> OperationResult:
-    """Merge a ref as a single squashed commit onto the current branch.
-
-    This applies all changes between HEAD and source_ref as one diff,
-    producing at most one conflict to resolve.
-    """
-    result = run_git(
-        ["merge", "--squash", "--no-edit", source_ref],
-        repo_path,
-        check=False,
-    )
-
-    conflict_files = get_conflict_files(repo_path)
-    if conflict_files:
-        return OperationResult(
-            success=False,
-            conflict_files=conflict_files,
-            error_message=result.stderr.strip() if result.stderr else None,
-        )
-
-    if result.returncode != 0:
-        return OperationResult(
-            success=False,
-            conflict_files=[],
-            error_message=result.stderr.strip() if result.stderr else None,
-        )
-
-    commit_result = run_git(
-        ["commit", "--no-edit", "-m", message],
-        repo_path,
-        check=False,
-    )
-    if commit_result.returncode != 0:
-        return OperationResult(success=True, conflict_files=[])
-
-    return OperationResult(success=True, conflict_files=[])
 
 
 # ---------------------------------------------------------------------------
@@ -654,22 +518,6 @@ def _stage_unmerged_paths(repo_path: Path) -> None:
     if not paths:
         return
     run_git(["add", "--"] + paths, repo_path, check=False)
-
-
-def commit_conflict_markers(repo_path: Path) -> bool:
-    """Stage conflict-marker files and commit as WIP.
-
-    Call this after a failed cherry-pick with abort_on_conflict=False.
-    Stages only unmerged paths \u2014 see :func:`_stage_unmerged_paths`.
-    """
-    _stage_unmerged_paths(repo_path)
-    result = run_git(
-        ["commit", "--no-edit", "-m",
-         "WIP: unresolved conflict markers \u2014 needs manual resolution"],
-        repo_path,
-        check=False,
-    )
-    return result.returncode == 0
 
 
 def commit_cherry_pick_conflict_as_is(

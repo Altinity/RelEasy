@@ -71,7 +71,7 @@ Moving a `config.yaml` trips an ownership check. Fix with
 | Path | Purpose | Edited by |
 |------|---------|-----------|
 | `config.yaml` | Stable per-project config — origin, target branch, AI, notifications. [Schema](configuration.md#configyaml-stable-infrastructure). | You; scaffolded by `releasy new`. |
-| `<config-dir>/<name>.session.yaml` | `features:` + `pr_sources:`. [Schema](configuration.md#namesessionyaml-per-effort-source-data). Override path with `session_file:` or `--session-file`. | You; mutated by [`releasy feature *`](commands.md#feature-management). |
+| `<config-dir>/<target_branch>.session.yaml` | `features:` + `pr_sources:` (falls back to `<name>` when `target_branch` is unset). [Schema](configuration.md#target_branchsessionyaml-per-effort-source-data). Override path with `session_file:` or `--session-file`. | You; mutated by [`releasy feature *`](commands.md#feature-management). |
 | `${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml` | Pipeline state (phase, branches, statuses, AI cost). | Auto. Not user-editable. |
 | `${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.lock` | POSIX advisory lock. | Auto. Crash leftovers self-reclaim. |
 

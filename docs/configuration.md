@@ -1,6 +1,6 @@
 # Configuration reference
 
-Two YAML files: `config.yaml` (stable) and `<name>.session.yaml`
+Two YAML files: `config.yaml` (stable) and `<target_branch>.session.yaml`
 (per-effort). Templates in [`config.yaml.example`](../config.yaml.example)
 and [`session.yaml.example`](../session.yaml.example). Conceptual model:
 [concepts.md → files](concepts.md#files-releasy-reads--writes).
@@ -10,7 +10,7 @@ and [`session.yaml.example`](../session.yaml.example). Conceptual model:
 ```yaml
 # Unique slug for this project on this machine (required).
 # Keys ${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml
-# and (by default) <config-dir>/<name>.session.yaml.
+# (and the session file when target_branch is unset).
 name: antalya-26.3
 
 # Optional: override session file path. Relative paths resolve against
@@ -37,9 +37,10 @@ target_branch: antalya-26.3         # when set, --onto becomes optional
 #   auto_pr: true
 #   retry_failed: true
 #   recreate_closed_prs: false
+#   detect_superseded: true
 ```
 
-## `<name>.session.yaml` (per-effort source data)
+## `<target_branch>.session.yaml` (per-effort source data)
 
 ```yaml
 features:
@@ -56,10 +57,12 @@ pr_sources:
   by_labels:
     - labels: ["forward-port", "v26.3"]
       merged_only: true
+      # mode: auto    # auto (default) | backport | forward_port
 
   exclude_labels: ["do-not-port"]
   exclude_authors: ["dependabot[bot]"]
   # include_authors: ["alice", "bob"]
+  # forward_port_labels: ["forward-port"]   # treat these PRs as forward-ports
 
   include_prs:
     - https://github.com/Altinity/ClickHouse/pull/123
@@ -81,6 +84,10 @@ pr_sources:
 
   # Optional: override deps overlay path (default <session-stem>.deps.yaml)
   # deps_file: deps/26.3.yaml
+
+# Labels applied to every rebase PR opened this session (auto-created on
+# origin; `refresh` reconciles them onto tracked PRs that are missing one).
+# pr_labels: ["antalya-26.3"]
 ```
 
 If a PR URL appears in two of `include_prs` / `exclude_prs` / a group's
@@ -94,7 +101,7 @@ Options live in `config.yaml` unless marked **(session)**.
 | Option | Description | Default |
 |--------|-------------|---------|
 | `name` | Project slug (required). Matches `[A-Za-z0-9._-]{1,64}`. | — |
-| `session_file` | Override session file path. | `<config-dir>/<name>.session.yaml` |
+| `session_file` | Override session file path. | `<config-dir>/<target_branch>.session.yaml` (or `<name>` when unset) |
 | `push` | Push branches + open PRs. | `false` |
 | `work_dir` | Repo clone path. | cwd |
 | `origin.remote` | Origin repo URL (required). | — |
@@ -102,18 +109,25 @@ Options live in `config.yaml` unless marked **(session)**.
 | `target_branch` | Explicit base branch; makes `--onto` optional. | derived |
 | `sequential` | One PR per invocation, gated on the previous rebase PR merging. See [Sequential mode](commands.md#sequential-mode). Incompatible with `pr_sources.groups`. | `false` |
 | `update_existing_prs` | Reuse existing PR and overwrite its title/body. | `false` |
+| `upstream.remote` | Optional fetch-only upstream remote (URL). Used **only** for `git log -S` prereq detection during AI resolve — never pushed to, never read for code. Sub-keys `upstream.remote_name` (`upstream`), `upstream.branch` (`master`). | unset |
+| `ai_resolve.enabled` | Master switch for the AI conflict resolver. When off, conflicts always stop the pipeline. | `false` |
+| `ai_resolve.build_command` | Shell command Claude runs to verify a resolution compiles. | `cd build && ninja` |
 | `ai_resolve.max_iterations` | Build attempts per conflict (passed to Claude). | `5` |
 | `ai_resolve.api_retries` | Retries on transient Anthropic API errors. | `3` |
 | `ai_resolve.label` | Label for AI-resolved PRs. | `ai-resolved` |
 | `ai_resolve.needs_attention_label` | Label for partial-group draft PRs. | `ai-needs-attention` |
 | `ai_resolve.prompt_file` | Prompt for cherry-pick conflicts. | `prompts/resolve_conflict.md` |
 | `ai_resolve.merge_prompt_file` | Prompt for merge conflicts (`refresh`). | `prompts/resolve_merge_conflict.md` |
+| `ai_resolve.split_conflict_commit` | Record the raw conflict and its resolution as two separate commits (clearer history). | `true` |
+| `ai_resolve.split_prompt_file` | Prompt used for the split-commit resolution pass. | `prompts/resolve_conflict_split.md` |
+| `ai_resolve.auto_add_prerequisite_prs` | Auto-pull a missing prerequisite PR when the resolver detects one. Bool sugar, or `{enabled, max_prereq_depth}`. | `enabled: false`, `max_prereq_depth: 7` |
 | `ai_changelog.enabled` | Synthesize one CHANGELOG entry per multi-PR group. Singletons reuse the source PR's entry. | `false` |
 | `ai_changelog.command` | Claude executable. | `claude` |
 | `ai_changelog.prompt_file` | Prompt template. | `prompts/synthesize_changelog.md` |
 | `ai_changelog.timeout_seconds` | Per-call timeout. | `300` |
 | `ai_changelog.max_pr_body_chars` | Per-PR body trim before inlining. | `3000` |
-| `review_response.trusted_reviewers` | Reviewer login allowlist. Combined with `--reviewer`. Empty both ⇒ command refuses. | `[]` |
+| `review_response.trusted_associations` | GitHub `author_association` values whose comments the AI is allowed to act on. The default gate handles the common case on its own. | `["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"]` |
+| `review_response.trusted_reviewers` | Extra GitHub-login allowlist, additive on top of `trusted_associations` (case-insensitive). Combined with `--reviewer`. Empty is fine. | `[]` |
 | `review_response.reply_to_non_addressable` | In-thread reply on non-actionable comments. | `true` |
 | `review_response.post_summary_comment` | Also post a top-level summary comment. | `false` |
 | `review_response.prompt_file` | Prompt template. | `prompts/address_review.md` |
@@ -136,6 +150,9 @@ Options live in `config.yaml` unless marked **(session)**.
 | `pr_sources.by_labels[].merged_only` **(session)** | Only merged PRs. | `false` |
 | `pr_sources.by_labels[].if_exists` **(session)** | Override `pr_policy.if_exists`. | inherits |
 | `pr_sources.by_labels[].ai_context` **(session)** | AI resolver hint applied to every matched PR. | `""` |
+| `pr_sources.by_labels[].mode` / `groups[].mode` **(session)** | Port direction: `auto` / `backport` / `forward_port`. | `auto` |
+| `pr_sources.forward_port_labels` **(session)** | Labels that mark a PR as a forward-port. | `[]` |
+| `pr_sources.deps_file` **(session)** | Override the deps overlay path. | `<session-stem>.deps.yaml` |
 | `pr_sources.exclude_labels` **(session)** | Drop PRs with any of these. | `[]` |
 | `pr_sources.include_authors` **(session)** | Allowlist of GitHub logins. Bypassed by `include_prs`. | `[]` |
 | `pr_sources.exclude_authors` **(session)** | Denylist of GitHub logins. Bypassed by `include_prs`. | `[]` |
@@ -147,6 +164,8 @@ Options live in `config.yaml` unless marked **(session)**.
 | `pr_sources.groups[].if_exists` **(session)** | Override. | inherits |
 | `pr_sources.groups[].sort` **(session)** | `listed` or `merged_at` (PR number breaks ties). | `listed` |
 | `pr_sources.groups[].ai_context` **(session)** | Hint for every cherry-pick step in the group. | `""` |
+| `pr_sources.groups[].depends_on` **(session)** | Other unit IDs that must port/merge first. | `[]` |
+| `pr_labels` **(session)** | Labels applied to every rebase PR opened this session (auto-created on origin). | `[]` |
 | `features[].id` **(session)** | Feature id → branch suffix. | — |
 | `features[].source_branch` **(session)** | Branch holding the commits. | — |
 | `features[].description` **(session)** | PR title + board text. | — |
@@ -202,7 +221,8 @@ auto-maintained.
 1. **Create the project** at `https://github.com/orgs/<org>/projects` →
    New project → Table layout.
 2. **Status field options** — set to exactly: `Needs Review`,
-   `Branch Created`, `Conflict`, `Skipped`.
+   `Branch Created`, `Conflict`, `Blocked`, `Skipped`, `Merged`,
+   `Closed`, `Superseded`.
 3. **Token permissions** — `RELEASY_GITHUB_TOKEN` needs `repo` + `project`
    scopes (classic) or "Projects" read/write (fine-grained).
 4. **Wire into config:**

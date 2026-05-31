@@ -102,8 +102,6 @@ _SQUASH_PR_RE = re.compile(r"\(#(\d+)\)\s*$")
 
 # "ClickHouse/ClickHouse#12345" or "owner/repo#N" cross-repo refs in body.
 _CROSSREPO_REF_RE = re.compile(r"\b([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)\b")
-# Bare "#12345" refs (treated as origin-repo PR references).
-_BARE_NUM_RE = re.compile(r"(?<![/\w])#(\d+)\b")
 # Markdown link to a github.com/.../pull/N
 _PR_URL_RE = re.compile(
     r"https?://github\.com/([^/\s)]+)/([^/\s)]+?)(?:\.git)?/pull/(\d+)\b",
@@ -381,7 +379,7 @@ def _author_handle(author: str | None) -> str:
     return f"@{handle}"
 
 
-def _render_entry(entry: ChangelogEntry, origin_slug: str) -> str:
+def _render_entry(entry: ChangelogEntry) -> str:
     """Render one bullet line.
 
     Layout cases:
@@ -486,7 +484,6 @@ def render_markdown(
     from_sha: str | None,
     from_url: str | None,
     entries: list[ChangelogEntry],
-    origin_slug: str,
     full_changelog_url: str | None = None,
     packages_block: str | None = None,
 ) -> str:
@@ -525,7 +522,7 @@ def render_markdown(
         rendered_any = True
         lines.append(f"#### {section}")
         for e in bucket:
-            lines.append(_render_entry(e, origin_slug))
+            lines.append(_render_entry(e))
         lines.append("")
 
     if not rendered_any:
@@ -755,7 +752,6 @@ def build_changelog(
             from_sha=from_sha,
             from_url=from_url,
             entries=[],
-            origin_slug=origin_slug,
             packages_block=packages_block,
         )
         return md, to_sha, to_is_tag
@@ -833,7 +829,6 @@ def build_changelog(
         from_sha=from_sha,
         from_url=from_url,
         entries=entries,
-        origin_slug=origin_slug,
         full_changelog_url=full_changelog_url,
         packages_block=packages_block,
     )

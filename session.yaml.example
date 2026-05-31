@@ -11,12 +11,13 @@
 # retry_failed, recreate_closed_prs) live in config.yaml under
 # `pr_policy:`.
 #
-# Default path: <config-dir>/<name>.session.yaml
-#   — where <name> is config.yaml's `name:` and <config-dir> is the
-#     directory containing config.yaml. Override with
-#     `session_file:` in config.yaml or `--session-file` on the CLI.
+# Default path: <config-dir>/<target_branch>.session.yaml
+#   — named after config.yaml's `target_branch:` (falling back to `name:`
+#     when target_branch is unset), where <config-dir> is the directory
+#     containing config.yaml. Override with `session_file:` in config.yaml
+#     or `--session-file` on the CLI.
 #
-# `releasy --stateless` (e.g. `releasy address-review --stateless`)
+# `--stateless` (e.g. `releasy refresh --address-review --stateless`)
 # deliberately SKIPS this file — AI settings come from config.yaml and
 # everything else from CLI flags.
 
@@ -207,3 +208,11 @@ features:
 #   # field only if you want the deps file somewhere else. Relative
 #   # paths resolve against this session file's directory.
 #   # deps_file: deps/26.3.yaml
+
+# ── Session-wide PR labels ─────────────────────────────────────────
+# Labels applied to EVERY rebase PR opened during this session. Each
+# name is auto-created on origin (releasy's default purple) the first
+# time it's needed, and `releasy refresh` reconciles them onto tracked
+# PRs that are missing one. Handy for tagging a whole porting effort.
+# pr_labels:
+#   - antalya-26.3

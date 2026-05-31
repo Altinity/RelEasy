@@ -4,8 +4,6 @@
 # Unique slug identifying this project on this machine. Keys the
 # per-project state file under
 #   ${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml
-# and (by default) the session file at
-#   <config-dir>/<name>.session.yaml
 # Allowed: A-Z a-z 0-9 . _ - (1-64 chars). Don't rename without
 # `releasy adopt` (or just edit the state file path).
 name: {{ name }}
@@ -27,8 +25,9 @@ name: {{ name }}
 # Optional explicit path to the session file (features + pr_sources).
 # Relative paths resolve against this config's directory. Can also be
 # overridden per-invocation with --session-file.
-# Default: <config-dir>/<name>.session.yaml
-# session_file: {{ name }}.session.yaml
+# Default: <config-dir>/<target_branch>.session.yaml (falls back to
+# <name>.session.yaml when target_branch is unset).
+# session_file: {{ target_branch }}.session.yaml
 
 origin:
   remote: <set me — https or ssh URL of the origin repo>

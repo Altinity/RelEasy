@@ -1,7 +1,8 @@
 """Feature management: add, enable, disable, remove, list.
 
-Features live in the session file (``<name>.session.yaml``), not in
-``config.yaml``. Every mutation here writes back via :func:`save_session`.
+Features live in the session file (``<target_branch>.session.yaml`` by
+default), not in ``config.yaml``. Every mutation here writes back via
+:func:`save_session`.
 """
 
 from __future__ import annotations

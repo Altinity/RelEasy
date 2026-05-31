@@ -1,6 +1,6 @@
 """PR membership management: add, remove, list.
 
-PRs live in the session file (``<name>.session.yaml``) under
+PRs live in the session file (``<target_branch>.session.yaml`` by default) under
 ``pr_sources.include_prs`` (top-level) and ``pr_sources.groups[].prs``
 (grouped). State entries (``FeatureState``) live in the project state
 file. Every mutation here writes back via :func:`save_session` and

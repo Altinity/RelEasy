@@ -1,86 +1,99 @@
 # RelEasy
 
-CLI tool for managing port branches, feature branches, and release construction.
+RelEasy ports features and PRs onto a stable **base branch** (a tag or commit
+you pin to), one cherry-picked port branch + PR at a time — a resumable
+alternative to rebasing long-lived branches. One machine can drive several
+porting projects at once.
 
-RelEasy automates porting features and PRs onto a stable **base branch** (a
-tag/commit you pin to) inside a single repo. Instead of rebasing long-lived
-branches (which accumulates conflicts), each feature / PR is cherry-picked onto
-its own port branch and opened as a PR — all in a resumable workflow.
-
-A single machine can drive **multiple ongoing porting projects in parallel**
-(e.g. an antalya-26.3 forward-port and an antalya-25.8 backport). Each project
-has its own `config.yaml` with a unique `name:`; pipeline state lives outside
-your repo under `${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml`,
-and a per-project lock keeps concurrent runs of the same project serialized
-while runs of *different* projects truly run in parallel.
-
-Each project spreads across three files with clear responsibilities:
-
-| File | What | Lifetime |
-|------|------|----------|
-| `config.yaml` | Stable infrastructure: origin remote, work_dir, target branch, AI settings, notifications, `pr_policy`. | Edited once at setup, rarely touched. |
-| `<name>.session.yaml` | Per-effort source data: `features:` list, `pr_sources:` selectors (labels, include/exclude PR URLs, groups, author filters). Lives next to `config.yaml` by default; point elsewhere with `session_file:` in config or `--session-file` on the CLI. | Edited between runs as your target work changes. |
-| `<name>.state.yaml` | Runtime progress managed by RelEasy. Lives under `${XDG_STATE_HOME:-~/.local/state}/releasy/`. | Never edited by hand. |
-
-`releasy --stateless` (e.g. `address-review --stateless`) loads `config.yaml`
-but skips the session and state files — useful for one-off runs where CLI flags
-supply everything session data would otherwise provide.
+This page is a quick start. For the full picture, see **[docs/](docs/)**.
 
 ## Install
 
 ```bash
 pip install -e .
+export RELEASY_GITHUB_TOKEN="ghp_..."   # needs repo scope (+ project, to sync a board)
 ```
 
-## TL;DR
+## Set up a project
+
+> Your base branch (e.g. `antalya-26.3`) must already exist on the origin remote.
+
+**1. Scaffold it.** Use one directory per project:
 
 ```bash
-export RELEASY_GITHUB_TOKEN="ghp_..."
-
 mkdir -p ~/work/antalya-26.3 && cd ~/work/antalya-26.3
 releasy new --target-branch antalya-26.3 --project antalya
-$EDITOR config.yaml                     # origin remote, work_dir, push: true, …
-$EDITOR antalya-26.3.session.yaml       # features + pr_sources
-releasy run
 ```
 
-See [`config.yaml.example`](config.yaml.example) and
-[`session.yaml.example`](session.yaml.example) for fully-documented references.
+This writes two files side by side:
 
-## How it works
+- `config.yaml` — stable settings (origin remote, push, AI).
+- `antalya-26.3.session.yaml` — *what* to port (named after the target branch).
 
+**2. Edit `config.yaml`.** Set your origin remote, and `push: true` once you
+want RelEasy to push branches and open PRs (leave it off to keep everything
+local while you try things out):
+
+```yaml
+origin:
+  remote: git@github.com:Altinity/ClickHouse.git
+push: true
 ```
-origin/antalya-26.3:          * (stable base branch on origin — you maintain it)
-                              |
-feature/antalya-26.3/pr-42:   * --- fix   (PR → antalya-26.3)
-feature/antalya-26.3/pr-99:   * --- feat  (PR → antalya-26.3)
+
+**3. Edit the session file.** Say what to port — by label, explicit PR URLs,
+or groups:
+
+```yaml
+pr_sources:
+  by_labels:
+    - labels: ["forward-port", "v26.3"]
+      merged_only: true
+  include_prs:
+    - https://github.com/Altinity/ClickHouse/pull/1500
 ```
 
-Given an existing base branch on origin, `releasy run`:
+## Port, resolve, repeat
 
-1. Discovers PRs from `pr_sources` in the session file (labels, explicit
-   include/exclude lists, groups).
-2. For each PR / group, creates a port branch `feature/<base>/<id>` from the
-   base.
-3. Cherry-picks the PR merge commit(s) onto the port branch.
-4. Pushes and opens a PR into the base (if `push: true` and
-   `pr_policy.auto_pr: true` — the default).
+```bash
+releasy run        # discover PRs, cherry-pick each onto its own branch, open PRs
+```
 
-On conflict, the pipeline stops with instructions. Resolve, run
-`releasy continue`, then `releasy run` again to resume with the remaining PRs.
+For every PR or group, RelEasy makes a `feature/<base>/<id>` branch off the
+base, cherry-picks the merge commit(s), and — with `push: true` — opens a PR
+into the base.
 
-## Documentation
+**Hit a conflict?** The run stops and names the branch. Resolve it in the
+work-dir repo, then:
 
-- **[docs/concepts.md](docs/concepts.md)** — the mental model: pipeline,
-  branch naming, multi-project layout, files RelEasy reads & writes, conflict
-  handling, PR titles & labels, the "PRs always target origin" safety guarantee.
-- **[docs/configuration.md](docs/configuration.md)** — full `config.yaml` and
-  session-file schemas, the complete key-options table, environment variables,
-  per-PR `ai_context`, GitHub Project board setup.
-- **[docs/commands.md](docs/commands.md)** — every CLI subcommand with options,
-  examples, and the "which command does what" matrix
-  (`run` / `continue` / `refresh` / `discover-deps` / `analyze-fails` /
-  `address-review` / `release` / `feature *` / project-board sync / sequential mode).
+```bash
+releasy continue   # mark the conflict resolved
+releasy run        # resume with the remaining PRs
+```
+
+(Set `ai_resolve.enabled: true` in `config.yaml` to let Claude attempt
+conflicts for you.)
+
+**Keep open PRs healthy** as the target branch moves and CI runs:
+
+```bash
+releasy refresh                  # re-sync status; catch upstream merges/closes
+releasy refresh --merge-target   # also merge the moved target into each PR
+releasy status                   # see where everything stands
+```
+
+Running several projects? Each directory has its own `config.yaml`; `releasy
+list` shows them all.
+
+## Learn more
+
+- **[docs/concepts.md](docs/concepts.md)** — how it works: the pipeline, branch
+  naming, the files RelEasy reads & writes, conflict handling, and the "PRs
+  always target origin" safety guarantee.
+- **[docs/configuration.md](docs/configuration.md)** — every `config.yaml` and
+  session-file key.
+- **[docs/commands.md](docs/commands.md)** — every command and flag.
+- **[config.yaml.example](config.yaml.example)** ·
+  **[session.yaml.example](session.yaml.example)** — fully-commented references.
 
 ## License
 

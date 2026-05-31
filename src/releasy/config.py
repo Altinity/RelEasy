@@ -6,17 +6,14 @@ Three layers, one responsibility each:
   notifications, push/sequential/update policies, the global ``pr_policy:``
   block). Loaded by :func:`load_config`.
 
-* ``<name>.session.yaml`` — per-effort source data (``features:``,
+* ``<target_branch>.session.yaml`` — per-effort source data (``features:``,
   ``pr_sources:``). Loaded by :func:`load_session`. Lives next to
-  ``config.yaml`` by default; overridable via CLI (``--session-file``) or
-  a ``session_file:`` key in ``config.yaml``.
+  ``config.yaml`` by default, named after the ``target_branch`` (falling
+  back to ``<name>`` when unset); overridable via CLI (``--session-file``)
+  or a ``session_file:`` key in ``config.yaml``.
 
 * ``<name>.state.yaml`` — runtime progress (status per feature, conflict
   files, AI cost, rebase-PR URLs). See :mod:`releasy.state`.
-
-The old all-in-one ``config.yaml`` layout (inline ``features:`` /
-``pr_sources:``) is deliberately no longer accepted; :func:`load_config`
-raises a helpful error pointing at the new layout.
 """
 
 from __future__ import annotations
@@ -30,9 +27,10 @@ import yaml
 
 
 # Slug constraints for the per-project ``name:`` field. The name doubles
-# as a filename (``<name>.state.yaml``, ``<name>.session.yaml``) so it
-# must be filesystem-safe and short enough to be readable in ``releasy
-# list`` output.
+# as a filename (``<name>.state.yaml``, the ``<name>.lock`` file, and the
+# session file when ``target_branch`` is unset) so it must be
+# filesystem-safe and short enough to be readable in ``releasy list``
+# output.
 _VALID_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _STATE_SUBDIR = "releasy"
 
@@ -753,7 +751,9 @@ class Config:
     # Optional override for the session file path, read from
     # ``session_file:`` in config.yaml. Relative paths resolve against the
     # config.yaml directory. When None, the default path
-    # ``<config-dir>/<name>.session.yaml`` is used.
+    # ``<config-dir>/<target_branch>.session.yaml`` is used (falling back to
+    # ``<name>.session.yaml`` when target_branch is unset). See
+    # :func:`session_file_path`.
     session_file: Path | None = None
     # Populated by :func:`load_session` when the caller needs the session
     # data (``run``, ``continue``, ``feature *``, …). Stays ``None`` for
@@ -869,8 +869,6 @@ class Config:
 # ---------------------------------------------------------------------------
 
 
-# Keys that used to live at the top level of config.yaml but now belong
-# elsewhere. Presence triggers a helpful error pointing at the new layout.
 def _parse_optional_label(value: object, *, key: str) -> str | None:
     if value is None:
         return None
@@ -889,23 +887,6 @@ def _parse_label_color(value: object, *, key: str, default: str) -> str:
     if not re.fullmatch(r"[0-9A-Fa-f]{6}", stripped):
         raise ValueError(f"{key} must be 6 hex digits (got {value!r})")
     return stripped.upper()
-
-
-_LEGACY_TOP_LEVEL_KEYS = {
-    "features": (
-        "features: now lives in the session file — move this list to the "
-        "session YAML (default path: <config-dir>/<name>.session.yaml; "
-        "scaffolded automatically by `releasy new`)."
-    ),
-    "pr_sources": (
-        "pr_sources: has been split. Move the selector fields "
-        "(by_labels, exclude_labels, include_prs, exclude_prs, "
-        "include_authors, exclude_authors, groups) into the session "
-        "file's pr_sources: block. Move the policy fields "
-        "(if_exists, auto_pr, retry_failed, recreate_closed_prs) into "
-        "a new pr_policy: block at the top level of config.yaml."
-    ),
-}
 
 
 def load_config(config_path: Path | None = None) -> Config:
@@ -928,14 +909,6 @@ def load_config(config_path: Path | None = None) -> Config:
 
     if not raw:
         raise ValueError("Config file is empty")
-
-    # Reject legacy inline features:/pr_sources: with a concrete migration hint.
-    for legacy_key, hint in _LEGACY_TOP_LEVEL_KEYS.items():
-        if legacy_key in raw:
-            raise ValueError(
-                f"Invalid config.yaml key {legacy_key!r}: {hint}\n"
-                f"See README for the new layout."
-            )
 
     name = raw.get("name")
     if not name:
@@ -1506,6 +1479,20 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 
+def default_session_stem(name: str, target_branch: str | None) -> str:
+    """Filesystem-safe stem for the default session filename.
+
+    Prefers ``target_branch`` — when one config directory drives several
+    porting efforts it is usually the most distinguishing identifier — and
+    falls back to the project ``name``. Characters outside the name-slug
+    set (notably ``/`` in branch names like ``feature/x``) collapse to
+    ``-`` so the result is always a valid filename.
+    """
+    raw = (target_branch or "").strip() or name
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("-")
+    return stem or name
+
+
 def session_file_path(
     config: Config, cli_override: Path | None = None,
 ) -> Path:
@@ -1516,7 +1503,9 @@ def session_file_path(
     1. ``cli_override`` — ``--session-file`` passed on the command line.
     2. ``config.session_file`` — the ``session_file:`` key in ``config.yaml``
        (relative paths resolve against the config dir).
-    3. Default: ``<config-dir>/<name>.session.yaml``.
+    3. Default: ``<config-dir>/<stem>.session.yaml`` where ``<stem>`` is the
+       ``target_branch`` (filesystem-sanitised) when set, else the project
+       ``name``.
     """
     if cli_override is not None:
         return Path(cli_override).expanduser().resolve()
@@ -1527,7 +1516,8 @@ def session_file_path(
         else:
             p = p.resolve()
         return p
-    return (config.config_path.parent / f"{config.name}.session.yaml").resolve()
+    stem = default_session_stem(config.name, config.target_branch)
+    return (config.config_path.parent / f"{stem}.session.yaml").resolve()
 
 
 def lookup_pr_ai_context(
@@ -1674,8 +1664,8 @@ def load_session(
     if not path.exists():
         raise FileNotFoundError(
             f"Session file not found: {path}\n"
-            f"Create one with `releasy new` (scaffolds config.yaml + "
-            f"<name>.session.yaml), edit it manually, or point to one "
+            f"Create one with `releasy new` (scaffolds config.yaml + the "
+            f"session file), edit it manually, or point to one "
             f"explicitly with --session-file."
         )
 
@@ -1706,15 +1696,6 @@ def load_session(
             f"pr_sources must be a mapping, got {type(ps_raw).__name__}"
         )
 
-    # Legacy-migration hint: the policy keys used to live here.
-    for legacy in ("if_exists", "auto_pr", "retry_failed", "recreate_closed_prs"):
-        if legacy in ps_raw:
-            raise ValueError(
-                f"pr_sources.{legacy} is no longer accepted in the session "
-                f"file — it moved to pr_policy.{legacy} in config.yaml. "
-                f"Set it there instead."
-            )
-
     policy_if_exists = config.pr_policy.if_exists
 
     by_labels: list[PRSourceConfig] = []
@@ -1727,11 +1708,6 @@ def load_session(
             raise ValueError(
                 f"pr_sources.by_labels[].if_exists must be one of "
                 f"{_VALID_IF_EXISTS}, got {entry_if_exists!r}"
-            )
-        if "auto_pr" in entry:
-            raise ValueError(
-                f"pr_sources.by_labels[labels={raw_labels!r}].auto_pr is no "
-                "longer supported. Use pr_policy.auto_pr in config.yaml."
             )
         entry_mode = entry.get("mode", "auto")
         if entry_mode not in _VALID_PORT_MODES:
@@ -1783,11 +1759,6 @@ def load_session(
             raise ValueError(
                 f"{source_label}: groups[{gid!r}].if_exists must be one of "
                 f"{_VALID_IF_EXISTS}, got {group_if_exists!r}"
-            )
-        if "auto_pr" in entry:
-            raise ValueError(
-                f"{source_label}: groups[id={gid!r}].auto_pr is no longer "
-                "supported. Use pr_policy.auto_pr in config.yaml."
             )
         group_sort = entry.get("sort", "listed")
         if group_sort not in _VALID_GROUP_SORT:

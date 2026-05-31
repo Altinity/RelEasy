@@ -2197,6 +2197,7 @@ STATUS_OPTIONS = [
     "Needs Review",
     "Branch Created",
     "Conflict",
+    "Blocked",
     "Skipped",
     "Merged",
     "Closed",
@@ -2207,6 +2208,7 @@ STATUS_COLORS = {
     "Needs Review": "BLUE",
     "Branch Created": "YELLOW",
     "Conflict": "RED",
+    "Blocked": "ORANGE",
     "Skipped": "YELLOW",
     "Merged": "GREEN",
     "Closed": "GRAY",
@@ -2518,17 +2520,11 @@ STATUS_MAP = {
     "needs_review": "Needs Review",
     "branch_created": "Branch Created",
     "conflict": "Conflict",
+    "blocked": "Blocked",
     "skipped": "Skipped",
     "merged": "Merged",
     "closed": "Closed",
     "superseded": "Superseded",
-    # Legacy aliases — state.load_state() already migrates these on read,
-    # but keep the mapping in case a raw status string slips through.
-    "ok": "Needs Review",
-    "resolved": "Needs Review",
-    "pending": "Needs Review",
-    "disabled": "Needs Review",
-    "needs_resolution": "Conflict",
 }
 
 REST_API_URL = "https://api.github.com"
