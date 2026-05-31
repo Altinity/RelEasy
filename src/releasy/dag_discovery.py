@@ -1,6 +1,6 @@
 """Auto-discover a PR dependency DAG and emit a recommended grouping.
 
-The ``releasy discover-deps`` command:
+The engine behind the ``releasy graph discover`` command:
 
 1. Walks the candidate PR set defined by ``config.pr_sources``, treating
    each user-declared group as a single super-node.
@@ -157,6 +157,14 @@ class DiscoveryReport:
     # means "newly discovered candidates / dependencies".
     refresh_removed: list[str] = field(default_factory=list)
     refresh_added: list[str] = field(default_factory=list)
+    # GitHub issue this graph was posted to via ``releasy graph discover
+    # --open-issue`` (``None`` until posted). ``last_ingested_at`` is the
+    # ``created_at`` of the newest issue comment already folded in by
+    # ``releasy graph update`` — used as the default ``--since`` so a
+    # re-run only considers comments posted after the last ingest.
+    issue_number: int | None = None
+    issue_url: str | None = None
+    last_ingested_at: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +196,7 @@ def run_discover_deps(
         base_branch = config.target_branch
     else:
         raise ValueError(
-            "discover-deps: cannot resolve base branch — pass --onto or set "
+            "graph discover: cannot resolve base branch — pass --onto or set "
             "target_branch in config.yaml."
         )
 
@@ -198,7 +206,7 @@ def run_discover_deps(
         raise RuntimeError(
             f"main repo {repo_path} has an in-progress git op (cherry-pick "
             f"/ merge / rebase) — finish or abort it first, then re-run "
-            "discover-deps."
+            "graph discover."
         )
     # Scratch parent is always the user-blessed work_dir. Plan §6:
     # ``<work_dir>/.releasy-discover-deps-<short_id>``. We deliberately
@@ -505,7 +513,8 @@ def run_discover_deps(
         _close_scratch_worktree(repo_path, scratch)
 
     # --- Break spurious cycles (older→newer wins) ---
-    edges = _break_cycles(edges, by_unit_id, warnings_acc)
+    sort_keys = _sort_keys_from_candidates(by_unit_id)
+    edges = _break_cycles(edges, sort_keys, warnings_acc)
 
     # User-declared groups whose discovery showed deps deserve to be
     # called out. We don't auto-mutate the main session — the user owns
@@ -523,7 +532,7 @@ def run_discover_deps(
                 )
 
     # --- Compute weakly-connected components and articulation points ---
-    components, singletons = _components(nodes, edges, by_unit_id)
+    components, singletons = _components(nodes, edges, sort_keys)
 
     # --- Build report ---
     skipped = sorted(fully_merged_units)
@@ -1379,7 +1388,7 @@ def _ai_resolve_fallback(
 def _components(
     nodes: dict[str, DAGNode],
     edges: set[tuple[str, str]],
-    by_unit_id: dict[str, _CandidateUnit],
+    sort_keys: dict[str, tuple[str, int]],
 ) -> tuple[list[DAGComponent], list[str]]:
     """Return (components, singletons). Components are the WCCs with ≥ 2
     nodes OR with at least one edge; singletons are leaf nodes with no
@@ -1418,7 +1427,7 @@ def _components(
             out_singletons.append(comp_nodes[0])
             continue
 
-        topo = _topo_sort_within(comp_nodes, edges, by_unit_id)
+        topo = _topo_sort_within(comp_nodes, edges, sort_keys)
         articulations = _articulation_points(comp_nodes, adj)
         comp_edges = sorted(
             [(a, b) for (a, b) in edges if a in comp_nodes and b in comp_nodes],
@@ -1438,7 +1447,7 @@ def _components(
 def _topo_sort_within(
     comp_nodes: list[str],
     edges: set[tuple[str, str]],
-    by_unit_id: dict[str, _CandidateUnit],
+    sort_keys: dict[str, tuple[str, int]],
 ) -> list[str]:
     """Topo-sort a single component so deps come before dependents.
 
@@ -1453,7 +1462,7 @@ def _topo_sort_within(
             succ[b].append(a)
     ready = sorted(
         [n for n, d in indeg.items() if d == 0],
-        key=lambda n: _candidate_sort_key(by_unit_id, n),
+        key=lambda n: _sort_key(sort_keys, n),
     )
     out: list[str] = []
     while ready:
@@ -1462,11 +1471,11 @@ def _topo_sort_within(
         for s in succ[n]:
             indeg[s] -= 1
             if indeg[s] == 0:
-                key = _candidate_sort_key(by_unit_id, s)
+                key = _sort_key(sort_keys, s)
                 lo, hi = 0, len(ready)
                 while lo < hi:
                     mid = (lo + hi) // 2
-                    if _candidate_sort_key(by_unit_id, ready[mid]) < key:
+                    if _sort_key(sort_keys, ready[mid]) < key:
                         lo = mid + 1
                     else:
                         hi = mid
@@ -1478,13 +1487,41 @@ def _topo_sort_within(
     return out
 
 
-def _candidate_sort_key(
-    by_unit_id: dict[str, _CandidateUnit], unit_id: str,
+def _sort_key(
+    sort_keys: dict[str, tuple[str, int]], unit_id: str,
 ) -> tuple[str, int]:
-    cu = by_unit_id.get(unit_id)
-    if cu is None:
-        return ("9999", 0)
-    return (cu.earliest_merged_at or "9999", cu.prs[0].number if cu.prs else 0)
+    """Topo/cycle tie-break key for ``unit_id`` (``(merged_at, pr_number)``).
+
+    Decoupled from :class:`_CandidateUnit` so the same graph algorithms
+    serve both fresh discovery (keys built from candidates) and
+    ``releasy graph update`` (keys rebuilt from :class:`DAGNode`s).
+    """
+    return sort_keys.get(unit_id, ("9999", 0))
+
+
+def _sort_keys_from_candidates(
+    by_unit_id: dict[str, _CandidateUnit],
+) -> dict[str, tuple[str, int]]:
+    return {
+        uid: (cu.earliest_merged_at or "9999", cu.prs[0].number if cu.prs else 0)
+        for uid, cu in by_unit_id.items()
+    }
+
+
+_PR_NUMBER_RE = re.compile(r"/pull/(\d+)")
+
+
+def _sort_keys_from_nodes(
+    nodes: list[DAGNode],
+) -> dict[str, tuple[str, int]]:
+    out: dict[str, tuple[str, int]] = {}
+    for n in nodes:
+        num = 0
+        if n.pr_urls:
+            m = _PR_NUMBER_RE.search(n.pr_urls[0])
+            num = int(m.group(1)) if m else 0
+        out[n.unit_id] = (n.earliest_merged_at or "9999", num)
+    return out
 
 
 def _articulation_points(
@@ -1544,7 +1581,7 @@ def _articulation_points(
 
 def _break_cycles(
     edges: set[tuple[str, str]],
-    by_unit_id: dict[str, _CandidateUnit],
+    sort_keys: dict[str, tuple[str, int]],
     warnings_acc: list[str],
 ) -> set[tuple[str, str]]:
     """Drop reverse edges in any 2-cycle to keep the graph acyclic.
@@ -1563,8 +1600,8 @@ def _break_cycles(
             continue
         if (b, a) in out and a != b:
             seen_pairs.add(pair)
-            ka = _candidate_sort_key(by_unit_id, a)
-            kb = _candidate_sort_key(by_unit_id, b)
+            ka = _sort_key(sort_keys, a)
+            kb = _sort_key(sort_keys, b)
             # Convention: an edge ``(x, y)`` means "x depends on y", so
             # we want to keep the edge that points from the NEWER unit
             # to the OLDER one (newer-depends-on-older).
@@ -1630,8 +1667,8 @@ def _node_sort_key(node: DAGNode) -> tuple[str, str]:
 
 
 def _default_report_path(config: Config, base_branch: str) -> Path:
-    """``<config-dir>/discover-deps.<base-branch>.yaml``."""
-    return config.config_path.parent / f"discover-deps.{base_branch}.yaml"
+    """``<config-dir>/graph.<base-branch>.yaml``."""
+    return config.config_path.parent / f"graph.{base_branch}.yaml"
 
 
 def _read_previous_overlay_auto_ids(overlay_path: Path) -> set[str]:
@@ -1671,6 +1708,13 @@ def _write_report(report: DiscoveryReport, path: Path) -> None:
         "candidate_unit_count": report.candidate_unit_count,
         "candidate_pr_count": report.candidate_pr_count,
     }
+    if report.issue_number is not None:
+        gi: dict = {"number": report.issue_number}
+        if report.issue_url:
+            gi["url"] = report.issue_url
+        if report.last_ingested_at:
+            gi["last_ingested_at"] = report.last_ingested_at
+        data["graph_issue"] = gi
     if report.skipped_already_in_target:
         data["skipped_already_in_target"] = list(report.skipped_already_in_target)
     if report.refresh_removed or report.refresh_added:
@@ -1765,11 +1809,98 @@ def _write_session_overlay(
     overlay_path.parent.mkdir(parents=True, exist_ok=True)
     with open(overlay_path, "w") as f:
         f.write(
-            "# AUTO-GENERATED by `releasy discover-deps`.\n"
+            "# AUTO-GENERATED by `releasy graph discover`.\n"
             "# Hand-edits will be overwritten on next run; remove this file\n"
             "# (or move entries into the main session file) to make them permanent.\n\n"
         )
         yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+
+
+def load_report(path: Path) -> DiscoveryReport:
+    """Reconstruct a :class:`DiscoveryReport` from a YAML written by
+    :func:`_write_report`.
+
+    Inverse of the writer; tolerant of its omit-when-empty conventions
+    (a missing ``deps`` / ``conflict_files_at_discovery`` → ``[]``, a
+    missing ``cached`` → ``False``) and re-tuples the 2-element edge
+    lists. Used by ``releasy graph update`` to reload the last
+    discovered graph without re-running the (expensive) trial picks.
+    """
+    with open(path) as f:
+        raw = yaml.safe_load(f) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: expected a mapping at the top level")
+
+    nodes: list[DAGNode] = []
+    for nd in raw.get("nodes", []) or []:
+        nodes.append(DAGNode(
+            unit_id=nd["unit_id"],
+            is_user_group=bool(nd.get("is_user_group", False)),
+            pr_urls=list(nd.get("pr_urls", []) or []),
+            pr_titles=list(nd.get("pr_titles", []) or []),
+            earliest_merged_at=nd.get("earliest_merged_at"),
+            deps=list(nd.get("deps", []) or []),
+            discovery_method=nd.get("discovery_method", ""),
+            conflict_files_at_discovery=list(
+                nd.get("conflict_files_at_discovery", []) or []
+            ),
+            cached=bool(nd.get("cached", False)),
+        ))
+
+    components: list[DAGComponent] = []
+    for cd in raw.get("components", []) or []:
+        components.append(DAGComponent(
+            component_id=cd.get("component_id", ""),
+            unit_ids=list(cd.get("unit_ids", []) or []),
+            recommend_first=list(cd.get("recommend_first", []) or []),
+            edges=[tuple(e) for e in (cd.get("edges", []) or []) if len(e) == 2],
+        ))
+
+    refresh = raw.get("refresh", {}) or {}
+    gi = raw.get("graph_issue", {}) or {}
+    return DiscoveryReport(
+        base_branch=raw.get("base_branch", ""),
+        target_sha=raw.get("target_sha", ""),
+        generated_at=raw.get("generated_at", ""),
+        candidate_unit_count=int(raw.get("candidate_unit_count", 0)),
+        candidate_pr_count=int(raw.get("candidate_pr_count", 0)),
+        skipped_already_in_target=list(
+            raw.get("skipped_already_in_target", []) or []
+        ),
+        nodes=nodes,
+        components=components,
+        singletons=list(raw.get("singletons", []) or []),
+        warnings=list(raw.get("warnings", []) or []),
+        refresh_removed=list(refresh.get("removed_since_last_run", []) or []),
+        refresh_added=list(refresh.get("added_since_last_run", []) or []),
+        issue_number=gi.get("number"),
+        issue_url=gi.get("url"),
+        last_ingested_at=gi.get("last_ingested_at"),
+    )
+
+
+def recompute_components(
+    report: DiscoveryReport,
+) -> tuple[list[DAGComponent], list[str]]:
+    """Recompute WCCs / topo order / articulation points from a report's
+    nodes and their ``deps``.
+
+    Used by ``releasy graph update`` after human corrections have mutated
+    the node/edge set: it mirrors the component-derivation step of
+    :func:`run_discover_deps` but works purely from :class:`DAGNode`
+    data — no ``_CandidateUnit`` or git worktree required. Edges are
+    re-derived from ``node.deps`` (the canonical per-node dependency
+    list), so a corrected ``deps`` is all the caller needs to mutate.
+    """
+    node_map = {n.unit_id: n for n in report.nodes}
+    edges: set[tuple[str, str]] = {
+        (n.unit_id, dep)
+        for n in report.nodes
+        for dep in n.deps
+        if dep in node_map
+    }
+    sort_keys = _sort_keys_from_nodes(report.nodes)
+    return _components(node_map, edges, sort_keys)
 
 
 # ---------------------------------------------------------------------------
