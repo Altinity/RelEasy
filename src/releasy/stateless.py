@@ -21,7 +21,7 @@ from typing import Literal
 
 from releasy.termlog import console
 
-from releasy.config import Config, make_stateless_config
+from releasy.config import Config, PortMode, make_stateless_config
 from releasy.git_ops import (
     OperationResult,
     abort_in_progress_op,
@@ -75,6 +75,12 @@ class StatelessOptions:
     push: bool = True
     open_pr: bool = False
     resolve_conflicts: bool = False
+    # Port direction for the AI resolver. ``backport`` unlocks the
+    # adapt/drop latitude (bucket 0 + bucket 2) so the resolver adjusts
+    # code rather than pulling prereqs; ``forward_port`` keeps the strict
+    # "report MISSING_PREREQS" behavior. Cross-repo one-offs are usually
+    # backports, hence the default.
+    mode: PortMode = "backport"
     build_command: str = ""
     claude_command: str = "claude"
     prompt_file: str | None = None
@@ -297,6 +303,7 @@ def _try_ai_resolve(
     target: str,
     pr_info: PRInfo,
     conflict_files: list[str],
+    mode: PortMode = "backport",
 ) -> tuple[bool, str | None]:
     """Invoke Claude on a conflicted cherry-pick. Returns ``(ok, error)``."""
     from releasy.ai_resolve import AIResolveContext, attempt_ai_resolve
@@ -307,6 +314,7 @@ def _try_ai_resolve(
         source_pr=pr_info,
         conflict_files=conflict_files,
         operation="cherry-pick",
+        mode=mode,
     )
     result = attempt_ai_resolve(config, repo_path, ctx)
 
@@ -587,7 +595,7 @@ def run_stateless_cherry_pick(opts: StatelessOptions) -> StatelessResult:
         if opts.resolve_conflicts and pr_info is not None:
             ok, err = _try_ai_resolve(
                 config, repo_path, branch, opts.target, pr_info,
-                cp_result.conflict_files,
+                cp_result.conflict_files, opts.mode,
             )
             if not ok:
                 _cleanup_failed(repo_path, branch, target_ref)

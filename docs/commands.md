@@ -544,6 +544,7 @@ time (pin it with `--branch-name`).
 releasy cherry-pick --origin <url> --target <branch> --commit <github-url>
                     [--branch-name <name>] [--push | --no-push] [--with-pr]
                     [--resolve-conflicts --build-command <cmd>]
+                    [--mode backport|forward_port]
                     [--claude-command <exe>] [--prompt-file <path>]
                     [--timeout <s>] [--max-iterations <n>]
                     [--formatting-example <pr-url>] [--work-dir <path>]
@@ -558,6 +559,7 @@ releasy cherry-pick --origin <url> --target <branch> --commit <github-url>
 | `--push` / `--no-push` | Push the branch to origin. | on |
 | `--with-pr` | Open a PR from the branch back to `--target` (implies `--push`; needs `RELEASY_GITHUB_TOKEN`). | off |
 | `--resolve-conflicts` | On conflict, invoke Claude. Requires `--build-command`. | off |
+| `--mode backport\|forward_port` | Port direction for the resolver. `backport` adapts code (adjust signatures, drop non-crucial upstream functionality) and declares a prerequisite only when the PR truly can't stand without it; `forward_port` is strict (reports `MISSING_PREREQS`). | `backport` |
 | `--build-command <cmd>` | Shell command Claude runs to verify the resolution compiles. Required with `--resolve-conflicts`. | — |
 | `--claude-command <exe>` | Claude executable. | `claude` |
 | `--prompt-file <path>` | AI-resolve prompt template. | bundled |

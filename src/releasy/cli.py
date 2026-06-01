@@ -407,6 +407,17 @@ def run(
          "the resolution compiles.",
 )
 @click.option(
+    "--mode",
+    "mode",
+    type=click.Choice(["backport", "forward_port"]),
+    default="backport",
+    show_default=True,
+    help="Port direction for the AI resolver. 'backport' lets it adapt "
+         "code (adjust signatures, drop non-crucial upstream functionality) "
+         "and only declares a prerequisite when the PR truly can't stand "
+         "without it; 'forward_port' is strict (reports MISSING_PREREQS).",
+)
+@click.option(
     "--build-command",
     "build_command",
     default="",
@@ -461,6 +472,7 @@ def cherry_pick_cmd(
     push: bool,
     with_pr: bool,
     resolve_conflicts: bool,
+    mode: str,
     build_command: str,
     claude_command: str,
     prompt_file: str | None,
@@ -507,6 +519,7 @@ def cherry_pick_cmd(
         push=push,
         open_pr=with_pr,
         resolve_conflicts=resolve_conflicts,
+        mode=mode,
         build_command=build_command,
         claude_command=claude_command,
         prompt_file=prompt_file,
