@@ -36,7 +36,8 @@ A short rationale, then the **complete** new graph as one fenced YAML block
 units:
   - id: <unit-id>            # keep prior ids stable
     prs:
-      - <pr-url>             # multiple ⇒ atomic group
+      - <pr-url>             # multiple ⇒ atomic group; list in apply order
+                             # (prerequisite first — this IS the cherry-pick seq)
     depends_on: [<unit-id>]  # omit if none
 exclude:                      # omit if nothing vetoed
   - url: <pr-url>

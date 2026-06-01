@@ -177,6 +177,91 @@ class BuildReportFromSpec(unittest.TestCase):
         self.assertIsNone(d._build_report_from_spec(report([node("u1", 1)]), {"units": []}, []))
 
 
+class CollapseComponentsToGroups(unittest.TestCase):
+    """Discovery now collapses each component into one ordered group node."""
+
+    def _nodes(self, *specs):
+        # specs: (uid, pr_num, is_user_group)
+        return {
+            uid: d.DAGNode(uid, grp, [URL(num)], [f"t{num}"],
+                           f"2026-01-{num:02d}T00:00:00+00:00", [], "trial-clean")
+            for uid, num, grp in specs
+        }
+
+    def test_component_merges_in_topo_order(self):
+        nodes = self._nodes(("u10", 10, False), ("u20", 20, False),
+                            ("u30", 30, False), ("solo", 99, False))
+        # comp.unit_ids is topo order (prereq first)
+        comp = d.DAGComponent("wcc-1", ["u10", "u20", "u30"], ["u10"],
+                              [("u20", "u10"), ("u30", "u20")])
+        folded, kept = d._collapse_components_to_groups(nodes, [comp], [])
+        self.assertEqual(folded, {"u10", "u20", "u30"})
+        self.assertEqual(kept, [])               # pure-auto: nothing kept
+        self.assertIn("solo", nodes)
+        gids = [k for k in nodes if k.startswith("auto-grp")]
+        self.assertEqual(len(gids), 1)
+        g = nodes[gids[0]]
+        self.assertEqual(gids[0], "auto-grp-u10")          # lead unit id (unique)
+        self.assertEqual(g.pr_urls, [URL(10), URL(20), URL(30)])  # prereq first
+        self.assertEqual(g.discovery_method, "grouped")
+        self.assertEqual(g.deps, [])
+        self.assertFalse(g.is_user_group)
+
+    def test_single_auto_unit_not_grouped(self):
+        nodes = self._nodes(("a", 1, False))
+        comp = d.DAGComponent("wcc-1", ["a"], [], [])
+        folded, kept = d._collapse_components_to_groups(nodes, [comp], [])
+        self.assertEqual(folded, set())
+        self.assertEqual(kept, [])
+        self.assertIn("a", nodes)
+
+    def test_mixed_component_kept_not_merged(self):
+        # auto `a` depends on user group `ug` → keep component (edges), don't
+        # merge, and `a` keeps its deps so the overlay can emit depends_on.
+        nodes = self._nodes(("ug", 5, True), ("a", 7, False))
+        nodes["a"].deps = ["ug"]
+        comp = d.DAGComponent("wcc-1", ["a", "ug"], [], [("a", "ug")])
+        w = []
+        folded, kept = d._collapse_components_to_groups(nodes, [comp], w)
+        self.assertEqual(folded, set())          # nothing merged
+        self.assertEqual(kept, [comp])           # component kept for overlay
+        self.assertIn("ug", nodes)
+        self.assertIn("a", nodes)
+        self.assertEqual(nodes["a"].deps, ["ug"])  # dependency preserved
+        self.assertFalse(any(k.startswith("auto-grp") for k in nodes))
+
+    def test_user_group_to_auto_dep_warned(self):
+        # user group depends on an auto unit → can't auto-apply → warn.
+        nodes = self._nodes(("ug", 5, True), ("a", 7, False))
+        nodes["ug"].deps = ["a"]
+        comp = d.DAGComponent("wcc-1", ["a", "ug"], [], [("ug", "a")])
+        w = []
+        folded, kept = d._collapse_components_to_groups(nodes, [comp], w)
+        self.assertEqual(kept, [comp])
+        self.assertTrue(any("user group" in x and "depends on" in x for x in w))
+
+    def test_no_gid_collision_cross_repo(self):
+        # Two pure-auto components whose lead PRs share a number but differ by
+        # repo must NOT collide (old auto-grp-<min-number> scheme would).
+        a = d.DAGNode("o-r-pr-100", False, ["https://github.com/o/r/pull/100"],
+                      ["t"], "2026-01-01T00:00:00+00:00", [], "trial-clean")
+        a2 = d.DAGNode("o-r-pr-101", False, ["https://github.com/o/r/pull/101"],
+                       ["t"], "2026-01-02T00:00:00+00:00", [], "trial-clean")
+        b = d.DAGNode("u-s-pr-100", False, ["https://github.com/u/s/pull/100"],
+                      ["t"], "2026-01-03T00:00:00+00:00", [], "trial-clean")
+        b2 = d.DAGNode("u-s-pr-102", False, ["https://github.com/u/s/pull/102"],
+                       ["t"], "2026-01-04T00:00:00+00:00", [], "trial-clean")
+        nodes = {n.unit_id: n for n in (a, a2, b, b2)}
+        comps = [
+            d.DAGComponent("wcc-1", ["o-r-pr-100", "o-r-pr-101"], [], [("o-r-pr-101", "o-r-pr-100")]),
+            d.DAGComponent("wcc-2", ["u-s-pr-100", "u-s-pr-102"], [], [("u-s-pr-102", "u-s-pr-100")]),
+        ]
+        folded, kept = d._collapse_components_to_groups(nodes, comps, [])
+        gids = sorted(k for k in nodes if k.startswith("auto-grp"))
+        self.assertEqual(gids, ["auto-grp-o-r-pr-100", "auto-grp-u-s-pr-100"])
+        self.assertEqual(len(gids), 2)           # two distinct groups, no clobber
+
+
 class ResolveBaseBranch(unittest.TestCase):
     def _cfg(self, target=None):
         return Config(
@@ -237,14 +322,99 @@ class ReconcileSessionUserGroups(unittest.TestCase):
         self.assertTrue(any("no matching session group" in x for x in w))
 
 
+class UpstreamPrereqRecursion(unittest.TestCase):
+    """Phase B pure pieces: cross-repo detection + upstream pull-in."""
+
+    def setUp(self):
+        from releasy.config import OriginConfig, UpstreamConfig
+        from releasy.pipeline import FeatureUnit
+        from releasy.github_ops import PRInfo
+        self._FeatureUnit, self._PRInfo = FeatureUnit, PRInfo
+        self.cfg = Config(
+            name="n", origin=OriginConfig(remote="git@github.com:Altinity/ClickHouse.git"),
+            project="p", upstream=UpstreamConfig(remote="git@github.com:ClickHouse/ClickHouse.git"),
+        )
+        self._save = (d.fetch_pr_by_url, d.ensure_remote, d.run_git)
+
+    def tearDown(self):
+        d.fetch_pr_by_url, d.ensure_remote, d.run_git = self._save
+
+    def _pr(self, slug, num, sha="deadbeef"):
+        return self._PRInfo(
+            number=num, title=f"PR {num}", body="", state="merged",
+            merge_commit_sha=sha, head_sha="h", url=f"https://github.com/{slug}/pull/{num}",
+            repo_slug=slug, merged_at="2026-01-01T00:00:00+00:00",
+        )
+
+    def _cu(self, slug, num):
+        pr = self._pr(slug, num)
+        fu = self._FeatureUnit(feature_id=f"pr-{num}", prs=[pr], if_exists="skip")
+        return d._CandidateUnit(f"pr-{num}", False, [pr], "2026-01-01T00:00:00+00:00", fu)
+
+    def test_is_cross_repo(self):
+        origin = "Altinity/ClickHouse"
+        self.assertTrue(d._is_cross_repo(self._cu("ClickHouse/ClickHouse", 1), origin))
+        self.assertFalse(d._is_cross_repo(self._cu("Altinity/ClickHouse", 2), origin))
+        self.assertFalse(d._is_cross_repo(self._cu("ClickHouse/ClickHouse", 3), None))
+
+    def test_pull_upstream_prereq_registers_unit(self):
+        pr = self._pr("ClickHouse/ClickHouse", 5000, sha="abc123")
+        d.fetch_pr_by_url = lambda config, url, **k: pr
+        d.ensure_remote = lambda *a, **k: True
+        d.run_git = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        by_id, url2u, sha2u = {}, {}, {}
+        url = "https://github.com/ClickHouse/ClickHouse/pull/5000"
+        cu = d._pull_upstream_prereq(self.cfg, Path("/x"), url, by_id, url2u, sha2u, [])
+        self.assertIsNotNone(cu)
+        self.assertEqual(cu.unit_id, "ClickHouse-ClickHouse-pr-5000")
+        self.assertEqual(url2u[url], cu.unit_id)
+        self.assertEqual(sha2u["abc123"], cu.unit_id)
+        self.assertIn(cu.unit_id, by_id)
+        # idempotent: second call returns the same registered unit
+        self.assertIs(d._pull_upstream_prereq(self.cfg, Path("/x"), url, by_id, url2u, sha2u, []), cu)
+
+    def test_pull_upstream_prereq_commit_unfetchable(self):
+        pr = self._pr("ClickHouse/ClickHouse", 6000, sha="nope")
+        d.fetch_pr_by_url = lambda config, url, **k: pr
+        d.ensure_remote = lambda *a, **k: True
+        # cat-file always fails → commit never available → None
+        d.run_git = lambda *a, **k: type("R", (), {"returncode": 1, "stdout": "", "stderr": ""})()
+        w = []
+        cu = d._pull_upstream_prereq(
+            self.cfg, Path("/x"), "https://github.com/ClickHouse/ClickHouse/pull/6000",
+            {}, {}, {}, w,
+        )
+        self.assertIsNone(cu)
+        self.assertTrue(any("not fetchable" in x for x in w))
+
+    def test_pull_upstream_prereq_no_upstream(self):
+        from releasy.config import OriginConfig
+        cfg = Config(name="n", origin=OriginConfig(remote="git@github.com:o/r.git"), project="p")
+        self.assertIsNone(d._pull_upstream_prereq(
+            cfg, Path("/x"), "https://github.com/u/s/pull/1", {}, {}, {}, []))
+
+    def test_fallback_surfaces_external_urls(self):
+        # _AIFallbackResult carries out-of-set prereq URLs for the caller.
+        r = d._AIFallbackResult(deps=[], resolved=False, method="ai-resolve",
+                                external_prereq_urls=["https://github.com/u/s/pull/9"])
+        self.assertEqual(r.external_prereq_urls, ["https://github.com/u/s/pull/9"])
+
+
 class IssueBodyAndRoundTrip(unittest.TestCase):
     def test_render_contains_key_parts(self):
-        r = report([node("u1", 1, deps=["u2"]), node("u2", 2)], excluded=[{"url": URL(9), "reason": "v"}])
+        # A multi-PR group + a standalone, plus an exclusion.
+        grp = d.DAGNode("auto-grp-1", False, [URL(1), URL(2)], ["t1", "t2"],
+                        "2026-01-01T00:00:00+00:00", [], "grouped")
+        r = report([grp, node("solo", 9)], excluded=[{"url": URL(7), "reason": "v"}])
         body = d.render_graph_issue_body(r)
-        self.assertIn("mermaid", body)
+        self.assertNotIn("mermaid", body)            # DAG is gone
         self.assertIn(d._issue_marker("b"), body)
-        self.assertIn("#9", body)
+        self.assertIn("Groups (port together", body)
+        self.assertIn("1. [#1]", body)               # numbered apply order
+        self.assertIn("2. [#2]", body)
+        self.assertIn("Standalone PRs", body)
         self.assertIn("Excluded", body)
+        self.assertIn("#7", body)
 
     def test_render_empty_graph_ok(self):
         d.render_graph_issue_body(report([]))  # must not raise

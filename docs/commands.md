@@ -225,20 +225,26 @@ failed, or any analyze-fails per-PR run errored — else `0`.
 
 ### `releasy graph discover`
 
-*Auto-discover a PR dependency DAG (and optionally post it as an issue).*
+*Auto-discover PR groups (and optionally post them as an issue).*
 
-Trial-cherry-picks every candidate in a scratch worktree, traces conflicts
-to older un-ported PRs touching the same files, emits a YAML grouping +
-writes a deps overlay at `<session-stem>.deps.yaml` that the loader picks
-up on the next [`run`](#releasy-run). Main session is never modified.
+Walks candidates **oldest-merged first**, trial-cherry-picking each onto the
+target in a scratch worktree. A real (non-cosmetic) conflict means the PR
+continues an earlier one, so the two are **grouped**: every connected set of
+such PRs collapses into one combined unit, cherry-picked together in
+**apply order** (prerequisite first). Cosmetic conflicts (whitespace, comment
+drift, independent regions) are *not* grouped — they port standalone and are
+resolved trivially at run time. Writes a deps overlay at
+`<session-stem>.deps.yaml` (multi-PR `auto_discovered` groups, `sort: listed`)
+that [`run`](#releasy-run) picks up. Main session is never modified.
 
-With `--open-issue` it also posts the rendered graph (Mermaid DAG +
-porting order + unit list) as a GitHub issue on origin, so the team can
-review and steer it — see [`graph update`](#releasy-graph-update). Re-running
-`--open-issue` updates that same issue rather than opening a duplicate.
+With `--open-issue` it posts the result as a GitHub issue on origin — each
+group shown as a numbered apply sequence — so the team can review and steer it
+via [`graph update`](#releasy-graph-update). Re-running `--open-issue` updates
+the same issue, not a duplicate.
 
 Declared `pr_sources.groups[]` are treated as **single super-nodes** —
-discovery never subdivides them.
+discovery never subdivides or auto-merges them (it only warns if one shares a
+dependency with other PRs).
 
 ```bash
 releasy graph discover [--onto <ver>] [--work-dir <path>]
@@ -273,29 +279,30 @@ releasy graph discover [--onto <ver>] [--work-dir <path>]
 `--no-ai` skips both AI steps. Trade-off: fast/free but the deterministic
 mapping misses semantic dependencies.
 
-**Port-branch caching:** when overlay write is enabled, the trial-pick
-result is preserved as `feature/<base>/<unit_id>`. The next
-[`run`](#releasy-run) reuses it via `if_exists: skip` — no re-cherry-pick,
-**no second AI resolve**. `--no-write` disables caching too (true
-dry-run). Re-runs always rewrite cache branches.
+**Port-branch caching:** a clean **standalone** PR's trial-pick is preserved as
+`feature/<base>/<unit_id>`, reused by [`run`](#releasy-run) via `if_exists:
+skip`. Grouped units are *not* cached — `run` cherry-picks the group fresh in
+the listed order. `--no-write` disables caching (true dry-run).
+
+**Upstream-backport recursion** (opt-in): when a **cross-repo** PR
+(`repo_slug` ≠ origin) conflicts on a prerequisite that isn't among the
+candidates, and `ai_resolve.auto_add_prerequisite_prs.enabled` is set with an
+`upstream` remote configured, the prerequisite PR is fetched from `upstream`,
+added to the candidate set, trial-picked, and folded into the same group
+(prerequisite first). Recurses on the prereq's own prereqs, bounded by
+`--max-depth` (default `max_prereq_depth`). Without those settings — or if the
+upstream commit can't be fetched — it's flagged `missing-prerequisites`.
 
 **Round-trip notes:**
 
-- Auto-discovered singletons become **1-PR groups** in the overlay
-  (carries `depends_on:`). Branch naming and AI-context semantics shift
-  to `is_group=True`. Move the entry into the main session (and drop
-  `auto_discovered:`) to make permanent.
-- Re-running rewrites the deps file from scratch. Hand-edits there will
-  be lost; use `--no-write` or `--deps-file <path>` to redirect.
-- Cycles in `depends_on` (from hand-edits) are rejected at session-load.
+- Groups are emitted as multi-PR `auto_discovered` entries (`sort: listed`,
+  prerequisite first). Move an entry into the main session (drop
+  `auto_discovered:`) to make it permanent.
+- Re-running rewrites the deps file from scratch — hand-edits are lost; use
+  `--no-write` / `--deps-file <path>` to redirect.
 
-**After the target moves:** just re-run `graph discover`. PRs that landed
-upstream drop out automatically. Summary line:
-
-```
-graph discover · base=antalya-26.3 · 24 candidates · 8 already in target
-  refresh: 3 removed [auto-pr-100, ...] · 1 added [auto-pr-300]
-```
+**After the target moves:** just re-run `graph discover`; PRs that landed
+upstream drop out automatically.
 
 Exit: `0` regardless of conflicts found — read-only diagnostic.
 

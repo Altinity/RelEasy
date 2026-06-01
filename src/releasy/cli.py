@@ -677,7 +677,7 @@ def graph_cmd() -> None:
 
 @graph_cmd.command(
     name="discover",
-    short_help="Auto-discover a PR dependency DAG from trial cherry-picks.",
+    short_help="Auto-discover PR groups from trial cherry-picks.",
 )
 @click.option(
     "--onto", default=None,
@@ -710,8 +710,9 @@ def graph_cmd() -> None:
          "candidates. Use deterministic git-graph deps as-is.",
 )
 @click.option(
-    "--max-depth", default=4, type=int, show_default=True,
-    help="Max recursion depth for transitive dep discovery.",
+    "--max-depth", default=None, type=int,
+    help="Cap for upstream-backport prereq recursion. Default: "
+         "ai_resolve.auto_add_prerequisite_prs.max_prereq_depth.",
 )
 @click.option(
     "--limit", "pr_limit", default=None, type=int,
@@ -746,20 +747,17 @@ def graph_discover_cmd(
     open_issue: bool,
     issue_title: str | None,
 ) -> None:
-    """Auto-discover a PR dependency DAG from trial cherry-picks.
+    """Auto-discover PR groups from trial cherry-picks.
 
-    Walks the candidate PR set defined by ``pr_sources``, trial-cherry-picks
-    each unit (singleton or user-declared group) onto the target branch tip
-    in a scratch git worktree, and on conflict, traces the conflicting
-    files back to older un-ported units that touched them. Always emits a
-    diagnostic YAML report.
+    Walks ``pr_sources`` candidates oldest-merged first, trial-cherry-picking
+    each onto the target tip in a scratch worktree. A real (non-cosmetic)
+    conflict groups the PR with its prerequisite; connected PRs collapse into
+    one combined unit, cherry-picked in apply order. Always emits a diagnostic
+    YAML report.
 
-    By default, also writes a deps overlay to the path declared in
-    ``pr_sources.deps_file`` of the session file (so the next
-    ``releasy run`` honors the discovered ``depends_on:``). Pass
-    ``--no-write`` to skip the overlay write, or ``--deps-file <path>``
-    to redirect it to a different file (without touching the configured
-    location).
+    By default also writes a deps overlay (multi-PR ``auto_discovered`` groups)
+    to ``pr_sources.deps_file`` so the next ``releasy run`` honors it. Pass
+    ``--no-write`` to skip, or ``--deps-file <path>`` to redirect.
 
     Read-only with respect to ``state.yaml`` and the main worktree. Acquires
     the project lock so it doesn't race with concurrent ``run`` invocations.
@@ -913,17 +911,23 @@ def _print_discovery_summary(report) -> None:  # noqa: ANN001 — DiscoveryRepor
                 f"{len(report.refresh_added)} added [{sample}{extra}]"
             )
         click.echo(f"  refresh: {' · '.join(bits)}")
+    groups = [
+        n for n in report.nodes
+        if not n.is_user_group and len(n.pr_urls) > 1
+    ]
+    if groups:
+        click.echo(f"  groups: {len(groups)} combined port(s)")
+        for g in groups:
+            click.echo(f"    {g.unit_id}: {len(g.pr_urls)} PR(s)")
     if report.components:
-        click.echo(f"  components: {len(report.components)}")
+        # Kept components: a user-declared group sharing deps with autos,
+        # emitted as depends_on edges rather than merged.
+        click.echo(f"  dependency components: {len(report.components)}")
         for comp in report.components:
             arrows = " → ".join(comp.unit_ids)
             click.echo(f"    {comp.component_id}: {arrows}")
-            if comp.recommend_first:
-                click.echo(
-                    f"      recommend_first: {', '.join(comp.recommend_first)}"
-                )
     if report.singletons:
-        click.echo(f"  singletons ({len(report.singletons)}): "
+        click.echo(f"  standalone PRs ({len(report.singletons)}): "
                    f"{', '.join(report.singletons[:8])}"
                    f"{' …' if len(report.singletons) > 8 else ''}")
     if report.warnings:

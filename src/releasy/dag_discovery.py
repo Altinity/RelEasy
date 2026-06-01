@@ -49,6 +49,7 @@ from releasy.git_ops import (
     abort_in_progress_op,
     append_commit_trailer,
     cherry_pick_merge_commit,
+    ensure_remote,
     ensure_work_repo,
     fetch_remote,
     get_conflict_files,
@@ -61,6 +62,7 @@ from releasy.github_ops import (
     create_issue,
     ensure_label,
     fetch_issue_comments,
+    fetch_pr_by_url,
     get_origin_repo_slug,
     parse_pr_url,
     update_issue,
@@ -354,22 +356,32 @@ def run_discover_deps(
     edges: set[tuple[str, str]] = set()
     by_unit_id: dict[str, _CandidateUnit] = {cu.unit_id: cu for cu in candidates}
     merge_containment_cache: dict[str, str] | None = None
+    # Recursion cap for upstream-backport pull-in: `--max-depth` overrides,
+    # else ai_resolve.auto_add_prerequisite_prs.max_prereq_depth.
+    cap = (
+        max_depth if max_depth is not None
+        else config.ai_resolve.auto_add_prerequisite_prs.max_prereq_depth
+    )
 
     scratch = _open_scratch_worktree(repo_path, scratch_parent, target_ref)
     try:
-        # Process latest-merged-at first (descending). Recursion into older
-        # candidates is pushed onto the queue.
+        # Process oldest-merged-at first (ascending), so a prereq is always
+        # trial-picked before any dependent — no in-set recursion needed.
+        # Out-of-set upstream prereqs (cross-repo backports) are appended to
+        # the queue with depth+1 and bounded by max_depth.
         queue: list[tuple[str, int]] = [
             (cu.unit_id, 0)
             for cu in sorted(
                 active_for_traversal,
-                key=lambda c: (c.earliest_merged_at or "0000", c.prs[0].number),
-                reverse=True,
+                key=lambda c: (
+                    c.earliest_merged_at or "0000",
+                    c.prs[0].number if c.prs else 0,
+                ),
             )
         ]
         console.print(
             f"  [dim]trial-picking {len(queue)} unit(s) onto {base_branch} "
-            "(latest first)…[/dim]"
+            "(oldest first)…[/dim]"
         )
 
         while queue:
@@ -385,10 +397,10 @@ def run_discover_deps(
                     f"unit {unit_id!r} referenced as a dep but not in candidate set; skipping"
                 )
                 continue
-            if depth > max_depth:
+            if depth > cap:
                 warnings_acc.append(
-                    f"unit {unit_id!r} hit max-depth={max_depth}; transitive "
-                    "deps may be incomplete"
+                    f"unit {unit_id!r} hit max recursion depth={cap}; "
+                    "upstream prerequisites may be incomplete"
                 )
                 # Still record the node so edges pointing at it resolve.
                 # Use a distinct ``discovery_method`` so the YAML reader
@@ -503,6 +515,33 @@ def run_discover_deps(
                         cand_dep_unit_ids = fb.deps
                         method = fb.method or "git-graph"
                         cache_kept = fb.resolved
+                        # Upstream-backport recursion: pull out-of-set
+                        # prereqs from upstream for cross-repo units, gated
+                        # on auto_add_prerequisite_prs.enabled + upstream +
+                        # depth cap. The pulled unit is queued (depth+1) and
+                        # grouped via the dependency edge.
+                        if (
+                            fb.external_prereq_urls
+                            and config.ai_resolve.auto_add_prerequisite_prs.enabled
+                            and config.upstream is not None
+                            and _is_cross_repo(cu, origin_slug)
+                            and depth < cap
+                        ):
+                            for ext_url in fb.external_prereq_urls:
+                                new_cu = _pull_upstream_prereq(
+                                    config, repo_path, ext_url,
+                                    by_unit_id, pr_url_to_unit,
+                                    merge_sha_to_unit, warnings_acc,
+                                )
+                                if new_cu is None:
+                                    continue
+                                edges.add((unit_id, new_cu.unit_id))
+                                if new_cu.unit_id not in nodes:
+                                    queue.append((new_cu.unit_id, depth + 1))
+                                console.print(
+                                    f"  [dim]· {unit_id}: pulled upstream "
+                                    f"prereq {new_cu.unit_id}[/dim]"
+                                )
                 # In ``--no-write`` (no cache_branch), we skip the AI
                 # fallback entirely — without the conflict state
                 # preserved we'd have to recreate it, defeating the
@@ -540,36 +579,44 @@ def run_discover_deps(
                 conflict_files=outcome.conflict_files,
                 cached=cache_kept,
             )
-            detail = f" → deps: {', '.join(deps)}" if deps else ""
+            detail = f" → groups with: {', '.join(deps)}" if deps else ""
             console.print(f"  [dim]· {unit_id}: {method}{detail}[/dim]")
+            # Record the directed prereq edges (dependent → prereq) used to
+            # order PRs within the collapsed group. Oldest-first means every
+            # in-set prereq is already processed; no recursion needed here.
             for d in deps:
                 edges.add((unit_id, d))
-                if d not in nodes:
-                    queue.append((d, depth + 1))
     finally:
         _close_scratch_worktree(repo_path, scratch)
 
-    # --- Break spurious cycles (older→newer wins) ---
+    # --- Break spurious cycles, find components, collapse them to groups ---
     sort_keys = _sort_keys_from_candidates(by_unit_id)
     edges = _break_cycles(edges, sort_keys, warnings_acc)
-
-    # User-declared groups whose discovery showed deps deserve to be
-    # called out. We don't auto-mutate the main session — the user owns
-    # those entries — but we do tell them via a warning so the
-    # recommendation isn't buried inside ``nodes[].deps``.
-    for cu in candidates:
-        if cu.is_user_group:
-            node = nodes.get(cu.unit_id)
-            if node and node.deps:
-                warnings_acc.append(
-                    f"user group {cu.unit_id!r} depends on: "
-                    f"{', '.join(node.deps)} — "
-                    "add these to its `depends_on:` in the session file "
-                    "if you want sequential gating in `releasy run`"
-                )
-
-    # --- Compute weakly-connected components and articulation points ---
-    components, singletons = _components(nodes, edges, sort_keys)
+    components, _singletons = _components(nodes, edges, sort_keys)
+    folded, components = _collapse_components_to_groups(
+        nodes, components, warnings_acc,
+    )
+    # The group isn't cached (run cherry-picks it fresh in the emitted
+    # order), so drop the now-superseded per-member cache branches.
+    if cache_enabled:
+        for uid in folded:
+            run_git(
+                ["branch", "-D", _cache_branch_name(base_branch, uid)],
+                repo_path, check=False,
+            )
+    if folded:
+        console.print(
+            f"  [dim]grouped {len(folded)} unit(s) into combined port(s)[/dim]"
+        )
+    # `components` now holds only the kept (user-group-bearing) components;
+    # singletons are the true standalone single-PR auto units.
+    _in_component = {uid for c in components for uid in c.unit_ids}
+    singletons = sorted(
+        n.unit_id for n in nodes.values()
+        if len(n.pr_urls) == 1
+        and not n.is_user_group
+        and n.unit_id not in _in_component
+    )
 
     # --- Build report ---
     skipped = sorted(fully_merged_units)
@@ -1333,6 +1380,9 @@ class _AIFallbackResult:
     # ``"ai-resolve-clean"`` — resolver succeeded without prereqs (drift).
     # ``None``               — neither: resolver failed without info.
     method: str | None
+    # Prereq PR URLs the resolver named that are NOT in the candidate set —
+    # candidates for upstream-backport recursion (cross-repo pull-in).
+    external_prereq_urls: list[str] = field(default_factory=list)
 
 
 def _ai_resolve_fallback(
@@ -1397,17 +1447,16 @@ def _ai_resolve_fallback(
             )
 
         if result.missing_prereq_prs:
-            # Map URLs → unit IDs.
+            # Map URLs → unit IDs; collect out-of-set URLs separately so the
+            # caller can pull them in from upstream (cross-repo backports).
             confirmed: list[str] = []
+            external: list[str] = []
             seen: set[str] = set()
             for url in result.missing_prereq_prs:
                 uid = pr_url_to_unit.get(url)
                 if uid is None:
-                    warnings_acc.append(
-                        f"unit {unit.unit_id!r}: AI-resolve fallback "
-                        f"reported {url!r} as a prereq but it's not in "
-                        "the candidate set; ignoring"
-                    )
+                    if url not in external:
+                        external.append(url)
                     continue
                 if uid == unit.unit_id:
                     continue
@@ -1423,6 +1472,7 @@ def _ai_resolve_fallback(
                 # the resolver's contract — no resolution happened.
                 resolved=False,
                 method="ai-resolve",
+                external_prereq_urls=external,
             )
 
         if result.success:
@@ -1438,6 +1488,73 @@ def _ai_resolve_fallback(
             f"unit {unit.unit_id!r}: AI-resolve fallback crashed: {e}"
         )
         return None
+
+
+def _is_cross_repo(cu: _CandidateUnit, origin_slug: str | None) -> bool:
+    """True if any of the unit's PRs lives in a repo other than origin."""
+    if not origin_slug:
+        return False
+    return any((p.repo_slug or origin_slug) != origin_slug for p in cu.prs)
+
+
+def _pull_upstream_prereq(
+    config: Config,
+    repo_path: Path,
+    url: str,
+    by_unit_id: dict[str, _CandidateUnit],
+    pr_url_to_unit: dict[str, str],
+    merge_sha_to_unit: dict[str, str],
+    warnings_acc: list[str],
+) -> _CandidateUnit | None:
+    """Fetch an out-of-set upstream prerequisite PR and register it as a unit.
+
+    Returns the new (or already-registered) ``_CandidateUnit``, or ``None``
+    if it can't be fetched / its merge commit can't be made available. Needs
+    ``config.upstream``. Best-effort: any failure degrades to ``None`` so the
+    prereq is just flagged, never crashing discovery.
+    """
+    if url in pr_url_to_unit:
+        return by_unit_id.get(pr_url_to_unit[url])
+    if config.upstream is None:
+        return None
+    parsed = parse_pr_url(url)
+    if parsed is None:
+        warnings_acc.append(f"upstream prereq {url!r}: unparseable URL; flagging missing")
+        return None
+    owner, repo, number = parsed
+    pr = fetch_pr_by_url(config, url, include_closed=True)
+    if pr is None or not pr.merge_commit_sha:
+        warnings_acc.append(
+            f"upstream prereq {url!r}: unreachable or no merge commit; flagging missing"
+        )
+        return None
+    # Make the merge commit available locally from the upstream remote.
+    ensure_remote(repo_path, config.upstream.remote_name, config.upstream.remote)
+    run_git(
+        ["fetch", config.upstream.remote_name, pr.merge_commit_sha],
+        repo_path, check=False,
+    )
+    if run_git(["cat-file", "-e", pr.merge_commit_sha], repo_path, check=False).returncode != 0:
+        run_git(
+            ["fetch", config.upstream.remote_name, config.upstream.branch],
+            repo_path, check=False,
+        )
+    if run_git(["cat-file", "-e", pr.merge_commit_sha], repo_path, check=False).returncode != 0:
+        warnings_acc.append(
+            f"upstream prereq {url!r}: merge commit {pr.merge_commit_sha[:8]} "
+            "not fetchable from upstream; flagging missing"
+        )
+        return None
+    feature_id = f"{owner}-{repo}-pr-{number}"
+    fu = FeatureUnit(feature_id=feature_id, prs=[pr], if_exists="skip", is_group=False)
+    cu = _CandidateUnit(
+        unit_id=feature_id, is_user_group=False, prs=[pr],
+        earliest_merged_at=pr.merged_at, feature_unit=fu,
+    )
+    by_unit_id[feature_id] = cu
+    pr_url_to_unit[url] = feature_id
+    merge_sha_to_unit[pr.merge_commit_sha] = feature_id
+    return cu
 
 
 # ---------------------------------------------------------------------------
@@ -1726,6 +1843,75 @@ def _node_sort_key(node: DAGNode) -> tuple[str, str]:
     return (node.earliest_merged_at or "9999", node.unit_id)
 
 
+def _collapse_components_to_groups(
+    nodes: dict[str, DAGNode],
+    components: list[DAGComponent],
+    warnings_acc: list[str],
+) -> tuple[set[str], list[DAGComponent]]:
+    """Merge each PURE-auto component into one ordered group node.
+
+    A real (non-cosmetic) dependency means the PRs port together, so a
+    component of only auto-discovered units collapses into a single group
+    whose ``pr_urls`` are in the component's topological (prereq-first)
+    order. A component that ALSO contains a user-declared group is NOT
+    merged (the user owns that entry) — it's kept as-is so its ``depends_on``
+    edges still reach the overlay; we only warn about user-group→auto deps
+    that can't be applied without editing the session.
+
+    Mutates ``nodes``. Returns ``(folded_member_ids, kept_components)`` —
+    folded ids for cache-branch cleanup, kept_components (the un-merged,
+    user-group-bearing ones) for the report so the overlay still emits them.
+    """
+    folded: set[str] = set()
+    kept_components: list[DAGComponent] = []
+    for comp in components:
+        member_ids = [uid for uid in comp.unit_ids if uid in nodes]
+        auto_ids = [uid for uid in member_ids if not nodes[uid].is_user_group]
+        user_ids = [uid for uid in member_ids if nodes[uid].is_user_group]
+        if user_ids:
+            # Can't merge across a user-declared group: keep the component
+            # as depends_on edges (auto nodes' deps reach the overlay). Warn
+            # only about user-group→auto deps we can't auto-apply.
+            kept_components.append(comp)
+            for uid in user_ids:
+                ug_deps = [d for d in nodes[uid].deps if d in member_ids]
+                if ug_deps:
+                    warnings_acc.append(
+                        f"user group {uid!r} depends on {', '.join(ug_deps)}; "
+                        "add these to its `depends_on:` in the session so "
+                        "`run` gates it correctly"
+                    )
+            continue
+        if len(auto_ids) < 2:
+            continue
+        pr_urls: list[str] = []
+        pr_titles: list[str] = []
+        merged_ats: list[str] = []
+        for uid in auto_ids:  # comp.unit_ids is topo order: prereq first
+            n = nodes[uid]
+            pr_urls.extend(n.pr_urls)
+            pr_titles.extend(n.pr_titles)
+            if n.earliest_merged_at:
+                merged_ats.append(n.earliest_merged_at)
+        # Key the group id on the lead (prereq-most) unit id, which is
+        # globally unique — `auto-grp-<min PR number>` collides across repos.
+        gid = f"auto-grp-{auto_ids[0]}"
+        for uid in auto_ids:
+            del nodes[uid]
+            folded.add(uid)
+        nodes[gid] = DAGNode(
+            unit_id=gid,
+            is_user_group=False,
+            pr_urls=pr_urls,
+            pr_titles=pr_titles,
+            earliest_merged_at=min(merged_ats) if merged_ats else None,
+            deps=[],
+            discovery_method="grouped",
+            cached=False,
+        )
+    return folded, kept_components
+
+
 def _default_report_path(config: Config, base_branch: str) -> Path:
     """``<config-dir>/graph.<base-branch>.yaml``."""
     return config.config_path.parent / f"graph.{base_branch}.yaml"
@@ -1864,6 +2050,10 @@ def _write_session_overlay(
             "prs": list(node.pr_urls),
             "auto_discovered": True,
         }
+        if len(node.pr_urls) > 1:
+            # prs are in apply order (prereq first) — honor it verbatim,
+            # don't re-sort by merged_at at port time (breaks cross-repo).
+            entry["sort"] = "listed"
         if node.deps:
             entry["depends_on"] = list(node.deps)
         overlay_groups.append(entry)
@@ -1990,21 +2180,6 @@ def _issue_marker(base_branch: str) -> str:
 _GRAPH_BOT_MARKER = "<!-- releasy-graph-bot -->"
 
 
-def _mermaid_id(index: int) -> str:
-    """Mermaid-safe node id (unit ids may contain ``.`` / ``-`` / ``/``)."""
-    return f"n{index}"
-
-
-def _node_pr_ref(node: DAGNode) -> str:
-    """Short ``#1500`` / ``#1500,#1501`` reference for a node's PRs."""
-    nums: list[str] = []
-    for url in node.pr_urls:
-        m = _PR_NUMBER_RE.search(url)
-        if m:
-            nums.append(f"#{m.group(1)}")
-    return ",".join(nums) if nums else node.unit_id
-
-
 def render_graph_issue_body(report: DiscoveryReport) -> str:
     """Render a DiscoveryReport as a GitHub issue body (markdown)."""
     lines: list[str] = [_issue_marker(report.base_branch)]
@@ -2014,70 +2189,39 @@ def render_graph_issue_body(report: DiscoveryReport) -> str:
         f"_Generated by `releasy graph` at {report.generated_at}._"
     )
     lines.append("")
+    groups = [n for n in report.nodes if len(n.pr_urls) > 1]
+    singles = [n for n in report.nodes if len(n.pr_urls) == 1]
     lines.append(
         f"**{report.candidate_unit_count} unit(s) across "
-        f"{report.candidate_pr_count} PR(s).** "
-        "An edge `A --> B` means **A depends on B** (port B first)."
+        f"{report.candidate_pr_count} PR(s)** — {len(groups)} group(s), "
+        f"{len(singles)} standalone. PRs inside a group port together as one "
+        "combined PR, cherry-picked in the listed order (prerequisite first)."
     )
     lines.append("")
 
-    id_map = {n.unit_id: _mermaid_id(i) for i, n in enumerate(report.nodes)}
-    nodes_by_id = {n.unit_id: n for n in report.nodes}
+    def _title_of(n: DAGNode, i: int) -> str:
+        return n.pr_titles[i] if i < len(n.pr_titles) and n.pr_titles[i] else ""
 
-    # --- Mermaid graph ---
-    lines.append("### Dependency graph")
-    lines.append("")
-    lines.append("```mermaid")
-    lines.append("graph TD")
-    if not report.nodes:
-        lines.append("  empty[\"(no units)\"]")
-    for n in report.nodes:
-        label = f"{n.unit_id} ({_node_pr_ref(n)})".replace('"', "'")
-        lines.append(f'  {id_map[n.unit_id]}["{label}"]')
-    for n in report.nodes:
-        for dep in n.deps:
-            if dep in id_map:
-                lines.append(f"  {id_map[n.unit_id]} --> {id_map[dep]}")
-    lines.append("```")
-    lines.append("")
-
-    # --- Components (porting order) ---
-    if report.components:
-        lines.append("### Components (suggested porting order)")
+    # --- Groups (port together, in order) ---
+    if groups:
+        lines.append("### Groups (port together, in apply order)")
         lines.append("")
-        for c in report.components:
-            lines.append(f"**{c.component_id}** — port in this order:")
-            for i, uid in enumerate(c.unit_ids, 1):
-                node = nodes_by_id.get(uid)
-                ref = _node_pr_ref(node) if node else uid
-                title = (node.pr_titles[0] if node and node.pr_titles else "")
-                lines.append(f"{i}. `{uid}` ({ref}) {title}".rstrip())
-            if c.recommend_first:
+        for n in groups:
+            lines.append(f"**`{n.unit_id}`**")
+            for i, url in enumerate(n.pr_urls):
                 lines.append(
-                    "   _Recommend first: "
-                    + ", ".join(f"`{u}`" for u in c.recommend_first)
-                    + "_"
+                    f"{i + 1}. [{_pr_short(url)}]({url}) {_title_of(n, i)}".rstrip()
                 )
             lines.append("")
 
-    # --- Full unit list ---
-    lines.append("### All units")
-    lines.append("")
-    for n in report.nodes:
-        pr_links = ", ".join(
-            f"[{_pr_short(url)}]({url})" for url in n.pr_urls
-        )
-        title = n.pr_titles[0] if n.pr_titles else ""
-        bits = [f"- `{n.unit_id}` — {pr_links}"]
-        if title:
-            bits.append(f" — {title}")
-        if n.deps:
-            bits.append(
-                " · depends on: " + ", ".join(f"`{d}`" for d in n.deps)
-            )
-        bits.append(f" · _{n.discovery_method}_")
-        lines.append("".join(bits))
-    lines.append("")
+    # --- Standalone PRs ---
+    if singles:
+        lines.append("### Standalone PRs")
+        lines.append("")
+        for n in singles:
+            url = n.pr_urls[0]
+            lines.append(f"- [{_pr_short(url)}]({url}) {_title_of(n, 0)}".rstrip())
+        lines.append("")
 
     # --- Excluded ---
     if report.excluded:
