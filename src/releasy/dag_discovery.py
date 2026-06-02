@@ -51,9 +51,11 @@ from releasy.git_ops import (
     cherry_pick_merge_commit,
     ensure_remote,
     ensure_work_repo,
+    fetch_commit,
     fetch_remote,
     get_conflict_files,
     is_operation_in_progress,
+    local_branch_exists,
     run_git,
 )
 from releasy.github_ops import (
@@ -65,6 +67,7 @@ from releasy.github_ops import (
     fetch_pr_by_url,
     get_origin_repo_slug,
     parse_pr_url,
+    slug_to_https_url,
     update_issue,
 )
 from releasy.pipeline import (
@@ -132,6 +135,10 @@ class DAGNode:
     # (no resolution attempted), or depth-cutoff. The presence of the
     # branch lets ``run`` skip the cherry-pick step entirely.
     cached: bool = False
+    # Merge-commit SHAs of this unit's PRs (parallel to ``pr_urls``). Used
+    # by incremental re-discovery to detect when a PR was re-merged (same
+    # URL, new SHA) so a stale cached branch isn't reused.
+    merge_shas: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -272,6 +279,32 @@ def run_discover_deps(
     cache_enabled = deps_overlay_path is not None
     origin_slug = get_origin_repo_slug(config)
 
+    # --- Incremental re-discovery ---
+    # If a prior report exists for the SAME target tip, reuse the cached
+    # results of unchanged standalone units and only trial-pick the new /
+    # changed ones. When the target moved, cached picks are stale — fall
+    # back to a full re-scan.
+    report_path = output_path or _default_report_path(config, base_branch)
+    reuse_index: dict[str, DAGNode] = {}
+    if cache_enabled and report_path.exists():
+        try:
+            prior_report = load_report(report_path)
+        except Exception:
+            # Incremental reuse is a pure optimization — a corrupt / stale /
+            # hand-edited prior report must degrade to a full re-scan, never
+            # crash discovery (YAML errors, KeyError, TypeError, …).
+            prior_report = None
+        if prior_report is not None and prior_report.target_sha == target_sha:
+            reuse_index = {n.unit_id: n for n in prior_report.nodes}
+            console.print(
+                "  [dim]incremental: target unchanged — reusing unchanged "
+                "units from the previous run[/dim]"
+            )
+        elif prior_report is not None:
+            console.print(
+                "  [dim]target moved since last run — full re-scan[/dim]"
+            )
+
     # Capture the auto-discovered unit IDs from the existing overlay (if
     # any) so we can show a refresh diff after the new overlay is built.
     # ``deps_overlay_path`` is None in --no-write mode; in that case we
@@ -354,6 +387,7 @@ def run_discover_deps(
     # --- Run trial picks in scratch worktree ---
     nodes: dict[str, DAGNode] = {}
     edges: set[tuple[str, str]] = set()
+    reused: list[str] = []
     by_unit_id: dict[str, _CandidateUnit] = {cu.unit_id: cu for cu in candidates}
     merge_containment_cache: dict[str, str] | None = None
     # Recursion cap for upstream-backport pull-in: `--max-depth` overrides,
@@ -411,6 +445,29 @@ def run_discover_deps(
                     conflict_files=[],
                 )
                 console.print(f"  [dim]· {unit_id}: depth-cutoff[/dim]")
+                continue
+
+            # Incremental reuse: a prior standalone clean/cached unit whose
+            # PRs (and merge SHAs) are unchanged, whose cache branch still
+            # exists AND is anchored to the current target tip, is reused
+            # as-is — skip the (re-)trial-pick (and any AI). The anchor
+            # check guards against a branch left on a stale/diverged base
+            # (interrupted run, `run --append`, force-push) being reused.
+            cache_br = _cache_branch_name(base_branch, unit_id)
+            prior_n = reuse_index.get(unit_id)
+            if (
+                prior_n is not None
+                and _is_reusable_unit(prior_n, cu)
+                and local_branch_exists(repo_path, cache_br)
+                and _branch_anchored_to(repo_path, cache_br, target_ref)
+            ):
+                nodes[unit_id] = _make_node(
+                    cu, deps=[], method=prior_n.discovery_method,
+                    conflict_files=list(prior_n.conflict_files_at_discovery),
+                    cached=True,
+                )
+                reused.append(unit_id)
+                console.print(f"  [dim]· {unit_id}: reused (unchanged)[/dim]")
                 continue
 
             # Cache branch path: when caching is enabled (the default),
@@ -586,37 +643,49 @@ def run_discover_deps(
             # in-set prereq is already processed; no recursion needed here.
             for d in deps:
                 edges.add((unit_id, d))
+
+        if reused:
+            console.print(
+                f"  [dim]reused {len(reused)} unchanged unit(s) from the "
+                "previous run[/dim]"
+            )
+
+        # --- Collapse components into groups, then build + cache each
+        # combined group branch while the scratch worktree is still open
+        # so `run` can reuse it instead of re-doing the cherry-picks ---
+        sort_keys = _sort_keys_from_candidates(by_unit_id)
+        edges = _break_cycles(edges, sort_keys, warnings_acc)
+        components, _singletons = _components(nodes, edges, sort_keys)
+        folded, components = _collapse_components_to_groups(
+            nodes, components, warnings_acc,
+        )
+        if cache_enabled:
+            # Build feature/<base>/<group-id> (clean → cached), then drop
+            # the now-superseded per-member branches.
+            _build_group_cache_branches(
+                scratch, base_branch, target_ref, nodes, by_unit_id,
+                origin_slug, warnings_acc,
+            )
+            for uid in folded:
+                run_git(
+                    ["branch", "-D", _cache_branch_name(base_branch, uid)],
+                    repo_path, check=False,
+                )
+        if folded:
+            console.print(
+                f"  [dim]grouped {len(folded)} unit(s) into combined port(s)[/dim]"
+            )
+        # `components` now holds only the kept (user-group-bearing)
+        # components; singletons are the true standalone single-PR units.
+        _in_component = {uid for c in components for uid in c.unit_ids}
+        singletons = sorted(
+            n.unit_id for n in nodes.values()
+            if len(n.pr_urls) == 1
+            and not n.is_user_group
+            and n.unit_id not in _in_component
+        )
     finally:
         _close_scratch_worktree(repo_path, scratch)
-
-    # --- Break spurious cycles, find components, collapse them to groups ---
-    sort_keys = _sort_keys_from_candidates(by_unit_id)
-    edges = _break_cycles(edges, sort_keys, warnings_acc)
-    components, _singletons = _components(nodes, edges, sort_keys)
-    folded, components = _collapse_components_to_groups(
-        nodes, components, warnings_acc,
-    )
-    # The group isn't cached (run cherry-picks it fresh in the emitted
-    # order), so drop the now-superseded per-member cache branches.
-    if cache_enabled:
-        for uid in folded:
-            run_git(
-                ["branch", "-D", _cache_branch_name(base_branch, uid)],
-                repo_path, check=False,
-            )
-    if folded:
-        console.print(
-            f"  [dim]grouped {len(folded)} unit(s) into combined port(s)[/dim]"
-        )
-    # `components` now holds only the kept (user-group-bearing) components;
-    # singletons are the true standalone single-PR auto units.
-    _in_component = {uid for c in components for uid in c.unit_ids}
-    singletons = sorted(
-        n.unit_id for n in nodes.values()
-        if len(n.pr_urls) == 1
-        and not n.is_user_group
-        and n.unit_id not in _in_component
-    )
 
     # --- Build report ---
     skipped = sorted(fully_merged_units)
@@ -689,7 +758,7 @@ def run_discover_deps(
             f"(would have written to {target})[/dim]"
         )
 
-    output_path = output_path or _default_report_path(config, base_branch)
+    output_path = report_path
 
     # Open/refresh the issue before the final write so issue_number persists
     # in the same report; carry a prior issue over to avoid duplicates.
@@ -1836,11 +1905,47 @@ def _make_node(
         discovery_method=method,
         conflict_files_at_discovery=list(conflict_files),
         cached=cached,
+        merge_shas=[p.merge_commit_sha or "" for p in cu.prs],
     )
 
 
 def _node_sort_key(node: DAGNode) -> tuple[str, str]:
     return (node.earliest_merged_at or "9999", node.unit_id)
+
+
+def _is_reusable_unit(prior_node: DAGNode, cu: _CandidateUnit) -> bool:
+    """Can a prior run's node be reused as-is (skip re-trial-picking)?
+
+    Only standalone, dependency-free, cached single-PR units qualify — their
+    cached ``feature/<base>/<id>`` branch already carries a working result,
+    and (with the target tip unchanged) re-picking the same PR is
+    deterministic. The PR's merge SHA must also be unchanged, so a PR that
+    was re-merged (same URL, new SHA) is re-picked rather than reused stale.
+    Grouped / conflicted units are always re-discovered. The caller
+    additionally verifies the cached branch is anchored to the target tip.
+    """
+    if not (
+        len(prior_node.pr_urls) == 1
+        and not prior_node.deps
+        and prior_node.cached
+        and prior_node.pr_urls == [p.url for p in cu.prs]
+    ):
+        return False
+    # Merge SHA must match too (re-merged PR → stale branch → re-pick).
+    # A prior report without merge_shas (older format) can't be verified —
+    # don't reuse, to be safe.
+    return bool(prior_node.merge_shas) and (
+        prior_node.merge_shas == [p.merge_commit_sha or "" for p in cu.prs]
+    )
+
+
+def _branch_anchored_to(repo_path: Path, branch: str, base_ref: str) -> bool:
+    """True if ``base_ref`` is an ancestor of ``branch`` — i.e. the cache
+    branch was built on top of the current target tip (not a stale base)."""
+    return run_git(
+        ["merge-base", "--is-ancestor", base_ref, branch],
+        repo_path, check=False,
+    ).returncode == 0
 
 
 def _collapse_components_to_groups(
@@ -1910,6 +2015,108 @@ def _collapse_components_to_groups(
             cached=False,
         )
     return folded, kept_components
+
+
+def _ensure_member_commits(
+    scratch: Path, prs: list[PRInfo], origin_slug: str | None,
+) -> list[str]:
+    """Make each PR's merge commit available locally, fetching cross-repo
+    members from their own repo (the broad origin fetch doesn't cover them).
+    Returns short refs for commits that still couldn't be obtained (empty =
+    all present), so the caller can skip caching cleanly instead of letting
+    the cherry-pick fail and misreport it as a conflict.
+    """
+    missing: list[str] = []
+    for p in prs:
+        sha = p.merge_commit_sha
+        if not sha:
+            missing.append(f"{p.repo_slug}#{p.number}")
+            continue
+        if run_git(["cat-file", "-e", sha], scratch, check=False).returncode == 0:
+            continue
+        if origin_slug is None or p.repo_slug != origin_slug:
+            fetch_commit(scratch, slug_to_https_url(p.repo_slug), sha)
+        if run_git(["cat-file", "-e", sha], scratch, check=False).returncode != 0:
+            missing.append(sha[:8])
+    return missing
+
+
+def _build_group_cache_branches(
+    scratch: Path,
+    base_branch: str,
+    target_ref: str,
+    nodes: dict[str, DAGNode],
+    by_unit_id: dict[str, _CandidateUnit],
+    origin_slug: str | None,
+    warnings_acc: list[str],
+) -> None:
+    """Build + cache each collapsed group's combined branch.
+
+    Cherry-picks a group's members in apply order onto a
+    ``feature/<base>/<group-id>`` branch. Clean → keep it and set
+    ``cached=True`` so ``run`` reuses it via ``if_exists: skip`` instead of
+    re-doing the work. Conflict → reset and leave ``cached=False`` (``run``
+    rebuilds and resolves). No AI here — discovery stays light; a group that
+    needs resolution falls back to ``run``'s resolver.
+    """
+    url_to_pr: dict[str, PRInfo] = {
+        p.url: p for cu in by_unit_id.values() for p in cu.prs
+    }
+    for node in [n for n in nodes.values() if n.discovery_method == "grouped"]:
+        prs = [url_to_pr[u] for u in node.pr_urls if u in url_to_pr]
+        if len(prs) != len(node.pr_urls):
+            warnings_acc.append(
+                f"group {node.unit_id!r}: could not resolve all member PRs; "
+                "not caching (run will build it)"
+            )
+            continue
+        # Ensure each member's merge commit is present locally — cross-repo
+        # (include_prs / upstream) members aren't in the broad origin fetch.
+        # If one can't be fetched, skip caching with an accurate message
+        # (run fetches + builds it); don't run the pick and misreport it.
+        missing = _ensure_member_commits(scratch, prs, origin_slug)
+        if missing:
+            warnings_acc.append(
+                f"group {node.unit_id!r}: member commit(s) {', '.join(missing)} "
+                "not fetchable locally; not cached — `run` will fetch + build"
+            )
+            continue
+        group_cu = _CandidateUnit(
+            unit_id=node.unit_id,
+            is_user_group=True,
+            prs=prs,
+            earliest_merged_at=node.earliest_merged_at,
+            feature_unit=FeatureUnit(
+                feature_id=node.unit_id, prs=prs, if_exists="skip",
+                is_group=True, group_id=node.unit_id,
+            ),
+        )
+        cache_branch = _cache_branch_name(base_branch, node.unit_id)
+        outcome = _trial_pick_unit(
+            scratch, group_cu, target_ref,
+            cache_branch=cache_branch, is_group=True, origin_slug=origin_slug,
+        )
+        if outcome.clean:
+            _release_cache_branch(scratch, target_ref, cache_branch, keep=True)
+            node.cached = True
+            console.print(
+                f"  [dim]· {node.unit_id}: group builds clean — cached[/dim]"
+            )
+        else:
+            _release_cache_branch(scratch, target_ref, cache_branch, keep=False)
+            node.cached = False
+            # Distinguish a real merge conflict from a non-conflict failure
+            # (empty / already-applied member) — both arrive as clean=False.
+            reason = (
+                f"combined cherry-pick conflicts ({len(outcome.conflict_files)} "
+                "file(s))"
+                if outcome.conflict_files
+                else "combined cherry-pick failed (member empty/already applied)"
+            )
+            warnings_acc.append(
+                f"group {node.unit_id!r}: {reason}; not "
+                "cached — `run` will resolve it"
+            )
 
 
 def _default_report_path(config: Config, base_branch: str) -> Path:
@@ -2005,6 +2212,7 @@ def _write_report(report: DiscoveryReport, path: Path) -> None:
                     n.conflict_files_at_discovery or None
                 ),
                 "cached": True if n.cached else None,
+                "merge_shas": n.merge_shas or None,
             }.items()
             if v is not None
         }
@@ -2104,6 +2312,7 @@ def load_report(path: Path) -> DiscoveryReport:
                 nd.get("conflict_files_at_discovery", []) or []
             ),
             cached=bool(nd.get("cached", False)),
+            merge_shas=list(nd.get("merge_shas", []) or []),
         ))
 
     components: list[DAGComponent] = []

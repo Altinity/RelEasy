@@ -279,10 +279,15 @@ releasy graph discover [--onto <ver>] [--work-dir <path>]
 `--no-ai` skips both AI steps. Trade-off: fast/free but the deterministic
 mapping misses semantic dependencies.
 
-**Port-branch caching:** a clean **standalone** PR's trial-pick is preserved as
-`feature/<base>/<unit_id>`, reused by [`run`](#releasy-run) via `if_exists:
-skip`. Grouped units are *not* cached — `run` cherry-picks the group fresh in
-the listed order. `--no-write` disables caching (true dry-run).
+**Port-branch caching:** trial-pick results are preserved as
+`feature/<base>/<unit_id>` and reused by [`run`](#releasy-run) via
+`if_exists: skip` — no re-cherry-pick. This covers **standalone** PRs and
+**auto-discovered groups**: a group's combined branch `feature/<base>/<group-id>`
+is built (members cherry-picked in apply order, cross-repo commits fetched as
+needed) and cached when it applies cleanly. A group that conflicts combined — or
+whose commits can't be fetched — isn't cached (`run` rebuilds and resolves it).
+User-declared `pr_sources.groups[]` are not combined-cached. `--no-write`
+disables caching (true dry-run).
 
 **Upstream-backport recursion** (opt-in): when a **cross-repo** PR
 (`repo_slug` ≠ origin) conflicts on a prerequisite that isn't among the
@@ -301,8 +306,16 @@ upstream commit can't be fetched — it's flagged `missing-prerequisites`.
 - Re-running rewrites the deps file from scratch — hand-edits are lost; use
   `--no-write` / `--deps-file <path>` to redirect.
 
-**After the target moves:** just re-run `graph discover`; PRs that landed
-upstream drop out automatically.
+**Re-scanning for new PRs:** just re-run `graph discover` — there is no
+`graph refresh`. It re-queries `pr_sources` (labels etc.) fresh each run, so
+PRs that newly match are picked up and PRs that landed in target drop out; the
+summary prints a refresh-diff (`refresh: N removed [...] · M added [...]`).
+
+**Incremental re-runs:** when the target tip is unchanged since the last run,
+discovery **reuses** the cached result of each unchanged standalone unit
+(skipping its trial-pick and any AI) and only processes new / changed PRs.
+Groups are re-discovered. If `origin/<base>` moved, cached picks are stale, so
+it falls back to a full re-scan (noted in the output).
 
 Exit: `0` regardless of conflicts found — read-only diagnostic.
 

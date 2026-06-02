@@ -262,6 +262,107 @@ class CollapseComponentsToGroups(unittest.TestCase):
         self.assertEqual(len(gids), 2)           # two distinct groups, no clobber
 
 
+class IsReusableUnit(unittest.TestCase):
+    """Incremental discovery reuses only standalone, cached, unchanged units."""
+
+    def _cu(self, num):
+        from releasy.pipeline import FeatureUnit
+        from releasy.github_ops import PRInfo
+        pr = PRInfo(number=num, title=f"t{num}", body="", state="merged",
+                    merge_commit_sha=f"s{num}", head_sha="h", url=URL(num),
+                    repo_slug="o/r", merged_at="2026-01-01T00:00:00+00:00")
+        return d._CandidateUnit(f"pr-{num}", False, [pr], pr.merged_at,
+                                FeatureUnit(feature_id=f"pr-{num}", prs=[pr], if_exists="skip"))
+
+    def _node(self, urls, *, deps=None, cached=True, shas=None):
+        return d.DAGNode("pr-x", False, urls, ["t"] * len(urls),
+                         "2026-01-01T00:00:00+00:00", deps or [], "trial-clean",
+                         cached=cached, merge_shas=shas if shas is not None else ["s1"])
+
+    def test_reusable_clean_standalone(self):
+        self.assertTrue(d._is_reusable_unit(self._node([URL(1)], shas=["s1"]), self._cu(1)))
+
+    def test_not_reusable_multi_pr(self):
+        self.assertFalse(d._is_reusable_unit(self._node([URL(1), URL(2)]), self._cu(1)))
+
+    def test_not_reusable_with_deps(self):
+        self.assertFalse(d._is_reusable_unit(self._node([URL(1)], deps=["pr-9"]), self._cu(1)))
+
+    def test_not_reusable_uncached(self):
+        self.assertFalse(d._is_reusable_unit(self._node([URL(1)], cached=False), self._cu(1)))
+
+    def test_not_reusable_url_changed(self):
+        self.assertFalse(d._is_reusable_unit(self._node([URL(2)]), self._cu(1)))
+
+    def test_not_reusable_sha_changed(self):
+        # same URL, but the PR was re-merged (new merge SHA) → must NOT reuse.
+        self.assertFalse(d._is_reusable_unit(self._node([URL(1)], shas=["OLD"]), self._cu(1)))
+
+    def test_not_reusable_missing_shas(self):
+        # prior report has no merge_shas (older format) → can't verify → no reuse.
+        self.assertFalse(d._is_reusable_unit(self._node([URL(1)], shas=[]), self._cu(1)))
+
+
+class BuildGroupCacheBranches(unittest.TestCase):
+    """Group combined branches are built + cached (clean) or skipped (conflict)."""
+
+    def setUp(self):
+        from releasy.pipeline import FeatureUnit
+        from releasy.github_ops import PRInfo
+        self._save = (d._trial_pick_unit, d._release_cache_branch, d._ensure_member_commits)
+        self._released = []
+        d._release_cache_branch = (
+            lambda scratch, ref, br, keep: self._released.append((br, keep))
+        )
+        d._ensure_member_commits = lambda scratch, prs, origin_slug: []  # all present
+        self._FeatureUnit, self._PRInfo = FeatureUnit, PRInfo
+
+    def tearDown(self):
+        d._trial_pick_unit, d._release_cache_branch, d._ensure_member_commits = self._save
+
+    def _setup(self, *, clean):
+        from releasy.github_ops import PRInfo
+        from releasy.pipeline import FeatureUnit
+        prs = [
+            PRInfo(number=n, title=f"t{n}", body="", state="merged",
+                   merge_commit_sha=f"sha{n}", head_sha="h",
+                   url=URL(n), repo_slug="o/r", merged_at=f"2026-01-0{n}T00:00:00+00:00")
+            for n in (1, 2)
+        ]
+        by_id = {
+            f"pr-{p.number}": d._CandidateUnit(
+                f"pr-{p.number}", False, [p], p.merged_at,
+                FeatureUnit(feature_id=f"pr-{p.number}", prs=[p], if_exists="skip"))
+            for p in prs
+        }
+        grp = d.DAGNode("auto-grp-pr-1", False, [URL(1), URL(2)], ["t1", "t2"],
+                        "2026-01-01T00:00:00+00:00", [], "grouped")
+        nodes = {"auto-grp-pr-1": grp, "solo": node("solo", 9)}
+        outcome = type("O", (), {"clean": clean, "conflict_files": [] if clean else ["f.cpp"],
+                                 "conflicting_pr_idx": None})()
+        picked = {}
+        d._trial_pick_unit = lambda scratch, unit, ref, **k: (
+            picked.update(prs=[p.url for p in unit.prs], is_group=k.get("is_group")) or outcome
+        )
+        return nodes, by_id, grp, picked
+
+    def test_clean_group_cached(self):
+        nodes, by_id, grp, picked = self._setup(clean=True)
+        d._build_group_cache_branches(Path("/x"), "b", "ref", nodes, by_id, "o/r", [])
+        self.assertTrue(grp.cached)
+        self.assertEqual(picked["prs"], [URL(1), URL(2)])   # apply order preserved
+        self.assertTrue(picked["is_group"])
+        self.assertIn(("feature/b/auto-grp-pr-1", True), self._released)  # kept
+
+    def test_conflicting_group_not_cached(self):
+        nodes, by_id, grp, picked = self._setup(clean=False)
+        w = []
+        d._build_group_cache_branches(Path("/x"), "b", "ref", nodes, by_id, "o/r", w)
+        self.assertFalse(grp.cached)
+        self.assertIn(("feature/b/auto-grp-pr-1", False), self._released)  # dropped
+        self.assertTrue(any("conflicts" in x and "1 file" in x for x in w))
+
+
 class ResolveBaseBranch(unittest.TestCase):
     def _cfg(self, target=None):
         return Config(
@@ -433,6 +534,15 @@ class IssueBodyAndRoundTrip(unittest.TestCase):
         self.assertEqual(back.issue_number, 77)
         self.assertEqual(back.last_ingested_at, "2026-05-30T12:00:00+00:00")
         self.assertEqual(back.excluded, [{"url": URL(9), "reason": "v"}])
+
+    def test_merge_shas_round_trip(self):
+        tmp = Path(tempfile.mkdtemp())
+        rp = tmp / "graph.b.yaml"
+        n = d.DAGNode("pr-1", False, [URL(1)], ["t"], "2026-01-01T00:00:00+00:00",
+                      [], "trial-clean", cached=True, merge_shas=["deadbeef"])
+        d._write_report(report([n]), rp)
+        back = d.load_report(rp)
+        self.assertEqual(back.nodes[0].merge_shas, ["deadbeef"])
 
 
 class OpenOrUpdateIssue(unittest.TestCase):
