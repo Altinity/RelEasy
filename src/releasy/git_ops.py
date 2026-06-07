@@ -621,3 +621,14 @@ def is_tag_ref(repo_path: Path, ref: str) -> bool:
         repo_path, check=False,
     )
     return result.returncode == 0
+
+
+def commit_date(repo_path: Path, ref: str) -> str | None:
+    """Committer date of ``ref`` as strict ISO 8601, or ``None``."""
+    result = run_git(
+        ["show", "-s", "--format=%cI", ref], repo_path, check=False,
+    )
+    if result.returncode != 0:
+        return None
+    lines = [ln for ln in (result.stdout or "").splitlines() if ln.strip()]
+    return lines[0].strip() if lines else None

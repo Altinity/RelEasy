@@ -573,6 +573,9 @@ class GraphConfig:
     post_comment: bool = True
     # Enforce vetoes by adding the PR to exclude_prs (else record-only).
     apply_exclusions: bool = True
+    # Collapse (mark Outdated) the comments an update actually addressed;
+    # unaddressed comments are left visible.
+    minimize_addressed_comments: bool = True
     extra_args: list[str] = field(default_factory=list)
 
 
@@ -1276,6 +1279,9 @@ def load_config(config_path: Path | None = None) -> Config:
         issue_labels=[s.strip() for s in gr_labels_raw if s.strip()],
         post_comment=bool(gr_raw.get("post_comment", True)),
         apply_exclusions=bool(gr_raw.get("apply_exclusions", True)),
+        minimize_addressed_comments=bool(
+            gr_raw.get("minimize_addressed_comments", True)
+        ),
         extra_args=gr_raw.get("extra_args", []) or [],
     )
 

@@ -84,6 +84,21 @@ releasy status                   # see where everything stands
 Running several projects? Each directory has its own `config.yaml`; `releasy
 list` shows them all.
 
+## Cut a release
+
+When the base branch is ready to ship, draft the GitHub release notes:
+
+```bash
+releasy draft-release --from v26.1.6.6-stable --to antalya-26.3 --name v26.1.6.20001.altinityantalya
+```
+
+This collects the PRs **merged into the target branch** in the
+`--from..--to` window (one GitHub query), drops forward-ports, classifies each
+by its Changelog category, and creates a **draft** release on origin (its URL
+is printed). Pass `--prs <url> ...` to draft from an explicit PR set instead,
+or `-o notes.md` to write the markdown to a file rather than publishing. Full
+flags: [docs/commands.md](docs/commands.md#releasy-draft-release).
+
 ## Learn more
 
 - **[docs/concepts.md](docs/concepts.md)** — how it works: the pipeline, branch

@@ -83,6 +83,54 @@ class ParseGraphSpec(unittest.TestCase):
     def test_missing_units_key(self):
         self.assertIsNone(d._parse_graph_spec("```yaml\nfoo: bar\n```"))
 
+    def test_units_as_mapping(self):
+        # `units:` as an id→fields map is normalised to a list with id injected.
+        txt = fence("units:\n  u1:\n    prs: [%s]" % URL(1))
+        spec = d._parse_graph_spec(txt)
+        self.assertEqual(spec["units"][0]["id"], "u1")
+        self.assertEqual(spec["units"][0]["prs"], [URL(1)])
+
+    def test_bare_top_level_list(self):
+        # A bare list of unit mappings (no `units:` wrapper) is accepted.
+        txt = fence("- id: u\n  prs: [%s]" % URL(1))
+        self.assertEqual(d._parse_graph_spec(txt)["units"][0]["id"], "u")
+
+    def test_bare_list_without_unit_keys_rejected(self):
+        # A list of dicts that aren't units (no prs/id) is not misread.
+        self.assertIsNone(d._parse_graph_spec(fence("- foo: 1\n- bar: 2")))
+
+
+class AddressedComments(unittest.TestCase):
+    def test_normalize_none(self):
+        self.assertEqual(d._normalize_addressed(None), set())
+
+    def test_normalize_list(self):
+        self.assertEqual(
+            d._normalize_addressed(["C1", "[c3]", " C2 "]), {"C1", "C2", "C3"},
+        )
+
+    def test_normalize_scalar(self):
+        self.assertEqual(d._normalize_addressed("C1"), {"C1"})
+
+    def test_normalize_drops_empty(self):
+        self.assertEqual(d._normalize_addressed(["", "C1"]), {"C1"})
+
+    def test_normalize_bare_int(self):
+        # Bare ints "3" coerce to "C3" so they still match the handle map.
+        self.assertEqual(d._normalize_addressed([1, 3]), {"C1", "C3"})
+
+    def test_render_block_has_handles(self):
+        import types
+        c = lambda n: types.SimpleNamespace(  # noqa: E731
+            author=f"u{n}", author_association="MEMBER",
+            created_at="2026-01-01T00:00:00+00:00", body=f"comment {n}",
+        )
+        handled = d._handle_comments([c(1), c(2)])
+        self.assertEqual([h for h, _ in handled], ["C1", "C2"])
+        block = d._render_comments_block(handled)
+        self.assertIn("[C1] Comment by @u1", block)
+        self.assertIn("[C2] Comment by @u2", block)
+
 
 class HasCycle(unittest.TestCase):
     def test_cycle(self):

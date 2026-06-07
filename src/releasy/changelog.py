@@ -1,8 +1,10 @@
-"""Generate a release changelog from merge commits on the target branch.
+"""Generate a release changelog from PRs merged into the target branch.
 
-Walks first-parent merge commits between two refs, fetches each merged
-PR from the origin repo, drops forward-ports, and renders a categorised
-markdown changelog matching the Altinity release-notes convention.
+Queries the origin repo (one Search-API call) for PRs whose base is the
+target branch and that merged within the ``--from``..``--to`` window,
+drops forward-ports, and renders a categorised markdown changelog
+matching the Altinity release-notes convention. An explicit PR set can
+be supplied instead, bypassing discovery.
 
 Output goes either to a file (``-o``) or to a draft GitHub release on
 the origin repo.
@@ -17,6 +19,7 @@ from pathlib import Path
 
 from releasy.config import Config
 from releasy.git_ops import (
+    commit_date,
     ensure_remote,
     ensure_work_repo,
     is_tag_ref,
@@ -27,8 +30,9 @@ from releasy.github_ops import (
     PRInfo,
     create_draft_release,
     fetch_pr_by_number,
+    fetch_pr_by_url,
     get_origin_repo_slug,
-    parse_pr_url,
+    search_merged_prs_by_base,
 )
 from releasy.termlog import console
 
@@ -95,11 +99,6 @@ _CATEGORY_PATTERNS: list[tuple[str, str]] = [
 _FWDPORT_TITLE_RE = re.compile(r"forward[\s\-]?port", re.IGNORECASE)
 _FWDPORT_LABELS = {"forwardport", "forward-port", "forward port"}
 
-# Standard GitHub merge-commit subject (open-PR merges, not squash).
-_MERGE_PR_RE = re.compile(r"^Merge pull request #(\d+) from\b")
-# Squash-merge / rebase-merge subjects often end with "(#N)" — fall back.
-_SQUASH_PR_RE = re.compile(r"\(#(\d+)\)\s*$")
-
 # "ClickHouse/ClickHouse#12345" or "owner/repo#N" cross-repo refs in body.
 _CROSSREPO_REF_RE = re.compile(r"\b([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)\b")
 # Markdown link to a github.com/.../pull/N
@@ -118,13 +117,6 @@ _CHERRY_PICKED_FROM_RE = re.compile(
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class MergeCommit:
-    sha: str
-    pr_number: int
-    subject: str
 
 
 @dataclass
@@ -238,32 +230,107 @@ def _is_forward_port(pr: PRInfo) -> bool:
     return False
 
 
+# "by @handle" attribution inside a parenthetical. The ``@`` is required so
+# prose like "fixed by hand" is not read as an author.
+_BY_AUTHOR_RE = re.compile(r"by\s+@([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)")
+
+
+def _trailing_paren_group(text: str) -> tuple[int, str] | None:
+    """Locate the balanced ``(...)`` group that ends ``text``.
+
+    Returns ``(start_index, inner_text)`` or ``None``. Unlike a simple
+    ``\\(([^()]+)\\)$`` regex, this spans nested parens — so a markdown
+    attribution like ``([#101272](url) by @x)`` is matched whole.
+    """
+    t = text.rstrip()
+    if not t.endswith(")"):
+        return None
+    depth = 0
+    for i in range(len(t) - 1, -1, -1):
+        if t[i] == ")":
+            depth += 1
+        elif t[i] == "(":
+            depth -= 1
+            if depth == 0:
+                return i, t[i + 1:len(t) - 1]
+    return None  # unbalanced
+
+
+def _paren_names_upstream(inner: str, upstream_prs: list[PRInfo]) -> bool:
+    """True if ``inner`` references any of ``upstream_prs`` by url or slug#N.
+
+    Only the two unambiguous forms count — the full PR url (which is also a
+    substring of a ``[#N](url)`` markdown link) and the ``owner/repo#N``
+    shorthand. A bare ``#N`` is NOT matched: it would strip a benign
+    parenthetical whose number happens to equal an upstream PR's.
+    """
+    for pr in upstream_prs:
+        if pr.url and pr.url in inner:
+            return True
+        if f"{pr.repo_slug}#{pr.number}" in inner:
+            return True
+    return False
+
+
+def _attribution_from_text(
+    inner: str, origin_slug: str,
+) -> list[tuple[str, int, str | None]]:
+    """Parse cross-repo ``(slug, number, author)`` from an attribution paren.
+
+    Only full PR URLs and ``owner/repo#N`` shorthands count (a bare
+    ``#N`` or ``(see notes)`` is ignored), so this won't misread an
+    ordinary trailing parenthetical as an upstream link. Each ref is
+    credited to the ``by @handle`` that follows it (so a paren naming two
+    PRs by different authors attributes each correctly), falling back to
+    the sole author when there's exactly one.
+    """
+    authors = [(m.start(), m.group(1)) for m in _BY_AUTHOR_RE.finditer(inner)]
+
+    def _author_for(end_pos: int) -> str | None:
+        for apos, a in authors:
+            if apos >= end_pos:
+                return a
+        return authors[0][1] if len(authors) == 1 else None
+
+    refs: list[tuple[int, int, str, int]] = []  # (start, end, slug, number)
+    for m in _PR_URL_RE.finditer(inner):
+        refs.append((m.start(), m.end(), f"{m.group(1)}/{m.group(2)}", int(m.group(3))))
+    for m in _CROSSREPO_REF_RE.finditer(inner):
+        refs.append((m.start(), m.end(), m.group(1), int(m.group(2))))
+    refs.sort()
+
+    out: list[tuple[str, int, str | None]] = []
+    seen: set[tuple[str, int]] = set()
+    for _start, end, slug, num in refs:
+        if slug.lower() == origin_slug.lower():
+            continue
+        key = (slug.lower(), num)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((slug, num, _author_for(end)))
+    return out
+
+
 def _strip_redundant_upstream_parens(
     description: str, upstream_prs: list[PRInfo],
 ) -> str:
     """Drop a trailing "(<upstream-url> by @author)" already in the entry.
 
     Altinity port PRs often copy the upstream PR's own changelog entry
-    verbatim — including its trailing "(<url> by @author)" parenthetical
-    that names the upstream PR. We then re-derive the same info from
-    the body's cross-repo references and append " via <altinity-url>",
-    which double-prints the upstream link. Strip the trailing
-    parenthetical when (and only when) it mentions one of the upstream
-    PRs we've already extracted, so the renderer can attach a single
-    combined parenthetical.
+    verbatim — including its trailing "(<url> by @author)" parenthetical.
+    We re-derive the same info and append " via <altinity-url>", so strip
+    the trailing parenthetical when it names one of the upstream PRs to
+    avoid double-printing. Balanced-paren aware (handles markdown links).
     """
     if not description or not upstream_prs:
         return description
-    m = re.search(r"\s*\(([^()]+)\)\s*$", description)
-    if not m:
+    grp = _trailing_paren_group(description)
+    if grp is None:
         return description
-    inner = m.group(1)
-    for pr in upstream_prs:
-        if pr.url and pr.url in inner:
-            return description[:m.start()].rstrip()
-        # Cross-repo shorthand like "ClickHouse/ClickHouse#102606".
-        if f"{pr.repo_slug}#{pr.number}" in inner:
-            return description[:m.start()].rstrip()
+    start, inner = grp
+    if _paren_names_upstream(inner, upstream_prs):
+        return description[:start].rstrip()
     return description
 
 
@@ -318,53 +385,125 @@ def _extract_upstream_refs(
 
 
 # ---------------------------------------------------------------------------
-# Git: walking merge commits
+# Git: ref dates + PR → entry
 # ---------------------------------------------------------------------------
 
 
-def walk_target_merges(
-    repo_path: Path, from_ref: str, to_ref: str,
-) -> list[MergeCommit]:
-    """Return first-parent merge commits in ``(from_ref..to_ref]``.
-
-    First-parent traversal keeps us on the target branch's mainline:
-    merges that landed on side branches before being merged here are
-    skipped. PR numbers are extracted from the standard GitHub
-    "Merge pull request #N from …" subject; squash-merges that don't
-    match aren't merge commits to begin with.
-    """
-    # Field separator: TAB. Python's ``str.splitlines()`` treats \x1e
-    # (RS, U+001E) as a line break, so a separator like %x1e silently
-    # splits each commit into two "lines" and breaks parsing. Tabs are
-    # safe — git's %s subject is a single line and never contains them.
-    fmt = "%H%x09%s"
-    result = run_git(
-        [
-            "log", "--first-parent", "--merges", "--reverse",
-            f"--format={fmt}", f"{from_ref}..{to_ref}",
-        ],
-        repo_path,
-        check=False,
-    )
-    if result.returncode != 0:
-        return []
-    out: list[MergeCommit] = []
-    for raw in result.stdout.splitlines():
-        if not raw:
-            continue
-        parts = raw.split("\t", 1)
-        if len(parts) != 2:
-            continue
-        sha, subject = parts
-        m = _MERGE_PR_RE.match(subject)
-        if not m:
-            m = _SQUASH_PR_RE.search(subject)
-        if not m:
-            continue
-        out.append(MergeCommit(
-            sha=sha.strip(), pr_number=int(m.group(1)), subject=subject,
-        ))
+def _fetch_upstream_prs(
+    config: Config,
+    pr: PRInfo,
+    origin_slug: str,
+    upstream_cache: dict[tuple[str, int], PRInfo | None],
+) -> list[PRInfo]:
+    """Cross-repo backport PRs (with bodies) named in pr's Cherry-picked-from line."""
+    out: list[PRInfo] = []
+    for slug, number in _extract_upstream_refs(pr.body or "", origin_slug):
+        key = (slug.lower(), number)
+        if key in upstream_cache:
+            u = upstream_cache[key]
+        else:
+            u = fetch_pr_by_number(config, number, slug=slug, include_closed=True)
+            upstream_cache[key] = u
+        if u is not None:
+            out.append(u)
     return out
+
+
+def _classify_and_describe(
+    src_pr: PRInfo, *, label: str,
+) -> tuple[str, str] | None:
+    """``(section, description)`` from a PR's body, or ``None`` to drop it.
+
+    Drops ``Not for Changelog`` PRs and PRs with no usable ``Changelog
+    entry`` (PR title is never a fallback); folds a missing category into
+    Improvements. ``label`` names the PR in the skip log.
+    """
+    section = _classify_category(_section_text(src_pr.body or "", "changelog category"))
+    if section == SECTION_NOT_FOR_CHANGELOG:
+        console.print(f"  [dim]not for changelog: skipping {label}[/dim]")
+        return None
+    description = _description_for_pr(src_pr)
+    if not description:
+        console.print(f"  [dim]no changelog entry: skipping {label}[/dim]")
+        return None
+    return (section if section is not None else SECTION_IMPROVEMENTS), description
+
+
+def _entry_from_upstream(altinity_pr: PRInfo, u: PRInfo) -> ChangelogEntry | None:
+    """One bullet sourced from an upstream backport PR's own changelog entry."""
+    cd = _classify_and_describe(u, label=f"upstream #{u.number}")
+    if cd is None:
+        return None
+    section, description = cd
+    description = _strip_redundant_upstream_parens(description, [u])
+    return ChangelogEntry(
+        pr=altinity_pr, description=description, section=section, upstream_prs=[u],
+    )
+
+
+def _entry_from_altinity(
+    pr: PRInfo,
+    origin_slug: str,
+    upstream_prs: list[PRInfo],
+) -> ChangelogEntry | None:
+    """One bullet from the port PR's own entry (single / zero-backport case)."""
+    cd = _classify_and_describe(pr, label=f"#{pr.number}")
+    if cd is None:
+        return None
+    section, description = cd
+
+    # Copy: never mutate the caller's list (it owns the fetched upstreams).
+    upstream_prs = list(upstream_prs)
+    # No ``Cherry-picked from`` line (non-RelEasy / older port): recover the
+    # upstream link + author from the entry's own trailing attribution so we
+    # still render the "via" form instead of crediting the porter.
+    if not upstream_prs:
+        grp = _trailing_paren_group(description)
+        if grp is not None:
+            for slug, number, author in _attribution_from_text(grp[1], origin_slug):
+                upstream_prs.append(PRInfo(
+                    number=number, title="", body="", state="merged",
+                    merge_commit_sha=None, head_sha="",
+                    url=f"https://github.com/{slug}/pull/{number}",
+                    repo_slug=slug, author=author,
+                ))
+
+    description = _strip_redundant_upstream_parens(description, upstream_prs)
+    return ChangelogEntry(
+        pr=pr, description=description, section=section, upstream_prs=upstream_prs,
+    )
+
+
+def _entries_for_pr(
+    config: Config,
+    pr: PRInfo,
+    origin_slug: str,
+    upstream_cache: dict[tuple[str, int], PRInfo | None],
+) -> list[ChangelogEntry]:
+    """Changelog bullets for one merged PR (0, 1, or N).
+
+    A bundle of ≥2 upstream backports yields one bullet per upstream PR —
+    each from its own entry, attributed ``via`` this port PR. Otherwise a
+    single bullet from this PR's own entry. Drops forward-ports,
+    ``Not for Changelog`` PRs, and entries with no ``Changelog entry``.
+    """
+    if _is_forward_port(pr):
+        console.print(f"  [dim]forward-port: skipping #{pr.number}[/dim]")
+        return []
+
+    upstream_prs = _fetch_upstream_prs(config, pr, origin_slug, upstream_cache)
+
+    if len(upstream_prs) >= 2:
+        # One bullet per upstream PR that carries its own entry. An upstream
+        # PR with no ``Changelog entry`` is dropped (logged) — same as a
+        # standalone PR: a missing entry is the author's opt-out, not a bug.
+        entries = [e for e in (_entry_from_upstream(pr, u) for u in upstream_prs) if e]
+        if entries:
+            return entries
+        # None had a usable entry → fall back to the bundle's own entry.
+
+    e = _entry_from_altinity(pr, origin_slug, upstream_prs)
+    return [e] if e is not None else []
 
 
 # ---------------------------------------------------------------------------
@@ -605,8 +744,14 @@ def build_changelog(
     work_dir: Path | None = None,
     compared_to_url: str | None = None,
     docker_image_url: str | None = None,
+    base_branch: str | None = None,
+    explicit_prs: list[str] | None = None,
 ) -> tuple[str, str, bool] | None:
-    """Walk merge commits, fetch + classify PRs, render the changelog.
+    """Collect PRs merged into the target branch and render the changelog.
+
+    By default queries origin for PRs whose base is ``base_branch`` (the
+    target branch) and that merged in the ``from_ref``..``to_ref`` window.
+    ``explicit_prs`` (URLs) bypasses discovery and uses exactly that set.
 
     ``release_name`` is the GitHub release **tag** (e.g.
     ``v26.1.6.20001.altinityantalya``). ``display_title`` is the
@@ -729,90 +874,67 @@ def build_changelog(
         )
         return None
 
-    console.print(
-        f"Walking merge commits in [cyan]{from_ref}..{to_ref}[/cyan] "
-        f"(first-parent only)..."
-    )
-    merges = walk_target_merges(repo_path, from_ref, to_ref)
-    console.print(f"  [dim]Found {len(merges)} merge commit(s)[/dim]")
-
     title = display_title or format_display_title(release_name)
     packages_block = render_packages_block(release_name, docker_image_url)
-
     to_is_tag = is_tag_ref(repo_path, to_ref)
 
-    if not merges:
-        from_label, from_sha, from_url = _resolve_compared_to(
-            config, repo_path, from_ref, compared_to_url,
+    # Collect the PR set: an explicit override, or the PRs merged into
+    # the target branch within the from..to window (one Search query).
+    upstream_cache: dict[tuple[str, int], PRInfo | None] = {}
+    prs: list[PRInfo] = []
+    if explicit_prs:
+        console.print(
+            f"Using [cyan]{len(explicit_prs)}[/cyan] PR(s) from "
+            f"--prs / --prs-file..."
         )
-        md = render_markdown(
-            display_title=title,
-            to_sha=to_sha,
-            from_ref_label=from_label,
-            from_sha=from_sha,
-            from_url=from_url,
-            entries=[],
-            packages_block=packages_block,
+        for url in explicit_prs:
+            pr = fetch_pr_by_url(config, url, include_closed=True)
+            if pr is None:
+                console.print(
+                    f"  [yellow]![/yellow] could not fetch {url} — skipping"
+                )
+                continue
+            if pr.state != "merged":
+                # Release notes list what shipped; an open / unmerged-closed
+                # PR doesn't belong even when explicitly named.
+                console.print(
+                    f"  [yellow]![/yellow] {url} is {pr.state}, not merged "
+                    "— skipping"
+                )
+                continue
+            prs.append(pr)
+    else:
+        base = base_branch or config.target_branch or to_ref
+        from_date = commit_date(repo_path, from_ref)
+        to_date = commit_date(repo_path, to_ref)
+        if from_date is None:
+            # Without a lower bound the query would scan the branch's entire
+            # history; refuse rather than emit a bogus whole-history changelog.
+            console.print(
+                f"[red]Could not read the commit date of --from {from_ref!r}.[/red] "
+                "Cannot bound the release window."
+            )
+            return None
+        console.print(
+            f"Querying PRs merged into [cyan]{base}[/cyan] in "
+            f"[cyan]{from_ref}..{to_ref}[/cyan]..."
         )
-        return md, to_sha, to_is_tag
+        prs = search_merged_prs_by_base(
+            config, base,
+            merged_from=from_date, merged_to=to_date,
+            exclude_labels=sorted(_FWDPORT_LABELS),
+        )
+        if len(prs) >= 1000:
+            # GitHub Search caps at 1000 results — never silently truncate.
+            console.print(
+                "  [yellow]warning:[/yellow] hit GitHub Search's 1000-result "
+                "cap; some PRs may be missing. Narrow the --from..--to window."
+            )
+    console.print(f"  [dim]Considering {len(prs)} PR(s)[/dim]")
 
     entries: list[ChangelogEntry] = []
-    upstream_cache: dict[tuple[str, int], PRInfo | None] = {}
-
-    for mc in merges:
-        pr = fetch_pr_by_number(config, mc.pr_number, slug=origin_slug)
-        if pr is None:
-            console.print(
-                f"  [yellow]![/yellow] PR #{mc.pr_number} (merge {mc.sha[:8]}) "
-                "could not be fetched — skipping"
-            )
-            continue
-        if _is_forward_port(pr):
-            console.print(f"  [dim]forward-port: skipping #{pr.number}[/dim]")
-            continue
-
-        category_text = _section_text(pr.body or "", "changelog category")
-        section = _classify_category(category_text)
-        if section == SECTION_NOT_FOR_CHANGELOG:
-            console.print(
-                f"  [dim]not for changelog: skipping #{pr.number}[/dim]"
-            )
-            continue
-
-        description = _description_for_pr(pr)
-        if not description:
-            # Strict rule: no Changelog entry → drop. PR title is NEVER
-            # used as a fallback, even when the category is otherwise
-            # eligible.
-            console.print(
-                f"  [dim]no changelog entry: skipping #{pr.number}[/dim]"
-            )
-            continue
-
-        # Category absent but description present → fold into Improvements.
-        if section is None:
-            section = SECTION_IMPROVEMENTS
-
-        upstream_refs = _extract_upstream_refs(pr.body or "", origin_slug)
-        upstream_prs: list[PRInfo] = []
-        for slug, number in upstream_refs:
-            key = (slug.lower(), number)
-            if key in upstream_cache:
-                u = upstream_cache[key]
-            else:
-                u = fetch_pr_by_number(config, number, slug=slug, include_closed=True)
-                upstream_cache[key] = u
-            if u is not None:
-                upstream_prs.append(u)
-
-        description = _strip_redundant_upstream_parens(description, upstream_prs)
-
-        entries.append(ChangelogEntry(
-            pr=pr,
-            description=description,
-            section=section,
-            upstream_prs=upstream_prs,
-        ))
+    for pr in prs:
+        entries.extend(_entries_for_pr(config, pr, origin_slug, upstream_cache))
 
     from_label, from_sha, from_url = _resolve_compared_to(
         config, repo_path, from_ref, compared_to_url,
@@ -846,6 +968,8 @@ def emit_changelog(
     work_dir: Path | None = None,
     compared_to_url: str | None = None,
     docker_image_url: str | None = None,
+    base_branch: str | None = None,
+    explicit_prs: list[str] | None = None,
 ) -> bool:
     """Run the changelog build and either write to file or open a draft release.
 
@@ -868,6 +992,8 @@ def emit_changelog(
         work_dir=work_dir,
         compared_to_url=compared_to_url,
         docker_image_url=docker_image_url,
+        base_branch=base_branch,
+        explicit_prs=explicit_prs,
     )
     if result is None:
         return False

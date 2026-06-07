@@ -66,6 +66,7 @@ from releasy.github_ops import (
     fetch_issue_comments,
     fetch_pr_by_url,
     get_origin_repo_slug,
+    minimize_comment,
     parse_pr_url,
     slug_to_https_url,
     update_issue,
@@ -2507,6 +2508,14 @@ _GRAPH_SPEC_FENCE_RE = re.compile(
     r"```(?:ya?ml)?\s*\n(.*?)```", re.DOTALL,
 )
 
+# Appended on a one-shot retry when the first reply had no parseable graph.
+_GRAPH_UPDATE_RETRY_SUFFIX = (
+    "\n\n---\n\nYour previous reply had no usable graph. Reply with the "
+    "COMPLETE new graph as one fenced ```yaml block with a top-level "
+    "`units:` list (per Output above) — every unit that should remain, not "
+    "a diff or a prose summary. Output the YAML block now."
+)
+
 
 def _comment_is_trusted(comment, config: Config) -> bool:  # noqa: ANN001
     assoc = (comment.author_association or "").upper()
@@ -2516,11 +2525,38 @@ def _comment_is_trusted(comment, config: Config) -> bool:  # noqa: ANN001
     return login in {r.lower() for r in config.graph.trusted_reviewers}
 
 
+def _normalize_spec(parsed: object) -> dict | None:
+    """Coerce a parsed fenced block into ``{'units': [...], ...}`` or None.
+
+    Tolerates the model's common format drift: ``units`` as a mapping of
+    id→fields, or a bare top-level list of unit mappings.
+    """
+    if isinstance(parsed, dict):
+        units = parsed.get("units")
+        if isinstance(units, list):
+            return parsed
+        if isinstance(units, dict):
+            out: list[dict] = []
+            for uid, fields in units.items():
+                d = dict(fields) if isinstance(fields, dict) else {}
+                d.setdefault("id", uid)
+                out.append(d)
+            new = dict(parsed)
+            new["units"] = out
+            return new
+        return None
+    if isinstance(parsed, list) and parsed and all(
+        isinstance(x, dict) and ("prs" in x or "id" in x) for x in parsed
+    ):
+        return {"units": parsed}
+    return None
+
+
 def _parse_graph_spec(text: str) -> dict | None:
     """Parse the fenced YAML graph spec from Claude's reply, or None.
 
-    Scans every fenced block and keeps the last that parses to a mapping
-    with a `units` list (skips leading example/prose fences).
+    Scans every fenced block and keeps the last that normalises to a
+    mapping with a `units` list (skips leading example/prose fences).
     """
     chosen: dict | None = None
     for block in _GRAPH_SPEC_FENCE_RE.findall(text):
@@ -2528,20 +2564,43 @@ def _parse_graph_spec(text: str) -> dict | None:
             parsed = yaml.safe_load(block)
         except yaml.YAMLError:
             continue
-        if isinstance(parsed, dict) and isinstance(parsed.get("units"), list):
-            chosen = parsed  # keep scanning — last valid block wins
+        norm = _normalize_spec(parsed)
+        if norm is not None:
+            chosen = norm  # keep scanning — last valid block wins
     return chosen
 
 
-def _render_comments_block(comments: list) -> str:  # noqa: ANN001
+def _handle_comments(comments: list) -> list[tuple[str, object]]:  # noqa: ANN001
+    """Assign each comment a stable ``C<n>`` handle. Single source of truth
+    shared by the prompt renderer and the addressed→minimize map so the two
+    can never drift out of sync."""
+    return [(f"C{i}", c) for i, c in enumerate(comments, start=1)]
+
+
+def _render_comments_block(handled: list[tuple[str, object]]) -> str:
     out: list[str] = []
-    for c in comments:
+    for handle, c in handled:
         assoc = c.author_association or "?"
         out.append(
-            f"### Comment by @{c.author or 'unknown'} ({assoc}) "
+            f"### [{handle}] Comment by @{c.author or 'unknown'} ({assoc}) "
             f"at {c.created_at}\n{c.body.strip()}"
         )
     return "\n\n".join(out) or "_(none)_"
+
+
+def _normalize_addressed(value: object) -> set[str]:
+    """Normalise Claude's ``addressed`` list into a set of ``C<n>`` handles."""
+    if value is None:
+        return set()
+    items = value if isinstance(value, list) else [value]
+    out: set[str] = set()
+    for x in items:
+        handle = re.sub(r"[^A-Za-z0-9]", "", str(x)).upper()  # "[c1]" → "C1"
+        if handle.isdigit():  # bare int "3" → "C3"
+            handle = "C" + handle
+        if handle:
+            out.add(handle)
+    return out
 
 
 def _render_current_graph_block(report: DiscoveryReport) -> str:
@@ -2567,11 +2626,12 @@ def _render_current_graph_block(report: DiscoveryReport) -> str:
 def _ask_claude_for_new_graph(
     config: Config,
     report: DiscoveryReport,
-    comments: list,  # noqa: ANN001
+    handled: list[tuple[str, object]],
     warnings_acc: list[str],
 ) -> dict | None:
     """Render the adjust-graph prompt, run Claude (text-only), parse the
-    spec. Returns the spec mapping or None on any failure."""
+    spec. ``handled`` is the (handle, comment) list. Returns the spec
+    mapping or None on any failure."""
     prompt_path = config.config_path.parent / config.graph.prompt_file
     if not prompt_path.exists():
         prompt_path = Path(__file__).parent / "prompts" / "adjust_graph.md"
@@ -2589,7 +2649,7 @@ def _ask_claude_for_new_graph(
         "base_branch": report.base_branch,
         "current_graph_block": _render_current_graph_block(report),
         "candidate_pr_list": candidate_pr_list,
-        "comments_block": _render_comments_block(comments),
+        "comments_block": _render_comments_block(handled),
     }
 
     def _replace(match: re.Match[str]) -> str:
@@ -2608,12 +2668,35 @@ def _ask_claude_for_new_graph(
             f"Claude graph-update call failed: {res.error or 'no output'}"
         )
         return None
+
     spec = _parse_graph_spec(res.text)
+    last_text = res.text
     if spec is None:
-        warnings_acc.append(
-            "Claude reply did not contain a parseable YAML graph spec; "
-            "changing nothing"
+        # The model sometimes returns only a prose "changes made" summary.
+        # Retry once, demanding the full graph as YAML and nothing else.
+        retry = synthesize_text(
+            config, rendered + _GRAPH_UPDATE_RETRY_SUFFIX,
+            label="graph-update-retry",
+            timeout_seconds=config.graph.timeout_seconds,
+            command=config.graph.command,
         )
+        if retry.success and retry.text:
+            last_text = retry.text
+            spec = _parse_graph_spec(retry.text)
+
+    if spec is None:
+        # Don't silently drop a paid reply: persist it so the user can
+        # inspect / hand-apply, and point at the file.
+        note = "Claude reply had no parseable YAML graph spec; changing nothing"
+        reply_path = _default_report_path(config, report.base_branch).with_name(
+            f"graph-update-reply.{report.base_branch}.md"
+        )
+        try:
+            reply_path.write_text(last_text, encoding="utf-8")
+            note += f". Raw reply saved to {reply_path}"
+        except OSError:
+            pass
+        warnings_acc.append(note)
     return spec
 
 
@@ -2888,7 +2971,8 @@ def run_graph_update(
         f"  [dim]Feeding {len(ingest)} trusted comment(s) to Claude...[/dim]"
     )
     warnings_acc: list[str] = []
-    spec = _ask_claude_for_new_graph(config, report, ingest, warnings_acc)
+    handled = _handle_comments(ingest)  # single source for the C<n> handles
+    spec = _ask_claude_for_new_graph(config, report, handled, warnings_acc)
     for w in warnings_acc:
         console.print(f"  [yellow]warning:[/yellow] {w}")
     if spec is None:
@@ -2969,6 +3053,22 @@ def run_graph_update(
         console.print("  [yellow]warning:[/yellow] failed to update the graph issue")
     else:
         console.print(f"  [green]✓[/green] updated issue #{new_report.issue_number}")
+
+    # --- Collapse the comments the update actually addressed ---
+    # Unaddressed comments (questions, 👍, requests Claude didn't action)
+    # stay visible so a human can see what's still pending.
+    if config.graph.minimize_addressed_comments:
+        handle_to_comment = dict(handled)  # same handles shown to Claude
+        addressed = _normalize_addressed(spec.get("addressed"))
+        n_min = 0
+        for handle in addressed:
+            c = handle_to_comment.get(handle)
+            if c and c.node_id and minimize_comment(c.node_id, "OUTDATED"):
+                n_min += 1
+        if n_min:
+            console.print(
+                f"  [green]✓[/green] marked {n_min} addressed comment(s) as outdated"
+            )
 
     if post_comment:
         summary = _render_update_comment(

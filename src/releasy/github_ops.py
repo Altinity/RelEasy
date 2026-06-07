@@ -724,6 +724,7 @@ class PRComment:
     is_resolved: bool | None = None  # None when comment isn't on a thread
     is_outdated: bool = False
     thread_id: str | None = None
+    node_id: str | None = None  # GraphQL global id (for minimizeComment)
 
 
 @dataclass
@@ -1100,6 +1101,7 @@ def fetch_issue_comments(
                 updated_at=_safe_iso(ic.updated_at),
                 url=ic.html_url,
                 body=ic.body or "",
+                node_id=(ic.raw_data or {}).get("node_id"),
             ))
         out.sort(key=lambda c: (c.created_at, c.id))
         return IssueCommentsResult(comments=out)
@@ -1190,6 +1192,93 @@ def search_prs_by_labels(
         return []
     except Exception as exc:
         log.warning("Unexpected error searching PRs: %s", exc)
+        return []
+
+
+def build_merged_base_query(
+    slug: str,
+    base_branch: str,
+    *,
+    merged_from: str | None = None,
+    merged_to: str | None = None,
+    exclude_labels: list[str] | None = None,
+) -> str:
+    """Build the Search-API query for merged PRs whose base is ``base_branch``.
+
+    ``merged_from`` / ``merged_to`` are ISO timestamps bounding ``merged:``.
+    The lower bound is EXCLUSIVE (``merged:>from``) so a PR merged at exactly
+    the ``--from`` ref's timestamp isn't double-counted with the prior
+    release; the upper bound is inclusive. ``exclude_labels`` adds
+    ``-label:"<l>"`` terms (forward-ports are dropped here so they're never
+    even fetched).
+    """
+    q = f"repo:{slug} is:pr is:merged base:{base_branch}"
+    if merged_from:
+        q += f" merged:>{merged_from}"
+    if merged_to:
+        q += f" merged:<={merged_to}"
+    for lbl in exclude_labels or []:
+        # Strip embedded quotes so a label can't break out of the term.
+        q += f' -label:"{lbl.replace(chr(34), "")}"'
+    return q
+
+
+def search_merged_prs_by_base(
+    config: Config,
+    base_branch: str,
+    *,
+    merged_from: str | None = None,
+    merged_to: str | None = None,
+    exclude_labels: list[str] | None = None,
+) -> list[PRInfo]:
+    """Merged PRs whose base branch is ``base_branch``, via one Search query.
+
+    Bodies come back inline (no per-PR fetch). ``merged_from`` /
+    ``merged_to`` are ISO timestamps bounding ``merged:``. Returns PRInfo
+    (``head_sha`` / ``merge_commit_sha`` unset) sorted by number ascending.
+    """
+    token = get_github_token()
+    if not token:
+        log.warning("RELEASY_GITHUB_TOKEN not set — cannot search PRs")
+        return []
+    slug = get_origin_repo_slug(config)
+    if not slug:
+        log.warning("Could not parse origin remote URL: %s", config.origin.remote)
+        return []
+
+    query = build_merged_base_query(
+        slug, base_branch,
+        merged_from=merged_from, merged_to=merged_to,
+        exclude_labels=exclude_labels,
+    )
+    try:
+        from github import Github, GithubException
+
+        gh = Github(token)
+        results: list[PRInfo] = []
+        for issue in gh.search_issues(query, sort="created", order="asc"):
+            if issue.pull_request is None:
+                continue
+            results.append(PRInfo(
+                number=issue.number,
+                title=issue.title or "",
+                body=issue.body or "",
+                state="merged",
+                merge_commit_sha=None,
+                head_sha="",
+                url=issue.html_url,
+                repo_slug=slug,
+                merged_at=None,
+                labels=[lbl.name for lbl in issue.labels],
+                author=issue.user.login if issue.user else None,
+            ))
+        results.sort(key=lambda p: p.number)
+        return results
+    except GithubException as exc:
+        log.warning("Failed to search merged PRs (base %s): %s", base_branch, exc)
+        return []
+    except Exception as exc:
+        log.warning("Unexpected error searching merged PRs: %s", exc)
         return []
 
 
@@ -1656,15 +1745,19 @@ def _gql(query: str, variables: dict | None = None) -> dict | None:
     if not token:
         return None
 
-    resp = requests.post(
-        GRAPHQL_URL,
-        json={"query": query, "variables": variables or {}},
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        timeout=30,
-    )
+    try:
+        resp = requests.post(
+            GRAPHQL_URL,
+            json={"query": query, "variables": variables or {}},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        log.warning("GitHub GraphQL transport error: %s", exc)
+        return None
     if resp.status_code != 200:
         log.warning("GitHub GraphQL request failed: %s %s", resp.status_code, resp.text)
         return None
@@ -1674,6 +1767,31 @@ def _gql(query: str, variables: dict | None = None) -> dict | None:
         log.warning("GitHub GraphQL errors: %s", data["errors"])
         return None
     return data.get("data")
+
+
+def minimize_comment(node_id: str, classifier: str = "OUTDATED") -> bool:
+    """Collapse a comment via GraphQL ``minimizeComment``. Returns success.
+
+    ``classifier`` is a ReportedContentClassifiers value (OUTDATED,
+    RESOLVED, OFF_TOPIC, DUPLICATE, …). No-op-safe: a comment already
+    minimized returns a GraphQL error → ``False`` (logged, not fatal).
+    """
+    if not node_id:
+        return False
+    mutation = """
+    mutation($id: ID!, $classifier: ReportedContentClassifiers!) {
+      minimizeComment(input: {subjectId: $id, classifier: $classifier}) {
+        minimizedComment { isMinimized }
+      }
+    }
+    """
+    data = _gql(mutation, {"id": node_id, "classifier": classifier})
+    if not data:
+        return False
+    # ``.get(k, {})`` returns None when the key is present with a null value,
+    # so chain through ``or {}`` to stay no-op-safe on a null payload.
+    payload = (data.get("minimizeComment") or {}).get("minimizedComment") or {}
+    return bool(payload.get("isMinimized"))
 
 
 def _parse_project_url(url: str) -> tuple[str, int, bool] | None:

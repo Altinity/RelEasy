@@ -1874,17 +1874,37 @@ def release(
 
 @cli.command(
     name="draft-release",
-    short_help="Generate a release changelog from merge commits.",
+    short_help="Generate a release changelog from merged PRs.",
 )
 @click.option(
     "--from", "from_ref", required=True,
-    help="Starting commit / tag (NON-inclusive). Typically the upstream "
-         "tag the target branch was branched from (e.g. v26.1.6.6-stable).",
+    help="Lower bound of the release window (NON-inclusive). PRs merged "
+         "AT/BEFORE this ref's date are excluded. Typically the previous "
+         "release tag, or the upstream tag the branch forked from "
+         "(e.g. v26.1.6.6-stable).",
 )
 @click.option(
     "--to", "to_ref", required=True,
-    help="Ending commit / tag (inclusive). Usually the tip of the release "
-         "branch or the tag you're cutting.",
+    help="Upper bound of the release window (inclusive) and the draft "
+         "release commitish. Usually the tip of the release branch or "
+         "the tag you're cutting.",
+)
+@click.option(
+    "--base", "base_branch", default=None,
+    help="Branch whose merged PRs are collected. Defaults to the "
+         "configured target branch, falling back to --to.",
+)
+@click.option(
+    "--prs", "prs", multiple=True,
+    help="Explicit PR URL(s) to include, bypassing discovery. Repeatable. "
+         "Combine with --prs-file. When given, --base / the merge window "
+         "are ignored.",
+)
+@click.option(
+    "--prs-file", "prs_file", default=None,
+    type=click.Path(dir_okay=False, exists=True, path_type=Path),
+    help="File of PR URLs (one per line, '#' comments allowed) to include, "
+         "merged with any --prs values.",
 )
 @click.option(
     "--name", "release_name", default=None,
@@ -1911,7 +1931,8 @@ def release(
 )
 @click.option(
     "--work-dir", default=None,
-    help="Working directory for the local clone used to walk merge commits.",
+    help="Working directory for the local clone used to resolve "
+         "--from / --to refs and dates.",
 )
 @click.option(
     "--compared-to-url", default=None,
@@ -1932,6 +1953,9 @@ def draft_release_cmd(
     ctx: click.Context,
     from_ref: str,
     to_ref: str,
+    base_branch: str | None,
+    prs: tuple[str, ...],
+    prs_file: Path | None,
     release_name: str | None,
     release_title: str | None,
     output_file: Path | None,
@@ -1939,12 +1963,14 @@ def draft_release_cmd(
     compared_to_url: str | None,
     docker_image_url: str | None,
 ) -> None:
-    """Build a categorised release changelog from target-branch merges.
+    """Build a categorised release changelog from merged PRs.
 
-    Walks the first-parent merge commits in ``--from..--to``, extracts
-    the merged PRs from origin, drops anything labelled / titled as a
-    forward-port, classifies each PR by its Changelog category, and
-    renders the markdown body in Altinity's release-notes format.
+    Queries origin (one Search call) for PRs whose base is ``--base``
+    (the target branch) and that merged in the ``--from``..``--to``
+    window, drops anything labelled / titled as a forward-port,
+    classifies each by its Changelog category, and renders the markdown
+    body in Altinity's release-notes format. ``--prs`` / ``--prs-file``
+    supply an explicit PR set instead, bypassing discovery.
 
     With ``-o`` the markdown is written to disk and nothing is published.
     Without ``-o`` a DRAFT GitHub release is created on origin (tag =
@@ -1957,6 +1983,14 @@ def draft_release_cmd(
 
     config = _load_and_verify(ctx, session="skip")
     wd = Path(work_dir) if work_dir else None
+
+    explicit_prs: list[str] = list(prs)
+    if prs_file is not None:
+        for raw in prs_file.read_text().splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if line:
+                explicit_prs.append(line)
+
     if not emit_changelog(
         config,
         from_ref=from_ref,
@@ -1967,6 +2001,8 @@ def draft_release_cmd(
         work_dir=wd,
         compared_to_url=compared_to_url,
         docker_image_url=docker_image_url,
+        base_branch=base_branch,
+        explicit_prs=explicit_prs or None,
     ):
         raise SystemExit(1)
 

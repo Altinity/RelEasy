@@ -416,6 +416,7 @@ notifications:
 #   issue_labels: [releasy]         # + the target-branch name; created if missing
 #   post_comment: true              # summary comment after each update
 #   apply_exclusions: true          # enforce vetoes via exclude_prs
+#   minimize_addressed_comments: true  # collapse addressed comments as Outdated
 #   # command: claude
 #   # prompt_file: prompts/adjust_graph.md
 #   # timeout_seconds: 7200

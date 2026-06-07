@@ -146,6 +146,7 @@ Options live in `config.yaml` unless marked **(session)**.
 | `graph.issue_labels` | Labels on the graph issue (the target-branch name is always added too; created on origin if missing). | `["releasy"]` |
 | `graph.post_comment` | Post a summary comment on the issue after each `graph update`. | `true` |
 | `graph.apply_exclusions` | Enforce member "don't port" vetoes by adding the PR to the session's `exclude_prs`. | `true` |
+| `graph.minimize_addressed_comments` | After an update, collapse (mark **Outdated**) the comments it actually addressed; unaddressed ones stay visible. | `true` |
 | `graph.prompt_file` | Prompt template for `graph update`. | `prompts/adjust_graph.md` |
 | `graph.timeout_seconds` | Per-invocation Claude timeout for `graph update`. | `7200` |
 | `pr_policy.auto_pr` | Open a PR for every pushed port branch. Needs `push: true`. | `true` |

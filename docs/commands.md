@@ -353,6 +353,10 @@ releasy graph update [--onto <ver>] [--since <iso>] [--work-dir <path>]
 login is in `graph.trusted_reviewers` reach Claude. RelEasy's own comments
 are skipped.
 
+**Addressed comments** are collapsed as **Outdated** (unless
+`graph.minimize_addressed_comments: false`); comments Claude ignored or
+couldn't action (questions, 👍) stay visible so a human sees what's pending.
+
 Rewrites the report, deps overlay, and session (`include_prs` /
 `exclude_prs`), and refreshes the issue. Deps here are AI/human-asserted, not
 trial-pick-verified — re-run `graph discover` for verified deps.
@@ -767,30 +771,42 @@ releasy release --base-tag <tag> --name <branch> [--strict] [--include-skipped] 
 
 ### `releasy draft-release`
 
-*Generate a release changelog from target-branch merge commits.*
+*Generate a release changelog from the PRs merged into the target branch.*
 
-Walks first-parent merges in `--from..--to`, extracts the merged origin
-PRs, drops forward-ports, classifies each by its Changelog category, and
-renders Altinity's release-notes markdown. With `-o` writes to disk and
-publishes nothing; without it, creates a **draft** GitHub release on
-origin (tag = `--name`, commitish = `--to`) and prints its URL.
+Queries origin in **one Search call** for PRs whose base is `--base` (the
+target branch) and that merged in the `--from`..`--to` window — no
+per-PR fetch, no merge-commit walk. Forward-ports (`forwardport` /
+`forward-port` label or title) are dropped, each PR is classified by its
+Changelog category, and the result is rendered as Altinity's release-notes
+markdown. `--prs` / `--prs-file` supply an explicit PR set instead,
+bypassing discovery. With `-o` writes to disk and publishes nothing;
+without it, creates a **draft** GitHub release on origin (tag = `--name`,
+commitish = `--to`) and prints its URL.
+
+`--from` / `--to` are resolved against a local clone only to derive the
+window dates and the comparison SHAs.
 
 ```bash
-releasy draft-release --from <ref> --to <ref> [--name <tag>] [--title <text>]
-                      [-o <file>] [--compared-to-url <url>]
-                      [--docker-image-url <url>] [--work-dir <path>]
+releasy draft-release --from <ref> --to <ref> [--base <branch>]
+                      [--prs <url> ...] [--prs-file <path>]
+                      [--name <tag>] [--title <text>] [-o <file>]
+                      [--compared-to-url <url>] [--docker-image-url <url>]
+                      [--work-dir <path>]
 ```
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--from <ref>` (required) | Start commit / tag, **non-inclusive** (usually the upstream tag the branch forked from). | — |
-| `--to <ref>` (required) | End commit / tag, inclusive (release-branch tip or the tag being cut). | — |
+| `--from <ref>` (required) | Window lower bound, **non-inclusive** by date (usually the previous release / upstream fork tag). | — |
+| `--to <ref>` (required) | Window upper bound (inclusive) and draft commitish (release-branch tip or the tag being cut). | — |
+| `--base <branch>` | Branch whose merged PRs are collected. | target branch → `--to` |
+| `--prs <url>` | Explicit PR URL to include (repeatable); bypasses discovery. | — |
+| `--prs-file <path>` | File of PR URLs (one per line, `#` comments ok); merged with `--prs`. | — |
 | `--name <tag>` | Release tag. Defaults to `--to` when it's a tag; left blank if `--to` is a commit / branch. | — |
 | `--title <text>` | Changelog heading / draft display name. | prettified `--name` |
 | `-o` / `--output <file>` | Write markdown to file instead of creating a draft release. | — |
 | `--compared-to-url <url>` | Override the "as compared to" header link. | auto |
 | `--docker-image-url <url>` | Docker image URL; placeholder `sha256-TBD` if omitted. | — |
-| `--work-dir <path>` | Local clone for walking merges. | config / cwd |
+| `--work-dir <path>` | Local clone for resolving `--from` / `--to`. | config / cwd |
 
 ## Feature management
 
