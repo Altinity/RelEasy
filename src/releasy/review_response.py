@@ -869,6 +869,8 @@ def address_review(
 
     class _ConfigShim:
         ai_resolve = _ResolveShim
+        ai_model = config.ai_model
+        ai_effort = config.ai_effort
 
     argv = _build_claude_argv(_ConfigShim, prompt)  # type: ignore[arg-type]
 

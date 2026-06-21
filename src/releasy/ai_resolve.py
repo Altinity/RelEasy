@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from rich.markup import escape
+
 from releasy.termlog import console
 
 from releasy.config import Config, PortMode
@@ -345,6 +347,16 @@ def _render_prompt(config: Config, repo_path: Path, ctx: AIResolveContext) -> st
 # ---------------------------------------------------------------------------
 
 
+def _model_effort_args(config: Config) -> list[str]:
+    """Global --model / --effort flags, appended to every claude invocation."""
+    args: list[str] = []
+    if config.ai_model:
+        args += ["--model", config.ai_model]
+    if config.ai_effort:
+        args += ["--effort", config.ai_effort]
+    return args
+
+
 def _build_claude_argv(config: Config, prompt: str) -> list[str]:
     cmd = [
         config.ai_resolve.command,
@@ -354,6 +366,7 @@ def _build_claude_argv(config: Config, prompt: str) -> list[str]:
     ]
     if config.ai_resolve.allowed_tools:
         cmd += ["--allowedTools", ",".join(config.ai_resolve.allowed_tools)]
+    cmd += _model_effort_args(config)
     cmd += list(config.ai_resolve.extra_args)
     return cmd
 
@@ -382,7 +395,13 @@ def _render_event(line: str, start: float) -> str | None:
         stripped = line.strip()
         if not stripped:
             return None
-        return f"[dim]│[/dim] {stripped}"
+        # ``escape`` everything that originates in claude's stream: its
+        # text routinely contains ``[…]`` (diff hunks, doc snippets, paths
+        # like ``[/<sub-path>]``) that Rich would otherwise parse as markup
+        # and throw ``MarkupError`` on — which used to tear down the whole
+        # stream and SIGTERM a healthy claude. Our own ``[dim]`` etc. tags
+        # are added *outside* the escaped segments so they still render.
+        return f"[dim]│[/dim] {escape(stripped)}"
 
     elapsed = _fmt_elapsed(time.monotonic() - start)
     etype = ev.get("type")
@@ -391,7 +410,7 @@ def _render_event(line: str, start: float) -> str | None:
         sub = ev.get("subtype", "")
         model = ev.get("model") or ""
         if sub == "init":
-            return f"[dim]│ [{elapsed}][/dim] [magenta]session start[/magenta] {model}".rstrip()
+            return f"[dim]│ [{elapsed}][/dim] [magenta]session start[/magenta] {escape(model)}".rstrip()
         return None
 
     if etype == "assistant":
@@ -402,11 +421,11 @@ def _render_event(line: str, start: float) -> str | None:
             if btype == "text":
                 txt = _flatten(block.get("text", ""))
                 if txt:
-                    parts.append(f"[dim]│ [{elapsed}][/dim] [cyan]💬[/cyan] {txt}")
+                    parts.append(f"[dim]│ [{elapsed}][/dim] [cyan]💬[/cyan] {escape(txt)}")
             elif btype == "thinking":
                 txt = _flatten(block.get("thinking", ""))
                 if txt:
-                    parts.append(f"[dim]│ [{elapsed}] 🧠 {txt}[/dim]")
+                    parts.append(f"[dim]│ [{elapsed}] 🧠 {escape(txt)}[/dim]")
             elif btype == "tool_use":
                 name = block.get("name", "tool")
                 inp = block.get("input") or {}
@@ -422,9 +441,9 @@ def _render_event(line: str, start: float) -> str | None:
                 else:
                     keys = ", ".join(list(inp)[:3])
                     summary = f"({keys})" if keys else ""
-                line_str = f"[dim]│ [{elapsed}][/dim] [yellow]🔧 {name}[/yellow]"
+                line_str = f"[dim]│ [{elapsed}][/dim] [yellow]🔧 {escape(str(name))}[/yellow]"
                 if summary:
-                    line_str += f" {summary}"
+                    line_str += f" {escape(summary)}"
                 parts.append(line_str)
         return "\n".join(parts) if parts else None
 
@@ -444,14 +463,14 @@ def _render_event(line: str, start: float) -> str | None:
                 summary = _flatten(text)
                 if not summary:
                     return None
-                return f"[dim]│ [{elapsed}][/dim] {marker} [dim]{summary}[/dim]"
+                return f"[dim]│ [{elapsed}][/dim] {marker} [dim]{escape(summary)}[/dim]"
         return None
 
     if etype == "result":
         sub = ev.get("subtype", "")
         cost = ev.get("total_cost_usd")
         turns = ev.get("num_turns")
-        bits = [f"result={sub}"]
+        bits = [f"result={escape(sub)}"]
         if turns is not None:
             bits.append(f"turns={turns}")
         if cost is not None:
@@ -508,8 +527,8 @@ def _spawn_claude(
     Returns (exit_code, combined_output, timed_out).
     """
     console.print(
-        f"    [dim]$ {shlex.join(argv[:2])} <prompt…> "
-        f"{shlex.join(argv[3:])}[/dim]"
+        f"    [dim]$ {escape(shlex.join(argv[:2]))} <prompt…> "
+        f"{escape(shlex.join(argv[3:]))}[/dim]"
     )
     console.print("    [dim](press Ctrl-C to abort claude)[/dim]")
 
@@ -568,7 +587,17 @@ def _spawn_claude(
             last_output = time.monotonic()
             rendered = _render_event(line, start)
             if rendered:
-                console.print(f"    {rendered}")
+                try:
+                    console.print(f"    {rendered}")
+                except Exception:
+                    # Belt-and-suspenders: _render_event already escapes
+                    # claude-originated text, but a console-rendering error
+                    # must NEVER tear down the stream loop — that would kill
+                    # an otherwise-healthy claude (exit 143). Fall back to a
+                    # raw, markup-free print of this one line.
+                    console.print(
+                        f"    {rendered}", markup=False, highlight=False,
+                    )
     except KeyboardInterrupt:
         interrupted = True
     except Exception as exc:
@@ -833,9 +862,101 @@ def _check_settings_history_whitelist(
     )
 
 
+# Postcondition failures whose ``err_kind`` may be handed back to Claude for
+# an in-place correction (bounded by ``ai_resolve.postcondition_retries``)
+# instead of discarding the whole resolution. These are blemishes on an
+# otherwise-good resolve — never "claude didn't finish" signals.
+_CORRECTABLE_POSTCONDITIONS = {"settings_history"}
+
+
+# Focused follow-up prompt for the ``settings_history`` postcondition. The
+# resolution is already committed; Claude only trims the unauthorized rows
+# and amends. Placeholders are filled with the same ``\{ident\}`` re.sub used
+# by :func:`_render_prompt`; literal ``{"..."}`` registry rows are left alone
+# because the char after ``{`` isn't an identifier.
+_SETTINGS_HISTORY_FIX_PROMPT = """\
+You are fixing ONE specific problem in an ALREADY-COMPLETED cherry-pick. Do not start over.
+
+## State
+- Repo: {cwd}
+- Port branch `{port_branch}` is checked out; the working tree is clean.
+- The cherry-pick of {source_pr_url} is ALREADY resolved and committed at HEAD.
+  Do NOT run `git cherry-pick`, `git reset`, `git rebase`, `git merge`, or check out any other ref.
+- Source PR merge/commit SHA: `{source_pr_merge_sha}`
+- Port base (HEAD before the pick): `{start_sha}`
+
+## Problem
+RelEasy's post-resolution check rejected the landed resolution:
+
+> {err}
+
+`src/Core/SettingsChangesHistory.cpp` is an APPEND-ONLY registry. The rows your
+port ADDS to this file must be a SUBSET of the rows the SOURCE PR's own diff
+adds. The flagged rows above are almost always context / "ours" lines that got
+swept in alongside a real edit — they are NOT part of this port.
+
+## Fix
+1. List the rows the SOURCE PR legitimately adds to this file:
+   ```
+   git show -m --first-parent --no-color {source_pr_merge_sha} -- src/Core/SettingsChangesHistory.cpp
+   ```
+2. List the rows your port currently adds:
+   ```
+   git diff --no-color {start_sha}..HEAD -- src/Core/SettingsChangesHistory.cpp
+   ```
+3. Edit `src/Core/SettingsChangesHistory.cpp` and DELETE every added
+   {"setting_name", ...} row whose setting name is NOT in the source PR's
+   additions from step 1. Keep the legitimately-added rows exactly where they
+   belong (in the correct version block). Change NOTHING else; touch NO other file.
+4. Keep the file valid C++ (balanced braces, no dangling/missing commas in the
+   initializer). A full rebuild is NOT required for this registry-only edit.
+5. Fold the fix into the existing resolution commit — do not create a new one:
+   ```
+   git add -- src/Core/SettingsChangesHistory.cpp
+   git commit --amend --no-edit
+   ```
+
+When done, print `DONE`. If the complaint is genuinely wrong (every flagged row
+really is in the source PR's diff from step 1), print `DONE` without editing and
+RelEasy will re-verify.
+"""
+
+
+def _render_correction_prompt(
+    config: Config, repo_path: Path, ctx: AIResolveContext,
+    err_kind: str, err: str | None,
+) -> str:
+    """Render the focused follow-up prompt for a correctable postcondition.
+
+    Raises ``ValueError`` for an ``err_kind`` we have no correction prompt
+    for, so :func:`resolve_with_claude` falls back to plain failure.
+    """
+    if err_kind != "settings_history":
+        raise ValueError(f"no correction prompt for postcondition {err_kind!r}")
+
+    source_sha = (
+        ctx.source_pr.merge_commit_sha or ctx.source_pr.head_sha or ""
+    )
+    placeholders = {
+        "cwd": str(repo_path),
+        "port_branch": ctx.port_branch,
+        "source_pr_url": ctx.source_pr.url,
+        "source_pr_merge_sha": source_sha,
+        "start_sha": ctx.start_sha or "",
+        "err": (err or "").strip(),
+    }
+
+    def _replace(match: re.Match[str]) -> str:
+        return placeholders.get(match.group(1), match.group(0))
+
+    return re.sub(
+        r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", _replace, _SETTINGS_HISTORY_FIX_PROMPT,
+    )
+
+
 def _verify_postconditions(
     config: Config, repo_path: Path, ctx: AIResolveContext,
-) -> tuple[bool, str | None, str | None]:
+) -> tuple[bool, str | None, str | None, str | None]:
     """Step-mode check: cherry-pick fully concluded, tree clean, HEAD moved.
 
     RelEasy itself owns push / PR / label, so we only verify Claude's
@@ -854,12 +975,17 @@ def _verify_postconditions(
       subset of the rows the source PR's own diff adds — see
       :func:`_check_settings_history_whitelist`.
 
-    Returns ``(ok, new_head_sha, error_message)``.
+    Returns ``(ok, new_head_sha, error_message, err_kind)``. ``err_kind`` is
+    a stable tag for the failure mode — ``None`` on success or for failures
+    that aren't worth re-prompting Claude about, and a member of
+    :data:`_CORRECTABLE_POSTCONDITIONS` (e.g. ``"settings_history"``) when
+    the resolution is otherwise good but trips a fixable content check that
+    :func:`resolve_with_claude` can hand back to Claude.
     """
     if is_operation_in_progress(repo_path):
         return False, None, (
             "cherry-pick/merge/rebase still in progress after claude exited"
-        )
+        ), None
 
     # Look only for **unmerged paths** — the unambiguous signal that the
     # cherry-pick wasn't finished. Other dirt (modified/staged/deleted
@@ -883,29 +1009,29 @@ def _verify_postconditions(
     ]
     if unmerged:
         files = ", ".join(line[3:] for line in unmerged[:5])
-        return False, None, f"unmerged paths after claude: {files}"
+        return False, None, f"unmerged paths after claude: {files}", None
 
     head = run_git(["rev-parse", "--verify", "HEAD"], repo_path, check=False)
     if head.returncode != 0:
-        return False, None, "could not read HEAD"
+        return False, None, "could not read HEAD", None
     new_head = head.stdout.strip()
 
     if ctx.start_sha and new_head == ctx.start_sha:
         return False, new_head, (
             "no new commits — cherry-pick was not concluded"
-        )
+        ), None
 
     if ctx.split_mode and ctx.pre_resolve_sha and new_head == ctx.pre_resolve_sha:
         return False, new_head, (
             "no resolution commit on top of the 'with conflicts' commit "
             "— claude did not produce a second commit"
-        )
+        ), None
 
     ok, sh_err = _check_settings_history_whitelist(repo_path, ctx, new_head)
     if not ok:
-        return False, new_head, sh_err
+        return False, new_head, sh_err, "settings_history"
 
-    return True, new_head, None
+    return True, new_head, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -913,47 +1039,24 @@ def _verify_postconditions(
 # ---------------------------------------------------------------------------
 
 
-def resolve_with_claude(
-    config: Config, repo_path: Path, ctx: AIResolveContext,
-) -> AIResolveResult:
-    """Render the prompt, run claude, and verify post-conditions."""
-    if shutil.which(config.ai_resolve.command) is None:
-        return AIResolveResult(
-            success=False,
-            error=f"'{config.ai_resolve.command}' not found on PATH",
-        )
+def _invoke_claude_with_retries(
+    config: Config, repo_path: Path, prompt: str,
+) -> tuple[int, str, bool, float | None]:
+    """Run claude on ``prompt``, retrying on transient Anthropic API errors.
 
-    try:
-        _write_build_script(repo_path, config.ai_resolve.build_command)
-    except OSError as exc:
-        return AIResolveResult(
-            success=False, error=f"could not write build wrapper: {exc}",
-        )
-
-    try:
-        prompt = _render_prompt(config, repo_path, ctx)
-    except FileNotFoundError as exc:
-        return AIResolveResult(success=False, error=str(exc))
-
+    Returns ``(exit_code, output, timed_out, cost_usd)`` for the final
+    attempt. Cost is summed across attempts — each retry is a separately
+    billed turn even when only the last one succeeds. Shared by the main
+    resolve and the postcondition-correction passes so both honour
+    ``api_retries`` / backoff identically.
+    """
     argv = _build_claude_argv(config, prompt)
-
-    console.print(
-        f"    [magenta]\U0001f916 invoking {config.ai_resolve.command} "
-        f"(timeout {config.ai_resolve.timeout_seconds}s, "
-        f"max {config.ai_resolve.max_iterations} build attempts, "
-        f"up to {config.ai_resolve.api_retries} API-error retries)[/magenta]"
-    )
-
     max_attempts = max(1, config.ai_resolve.api_retries + 1)
     backoff = max(0, config.ai_resolve.api_retry_backoff_seconds)
 
     last_exit_code = -1
     last_output = ""
     last_timed_out = False
-    # Cost accrues across retries — each attempt is a separate billed
-    # turn even when only the last one succeeded. ``last_output`` only
-    # carries the most recent attempt's transcript, so we aggregate the
-    # per-attempt cost as we go.
     cost_usd_total: float | None = None
 
     for attempt in range(1, max_attempts + 1):
@@ -990,9 +1093,42 @@ def resolve_with_claude(
 
         break
 
-    exit_code = last_exit_code
-    output = last_output
-    timed_out = last_timed_out
+    return last_exit_code, last_output, last_timed_out, cost_usd_total
+
+
+def resolve_with_claude(
+    config: Config, repo_path: Path, ctx: AIResolveContext,
+) -> AIResolveResult:
+    """Render the prompt, run claude, and verify post-conditions."""
+    if shutil.which(config.ai_resolve.command) is None:
+        return AIResolveResult(
+            success=False,
+            error=f"'{config.ai_resolve.command}' not found on PATH",
+        )
+
+    try:
+        _write_build_script(repo_path, config.ai_resolve.build_command)
+    except OSError as exc:
+        return AIResolveResult(
+            success=False, error=f"could not write build wrapper: {exc}",
+        )
+
+    try:
+        prompt = _render_prompt(config, repo_path, ctx)
+    except FileNotFoundError as exc:
+        return AIResolveResult(success=False, error=str(exc))
+
+    console.print(
+        f"    [magenta]\U0001f916 invoking {config.ai_resolve.command} "
+        f"(timeout {config.ai_resolve.timeout_seconds}s, "
+        f"max {config.ai_resolve.max_iterations} build attempts, "
+        f"up to {config.ai_resolve.api_retries} API-error retries)[/magenta]"
+    )
+
+    max_attempts = max(1, config.ai_resolve.api_retries + 1)
+    exit_code, output, timed_out, cost_usd_total = _invoke_claude_with_retries(
+        config, repo_path, prompt,
+    )
 
     iterations = _count_iterations(output)
     assistant_text = _extract_assistant_text(output)
@@ -1047,8 +1183,78 @@ def resolve_with_claude(
             cost_usd=cost_usd_total,
         )
 
-    ok, new_head, err = _verify_postconditions(config, repo_path, ctx)
+    ok, new_head, err, err_kind = _verify_postconditions(config, repo_path, ctx)
+
+    # Corrective re-resolution: a content-correctable postcondition (today
+    # only the append-only SettingsChangesHistory.cpp whitelist) is a
+    # fixable blemish on an otherwise-good resolution. Rather than discard
+    # the whole resolve (the caller hard-resets to start_sha on failure),
+    # hand the exact error back to Claude and let it trim the offending file
+    # in place. The resolution is still committed on the branch here, so the
+    # follow-up amends it. Bounded by ``postcondition_retries``.
+    fix_passes = max(0, config.ai_resolve.postcondition_retries)
+    pass_no = 0
+    while (
+        not ok
+        and err_kind in _CORRECTABLE_POSTCONDITIONS
+        and pass_no < fix_passes
+    ):
+        try:
+            fix_prompt = _render_correction_prompt(
+                config, repo_path, ctx, err_kind, err,
+            )
+        except ValueError:
+            break  # no correction prompt for this kind — fail as usual
+
+        # Count (and announce) only passes that actually invoke Claude, so
+        # ``pass_no`` is an accurate attempt count for the diagnostics below.
+        pass_no += 1
+        console.print(
+            f"    [yellow]↻ postcondition '{err_kind}' failed — asking "
+            f"{config.ai_resolve.command} to correct it in place "
+            f"(pass {pass_no}/{fix_passes})[/yellow]"
+        )
+
+        fc, fout, fto, fcost = _invoke_claude_with_retries(
+            config, repo_path, fix_prompt,
+        )
+        if fcost is not None:
+            cost_usd_total = (cost_usd_total or 0.0) + fcost
+        if fto:
+            return AIResolveResult(
+                success=False, timed_out=True, iterations=iterations,
+                new_head=new_head, cost_usd=cost_usd_total,
+                error=(
+                    f"claude timed out after {config.ai_resolve.timeout_seconds}s "
+                    f"correcting postcondition '{err_kind}' (pass {pass_no})"
+                ),
+            )
+        # A transient API error means the turn was dropped before Claude
+        # could act — re-prompting just burns the rest of the budget, so
+        # bail now with a diagnostic that names the real cause (the main
+        # resolve path does the same on a non-zero exit). For a non-transient
+        # exit we still re-verify: Claude may have committed the fix and then
+        # exited non-zero on an unrelated late step.
+        if fc != 0:
+            transient = _find_transient_api_error(fout)
+            if transient:
+                return AIResolveResult(
+                    success=False, iterations=iterations, new_head=new_head,
+                    cost_usd=cost_usd_total,
+                    error=(
+                        f"transient API error correcting postcondition "
+                        f"'{err_kind}' (pass {pass_no}): {transient}"
+                    ),
+                )
+        ok, new_head, err, err_kind = _verify_postconditions(
+            config, repo_path, ctx,
+        )
+
     if not ok:
+        # Make it clear the corrective loop ran, so the surfaced error isn't
+        # mistaken for an un-attempted first-pass failure.
+        if pass_no:
+            err = f"{err}\n(still failing after {pass_no} correction pass(es))"
         return AIResolveResult(
             success=False, iterations=iterations, new_head=new_head, error=err,
             cost_usd=cost_usd_total,
@@ -1132,6 +1338,7 @@ def synthesize_text(
         # text-generation mode for this call.
         "--allowedTools", "",
     ]
+    argv += _model_effort_args(config)
 
     console.print(
         f"    [magenta]\U0001f916 synthesizing text via "
@@ -1464,6 +1671,7 @@ def verify_ai_resolution(
         "--verbose",
         "--allowedTools", ",".join(_VERIFY_ALLOWED_TOOLS),
     ]
+    argv += _model_effort_args(config)
     argv += list(config.ai_resolve.extra_args)
 
     console.print(

@@ -270,6 +270,15 @@ target_branch: antalya-26.3
 notifications:
   github_project: https://github.com/orgs/Altinity/projects/1
 
+# ── Global AI model / effort (optional) ─────────────────────────────
+# Applied to EVERY claude invocation (conflict resolve, changelog,
+# review response, analyze-fails, graph). Leave unset to use the claude
+# CLI defaults.
+#   ai_model:  model alias or full id (e.g. opus, sonnet, claude-opus-4-8)
+#   ai_effort: low | medium | high | xhigh | max
+# ai_model: opus
+# ai_effort: high
+
 # ── AI conflict resolver (Claude) ───────────────────────────────────
 # Optional. When enabled, releasy invokes `claude` to resolve cherry-
 # pick conflicts, build, and commit. If Claude prints UNRESOLVED or
@@ -311,6 +320,13 @@ notifications:
 #   # `max_iterations`.
 #   api_retries: 3
 #   api_retry_backoff_seconds: 15
+#   # When a resolution lands but trips a *content-correctable*
+#   # postcondition — today only the append-only
+#   # SettingsChangesHistory.cpp whitelist (extra setting rows swept in
+#   # from "ours") — hand the exact error back to Claude this many times
+#   # to trim the offending file in place (amend), instead of discarding
+#   # the whole resolution. 0 = old fail-and-reset behaviour.
+#   postcondition_retries: 2
 #   # When a conflict is identified as a MISSING PREREQUISITE (an
 #   # upstream PR the target lacks), optionally pull that prerequisite
 #   # PR in automatically before retrying. Accepts a bool (sugar) or

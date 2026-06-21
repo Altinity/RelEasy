@@ -137,6 +137,7 @@ _VALID_IF_EXISTS = ("skip", "recreate", "append")
 _VALID_GROUP_SORT = ("listed", "merged_at")
 # Config accepts all three; post-detection only the last two survive.
 _VALID_PORT_MODES = ("auto", "backport", "forward_port")
+_VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 from typing import Literal  # noqa: E402
 PortMode = Literal["backport", "forward_port"]
@@ -694,6 +695,13 @@ class AIResolveConfig:
     # "Overloaded", "Connection reset", …). Each retry is a fresh turn.
     api_retries: int = 3
     api_retry_backoff_seconds: int = 15
+    # How many corrective Claude passes to run when a resolution lands but
+    # trips a *content-correctable* postcondition — today only the
+    # append-only ``SettingsChangesHistory.cpp`` whitelist (extra rows swept
+    # in from "ours"). Instead of discarding the whole resolution, RelEasy
+    # hands the exact error back to Claude to trim the offending file in
+    # place. 0 disables (revert to the old fail-and-reset behaviour).
+    postcondition_retries: int = 2
     # Auto-recovery on detected missing prerequisites (off by default).
     # See ``AutoAddPrerequisitePRsConfig``.
     auto_add_prerequisite_prs: AutoAddPrerequisitePRsConfig = field(
@@ -803,6 +811,10 @@ class Config:
     # changes. Read-only GitHub fetches still happen so the plan is
     # accurate.
     dry_run: bool = False
+
+    # Global claude --model / --effort applied to every AI invocation.
+    ai_model: str | None = None
+    ai_effort: str | None = None
 
     @property
     def repo_dir(self) -> Path:
@@ -1164,6 +1176,7 @@ def load_config(config_path: Path | None = None) -> Config:
         extra_args=ai_raw.get("extra_args", []) or [],
         api_retries=int(ai_raw.get("api_retries", 3)),
         api_retry_backoff_seconds=int(ai_raw.get("api_retry_backoff_seconds", 15)),
+        postcondition_retries=int(ai_raw.get("postcondition_retries", 2)),
         auto_add_prerequisite_prs=auto_add_prerequisite_prs,
     )
 
@@ -1317,6 +1330,15 @@ def load_config(config_path: Path | None = None) -> Config:
 
     sequential = bool(raw.get("sequential", False))
 
+    ai_model = raw.get("ai_model") or None
+    if ai_model is not None and not isinstance(ai_model, str):
+        raise ValueError("ai_model must be a string")
+    ai_effort = raw.get("ai_effort") or None
+    if ai_effort is not None and ai_effort not in _VALID_EFFORTS:
+        raise ValueError(
+            f"ai_effort must be one of {_VALID_EFFORTS}, got {ai_effort!r}"
+        )
+
     from releasy.termlog import configure as _configure_term_log
 
     cfg = Config(
@@ -1347,6 +1369,8 @@ def load_config(config_path: Path | None = None) -> Config:
         push=raw.get("push", False),
         sequential=sequential,
         session_file=session_file,
+        ai_model=ai_model,
+        ai_effort=ai_effort,
     )
     _configure_term_log(log_file)
     return cfg
@@ -1486,6 +1510,8 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         ai_data["api_retries"] = ai.api_retries
     if ai.api_retry_backoff_seconds != ai_defaults.api_retry_backoff_seconds:
         ai_data["api_retry_backoff_seconds"] = ai.api_retry_backoff_seconds
+    if ai.postcondition_retries != ai_defaults.postcondition_retries:
+        ai_data["postcondition_retries"] = ai.postcondition_retries
     auto_prereq_defaults = AutoAddPrerequisitePRsConfig()
     if (
         ai.auto_add_prerequisite_prs.enabled != auto_prereq_defaults.enabled
