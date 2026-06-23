@@ -22,6 +22,7 @@ config they read, see [configuration.md](configuration.md).
   [`clear`](#releasy-clear)
 - One-off porting:
   [`cherry-pick`](#releasy-cherry-pick) ·
+  [`project-backport`](#releasy-project-backport) ·
   [`rebase`](#releasy-rebase)
 - Inspection: [`status`](#releasy-status)
 - Multi-project:
@@ -584,6 +585,55 @@ releasy cherry-pick --origin <url> --target <branch> --commit <github-url>
 | `--max-iterations <n>` | Max build attempts per resolve. | `5` |
 | `--formatting-example <pr-url>` | Append that PR's "CI/CD Options" section to the new PR body (needs `--with-pr`). | — |
 | `--work-dir <path>` | Working dir for git ops. | cwd |
+
+### `releasy project-backport`
+
+*Batch backport upstream PRs queued in a GitHub Project — no config, no state.*
+
+For "Stable" releases. Walks a GitHub Project (one view per version), and
+for every item whose **content is an upstream `ClickHouse/ClickHouse` PR**
+whose **`Port Versions` field includes `--version`**, opens a Backport PR
+into `--target` on origin (Altinity/ClickHouse): cherry-picks the upstream
+merge commit (`-m 1`), optionally AI-resolves conflicts in backport mode,
+pushes, and opens the PR. The PR title is `<version> Backport of #<n> -
+<upstream title>`; the body carries the upstream PR's changelog
+category + entry (entry text with ` (<upstream url> by @<author>)`
+appended) followed by the `CI/CD Options` section taken verbatim from the
+target branch's `PULL_REQUEST_TEMPLATE.md`; a `<version>` label is added.
+After creating the PR it is **added back to the same project** with its
+`Port Versions` set to `<version>` (nothing is ever deleted).
+
+**Persists nothing** — the GitHub Project + open origin PRs are the only
+source of truth. Re-running is **idempotent**: any item that already has a
+backport PR into `--target` (matched by branch name, then by an open PR
+titled `Backport of #<n>` / referencing the upstream URL) is skipped. Only
+ever opens PRs into origin — never upstream. Needs `RELEASY_GITHUB_TOKEN`
+with the `project` scope.
+
+```bash
+releasy project-backport --project <project-url> --version <ver> --target <branch>
+                         [--origin <url>] [--work-dir <path>]
+                         [--resolve-conflicts --build-command <cmd>]
+                         [--claude-command <exe>] [--prompt-file <path>]
+                         [--timeout <s>] [--max-iterations <n>]
+                         [--limit <n>] [--dry-run]
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--project <url>` (required) | GitHub ProjectV2 URL, e.g. `https://github.com/orgs/Altinity/projects/26`. | — |
+| `--version <ver>` (required) | Target version (e.g. `24.8`). Filters items by `Port Versions`; also the PR label, title prefix, and `Port Versions` value set on the new card. | — |
+| `--target <branch>` (required) | Existing origin branch to cherry-pick onto and open PRs against (e.g. `customizations/24.8.14`). | — |
+| `--origin <url>` | Origin remote to clone / push / open PRs against. | `git@github.com:Altinity/ClickHouse.git` |
+| `--work-dir <path>` | Working dir for git ops. If omitted, a stable cache clone is created/reused. | `$XDG_CACHE_HOME/releasy/Altinity-ClickHouse` |
+| `--resolve-conflicts` | On conflict, invoke the AI resolver (backport mode). Requires `--build-command`. | off |
+| `--build-command <cmd>` | Shell command Claude runs to verify the resolution compiles. Required with `--resolve-conflicts`. | — |
+| `--claude-command <exe>` | Claude executable. | `claude` |
+| `--prompt-file <path>` | AI-resolve prompt template. | bundled |
+| `--timeout <s>` | Per-attempt Claude timeout (seconds). | `7200` |
+| `--max-iterations <n>` | Max build attempts per resolve. | `5` |
+| `--limit <n>` | Process at most `n` items (newest upstream PR first). | all |
+| `--dry-run` | Plan only: list qualifying items and what would be created / skipped. No clone, cherry-pick, push, or GitHub writes. | off |
 
 ### `releasy rebase`
 

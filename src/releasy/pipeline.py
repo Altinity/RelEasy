@@ -2244,6 +2244,18 @@ def _build_changelog_block(unit: FeatureUnit) -> str | None:
                 entry_text = entry.strip()
                 break
 
+    return render_changelog_block(category, entry_text, unit.prs)
+
+
+def render_changelog_block(
+    category: str | None, entry_text: str | None, prs: "list[PRInfo]",
+) -> str | None:
+    """Render a 'Changelog category' + 'Changelog entry' block.
+
+    The entry gets a ``(<url> by @author, …)`` attribution suffix for
+    ``prs``. Returns ``None`` when both ``category`` and ``entry_text``
+    are empty. Shared by the pipeline and the project-backport flow.
+    """
     if not category and not entry_text:
         return None
 
@@ -2259,12 +2271,10 @@ def _build_changelog_block(unit: FeatureUnit) -> str | None:
             "changes that goes to CHANGELOG.md):"
         )
         out.append("")
-        attribution = _format_pr_attribution(unit.prs)
-        final_entry = entry_text
+        attribution = _format_pr_attribution(prs)
+        final_entry = entry_text.strip()
         if attribution:
-            # If the entry already ends with ')' keep them on the same
-            # line; otherwise append with a space. Either way we strip a
-            # trailing period before the paren so punctuation reads
+            # Strip a trailing period before the paren so punctuation reads
             # cleanly.
             if final_entry.endswith("."):
                 final_entry = final_entry[:-1]

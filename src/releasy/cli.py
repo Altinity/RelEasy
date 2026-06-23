@@ -536,6 +536,143 @@ def cherry_pick_cmd(
 
 
 @cli.command(
+    name="project-backport",
+    short_help="Batch-create backport PRs for a version from a GitHub Project.",
+)
+@click.option(
+    "--project",
+    "project_url",
+    required=True,
+    help="GitHub ProjectV2 URL, e.g. "
+         "https://github.com/orgs/Altinity/projects/26.",
+)
+@click.option(
+    "--version",
+    "version",
+    required=True,
+    help="Target version, e.g. 24.8. Items whose 'Port Versions' field "
+         "includes this are backported; also used as the PR label, the "
+         "title prefix, and the 'Port Versions' value set on the new card.",
+)
+@click.option(
+    "--target",
+    "target",
+    required=True,
+    help="Origin branch to cherry-pick onto and open PRs against (e.g. "
+         "customizations/24.8.14). Must already exist on origin.",
+)
+@click.option(
+    "--origin",
+    "origin",
+    default=None,
+    help="Origin remote URL to clone / push / open PRs against. Defaults "
+         "to git@github.com:Altinity/ClickHouse.git.",
+)
+@click.option(
+    "--work-dir",
+    default=None,
+    help="Working directory for git operations. If omitted, a stable cache "
+         "clone is created/reused under $XDG_CACHE_HOME/releasy.",
+)
+@click.option(
+    "--resolve-conflicts",
+    is_flag=True,
+    default=False,
+    help="On cherry-pick conflict, invoke the AI resolver in backport mode "
+         "(same machinery as `cherry-pick`). Requires --build-command.",
+)
+@click.option(
+    "--build-command",
+    "build_command",
+    default="",
+    help="Shell command Claude runs to verify a conflict resolution "
+         "compiles. Required when --resolve-conflicts is set.",
+)
+@click.option("--claude-command", "claude_command", default="claude", show_default=True)
+@click.option("--prompt-file", "prompt_file", default=None)
+@click.option("--timeout", "timeout_seconds", type=int, default=7200, show_default=True)
+@click.option("--max-iterations", "max_iterations", type=int, default=5, show_default=True)
+@click.option(
+    "--limit",
+    "limit",
+    type=int,
+    default=None,
+    help="Process at most this many items (newest upstream PR first).",
+)
+@click.option(
+    "--dry-run",
+    "dry_run",
+    is_flag=True,
+    default=False,
+    help="Plan only: list qualifying items and what would be created / "
+         "skipped. No clone, no cherry-pick, no pushes, no GitHub writes.",
+)
+def project_backport_cmd(
+    project_url: str,
+    version: str,
+    target: str,
+    origin: str | None,
+    work_dir: str | None,
+    resolve_conflicts: bool,
+    build_command: str,
+    claude_command: str,
+    prompt_file: str | None,
+    timeout_seconds: int,
+    max_iterations: int,
+    limit: int | None,
+    dry_run: bool,
+) -> None:
+    """Batch-backport upstream PRs queued in a GitHub Project — no state file.
+
+    Walks the project, and for every item whose content is an upstream
+    (ClickHouse/ClickHouse) PR whose 'Port Versions' field includes
+    ``--version``, opens a Backport PR into ``--target`` on origin
+    (Altinity/ClickHouse), then adds the new PR back to the project with
+    its 'Port Versions' set so it shows in that version's view.
+
+    Stateless and idempotent: the GitHub Project + open origin PRs are the
+    only source of truth. Re-running skips any item that already has a
+    backport PR. Only ever opens PRs into origin — never upstream.
+    """
+    if not version.strip():
+        raise click.UsageError("--version must not be empty.")
+    if resolve_conflicts and not build_command.strip():
+        raise click.UsageError(
+            "--resolve-conflicts requires --build-command (the shell "
+            "command Claude runs to verify the resolution compiles). "
+            "Pass --build-command 'cd build && ninja' (or similar)."
+        )
+
+    from releasy.project_backport import (
+        DEFAULT_ORIGIN,
+        ProjectBackportOptions,
+        run_project_backport,
+    )
+
+    opts = ProjectBackportOptions(
+        project_url=project_url,
+        version=version,
+        target=target,
+        origin=origin or DEFAULT_ORIGIN,
+        work_dir=Path(work_dir) if work_dir else None,
+        resolve_conflicts=resolve_conflicts,
+        build_command=build_command,
+        claude_command=claude_command,
+        prompt_file=prompt_file,
+        timeout_seconds=timeout_seconds,
+        max_iterations=max_iterations,
+        dry_run=dry_run,
+        limit=limit,
+    )
+
+    result = run_project_backport(opts)
+    if result.fatal:
+        raise click.ClickException(result.fatal)
+    if result.had_failures:
+        raise SystemExit(1)
+
+
+@cli.command(
     name="continue",
     short_help="Reconcile state after manual fixes.",
 )

@@ -1583,6 +1583,64 @@ def find_pr_for_branch(
         return None
 
 
+def find_open_backport_pr(
+    config: Config,
+    base_branch: str,
+    upstream_number: int,
+    upstream_url: str | None = None,
+) -> str | None:
+    """URL of an open origin backport PR for an upstream PR, else None.
+
+    Secondary idempotency for ``project-backport`` (the deterministic
+    branch name is the primary, immediately-consistent check). Matches an
+    open PR into ``base_branch`` by the ``Backport of #<n>`` title
+    fingerprint, or by an ``upstream_url`` body reference whose title also
+    contains "backport" (the title guard rejects umbrella/tracking PRs
+    that merely list the URL). GitHub Search is eventually consistent.
+    """
+    token = get_github_token()
+    if not token:
+        return None
+    slug = get_origin_repo_slug(config)
+    if not slug:
+        return None
+
+    title_query = (
+        f'repo:{slug} is:pr is:open base:{base_branch} '
+        f'in:title "Backport of #{upstream_number}"'
+    )
+    body_query = (
+        f'repo:{slug} is:pr is:open base:{base_branch} in:body "{upstream_url}"'
+        if upstream_url else None
+    )
+
+    try:
+        from github import Github, GithubException
+
+        gh = Github(token)
+        # Title fingerprint: trust any matching PR (it's the title we mint).
+        # Body match: require a "backport"-y title so a tracking PR that
+        # merely links the upstream URL doesn't suppress a real port.
+        for query, require_backport_title in (
+            (title_query, False), (body_query, True),
+        ):
+            if not query:
+                continue
+            try:
+                for issue in gh.search_issues(query):
+                    if issue.pull_request is None:
+                        continue
+                    if require_backport_title and "backport" not in (issue.title or "").lower():
+                        continue
+                    return issue.html_url
+            except GithubException as exc:
+                log.warning("Backport-PR search failed (%s): %s", query, exc)
+        return None
+    except Exception as exc:
+        log.warning("Unexpected error searching for existing backport PR: %s", exc)
+        return None
+
+
 def find_latest_pr_for_branch(
     config: Config, head_branch: str, base: str | None = None,
 ) -> PRInfo | None:
@@ -2104,23 +2162,103 @@ def _list_project_items_with_fields(project_id: str) -> list[dict]:
       }
     }
     """
-    items: list[dict] = []
+    return _paginate_project_v2_items(project_id, query)
+
+
+def _paginate_project_v2_items(project_id: str, query: str) -> list[dict]:
+    """Run a ProjectV2 ``items(first: 100, after: $cursor)`` query to
+    exhaustion and return the raw item nodes. ``query`` must shape its
+    ``items`` connection with ``pageInfo { hasNextPage endCursor }``.
+    """
+    nodes: list[dict] = []
     cursor: str | None = None
     while True:
         data = _gql(query, {"projectId": project_id, "cursor": cursor})
         if not data:
-            return items
+            return nodes
         try:
             page = data["node"]["items"]
         except (KeyError, TypeError):
-            return items
-        items.extend(page.get("nodes") or [])
+            return nodes
+        nodes.extend(page.get("nodes") or [])
         info = page.get("pageInfo") or {}
         if not info.get("hasNextPage"):
-            return items
+            return nodes
         cursor = info.get("endCursor")
         if not cursor:
-            return items
+            return nodes
+
+
+def list_project_items_for_backport(project_id: str) -> list[dict]:
+    """Project items with content repo slug + named field values.
+
+    Like :func:`_list_project_items_with_fields` but also returns each
+    content item's repository slug (upstream vs origin) and reads TEXT
+    field values (``Port Versions`` may be TEXT). Each dict: ``item_id``,
+    ``content_typename``, ``pr_number``, ``pr_url``, ``repo_slug``,
+    ``field_values`` ({lowercased field name: value-as-str}).
+    """
+    # first: 50 matches the fields(first: 50) cap in _list_project_fields,
+    # so every field's value is reachable (no silent truncation of the
+    # Port Versions value the caller filters on).
+    query = """
+    query($projectId: ID!, $cursor: String) {
+      node(id: $projectId) {
+        ... on ProjectV2 {
+          items(first: 100, after: $cursor) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              id
+              content {
+                __typename
+                ... on PullRequest { number url repository { nameWithOwner } }
+                ... on Issue { number url repository { nameWithOwner } }
+              }
+              fieldValues(first: 50) {
+                nodes {
+                  __typename
+                  ... on ProjectV2ItemFieldTextValue {
+                    text field { ... on ProjectV2FieldCommon { name } }
+                  }
+                  ... on ProjectV2ItemFieldSingleSelectValue {
+                    name field { ... on ProjectV2FieldCommon { name } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    items: list[dict] = []
+    for node in _paginate_project_v2_items(project_id, query):
+        content = node.get("content") or {}
+        tn = content.get("__typename")
+        repo_slug = (content.get("repository") or {}).get("nameWithOwner")
+        field_values: dict[str, str] = {}
+        for fv in (node.get("fieldValues") or {}).get("nodes", []) or []:
+            fname = ((fv.get("field") or {}).get("name") or "").lower()
+            if not fname:
+                continue
+            fvtn = fv.get("__typename")
+            if fvtn == "ProjectV2ItemFieldTextValue":
+                val = fv.get("text")
+            elif fvtn == "ProjectV2ItemFieldSingleSelectValue":
+                val = fv.get("name")
+            else:
+                continue
+            if val is not None:
+                field_values[fname] = val
+        items.append({
+            "item_id": node.get("id") or "",
+            "content_typename": tn,
+            "pr_number": content.get("number") if tn == "PullRequest" else None,
+            "pr_url": content.get("url") if tn == "PullRequest" else None,
+            "repo_slug": repo_slug,
+            "field_values": field_values,
+        })
+    return items
 
 
 def fetch_project_board_snapshot(
@@ -2226,23 +2364,7 @@ def _list_project_items(project_id: str) -> list[dict]:
       }
     }
     """
-    items: list[dict] = []
-    cursor: str | None = None
-    while True:
-        data = _gql(query, {"projectId": project_id, "cursor": cursor})
-        if not data:
-            return items
-        try:
-            page = data["node"]["items"]
-        except (KeyError, TypeError):
-            return items
-        items.extend(page.get("nodes") or [])
-        info = page.get("pageInfo") or {}
-        if not info.get("hasNextPage"):
-            return items
-        cursor = info.get("endCursor")
-        if not cursor:
-            return items
+    return _paginate_project_v2_items(project_id, query)
 
 
 def _is_closed_unmerged_pr(content: dict) -> bool:
@@ -2504,6 +2626,36 @@ def _set_item_number_field(
         "itemId": item_id,
         "fieldId": field_id,
         "value": safe_value,
+    })
+    return data is not None
+
+
+def _set_item_text_field(
+    project_id: str, item_id: str, field_id: str, value: str,
+) -> bool:
+    """Set a TEXT field on a project item to ``value``.
+
+    Companion to :func:`_set_item_number_field` / :func:`_set_item_field`
+    for the one field type those don't cover. Used by ``project-backport``
+    when ``Port Versions`` is a free-text field.
+    """
+    mutation = """
+    mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: String!) {
+      updateProjectV2ItemFieldValue(input: {
+        projectId: $projectId
+        itemId: $itemId
+        fieldId: $fieldId
+        value: { text: $value }
+      }) {
+        projectV2Item { id }
+      }
+    }
+    """
+    data = _gql(mutation, {
+        "projectId": project_id,
+        "itemId": item_id,
+        "fieldId": field_id,
+        "value": value,
     })
     return data is not None
 
