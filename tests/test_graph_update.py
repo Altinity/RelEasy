@@ -351,6 +351,65 @@ class IsReusableUnit(unittest.TestCase):
         self.assertFalse(d._is_reusable_unit(self._node([URL(1)], shas=[]), self._cu(1)))
 
 
+class ReusablePriorGroups(unittest.TestCase):
+    """Incremental discovery reuses prior groups whose members are unchanged."""
+
+    def _grp(self, gid, nums, shas=None):
+        urls = [URL(n) for n in nums]
+        return d.DAGNode(gid, False, urls, ["t"] * len(urls),
+                         "2026-01-01T00:00:00+00:00", [], "grouped",
+                         merge_shas=shas if shas is not None else [f"s{n}" for n in nums])
+
+    def _env(self, nums):
+        # All `nums` are active candidates with merge SHA s<n>.
+        pr_url_to_unit = {URL(n): f"pr-{n}" for n in nums}
+        url_to_sha = {URL(n): f"s{n}" for n in nums}
+        return pr_url_to_unit, url_to_sha
+
+    def test_unchanged_group_reused_with_chain(self):
+        pr_url_to_unit, url_to_sha = self._env([1, 2, 3])
+        members, edges, urls = d._reusable_prior_groups(
+            [self._grp("auto-grp-pr-1", [1, 2, 3])],
+            pr_url_to_unit, set(), url_to_sha,
+        )
+        self.assertEqual(members, {"pr-1", "pr-2", "pr-3"})
+        # prereq chain in apply order: each member depends on the previous.
+        self.assertEqual(edges, {("pr-2", "pr-1"), ("pr-3", "pr-2")})
+        # gid keyed on the lead (prereq-most) member; ordered urls recorded.
+        self.assertEqual(urls, {"auto-grp-pr-1": [URL(1), URL(2), URL(3)]})
+
+    def test_member_sha_changed_not_reused(self):
+        pr_url_to_unit, url_to_sha = self._env([1, 2])
+        url_to_sha[URL(2)] = "RE-MERGED"
+        members, edges, urls = d._reusable_prior_groups(
+            [self._grp("auto-grp-pr-1", [1, 2])], pr_url_to_unit, set(), url_to_sha,
+        )
+        self.assertEqual((members, edges, urls), (set(), set(), {}))
+
+    def test_member_now_merged_not_reused(self):
+        pr_url_to_unit, url_to_sha = self._env([1, 2])
+        members, _, _ = d._reusable_prior_groups(
+            [self._grp("auto-grp-pr-1", [1, 2])], pr_url_to_unit, {"pr-2"}, url_to_sha,
+        )
+        self.assertEqual(members, set())
+
+    def test_member_dropped_from_candidates_not_reused(self):
+        # pr-2 no longer a candidate (removed from labels) → group not reused.
+        pr_url_to_unit, url_to_sha = self._env([1])
+        members, _, _ = d._reusable_prior_groups(
+            [self._grp("auto-grp-pr-1", [1, 2])], pr_url_to_unit, set(), url_to_sha,
+        )
+        self.assertEqual(members, set())
+
+    def test_missing_merge_shas_not_reused(self):
+        # older-format group node without merge_shas → can't verify → no reuse.
+        pr_url_to_unit, url_to_sha = self._env([1, 2])
+        members, _, _ = d._reusable_prior_groups(
+            [self._grp("auto-grp-pr-1", [1, 2], shas=[])], pr_url_to_unit, set(), url_to_sha,
+        )
+        self.assertEqual(members, set())
+
+
 class BuildGroupCacheBranches(unittest.TestCase):
     """Group combined branches are built + cached (clean) or skipped (conflict)."""
 
@@ -396,7 +455,8 @@ class BuildGroupCacheBranches(unittest.TestCase):
 
     def test_clean_group_cached(self):
         nodes, by_id, grp, picked = self._setup(clean=True)
-        d._build_group_cache_branches(Path("/x"), "b", "ref", nodes, by_id, "o/r", [])
+        d._build_group_cache_branches(Path("/x"), "b", "ref", nodes, by_id, "o/r", [],
+                                      repo_path=Path("/x"))
         self.assertTrue(grp.cached)
         self.assertEqual(picked["prs"], [URL(1), URL(2)])   # apply order preserved
         self.assertTrue(picked["is_group"])
@@ -405,10 +465,46 @@ class BuildGroupCacheBranches(unittest.TestCase):
     def test_conflicting_group_not_cached(self):
         nodes, by_id, grp, picked = self._setup(clean=False)
         w = []
-        d._build_group_cache_branches(Path("/x"), "b", "ref", nodes, by_id, "o/r", w)
+        d._build_group_cache_branches(Path("/x"), "b", "ref", nodes, by_id, "o/r", w,
+                                      repo_path=Path("/x"))
         self.assertFalse(grp.cached)
         self.assertIn(("feature/b/auto-grp-pr-1", False), self._released)  # dropped
         self.assertTrue(any("conflicts" in x and "1 file" in x for x in w))
+
+    def test_unchanged_reused_group_skips_rebuild(self):
+        # Membership matches the prior run AND the branch is anchored:
+        # keep the cached branch, never re-pick.
+        nodes, by_id, grp, picked = self._setup(clean=True)
+        save = (d.local_branch_exists, d._branch_anchored_to)
+        d.local_branch_exists = lambda repo, br: True
+        d._branch_anchored_to = lambda repo, br, ref: True
+        try:
+            d._build_group_cache_branches(
+                Path("/x"), "b", "ref", nodes, by_id, "o/r", [],
+                repo_path=Path("/x"),
+                reusable_group_urls={"auto-grp-pr-1": [URL(1), URL(2)]},
+            )
+        finally:
+            d.local_branch_exists, d._branch_anchored_to = save
+        self.assertTrue(grp.cached)
+        self.assertEqual(picked, {})       # trial-pick never ran
+        self.assertEqual(self._released, [])  # branch left untouched
+
+    def test_grown_group_rebuilt_not_skipped(self):
+        # A new member joined since the prior run (urls differ) → rebuild.
+        nodes, by_id, grp, picked = self._setup(clean=True)
+        save = (d.local_branch_exists, d._branch_anchored_to)
+        d.local_branch_exists = lambda repo, br: True
+        d._branch_anchored_to = lambda repo, br, ref: True
+        try:
+            d._build_group_cache_branches(
+                Path("/x"), "b", "ref", nodes, by_id, "o/r", [],
+                repo_path=Path("/x"),
+                reusable_group_urls={"auto-grp-pr-1": [URL(1)]},  # prior had 1 member
+            )
+        finally:
+            d.local_branch_exists, d._branch_anchored_to = save
+        self.assertEqual(picked["prs"], [URL(1), URL(2)])  # rebuilt with both
 
 
 class ResolveBaseBranch(unittest.TestCase):

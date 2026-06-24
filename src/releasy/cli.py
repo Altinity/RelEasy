@@ -873,6 +873,12 @@ def graph_cmd() -> None:
     help="Include units already in target as zero-edge nodes in the report.",
 )
 @click.option(
+    "--redo", is_flag=True, default=False,
+    help="Re-discover everything from scratch. By default a re-run reuses "
+         "the units already in the prior graph (standalone PRs AND groups) "
+         "and only trial-picks PRs new since the last run.",
+)
+@click.option(
     "--open-issue/--no-open-issue", default=False,
     help="Open (or refresh) a GitHub issue on origin carrying the graph. "
          "Re-running updates the same issue instead of opening a duplicate. "
@@ -894,6 +900,7 @@ def graph_discover_cmd(
     max_depth: int,
     pr_limit: int | None,
     include_already_merged: bool,
+    redo: bool,
     open_issue: bool,
     issue_title: str | None,
 ) -> None:
@@ -979,6 +986,7 @@ def graph_discover_cmd(
                 max_depth=max_depth,
                 pr_limit=pr_limit,
                 include_already_merged=include_already_merged,
+                redo=redo,
                 open_issue=open_issue,
                 issue_title=issue_title,
             )

@@ -251,9 +251,13 @@ dependency with other PRs).
 releasy graph discover [--onto <ver>] [--work-dir <path>]
                        [-o <path>] [--deps-file <path> | --no-write]
                        [--no-ai] [--max-depth <N>] [--limit <N>]
-                       [--include-already-merged]
+                       [--include-already-merged] [--redo]
                        [--open-issue] [--issue-title <text>]
 ```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--redo` | Re-discover from scratch, ignoring the prior graph. By default a re-run reuses every already-discovered unit and only trial-picks PRs new since the last run (see **Incremental re-runs**). | off |
 
 | Output | Where | Override |
 |--------|-------|----------|
@@ -312,11 +316,22 @@ upstream commit can't be fetched — it's flagged `missing-prerequisites`.
 PRs that newly match are picked up and PRs that landed in target drop out; the
 summary prints a refresh-diff (`refresh: N removed [...] · M added [...]`).
 
-**Incremental re-runs:** when the target tip is unchanged since the last run,
-discovery **reuses** the cached result of each unchanged standalone unit
-(skipping its trial-pick and any AI) and only processes new / changed PRs.
-Groups are re-discovered. If `origin/<base>` moved, cached picks are stale, so
-it falls back to a full re-scan (noted in the output).
+**Incremental re-runs (default):** a re-run **reuses every unit already in the
+prior `graph.<base>.yaml`** — standalone PRs *and* groups — and only trial-picks
+PRs that are new in `pr_sources` since the last run (skipping their re-pick,
+prereq-tracing, and AI). A reused group is rebuilt from its recorded members; a
+brand-new PR that conflicts into a member **attaches** to that group. A PR that
+was re-merged (same URL, new SHA) or that dropped out of the candidate set is
+re-discovered, not reused.
+
+Pass **`--redo`** to ignore the prior graph and trial-pick everything from
+scratch.
+
+When `origin/<base>` has **moved** since the last run, discovery still reuses
+the prior groupings but treats cached branches as stale: reused units are
+emitted `cached: false` (so `run` re-picks them onto the new tip) and a warning
+nudges you toward `--redo`. The refresh-diff (`refresh: N removed · M added`)
+still reports what changed either way.
 
 Exit: `0` regardless of conflicts found — read-only diagnostic.
 

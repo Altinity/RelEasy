@@ -215,6 +215,7 @@ def run_discover_deps(
     max_depth: int,
     pr_limit: int | None,
     include_already_merged: bool,
+    redo: bool = False,
     open_issue: bool = False,
     issue_title: str | None = None,
 ) -> DiscoveryReport:
@@ -280,14 +281,19 @@ def run_discover_deps(
     cache_enabled = deps_overlay_path is not None
     origin_slug = get_origin_repo_slug(config)
 
-    # --- Incremental re-discovery ---
-    # If a prior report exists for the SAME target tip, reuse the cached
-    # results of unchanged standalone units and only trial-pick the new /
-    # changed ones. When the target moved, cached picks are stale — fall
-    # back to a full re-scan.
+    # --- Incremental re-discovery (default) ---
+    # Reuse every unit already in the prior report — standalone PRs AND
+    # groups — and only trial-pick PRs that are new since the last run.
+    # ``--redo`` forces a full from-scratch scan. When the base moved since
+    # the prior run we still reuse the grouping decisions (they usually
+    # hold), but treat cached branches as stale: nodes are emitted
+    # ``cached=False`` so ``run`` re-picks them, plus a warning nudging
+    # toward ``--redo``.
     report_path = output_path or _default_report_path(config, base_branch)
-    reuse_index: dict[str, DAGNode] = {}
-    if cache_enabled and report_path.exists():
+    warnings_acc: list[str] = []
+    prior_report: DiscoveryReport | None = None
+    target_moved = False
+    if cache_enabled and not redo and report_path.exists():
         try:
             prior_report = load_report(report_path)
         except Exception:
@@ -295,16 +301,30 @@ def run_discover_deps(
             # hand-edited prior report must degrade to a full re-scan, never
             # crash discovery (YAML errors, KeyError, TypeError, …).
             prior_report = None
-        if prior_report is not None and prior_report.target_sha == target_sha:
-            reuse_index = {n.unit_id: n for n in prior_report.nodes}
-            console.print(
-                "  [dim]incremental: target unchanged — reusing unchanged "
-                "units from the previous run[/dim]"
+    reuse_index: dict[str, DAGNode] = {}
+    prior_groups: list[DAGNode] = []
+    if prior_report is not None:
+        target_moved = prior_report.target_sha != target_sha
+        if target_moved:
+            warnings_acc.append(
+                f"base {base_branch} moved since last discover "
+                f"({prior_report.target_sha[:8]} → {target_sha[:8]}); reused "
+                "picks may be stale — run `graph discover --redo` to rebuild."
             )
-        elif prior_report is not None:
             console.print(
-                "  [dim]target moved since last run — full re-scan[/dim]"
+                "  [yellow]base moved since last discover — reusing prior "
+                "picks (may be stale); --redo to rebuild[/yellow]"
             )
+        else:
+            console.print(
+                "  [dim]incremental: reusing units from the previous run "
+                "(only new PRs are trial-picked)[/dim]"
+            )
+        for n in prior_report.nodes:
+            if n.discovery_method == "grouped":
+                prior_groups.append(n)
+            else:
+                reuse_index[n.unit_id] = n
 
     # Capture the auto-discovered unit IDs from the existing overlay (if
     # any) so we can show a refresh diff after the new overlay is built.
@@ -321,7 +341,6 @@ def run_discover_deps(
     if pr_limit is not None and len(candidates) > pr_limit:
         candidates = candidates[-pr_limit:]  # most-recent N (sorted newest-last)
 
-    warnings_acc: list[str] = []
     candidate_pr_urls = {p.url for cu in candidates for p in cu.prs}
 
     console.print(
@@ -391,6 +410,21 @@ def run_discover_deps(
     reused: list[str] = []
     by_unit_id: dict[str, _CandidateUnit] = {cu.unit_id: cu for cu in candidates}
     merge_containment_cache: dict[str, str] | None = None
+
+    # --- Incremental: prior groups reusable as-is ---
+    # Skip the members' trial-picks and re-inject a prereq chain so the
+    # component-collapse rebuilds each unchanged group (a new PR that
+    # conflicts into a member still attaches via its own traced edge).
+    url_to_sha = {
+        p.url: (p.merge_commit_sha or "")
+        for cu in candidates for p in cu.prs
+    }
+    reused_group_member_ids, preseeded_edges, prior_group_pr_urls = (
+        _reusable_prior_groups(
+            prior_groups, pr_url_to_unit, fully_merged_units, url_to_sha,
+        )
+    )
+
     # Recursion cap for upstream-backport pull-in: `--max-depth` overrides,
     # else ai_resolve.auto_add_prerequisite_prs.max_prereq_depth.
     cap = (
@@ -448,28 +482,46 @@ def run_discover_deps(
                 console.print(f"  [dim]· {unit_id}: depth-cutoff[/dim]")
                 continue
 
-            # Incremental reuse: a prior standalone clean/cached unit whose
-            # PRs (and merge SHAs) are unchanged, whose cache branch still
-            # exists AND is anchored to the current target tip, is reused
-            # as-is — skip the (re-)trial-pick (and any AI). The anchor
-            # check guards against a branch left on a stale/diverged base
-            # (interrupted run, `run --append`, force-push) being reused.
-            cache_br = _cache_branch_name(base_branch, unit_id)
-            prior_n = reuse_index.get(unit_id)
-            if (
-                prior_n is not None
-                and _is_reusable_unit(prior_n, cu)
-                and local_branch_exists(repo_path, cache_br)
-                and _branch_anchored_to(repo_path, cache_br, target_ref)
-            ):
+            # Incremental reuse: reused group member. Skip the trial-pick —
+            # the prereq chain in ``preseeded_edges`` rebuilds the group at
+            # collapse time (this node is folded into the group there).
+            if unit_id in reused_group_member_ids:
                 nodes[unit_id] = _make_node(
-                    cu, deps=[], method=prior_n.discovery_method,
-                    conflict_files=list(prior_n.conflict_files_at_discovery),
-                    cached=True,
+                    cu, deps=[], method="reused-group-member",
+                    conflict_files=[],
                 )
                 reused.append(unit_id)
-                console.print(f"  [dim]· {unit_id}: reused (unchanged)[/dim]")
+                console.print(f"  [dim]· {unit_id}: reused (group member)[/dim]")
                 continue
+
+            # Incremental reuse: a prior standalone clean/cached unit whose
+            # PRs (and merge SHAs) are unchanged is reused as-is — skip the
+            # (re-)trial-pick (and any AI). With the base unchanged and the
+            # cache branch still anchored to the target tip, reuse it
+            # ``cached`` (the anchor check guards against a branch left on a
+            # stale/diverged base — interrupted run, force-push). With the
+            # base moved, we still skip the expensive re-pick but emit
+            # ``cached=False`` and drop any stale branch so ``run`` re-picks
+            # onto the new tip.
+            cache_br = _cache_branch_name(base_branch, unit_id)
+            prior_n = reuse_index.get(unit_id)
+            if prior_n is not None and _is_reusable_unit(prior_n, cu):
+                branch_live = (
+                    local_branch_exists(repo_path, cache_br)
+                    and _branch_anchored_to(repo_path, cache_br, target_ref)
+                )
+                if branch_live or target_moved:
+                    if not branch_live and local_branch_exists(repo_path, cache_br):
+                        run_git(["branch", "-D", cache_br], repo_path, check=False)
+                    nodes[unit_id] = _make_node(
+                        cu, deps=[], method=prior_n.discovery_method,
+                        conflict_files=list(prior_n.conflict_files_at_discovery),
+                        cached=branch_live,
+                    )
+                    reused.append(unit_id)
+                    suffix = "" if branch_live else " (base moved — run re-picks)"
+                    console.print(f"  [dim]· {unit_id}: reused{suffix}[/dim]")
+                    continue
 
             # Cache branch path: when caching is enabled (the default),
             # trial-pick onto a named branch ``feature/<base>/<unit_id>``
@@ -647,9 +699,13 @@ def run_discover_deps(
 
         if reused:
             console.print(
-                f"  [dim]reused {len(reused)} unchanged unit(s) from the "
+                f"  [dim]reused {len(reused)} unit(s) from the "
                 "previous run[/dim]"
             )
+
+        # Re-inject reused groups' prereq chains so the collapse rebuilds
+        # them (and lets any new PR that conflicted into a member attach).
+        edges |= preseeded_edges
 
         # --- Collapse components into groups, then build + cache each
         # combined group branch while the scratch worktree is still open
@@ -662,10 +718,13 @@ def run_discover_deps(
         )
         if cache_enabled:
             # Build feature/<base>/<group-id> (clean → cached), then drop
-            # the now-superseded per-member branches.
+            # the now-superseded per-member branches. A reused group whose
+            # membership is unchanged and whose branch is still anchored is
+            # kept as-is (no re-pick); a moved base forces a rebuild.
             _build_group_cache_branches(
                 scratch, base_branch, target_ref, nodes, by_unit_id,
-                origin_slug, warnings_acc,
+                origin_slug, warnings_acc, repo_path=repo_path,
+                reusable_group_urls=({} if target_moved else prior_group_pr_urls),
             )
             for uid in folded:
                 run_git(
@@ -1940,6 +1999,53 @@ def _is_reusable_unit(prior_node: DAGNode, cu: _CandidateUnit) -> bool:
     )
 
 
+def _reusable_prior_groups(
+    prior_groups: list[DAGNode],
+    pr_url_to_unit: dict[str, str],
+    fully_merged_units: set[str],
+    url_to_sha: dict[str, str],
+) -> tuple[set[str], set[tuple[str, str]], dict[str, list[str]]]:
+    """Which prior ``grouped`` nodes can be reused wholesale this run?
+
+    A group is reusable when every member PR is still an active (not-yet-
+    merged) candidate with an unchanged merge SHA. For each such group we:
+
+    * mark its member unit_ids reused (caller skips their trial-picks),
+    * synthesise a prereq chain ``member[i] → member[i-1]`` over its
+      apply-ordered ``pr_urls`` so the component-collapse rebuilds the same
+      ``auto-grp-<lead>`` group (a new PR that conflicts into a member still
+      attaches via its own traced edge — the group simply grows), and
+    * record the group's ordered member urls so the cache-branch builder can
+      skip a group whose membership is unchanged.
+
+    Returns ``(reused_member_ids, preseeded_edges, prior_group_pr_urls)``.
+    """
+    reused_member_ids: set[str] = set()
+    preseeded_edges: set[tuple[str, str]] = set()
+    prior_group_pr_urls: dict[str, list[str]] = {}
+    for g in prior_groups:
+        if not g.merge_shas or len(g.merge_shas) != len(g.pr_urls):
+            continue
+        member_uids: list[str] = []
+        ok = True
+        for url, sha in zip(g.pr_urls, g.merge_shas):
+            uid = pr_url_to_unit.get(url)
+            if (uid is None or uid in fully_merged_units
+                    or url_to_sha.get(url, "") != sha):
+                ok = False
+                break
+            if uid not in member_uids:
+                member_uids.append(uid)
+        if not ok or len(member_uids) < 2:
+            continue
+        gid = f"auto-grp-{member_uids[0]}"
+        prior_group_pr_urls[gid] = list(g.pr_urls)
+        reused_member_ids.update(member_uids)
+        for i in range(1, len(member_uids)):
+            preseeded_edges.add((member_uids[i], member_uids[i - 1]))
+    return reused_member_ids, preseeded_edges, prior_group_pr_urls
+
+
 def _branch_anchored_to(repo_path: Path, branch: str, base_ref: str) -> bool:
     """True if ``base_ref`` is an ancestor of ``branch`` — i.e. the cache
     branch was built on top of the current target tip (not a stale base)."""
@@ -2050,6 +2156,9 @@ def _build_group_cache_branches(
     by_unit_id: dict[str, _CandidateUnit],
     origin_slug: str | None,
     warnings_acc: list[str],
+    *,
+    repo_path: Path,
+    reusable_group_urls: dict[str, list[str]] | None = None,
 ) -> None:
     """Build + cache each collapsed group's combined branch.
 
@@ -2059,11 +2168,28 @@ def _build_group_cache_branches(
     re-doing the work. Conflict → reset and leave ``cached=False`` (``run``
     rebuilds and resolves). No AI here — discovery stays light; a group that
     needs resolution falls back to ``run``'s resolver.
+
+    ``reusable_group_urls`` (gid → ordered member urls from the prior run)
+    lets an incremental re-run skip rebuilding a group whose membership is
+    unchanged and whose combined branch is still anchored to the target tip.
     """
+    reusable_group_urls = reusable_group_urls or {}
     url_to_pr: dict[str, PRInfo] = {
         p.url: p for cu in by_unit_id.values() for p in cu.prs
     }
     for node in [n for n in nodes.values() if n.discovery_method == "grouped"]:
+        cache_branch = _cache_branch_name(base_branch, node.unit_id)
+        # Unchanged reused group with a still-anchored branch: keep as-is.
+        if (
+            reusable_group_urls.get(node.unit_id) == node.pr_urls
+            and local_branch_exists(repo_path, cache_branch)
+            and _branch_anchored_to(repo_path, cache_branch, target_ref)
+        ):
+            node.cached = True
+            console.print(
+                f"  [dim]· {node.unit_id}: group unchanged — reused cache[/dim]"
+            )
+            continue
         prs = [url_to_pr[u] for u in node.pr_urls if u in url_to_pr]
         if len(prs) != len(node.pr_urls):
             warnings_acc.append(
@@ -2092,7 +2218,6 @@ def _build_group_cache_branches(
                 is_group=True, group_id=node.unit_id,
             ),
         )
-        cache_branch = _cache_branch_name(base_branch, node.unit_id)
         outcome = _trial_pick_unit(
             scratch, group_cu, target_ref,
             cache_branch=cache_branch, is_group=True, origin_slug=origin_slug,
