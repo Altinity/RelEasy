@@ -110,6 +110,8 @@ Options live in `config.yaml` unless marked **(session)**.
 | `sequential` | One PR per invocation, gated on the previous rebase PR merging. See [Sequential mode](commands.md#sequential-mode). Incompatible with `pr_sources.groups`. | `false` |
 | `update_existing_prs` | Reuse existing PR and overwrite its title/body. | `false` |
 | `upstream.remote` | Optional fetch-only upstream remote (URL). Used **only** for `git log -S` prereq detection during AI resolve — never pushed to, never read for code. Sub-keys `upstream.remote_name` (`upstream`), `upstream.branch` (`master`). | unset |
+| `ai_model` | `claude --model` for **every** AI call (resolve, changelog, review, analyze-fails, graph). Alias or full id (`opus`, `sonnet`, `claude-opus-4-8`). | claude CLI default |
+| `ai_effort` | `claude --effort` for every AI call. One of `low`/`medium`/`high`/`xhigh`/`max`. | claude CLI default |
 | `ai_resolve.enabled` | Master switch for the AI conflict resolver. When off, conflicts always stop the pipeline. | `false` |
 | `ai_resolve.build_command` | Shell command Claude runs to verify a resolution compiles. | `cd build && ninja` |
 | `ai_resolve.max_iterations` | Build attempts per conflict (passed to Claude). | `5` |
