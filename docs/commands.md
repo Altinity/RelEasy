@@ -107,6 +107,11 @@ conflicts when `ai_resolve.enabled` is on. Unresolved → singleton dropped
 or partial-group draft PR with `ai-needs-attention`. See
 [Conflict resolution](concepts.md#conflict-resolution).
 
+A **partial-group draft PR** is auto-resumed on the next `run` (with
+`retry_failed` on): the not-yet-applied PRs are appended and re-resolved,
+up to `pr_policy.max_partial_continue_attempts` (default 2) before it's
+left for manual help. No need to set `if_exists: append` by hand.
+
 For PRs with an existing rebase PR, `run` doesn't rebuild — it routes
 through the same merge-target flow [`refresh`](#releasy-refresh) uses:
 clean merge → leave alone; conflict → AI-resolve and plain push (never

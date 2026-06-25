@@ -233,6 +233,15 @@ class PRPolicyConfig:
     # base. Default on; disable when you want the old behaviour (releasy
     # keeps refreshing its own port regardless of parallel work).
     detect_superseded: bool = True
+    # How many times `releasy run` auto-resumes a partially-applied group.
+    # A prior run cherry-picked some of a group's PRs, then a conflict
+    # (often an AI token/budget exhaustion) stopped it mid-way, leaving a
+    # draft PR labelled ai-needs-attention. With retry_failed on (default),
+    # each run appends the not-yet-applied PRs and re-resolves. After this
+    # many attempts it stops and leaves the draft PR for manual help.
+    # 0 disables auto-continue (old behaviour: leave it until the user sets
+    # if_exists: append by hand).
+    max_partial_continue_attempts: int = 2
 
 
 @dataclass
@@ -1018,6 +1027,9 @@ def load_config(config_path: Path | None = None) -> Config:
         retry_failed=bool(pp_raw.get("retry_failed", True)),
         recreate_closed_prs=bool(pp_raw.get("recreate_closed_prs", False)),
         detect_superseded=bool(pp_raw.get("detect_superseded", True)),
+        max_partial_continue_attempts=int(
+            pp_raw.get("max_partial_continue_attempts", 2) or 0
+        ),
     )
 
     notif_raw = raw.get("notifications", {}) or {}
@@ -1438,6 +1450,13 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         pp_data["recreate_closed_prs"] = pp.recreate_closed_prs
     if pp.detect_superseded != pp_defaults.detect_superseded:
         pp_data["detect_superseded"] = pp.detect_superseded
+    if (
+        pp.max_partial_continue_attempts
+        != pp_defaults.max_partial_continue_attempts
+    ):
+        pp_data["max_partial_continue_attempts"] = (
+            pp.max_partial_continue_attempts
+        )
     if pp_data:
         data["pr_policy"] = pp_data
 

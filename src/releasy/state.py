@@ -140,6 +140,10 @@ class FeatureState:
     # failed conflict resolution, and how many earlier picks were committed.
     failed_step_index: int | None = None
     partial_pr_count: int | None = None
+    # How many times ``releasy run`` has auto-resumed this partially-applied
+    # group (bounded by ``pr_policy.max_partial_continue_attempts``). Reset to
+    # 0 once the group finally lands clean.
+    partial_continue_attempts: int = 0
     # ----- Missing-prerequisite detection / auto-recovery state -----
     # Populated by the AI resolver when Claude judges the conflict to be
     # caused by an unported upstream PR. Even in detection-only mode (no
@@ -257,6 +261,9 @@ def _parse_features(raw_features: dict) -> dict[str, FeatureState]:
             mode=fraw.get("mode"),
             failed_step_index=fraw.get("failed_step_index"),
             partial_pr_count=fraw.get("partial_pr_count"),
+            partial_continue_attempts=int(
+                fraw.get("partial_continue_attempts", 0) or 0
+            ),
             missing_prereq_prs=fraw.get("missing_prereq_prs", []) or [],
             missing_prereq_note=fraw.get("missing_prereq_note"),
             dynamic_prereq_urls=fraw.get("dynamic_prereq_urls", []) or [],
@@ -372,6 +379,8 @@ def save_state(state: PipelineState, config: Config) -> None:
             entry["failed_step_index"] = fs.failed_step_index
         if fs.partial_pr_count is not None:
             entry["partial_pr_count"] = fs.partial_pr_count
+        if fs.partial_continue_attempts:
+            entry["partial_continue_attempts"] = fs.partial_continue_attempts
         if fs.missing_prereq_prs:
             entry["missing_prereq_prs"] = fs.missing_prereq_prs
         if fs.missing_prereq_note:

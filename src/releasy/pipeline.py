@@ -199,6 +199,11 @@ class FeatureUnit:
     # group order regardless of whether a given PR was applied on this
     # run or a prior one.
     applied_pr_urls: set[str] = field(default_factory=set)
+    # When ``releasy run`` auto-resumes a partially-applied group, the
+    # number of auto-continue attempts INCLUDING this run. Carried into the
+    # next ``conflict`` state by :func:`_handle_unresolved_conflict` so the
+    # ``pr_policy.max_partial_continue_attempts`` cap is enforced across runs.
+    partial_continue_attempts: int = 0
     # Other unit IDs this unit depends on. Populated from
     # :class:`PRGroupConfig.depends_on` for group units (singletons can
     # only carry deps via single-PR groups in the deps_file overlay).
@@ -2788,6 +2793,21 @@ def _next_free_renumbered_port_branch(
         n += 1
 
 
+def _is_partial_group(fs: FeatureState | None) -> bool:
+    """True for a unit a prior run left mid-cherry-pick.
+
+    A partial group has ``status == "conflict"`` with at least one PR
+    already committed (``partial_pr_count > 0``) — i.e. the draft-PR /
+    ``ai-needs-attention`` flavour of :func:`_handle_unresolved_conflict`,
+    not the first-pick-failed flavour (which keeps nothing).
+    """
+    return (
+        fs is not None
+        and fs.status == "conflict"
+        and (fs.partial_pr_count or 0) > 0
+    )
+
+
 def _process_feature_unit(
     config: Config,
     repo_path: Path,
@@ -2884,6 +2904,42 @@ def _process_feature_unit(
         )
         _dry_record(state, "skip-conflict-retry-off")
         return "continue"
+
+    # --- Auto-continue a partially-applied group ---
+    # A prior run cherry-picked part of a group, then a conflict (often an
+    # AI token/budget exhaustion) stopped it mid-way, leaving a draft PR
+    # labelled ai-needs-attention. With retry_failed on (the default),
+    # resume where it left off — re-route through the append flow so the
+    # not-yet-applied PRs are cherry-picked + re-resolved on top of the
+    # existing branch — instead of skipping ("rebase PR already open").
+    # Bounded by pr_policy.max_partial_continue_attempts so an unwinnable
+    # conflict doesn't re-burn budget on every run. An explicit
+    # if_exists (append already resumes; recreate is a deliberate rebuild)
+    # is left untouched.
+    cap = config.pr_policy.max_partial_continue_attempts
+    if (
+        is_failed_prev and retry_failed and cap > 0
+        and _is_partial_group(prev_state)
+        and unit.if_exists not in ("append", "recreate")
+    ):
+        attempts = prev_state.partial_continue_attempts
+        if attempts >= cap:
+            console.print(
+                f"\n    [yellow]⏭[/yellow]  [cyan]{canonical_branch}[/cyan] "
+                f"({label}) — partial group: auto-continue cap reached "
+                f"({attempts}/{cap}); leaving the draft PR for manual help. "
+                "[dim](bump pr_policy.max_partial_continue_attempts to retry, "
+                "or finish it by hand)[/dim]"
+            )
+            _dry_record(state, "skip-partial-continue-exhausted")
+            return "continue"
+        unit.if_exists = "append"
+        unit.partial_continue_attempts = attempts + 1
+        console.print(
+            f"\n    [yellow]↻[/yellow]  [cyan]{canonical_branch}[/cyan] "
+            f"({label}) — resuming partial group from a prior run "
+            f"(auto-continue attempt {attempts + 1}/{cap})"
+        )
 
     on_remote_canon = remote_branch_exists(
         repo_path, canonical_branch, remote,
@@ -4715,6 +4771,11 @@ def _handle_unresolved_conflict(
         conflict_files=conflict_files,
         failed_step_index=applied,
         partial_pr_count=applied,
+        # Carry the auto-continue attempt count forward so the cap in
+        # pr_policy.max_partial_continue_attempts is enforced across runs.
+        # 0 on the original failure; >0 once `run` has been re-routed
+        # through the auto-continue path.
+        partial_continue_attempts=unit.partial_continue_attempts,
         ai_cost_usd=unit.ai_cost_usd_total,
         verify_needs_attention=unit.verify_needs_attention,
         verify_comment_posted=verify_comment_posted,

@@ -241,6 +241,14 @@ target_branch: antalya-26.3
 #     # `status: superseded` — no further cherry-pick attempts, no
 #     # monitoring. Disable to keep the old behaviour (releasy keeps
 #     # refreshing its own port regardless of parallel work).
+#   max_partial_continue_attempts: 2
+#     # How many times `run` auto-resumes a partially-applied group. When a
+#     # prior run cherry-picked some of a group's PRs and then a conflict
+#     # (often an AI token/budget exhaustion) left a draft PR labelled
+#     # `ai-needs-attention`, the next run (with retry_failed on) appends
+#     # the not-yet-applied PRs and re-resolves — no need to set
+#     # `if_exists: append` by hand. After this many attempts it stops and
+#     # leaves the draft PR for manual help. 0 disables (old behaviour).
 
 # ── PR sources and features ─────────────────────────────────────────
 # These live in the session file, not here. Look for
