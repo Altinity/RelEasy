@@ -7,6 +7,33 @@ porting projects at once.
 
 This page is a quick start. For the full picture, see **[docs/](docs/)**.
 
+## TL;DR — which command do I want?
+
+All commands need `RELEASY_GITHUB_TOKEN`. The first group works anywhere
+(no project / config / state); the rest assume a set-up project (see below).
+
+**One-off (stateless):**
+
+- Cherry-pick / backport one PR or commit into a branch → `releasy cherry-pick --origin <url> --target <branch> --commit <github-url> [--with-pr]`
+- Batch-backport upstream PRs queued in a GitHub Project (Stable releases) → `releasy project-backport --project <url> --version <ver> --target <branch>`
+- Address review comments on one PR in any repo → `releasy refresh --pr <url> --address-review --stateless`
+
+**In a set-up project:**
+
+- Port everything in scope (discover, cherry-pick, open PRs) → `releasy run`
+- Resume after fixing a conflict by hand → `releasy continue`
+- Map PR dependencies before porting → `releasy graph discover` (add `--open-issue` to track it)
+- Update every in-scope PR's branch to the latest target → `releasy refresh --merge-target`
+- Address reviewer comments across all in-scope PRs → `releasy refresh --address-review`
+- CI is red — let AI triage failing tests → `releasy analyze-fails` (or `releasy refresh --analyze-fails`)
+- Re-port all rebase PRs onto a different target → `releasy rebase --target <branch>`
+- Discard a broken local-only branch with no PR yet → `releasy clear <id>`
+- See where everything stands → `releasy status`
+- Draft the GitHub release notes → `releasy draft-release --from <tag> --to <branch> --name <name>`
+
+The flags compose: e.g. `releasy refresh --merge-target --analyze-fails --address-review`
+does all three in one locked pass.
+
 ## Install
 
 ```bash
@@ -86,18 +113,15 @@ list` shows them all.
 
 ## Cut a release
 
-When the base branch is ready to ship, draft the GitHub release notes:
+When the base branch is ready to ship, draft the GitHub release notes from the
+PRs merged into it:
 
 ```bash
 releasy draft-release --from v26.1.6.6-stable --to antalya-26.3 --name v26.1.6.20001.altinityantalya
 ```
 
-This collects the PRs **merged into the target branch** in the
-`--from..--to` window (one GitHub query), drops forward-ports, classifies each
-by its Changelog category, and creates a **draft** release on origin (its URL
-is printed). Pass `--prs <url> ...` to draft from an explicit PR set instead,
-or `-o notes.md` to write the markdown to a file rather than publishing. Full
-flags: [docs/commands.md](docs/commands.md#releasy-draft-release).
+Creates a **draft** release on origin (its URL is printed). Full flags:
+[docs/commands.md](docs/commands.md#releasy-draft-release).
 
 ## Learn more
 
