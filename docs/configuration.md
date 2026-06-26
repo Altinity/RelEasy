@@ -113,9 +113,22 @@ Options live in `config.yaml` unless marked **(session)**.
 | `ai_model` | `claude --model` for **every** AI call (resolve, changelog, review, analyze-fails, graph). Alias or full id (`opus`, `sonnet`, `claude-opus-4-8`). | claude CLI default |
 | `ai_effort` | `claude --effort` for every AI call. One of `low`/`medium`/`high`/`xhigh`/`max`. | claude CLI default |
 | `ai_resolve.enabled` | Master switch for the AI conflict resolver. When off, conflicts always stop the pipeline. | `false` |
-| `ai_resolve.build_command` | Shell command Claude runs to verify a resolution compiles. | `cd build && ninja` |
-| `ai_resolve.max_iterations` | Build attempts per conflict (passed to Claude). | `5` |
-| `ai_resolve.api_retries` | Retries on transient Anthropic API errors. | `3` |
+| `ai_resolve.build_command` | Shell command for the build. RelEasy runs it (deterministic flow), or Claude runs it (legacy). | `cd build && ninja` |
+| `ai_resolve.deterministic_build` | Claude resolves only; RelEasy builds + runs the PR's tests, looping fresh-context build fixes. `false` = legacy single-session resolve+build. | `true` |
+| `ai_resolve.max_build_attempts` | Consecutive build-fix attempts per run before parking as `build_failed`. Resets each run. | `5` |
+| `ai_resolve.max_verify_resume_attempts` | How many times a `build_failed` branch is resumed on later runs before it's left for a human. `0` disables resume. | `2` |
+| `ai_resolve.max_verify_iterations` | Overall cap on build↔test iterations within one verify pass. | `12` |
+| `ai_resolve.build_log_tail_lines` | Lines of `.releasy/build.log` fed to the fix-build prompt (plus grepped errors). | `500` |
+| `ai_resolve.build_timeout_seconds` | RelEasy's wall-clock cap for one build subprocess. | `7200` |
+| `ai_resolve.run_pr_tests` | After a green build, run the source PR's own tests (Claude-driven). | `true` |
+| `ai_resolve.test_file_globs` | Globs marking a changed file as a runnable test. | ClickHouse defaults |
+| `ai_resolve.test_timeout_seconds` | Wall-clock cap for one run-tests invocation. | `3600` |
+| `ai_resolve.max_iterations` | Legacy build attempts per conflict (only when `deterministic_build: false`). | `5` |
+| `ai_resolve.api_retries` | Retries on transient Anthropic API errors (short backoff). | `3` |
+| `ai_resolve.wait_on_session_exhaustion` | When the Claude session usage limit is hit (incl. the CLI's misleadingly-worded "monthly spend limit · /usage-credits" message — it's a session reset, not a billing cap), wait and re-prompt on a schedule instead of failing. Applies to every Claude call; Ctrl-C aborts. | `true` |
+| `ai_resolve.session_exhaustion_max_wait_hours` | Cap on cumulative waiting for the session to reset. | `60` |
+| `ai_resolve.session_exhaustion_poll_minutes` | Sleep between re-prompts while waiting. | `30` |
+| `ai_resolve.session_exhaustion_extra_patterns` | Extra regexes (OR-ed with the built-ins) for recognising a limit message, for a CLI wording the defaults miss. | `[]` |
 | `ai_resolve.label` | Label for AI-resolved PRs. | `ai-resolved` |
 | `ai_resolve.needs_attention_label` | Label for partial-group draft PRs. | `ai-needs-attention` |
 | `ai_resolve.prompt_file` | Prompt for cherry-pick conflicts. | `prompts/resolve_conflict.md` |

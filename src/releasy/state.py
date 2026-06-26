@@ -32,6 +32,9 @@ BranchStatus = Literal[
     "needs_review",
     "branch_created",
     "conflict",
+    # Resolved on a LOCAL branch (no PR), but RelEasy's build/tests didn't
+    # pass this run; the next ``releasy run`` resumes the fix-loop on it.
+    "build_failed",
     "skipped",
     "merged",
     "blocked",
@@ -58,6 +61,7 @@ PipelinePhase = Literal["init", "ports_done"]
 # sub-tables, ``releasy list`` summary). Highest-attention first.
 STATUS_DISPLAY_ORDER: tuple[str, ...] = (
     "conflict",
+    "build_failed",
     "blocked",
     "branch_created",
     "needs_review",
@@ -144,6 +148,10 @@ class FeatureState:
     # group (bounded by ``pr_policy.max_partial_continue_attempts``). Reset to
     # 0 once the group finally lands clean.
     partial_continue_attempts: int = 0
+    # ----- Deterministic build/test verification state (build_failed) -----
+    build_attempts: int = 0  # build-fix attempts spent in the last verify pass
+    verify_resume_attempts: int = 0  # cross-run resumes (cap: max_verify_resume_attempts)
+    last_verify_error: str | None = None
     # ----- Missing-prerequisite detection / auto-recovery state -----
     # Populated by the AI resolver when Claude judges the conflict to be
     # caused by an unported upstream PR. Even in detection-only mode (no
@@ -264,6 +272,11 @@ def _parse_features(raw_features: dict) -> dict[str, FeatureState]:
             partial_continue_attempts=int(
                 fraw.get("partial_continue_attempts", 0) or 0
             ),
+            build_attempts=int(fraw.get("build_attempts", 0) or 0),
+            verify_resume_attempts=int(
+                fraw.get("verify_resume_attempts", 0) or 0
+            ),
+            last_verify_error=fraw.get("last_verify_error"),
             missing_prereq_prs=fraw.get("missing_prereq_prs", []) or [],
             missing_prereq_note=fraw.get("missing_prereq_note"),
             dynamic_prereq_urls=fraw.get("dynamic_prereq_urls", []) or [],
@@ -381,6 +394,12 @@ def save_state(state: PipelineState, config: Config) -> None:
             entry["partial_pr_count"] = fs.partial_pr_count
         if fs.partial_continue_attempts:
             entry["partial_continue_attempts"] = fs.partial_continue_attempts
+        if fs.build_attempts:
+            entry["build_attempts"] = fs.build_attempts
+        if fs.verify_resume_attempts:
+            entry["verify_resume_attempts"] = fs.verify_resume_attempts
+        if fs.last_verify_error:
+            entry["last_verify_error"] = fs.last_verify_error
         if fs.missing_prereq_prs:
             entry["missing_prereq_prs"] = fs.missing_prereq_prs
         if fs.missing_prereq_note:

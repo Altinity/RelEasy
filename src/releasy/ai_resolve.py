@@ -82,6 +82,10 @@ class AIResolveContext:
     # Backport unlocks bucket-0 (drop optional missing-prereq surfaces);
     # forward-port keeps the MISSING_PREREQS-only flow.
     mode: PortMode = "forward_port"
+    # Resolve + commit but do NOT build (no-build prompt); RelEasy builds +
+    # tests afterwards via ``build_verify``. Set by the cherry-pick port path
+    # when ``deterministic_build`` is on; merge/rebase leave it False (legacy).
+    skip_build: bool = False
 
 
 @dataclass
@@ -181,6 +185,10 @@ def _resolve_prompt_template(config: Config, ctx: AIResolveContext) -> Path:
     """
     if ctx.operation == "merge":
         raw = config.ai_resolve.merge_prompt_file
+    elif ctx.skip_build:
+        # Resolve-only: same split-commit contract as split_prompt_file, minus
+        # the Build step (RelEasy builds afterwards).
+        raw = config.ai_resolve.resolve_only_prompt_file
     elif ctx.split_mode:
         raw = config.ai_resolve.split_prompt_file
     else:
@@ -198,6 +206,8 @@ def _render_prompt(config: Config, repo_path: Path, ctx: AIResolveContext) -> st
     if not prompt_path.exists():
         if ctx.operation == "merge":
             which = "ai_resolve.merge_prompt_file"
+        elif ctx.skip_build:
+            which = "ai_resolve.resolve_only_prompt_file"
         elif ctx.split_mode:
             which = "ai_resolve.split_prompt_file"
         else:
@@ -357,15 +367,18 @@ def _model_effort_args(config: Config) -> list[str]:
     return args
 
 
-def _build_claude_argv(config: Config, prompt: str) -> list[str]:
+def _build_claude_argv(
+    config: Config, prompt: str, allowed_tools: list[str] | None = None,
+) -> list[str]:
     cmd = [
         config.ai_resolve.command,
         "-p", prompt,
         "--output-format", "stream-json",
         "--verbose",
     ]
-    if config.ai_resolve.allowed_tools:
-        cmd += ["--allowedTools", ",".join(config.ai_resolve.allowed_tools)]
+    tools = allowed_tools if allowed_tools is not None else config.ai_resolve.allowed_tools
+    if tools:
+        cmd += ["--allowedTools", ",".join(tools)]
     cmd += _model_effort_args(config)
     cmd += list(config.ai_resolve.extra_args)
     return cmd
@@ -513,7 +526,89 @@ def _kill_proc_tree(proc: subprocess.Popen) -> None:
         pass
 
 
+# Session-exhaustion wait defaults — baked in so every _spawn_claude caller
+# waits by default; config-aware callers override via _exhaustion_kwargs.
+_DEFAULT_EXHAUSTION_MAX_WAIT_SECONDS = 60 * 3600  # 60h
+_DEFAULT_EXHAUSTION_POLL_SECONDS = 30 * 60  # 30m
+
+
+def _exhaustion_kwargs(config: Config) -> dict:
+    """``_spawn_claude`` session-exhaustion kwargs derived from config."""
+    ai = config.ai_resolve
+    return {
+        "exhaustion_wait": ai.wait_on_session_exhaustion,
+        "exhaustion_max_wait_seconds": ai.session_exhaustion_max_wait_hours * 3600,
+        "exhaustion_poll_seconds": ai.session_exhaustion_poll_minutes * 60,
+        "exhaustion_extra_patterns": tuple(ai.session_exhaustion_extra_patterns),
+    }
+
+
+def _interruptible_sleep(seconds: float) -> None:
+    """Sleep ``seconds`` in small chunks (Ctrl-C responsive, 5-min heartbeat)."""
+    end = time.monotonic() + seconds
+    next_beat = time.monotonic() + 300.0
+    while True:
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(15.0, remaining))
+        if time.monotonic() >= next_beat:
+            mins_left = int((end - time.monotonic()) / 60) + 1
+            console.print(
+                f"    [dim]│ …waiting for Claude session (~{mins_left}m "
+                "left this poll)[/dim]"
+            )
+            next_beat += 300.0
+
+
 def _spawn_claude(
+    argv: list[str], repo_path: Path, timeout: int,
+    *,
+    exhaustion_wait: bool = True,
+    exhaustion_max_wait_seconds: int = _DEFAULT_EXHAUSTION_MAX_WAIT_SECONDS,
+    exhaustion_poll_seconds: int = _DEFAULT_EXHAUSTION_POLL_SECONDS,
+    exhaustion_extra_patterns: tuple[str, ...] = (),
+) -> tuple[int, str, bool]:
+    """Run claude, waiting out an exhausted usage session.
+
+    Wraps :func:`_spawn_claude_once`: on a session-exhaustion failure (not a
+    transient API error — those retry one level up), sleep and re-prompt
+    until Claude works or the wait cap is hit, then return the last result.
+    """
+    # A non-positive poll interval would busy-loop; treat it as "disabled".
+    wait_enabled = (
+        exhaustion_wait
+        and exhaustion_poll_seconds > 0
+        and exhaustion_max_wait_seconds > 0
+    )
+    waited = 0.0
+    while True:
+        exit_code, output, timed_out = _spawn_claude_once(argv, repo_path, timeout)
+        if not wait_enabled or timed_out or exit_code == 0:
+            return exit_code, output, timed_out
+        reason = _find_session_exhausted(output, exhaustion_extra_patterns)
+        if reason is None:
+            return exit_code, output, timed_out
+        if waited + exhaustion_poll_seconds > exhaustion_max_wait_seconds:
+            console.print(
+                f"    [red]✗ Claude session still exhausted after "
+                f"{_fmt_elapsed(waited)} of waiting "
+                f"(cap {_fmt_elapsed(exhaustion_max_wait_seconds)}); giving up"
+                f"[/red] [dim]({reason})[/dim]"
+            )
+            return exit_code, output, timed_out
+        console.print(
+            f"    [yellow]⏳ Claude session exhausted[/yellow] "
+            f"[dim]({reason})[/dim] — sleeping "
+            f"{_fmt_elapsed(exhaustion_poll_seconds)}, then retrying "
+            f"[dim](waited {_fmt_elapsed(waited)} / "
+            f"{_fmt_elapsed(exhaustion_max_wait_seconds)}; Ctrl-C to abort)[/dim]"
+        )
+        _interruptible_sleep(exhaustion_poll_seconds)
+        waited += exhaustion_poll_seconds
+
+
+def _spawn_claude_once(
     argv: list[str], repo_path: Path, timeout: int,
 ) -> tuple[int, str, bool]:
     """Run claude as a subprocess, streaming stdout/stderr to the console.
@@ -687,6 +782,47 @@ def _find_transient_api_error(output: str) -> str | None:
             m = pat.search(haystack)
             if m:
                 return m.group(0)
+    return None
+
+
+# Signals that the Claude usage session is spent (warrants the scheduled
+# wait, not a 15s retry). Distinct from the transient "API Error: …" patterns
+# above. Only consulted on a non-zero exit. NB: the "monthly spend limit ·
+# run /usage-credits" wording is the CLI mislabeling a session limit that
+# resets — correct to wait out, not a real billing cap.
+_SESSION_EXHAUSTED_RES = [
+    re.compile(r"\blimit reached\b", re.IGNORECASE),
+    re.compile(r"reached your (?:usage |5-hour |weekly |daily )?limit", re.IGNORECASE),
+    re.compile(r"\bhit your\b[^\n]*?\blimit\b", re.IGNORECASE),
+    re.compile(r"\bspend limit\b", re.IGNORECASE),
+    re.compile(r"/usage-credits", re.IGNORECASE),
+    re.compile(r"\b(?:usage|rate|spend|\d+-hour|weekly|daily|monthly)\s+limit\b", re.IGNORECASE),
+    re.compile(r"\blimit (?:will )?reset", re.IGNORECASE),
+    re.compile(r"(?:upgrade|ask your admin)[^\n]*(?:higher|increase|raise)[^\n]*limit", re.IGNORECASE),
+    re.compile(r"API Error:\s*429", re.IGNORECASE),
+]
+
+
+def _find_session_exhausted(
+    output: str, extra_patterns: tuple[str, ...] = (),
+) -> str | None:
+    """Short reason if the run failed on an exhausted usage limit, else None.
+
+    Scans the raw transcript only (the limit notice is a CLI message; skipping
+    model text avoids false positives). ``extra_patterns`` are user regexes
+    OR-ed with the built-ins.
+    """
+    for pat in _SESSION_EXHAUSTED_RES:
+        m = pat.search(output)
+        if m:
+            return m.group(0)
+    for raw in extra_patterns:
+        try:
+            m = re.search(raw, output, re.IGNORECASE)
+        except re.error:
+            continue  # a malformed user pattern must not crash the run
+        if m:
+            return m.group(0)
     return None
 
 
@@ -1041,6 +1177,7 @@ def _verify_postconditions(
 
 def _invoke_claude_with_retries(
     config: Config, repo_path: Path, prompt: str,
+    *, timeout: int | None = None, allowed_tools: list[str] | None = None,
 ) -> tuple[int, str, bool, float | None]:
     """Run claude on ``prompt``, retrying on transient Anthropic API errors.
 
@@ -1049,8 +1186,14 @@ def _invoke_claude_with_retries(
     billed turn even when only the last one succeeds. Shared by the main
     resolve and the postcondition-correction passes so both honour
     ``api_retries`` / backoff identically.
+
+    ``timeout`` / ``allowed_tools`` override the resolve defaults (used by
+    ``build_verify`` for the run-tests step).
     """
-    argv = _build_claude_argv(config, prompt)
+    spawn_timeout = (
+        timeout if timeout is not None else config.ai_resolve.timeout_seconds
+    )
+    argv = _build_claude_argv(config, prompt, allowed_tools)
     max_attempts = max(1, config.ai_resolve.api_retries + 1)
     backoff = max(0, config.ai_resolve.api_retry_backoff_seconds)
 
@@ -1072,7 +1215,7 @@ def _invoke_claude_with_retries(
                 raise
 
         exit_code, output, timed_out = _spawn_claude(
-            argv, repo_path, config.ai_resolve.timeout_seconds,
+            argv, repo_path, spawn_timeout, **_exhaustion_kwargs(config),
         )
         last_exit_code, last_output, last_timed_out = exit_code, output, timed_out
 
@@ -1106,22 +1249,27 @@ def resolve_with_claude(
             error=f"'{config.ai_resolve.command}' not found on PATH",
         )
 
-    try:
-        _write_build_script(repo_path, config.ai_resolve.build_command)
-    except OSError as exc:
-        return AIResolveResult(
-            success=False, error=f"could not write build wrapper: {exc}",
-        )
+    # In resolve-only mode build_verify owns the build wrapper.
+    if not ctx.skip_build:
+        try:
+            _write_build_script(repo_path, config.ai_resolve.build_command)
+        except OSError as exc:
+            return AIResolveResult(
+                success=False, error=f"could not write build wrapper: {exc}",
+            )
 
     try:
         prompt = _render_prompt(config, repo_path, ctx)
     except FileNotFoundError as exc:
         return AIResolveResult(success=False, error=str(exc))
 
+    build_note = (
+        "resolve only, no build" if ctx.skip_build
+        else f"max {config.ai_resolve.max_iterations} build attempts"
+    )
     console.print(
         f"    [magenta]\U0001f916 invoking {config.ai_resolve.command} "
-        f"(timeout {config.ai_resolve.timeout_seconds}s, "
-        f"max {config.ai_resolve.max_iterations} build attempts, "
+        f"(timeout {config.ai_resolve.timeout_seconds}s, {build_note}, "
         f"up to {config.ai_resolve.api_retries} API-error retries)[/magenta]"
     )
 
@@ -1351,7 +1499,7 @@ def synthesize_text(
     with tempfile.TemporaryDirectory(prefix="releasy-ai-text-") as td:
         try:
             exit_code, output, timed_out = _spawn_claude(
-                argv, Path(td), timeout_seconds,
+                argv, Path(td), timeout_seconds, **_exhaustion_kwargs(config),
             )
         except KeyboardInterrupt:
             raise
@@ -1682,6 +1830,7 @@ def verify_ai_resolution(
     try:
         exit_code, output, timed_out = _spawn_claude(
             argv, repo_path, config.ai_resolve.verify_timeout_seconds,
+            **_exhaustion_kwargs(config),
         )
     except KeyboardInterrupt:
         raise

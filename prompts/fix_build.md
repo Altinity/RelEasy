@@ -1,0 +1,1 @@
+../src/releasy/prompts/fix_build.md

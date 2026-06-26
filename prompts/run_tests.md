@@ -1,0 +1,1 @@
+../src/releasy/prompts/run_tests.md

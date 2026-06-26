@@ -449,6 +449,22 @@ def _default_analyze_fails_allowed_tools() -> list[str]:
     ]
 
 
+def _default_test_file_globs() -> list[str]:
+    """Repo-relative globs marking a changed file as a runnable test.
+
+    Used to decide whether a ported PR carries tests worth running after a
+    green build. ClickHouse defaults; override per project via
+    ``ai_resolve.test_file_globs``.
+    """
+    return [
+        "tests/queries/**",
+        "tests/integration/**",
+        "src/**/tests/**",
+        "**/gtest_*",
+        "**/*_test.cpp",
+    ]
+
+
 @dataclass
 class AIChangelogConfig:
     """Claude-driven CHANGELOG entry synthesis for grouped PR ports.
@@ -671,6 +687,27 @@ class AIResolveConfig:
     max_iterations: int = 5
     timeout_seconds: int = 7200  # 2h
     build_command: str = "cd build && ninja"
+    # --- Deterministic build/test split (the `run` cherry-pick flow) ---
+    # True: Claude resolves only; RelEasy builds + tests and loops fresh-context
+    # build fixes. False: legacy single-session resolve+build. See docs.
+    deterministic_build: bool = True
+    max_build_attempts: int = 5  # consecutive build-fix attempts per run
+    # Resumes of a parked build_failed branch on later runs; 0 disables.
+    max_verify_resume_attempts: int = 2
+    max_verify_iterations: int = 12  # cap on build↔test iterations per pass
+    build_log_tail_lines: int = 500  # log tail fed to the fix-build prompt
+    # RelEasy's own wall-clock cap for one build subprocess.
+    build_timeout_seconds: int = 7200  # 2h
+    # Run the source PR's own tests after a green build (Claude-driven).
+    run_pr_tests: bool = True
+    # Globs (repo-relative) marking a changed file as a runnable test.
+    test_file_globs: list[str] = field(default_factory=_default_test_file_globs)
+    # Wall-clock cap for one run-tests Claude invocation.
+    test_timeout_seconds: int = 3600  # 1h
+    # Prompt templates for the split flow.
+    resolve_only_prompt_file: str = "prompts/resolve_conflict_nobuild.md"
+    fix_build_prompt_file: str = "prompts/fix_build.md"
+    run_tests_prompt_file: str = "prompts/run_tests.md"
     label: str = "ai-resolved"
     label_color: str = "8B5CF6"
     # Label attached to a PR that needs human attention because the AI
@@ -704,6 +741,13 @@ class AIResolveConfig:
     # "Overloaded", "Connection reset", …). Each retry is a fresh turn.
     api_retries: int = 3
     api_retry_backoff_seconds: int = 15
+    # On an exhausted Claude usage session, poll + re-prompt instead of
+    # failing (applies to every Claude call). False ⇒ fail fast. See docs.
+    wait_on_session_exhaustion: bool = True
+    session_exhaustion_max_wait_hours: int = 60
+    session_exhaustion_poll_minutes: int = 30
+    # Extra regexes (OR-ed with the built-ins) for recognising a limit message.
+    session_exhaustion_extra_patterns: list[str] = field(default_factory=list)
     # How many corrective Claude passes to run when a resolution lands but
     # trips a *content-correctable* postcondition — today only the
     # append-only ``SettingsChangesHistory.cpp`` whitelist (extra rows swept
@@ -1158,6 +1202,26 @@ def load_config(config_path: Path | None = None) -> Config:
         max_iterations=int(ai_raw.get("max_iterations", 5)),
         timeout_seconds=int(ai_raw.get("timeout_seconds", 7200)),
         build_command=ai_raw.get("build_command", "cd build && ninja"),
+        deterministic_build=bool(ai_raw.get("deterministic_build", True)),
+        max_build_attempts=int(ai_raw.get("max_build_attempts", 5)),
+        max_verify_resume_attempts=int(
+            ai_raw.get("max_verify_resume_attempts", 2) or 0
+        ),
+        max_verify_iterations=int(ai_raw.get("max_verify_iterations", 12)),
+        build_log_tail_lines=int(ai_raw.get("build_log_tail_lines", 500)),
+        build_timeout_seconds=int(ai_raw.get("build_timeout_seconds", 7200)),
+        run_pr_tests=bool(ai_raw.get("run_pr_tests", True)),
+        test_file_globs=ai_raw.get("test_file_globs") or _default_test_file_globs(),
+        test_timeout_seconds=int(ai_raw.get("test_timeout_seconds", 3600)),
+        resolve_only_prompt_file=ai_raw.get(
+            "resolve_only_prompt_file", "prompts/resolve_conflict_nobuild.md",
+        ),
+        fix_build_prompt_file=ai_raw.get(
+            "fix_build_prompt_file", "prompts/fix_build.md",
+        ),
+        run_tests_prompt_file=ai_raw.get(
+            "run_tests_prompt_file", "prompts/run_tests.md",
+        ),
         label=ai_raw.get("label", "ai-resolved"),
         label_color=ai_raw.get("label_color", "8B5CF6"),
         needs_attention_label=ai_raw.get(
@@ -1188,6 +1252,18 @@ def load_config(config_path: Path | None = None) -> Config:
         extra_args=ai_raw.get("extra_args", []) or [],
         api_retries=int(ai_raw.get("api_retries", 3)),
         api_retry_backoff_seconds=int(ai_raw.get("api_retry_backoff_seconds", 15)),
+        wait_on_session_exhaustion=bool(
+            ai_raw.get("wait_on_session_exhaustion", True)
+        ),
+        session_exhaustion_max_wait_hours=int(
+            ai_raw.get("session_exhaustion_max_wait_hours", 60)
+        ),
+        session_exhaustion_poll_minutes=int(
+            ai_raw.get("session_exhaustion_poll_minutes", 30)
+        ),
+        session_exhaustion_extra_patterns=list(
+            ai_raw.get("session_exhaustion_extra_patterns", []) or []
+        ),
         postcondition_retries=int(ai_raw.get("postcondition_retries", 2)),
         auto_add_prerequisite_prs=auto_add_prerequisite_prs,
     )
@@ -1497,6 +1573,30 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         ai_data["timeout_seconds"] = ai.timeout_seconds
     if ai.build_command != ai_defaults.build_command:
         ai_data["build_command"] = ai.build_command
+    if ai.deterministic_build != ai_defaults.deterministic_build:
+        ai_data["deterministic_build"] = ai.deterministic_build
+    if ai.max_build_attempts != ai_defaults.max_build_attempts:
+        ai_data["max_build_attempts"] = ai.max_build_attempts
+    if ai.max_verify_resume_attempts != ai_defaults.max_verify_resume_attempts:
+        ai_data["max_verify_resume_attempts"] = ai.max_verify_resume_attempts
+    if ai.max_verify_iterations != ai_defaults.max_verify_iterations:
+        ai_data["max_verify_iterations"] = ai.max_verify_iterations
+    if ai.build_log_tail_lines != ai_defaults.build_log_tail_lines:
+        ai_data["build_log_tail_lines"] = ai.build_log_tail_lines
+    if ai.build_timeout_seconds != ai_defaults.build_timeout_seconds:
+        ai_data["build_timeout_seconds"] = ai.build_timeout_seconds
+    if ai.run_pr_tests != ai_defaults.run_pr_tests:
+        ai_data["run_pr_tests"] = ai.run_pr_tests
+    if ai.test_file_globs != _default_test_file_globs():
+        ai_data["test_file_globs"] = ai.test_file_globs
+    if ai.test_timeout_seconds != ai_defaults.test_timeout_seconds:
+        ai_data["test_timeout_seconds"] = ai.test_timeout_seconds
+    if ai.resolve_only_prompt_file != ai_defaults.resolve_only_prompt_file:
+        ai_data["resolve_only_prompt_file"] = ai.resolve_only_prompt_file
+    if ai.fix_build_prompt_file != ai_defaults.fix_build_prompt_file:
+        ai_data["fix_build_prompt_file"] = ai.fix_build_prompt_file
+    if ai.run_tests_prompt_file != ai_defaults.run_tests_prompt_file:
+        ai_data["run_tests_prompt_file"] = ai.run_tests_prompt_file
     if ai.label != ai_defaults.label:
         ai_data["label"] = ai.label
     if ai.label_color != ai_defaults.label_color:
@@ -1529,6 +1629,14 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         ai_data["api_retries"] = ai.api_retries
     if ai.api_retry_backoff_seconds != ai_defaults.api_retry_backoff_seconds:
         ai_data["api_retry_backoff_seconds"] = ai.api_retry_backoff_seconds
+    if ai.wait_on_session_exhaustion != ai_defaults.wait_on_session_exhaustion:
+        ai_data["wait_on_session_exhaustion"] = ai.wait_on_session_exhaustion
+    if ai.session_exhaustion_max_wait_hours != ai_defaults.session_exhaustion_max_wait_hours:
+        ai_data["session_exhaustion_max_wait_hours"] = ai.session_exhaustion_max_wait_hours
+    if ai.session_exhaustion_poll_minutes != ai_defaults.session_exhaustion_poll_minutes:
+        ai_data["session_exhaustion_poll_minutes"] = ai.session_exhaustion_poll_minutes
+    if ai.session_exhaustion_extra_patterns:
+        ai_data["session_exhaustion_extra_patterns"] = ai.session_exhaustion_extra_patterns
     if ai.postcondition_retries != ai_defaults.postcondition_retries:
         ai_data["postcondition_retries"] = ai.postcondition_retries
     auto_prereq_defaults = AutoAddPrerequisitePRsConfig()

@@ -98,7 +98,10 @@ releasy run        # resume with the remaining PRs
 ```
 
 (Set `ai_resolve.enabled: true` in `config.yaml` to let Claude attempt
-conflicts for you.)
+conflicts for you. Claude resolves; RelEasy then builds the result itself
+and runs the PR's tests, retrying build fixes in fresh context. A
+resolution that won't build yet is parked on a local branch as
+`build_failed` and retried on the next `releasy run`.)
 
 **Keep open PRs healthy** as the target branch moves and CI runs:
 

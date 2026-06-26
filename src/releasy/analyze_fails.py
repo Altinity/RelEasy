@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 
 from releasy.ai_resolve import (
     _build_claude_argv,
+    _exhaustion_kwargs,
     _extract_assistant_text,
     _extract_cost_usd,
     _find_transient_api_error,
@@ -619,6 +620,7 @@ def _invoke_claude(
     argv = _build_claude_argv(_ConfigShim, prompt)  # type: ignore[arg-type]
     exit_code, output, timed_out = _spawn_claude(
         argv, repo_path, config.analyze_fails.timeout_seconds,
+        **_exhaustion_kwargs(config),
     )
     cost = _extract_cost_usd(output)
     return exit_code, output, timed_out, cost

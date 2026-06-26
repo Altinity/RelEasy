@@ -46,6 +46,7 @@ from releasy.termlog import console
 
 from releasy.ai_resolve import (
     _build_claude_argv,
+    _exhaustion_kwargs,
     _extract_assistant_text,
     _extract_cost_usd,
     _find_transient_api_error,
@@ -884,6 +885,7 @@ def address_review(
 
     exit_code, output, timed_out = _spawn_claude(
         argv, repo_path, config.review_response.timeout_seconds,
+        **_exhaustion_kwargs(config),
     )
     cost_usd = _extract_cost_usd(output)
 

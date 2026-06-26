@@ -64,8 +64,10 @@ name: antalya-26.3
 
 # ── Conflict handling ───────────────────────────────────────────────
 # When a cherry-pick conflicts and the AI resolver is disabled or gives
-# up (after exhausting `ai_resolve.max_iterations` build attempts), the
-# pipeline:
+# up resolving it, the pipeline:
+# (A resolution that lands but fails RelEasy's deterministic build/tests is
+# a separate, resumable `build_failed` state — see `ai_resolve` below — not
+# a conflict.)
 #   * Singleton PR or first-of-group: aborts the cherry-pick, deletes the
 #     local port branch (it has no useful commits), records the entry as
 #     "Conflict" in the GitHub Project. No push, no PR.
@@ -289,10 +291,13 @@ notifications:
 
 # ── AI conflict resolver (Claude) ───────────────────────────────────
 # Optional. When enabled, releasy invokes `claude` to resolve cherry-
-# pick conflicts, build, and commit. If Claude prints UNRESOLVED or
-# BUILD FAILED (after exhausting `max_iterations` build attempts) or
-# fails outright, releasy treats the unit as "Conflict" — see
-# the "Conflict handling" section above.
+# pick conflicts and commit. By default (`deterministic_build: true`)
+# Claude resolves ONLY — releasy then builds the result itself and runs
+# the PR's tests, looping fresh-context build fixes (see the
+# deterministic-build knobs below). If Claude prints UNRESOLVED or fails
+# to resolve, releasy treats the unit as "Conflict"; if the resolution
+# builds/tests cleanly it opens the PR; otherwise it parks the local
+# branch as `build_failed` and retries on the next `releasy run`.
 #
 # ai_resolve:
 #   enabled: false
@@ -309,11 +314,36 @@ notifications:
 #   # dedicated prompt. Set false for a single squashed resolution.
 #   split_conflict_commit: true
 #   split_prompt_file: prompts/resolve_conflict_split.md
-#   # Hard cap (passed into the prompt) on how many build attempts
-#   # Claude is allowed to make per conflict before giving up.
+#   # Legacy single-session cap on build attempts Claude makes per
+#   # conflict (only used when `deterministic_build: false`).
 #   max_iterations: 5
 #   timeout_seconds: 7200
 #   build_command: cd build && ninja
+#   # --- Deterministic build/test split (default) ---
+#   # true: Claude resolves only; RelEasy builds `build_command` itself and,
+#   # on failure, loops fresh-context build fixes (up to max_build_attempts),
+#   # then runs the PR's tests. Failures park on a local branch (build_failed,
+#   # no PR) and resume next `releasy run`. false: legacy resolve+build.
+#   deterministic_build: true
+#   max_build_attempts: 5             # consecutive build-fix attempts per run
+#   max_verify_resume_attempts: 2     # cross-run resumes of build_failed; 0 disables
+#   max_verify_iterations: 12         # cap on build↔test iterations per pass
+#   build_log_tail_lines: 500         # log tail fed to the fix-build prompt
+#   build_timeout_seconds: 7200       # cap for one build subprocess
+#   run_pr_tests: true                # run the PR's own tests after a green build
+#   # Globs marking a changed file as a runnable test (run-tests reuses
+#   # analyze_fails.allowed_tools). Defaults shown; override per project.
+#   test_file_globs:
+#     - "tests/queries/**"
+#     - "tests/integration/**"
+#     - "src/**/tests/**"
+#     - "**/gtest_*"
+#     - "**/*_test.cpp"
+#   test_timeout_seconds: 3600
+#   # Prompt templates for the split flow.
+#   resolve_only_prompt_file: prompts/resolve_conflict_nobuild.md
+#   fix_build_prompt_file: prompts/fix_build.md
+#   run_tests_prompt_file: prompts/run_tests.md
 #   # Label automatically applied to PRs whose conflicts Claude
 #   # resolved cleanly.
 #   label: ai-resolved
@@ -328,6 +358,17 @@ notifications:
 #   # `max_iterations`.
 #   api_retries: 3
 #   api_retry_backoff_seconds: 15
+#   # On an exhausted Claude session, poll + re-prompt instead of failing,
+#   # until the session resets or the wait cap elapses. Applies to every
+#   # Claude call; Ctrl-C aborts. (The CLI's "monthly spend limit · run
+#   # /usage-credits" wording is still a session reset, not a billing cap.)
+#   # false ⇒ fail fast.
+#   wait_on_session_exhaustion: true
+#   session_exhaustion_max_wait_hours: 60
+#   session_exhaustion_poll_minutes: 30
+#   # Extra regexes (OR-ed with the built-ins) for a limit wording not caught:
+#   # session_exhaustion_extra_patterns:
+#   #   - "your balance is too low"
 #   # When a resolution lands but trips a *content-correctable*
 #   # postcondition — today only the append-only
 #   # SettingsChangesHistory.cpp whitelist (extra setting rows swept in

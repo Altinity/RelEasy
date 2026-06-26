@@ -1489,10 +1489,14 @@ def run_pipeline(
     conflicts = sum(
         1 for fs in state.features.values() if fs.status == "conflict"
     )
-    if ready or branch_only or conflicts:
+    build_failed = sum(
+        1 for fs in state.features.values() if fs.status == "build_failed"
+    )
+    if ready or branch_only or conflicts or build_failed:
+        bf = f", {build_failed} build-failed" if build_failed else ""
         console.print(
             f"  Ports: {ready} needs-review, {branch_only} branch-created, "
-            f"{conflicts} conflict ({ai_assisted} ai-assisted)"
+            f"{conflicts} conflict{bf} ({ai_assisted} ai-assisted)"
         )
 
     return state
@@ -2851,6 +2855,11 @@ def _process_feature_unit(
 
     prev_state = state.features.get(unit.feature_id)
     is_failed_prev = prev_state is not None and prev_state.status == "conflict"
+    # A branch parked by the deterministic build/test verifier — resolved
+    # locally but not yet green. Resumed (not re-resolved) below.
+    is_build_failed_prev = (
+        prev_state is not None and prev_state.status == "build_failed"
+    )
     force_retry = is_failed_prev and retry_failed
 
     # --- Sequential gate: every depends_on must be merged in target ---
@@ -2893,17 +2902,35 @@ def _process_feature_unit(
             prev_state.status = "needs_review"
             prev_state.blocked_by = []
 
-    if is_failed_prev and not retry_failed:
-        # User opted out of retries — leave the conflicted entry exactly
-        # as it is so manual fix-ups (or a later --retry-failed run) can
-        # take over without us touching the PR / branch / project board.
+    if (is_failed_prev or is_build_failed_prev) and not retry_failed:
+        # User opted out of retries — leave the conflicted / build-failed
+        # entry exactly as it is so manual fix-ups (or a later
+        # --retry-failed run) can take over without us touching the PR /
+        # branch / project board.
+        kind = "build-failed" if is_build_failed_prev else "previously conflicted"
         console.print(
-            f"\n    [dim]{canonical_branch} ({label}) — previously conflicted, "
+            f"\n    [dim]{canonical_branch} ({label}) — {kind}, "
             "skipping (pr_policy.retry_failed: false / "
             "--no-retry-failed)[/dim]"
         )
         _dry_record(state, "skip-conflict-retry-off")
         return "continue"
+
+    # --- Resume a build_failed branch ---
+    # Re-run the build/test loop on the existing resolution (no re-resolve),
+    # bounded by max_verify_resume_attempts; falls through to a fresh port if
+    # the local branch is gone.
+    if (
+        is_build_failed_prev and retry_failed
+        and config.ai_resolve.deterministic_build
+        and unit.if_exists not in ("append", "recreate")
+    ):
+        resumed = _resume_build_failed_unit(
+            config, repo_path, state, unit, prev_state,
+            canonical_branch, base_branch, label,
+        )
+        if resumed is not None:
+            return resumed
 
     # --- Auto-continue a partially-applied group ---
     # A prior run cherry-picked part of a group, then a conflict (often an
@@ -3201,6 +3228,18 @@ def _process_feature_unit(
             # those already produced a draft PR with the per-PR fallback
             # wording, and a successful retry will hit this same path.
             _maybe_synthesize_changelog(config, unit, base_branch)
+            # Deterministic build + tests before opening the PR; on failure
+            # park as build_failed (local branch, no PR) and resume next run.
+            if _should_verify_build(config, unit):
+                vres = _run_verify_phase(
+                    config, repo_path, unit, new_branch, base_branch, onto,
+                )
+                if not vres.success:
+                    _park_build_failed(
+                        config, repo_path, state, unit, new_branch, onto,
+                        vres, resume_attempts=0,
+                    )
+                    return "continue"
             _finish_clean_unit(
                 config, repo_path, state, unit, new_branch, base_branch,
                 onto, pr_meta,
@@ -3664,6 +3703,122 @@ def _ensure_pr_for_existing_remote_branch(
             if relabelled and not fs.ai_resolved:
                 fs.ai_resolved = True
     _persist_state(config, state)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic build + test verification (the resolve-only flow)
+# ---------------------------------------------------------------------------
+
+
+def _should_verify_build(config: Config, unit: "FeatureUnit") -> bool:
+    """Verify only when deterministic-build is on and a conflict was
+    AI-resolved this run (resolve-only ⇒ branch was never built). Clean
+    picks are left to CI."""
+    return config.ai_resolve.deterministic_build and unit.ai_resolved_count > 0
+
+
+def _run_verify_phase(
+    config: Config, repo_path: Path, unit: "FeatureUnit",
+    branch: str, base_branch: str, onto: str,
+) -> "VerifyResult":
+    """Build the branch + run the PR's tests; accumulate AI cost on the unit."""
+    from releasy.build_verify import verify_build_and_tests
+
+    result = verify_build_and_tests(
+        config, repo_path, unit.primary_pr(),
+        port_branch=branch, base_branch=base_branch, base_sha=onto,
+    )
+    if result.cost_usd is not None:
+        unit.ai_cost_usd_total = (
+            (unit.ai_cost_usd_total or 0.0) + result.cost_usd
+        )
+    return result
+
+
+def _park_build_failed(
+    config: Config, repo_path: Path, state: PipelineState, unit: "FeatureUnit",
+    branch: str, onto: str, result: "VerifyResult", *, resume_attempts: int,
+) -> None:
+    """Park a unit whose build/tests didn't pass as ``build_failed`` — stays
+    on the local branch (no PR), resumes next run. ``resume_attempts`` is the
+    cross-run counter (0 on the first park)."""
+    fs = FeatureState(
+        status="build_failed", branch_name=branch, base_commit=onto,
+        **_unit_pr_meta(unit),
+    )
+    fs.ai_resolved = True  # the resolution landed; only the build lags
+    fs.mode = unit.mode
+    fs.build_attempts = result.build_attempts
+    fs.verify_resume_attempts = resume_attempts
+    fs.last_verify_error = result.error
+    if unit.ai_cost_usd_total is not None:
+        fs.ai_cost_usd = unit.ai_cost_usd_total
+    state.features[unit.feature_id] = fs
+    _persist_state(config, state)
+    console.print(
+        f"    [yellow]⏸ parked[/yellow] [cyan]{branch}[/cyan] as "
+        f"[yellow]build_failed[/yellow] [dim]({result.error}; local branch "
+        "kept, resumes next run)[/dim]"
+    )
+
+
+def _resume_build_failed_unit(
+    config: Config, repo_path: Path, state: PipelineState, unit: "FeatureUnit",
+    prev_state: FeatureState, branch: str, base_branch: str, label: str,
+) -> str | None:
+    """Resume a parked ``build_failed`` branch: re-run build/tests without
+    re-resolving. Returns ``"continue"`` when handled, or ``None`` to fall
+    back to a fresh port (the local branch/base is gone)."""
+    cap = config.ai_resolve.max_verify_resume_attempts
+    attempts = prev_state.verify_resume_attempts
+    if cap <= 0 or attempts >= cap:
+        console.print(
+            f"\n    [yellow]⏭[/yellow]  [cyan]{branch}[/cyan] ({label}) — "
+            f"build_failed resume cap reached ({attempts}/{cap}); leaving the "
+            "local branch for manual help. [dim](bump "
+            "ai_resolve.max_verify_resume_attempts, or fix it by hand)[/dim]"
+        )
+        _dry_record(state, "skip-build-failed-exhausted")
+        return "continue"
+
+    onto = prev_state.base_commit
+    if not onto or not local_branch_exists(repo_path, branch):
+        return None  # branch/base gone — re-port from scratch
+
+    stash_and_clean(repo_path)
+    co = run_git(["checkout", branch], repo_path, check=False)
+    if co.returncode != 0:
+        console.print(
+            f"    [yellow]![/yellow] could not checkout {branch} to resume "
+            "build_failed — re-porting from scratch"
+        )
+        return None
+
+    console.print(
+        f"\n    [yellow]↻[/yellow]  [cyan]{branch}[/cyan] ({label}) — resuming "
+        f"build/test on the existing resolution "
+        f"(resume attempt {attempts + 1}/{cap})"
+    )
+    # Carry forward AI-resolved provenance + prior cost (no resolve ran now).
+    if prev_state.ai_resolved and unit.ai_resolved_count == 0:
+        unit.ai_resolved_count = 1
+    if prev_state.ai_cost_usd is not None and unit.ai_cost_usd_total is None:
+        unit.ai_cost_usd_total = prev_state.ai_cost_usd
+
+    vres = _run_verify_phase(config, repo_path, unit, branch, base_branch, onto)
+    if vres.success:
+        _maybe_synthesize_changelog(config, unit, base_branch)
+        _finish_clean_unit(
+            config, repo_path, state, unit, branch, base_branch, onto,
+            _unit_pr_meta(unit), was_failed_prev=True,
+        )
+        return "continue"
+
+    _park_build_failed(
+        config, repo_path, state, unit, branch, onto, vres,
+        resume_attempts=attempts + 1,
+    )
+    return "continue"
 
 
 def _finish_clean_unit(
@@ -4862,6 +5017,8 @@ def _try_ai_resolve_step(
         pre_resolve_sha=pre_resolve_sha,
         start_sha=start_sha,
         mode=unit.mode,
+        # Resolve only; RelEasy builds + tests afterwards (see _run_verify_phase).
+        skip_build=config.ai_resolve.deterministic_build,
     )
 
     result = attempt_ai_resolve(config, repo_path, ctx)
@@ -5346,6 +5503,15 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
             console.print(
                 f"{header} — [dim]conflict (AI gave up)[/dim] "
                 "— fix locally / on the draft PR, then re-run"
+            )
+            continue
+
+        # Resolved locally but build/tests not green — resumed by `releasy run`.
+        if fs.status == "build_failed":
+            err = fs.last_verify_error or "build/tests not green"
+            console.print(
+                f"{header} — [dim]build-failed: {err}[/dim] "
+                "— re-run [cyan]releasy run[/cyan] to retry the build/tests"
             )
             continue
 
