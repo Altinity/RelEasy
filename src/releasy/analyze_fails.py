@@ -617,10 +617,10 @@ def _invoke_claude(
         ai_model = config.ai_model
         ai_effort = config.ai_effort
 
-    argv = _build_claude_argv(_ConfigShim, prompt)  # type: ignore[arg-type]
+    argv = _build_claude_argv(_ConfigShim)  # type: ignore[arg-type]
     exit_code, output, timed_out = _spawn_claude(
         argv, repo_path, config.analyze_fails.timeout_seconds,
-        **_exhaustion_kwargs(config),
+        prompt=prompt, **_exhaustion_kwargs(config),
     )
     cost = _extract_cost_usd(output)
     return exit_code, output, timed_out, cost

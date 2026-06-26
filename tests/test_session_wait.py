@@ -87,7 +87,7 @@ class SpawnWaitLoop(unittest.TestCase):
             exhaustion_poll_seconds=1800,
         )
         defaults.update(kw)
-        return a._spawn_claude(["claude"], Path("."), 10, **defaults)
+        return a._spawn_claude(["claude"], Path("."), 10, prompt="x", **defaults)
 
     def test_retries_until_success(self):
         seq = [
@@ -97,7 +97,7 @@ class SpawnWaitLoop(unittest.TestCase):
         ]
         n = {"i": 0}
 
-        def fake(argv, repo, timeout):
+        def fake(argv, repo, timeout, prompt):
             r = seq[n["i"]]
             n["i"] += 1
             return r
@@ -109,7 +109,7 @@ class SpawnWaitLoop(unittest.TestCase):
         self.assertEqual(len(self.sleeps), 2)
 
     def test_respects_cap(self):
-        a._spawn_claude_once = lambda argv, repo, timeout: (
+        a._spawn_claude_once = lambda argv, repo, timeout, prompt: (
             1, "usage limit reached", False,
         )
         ec, out, to = self._spawn(exhaustion_max_wait_seconds=2 * 1800)
@@ -120,7 +120,7 @@ class SpawnWaitLoop(unittest.TestCase):
     def test_disabled_means_no_wait(self):
         n = {"i": 0}
 
-        def fake(argv, repo, timeout):
+        def fake(argv, repo, timeout, prompt):
             n["i"] += 1
             return (1, "usage limit reached", False)
 
@@ -132,7 +132,7 @@ class SpawnWaitLoop(unittest.TestCase):
     def test_transient_is_not_exhaustion(self):
         # A transient API error must NOT trigger the long wait — it's handled
         # by the short-backoff retry one level up.
-        a._spawn_claude_once = lambda argv, repo, timeout: (
+        a._spawn_claude_once = lambda argv, repo, timeout, prompt: (
             1, "API Error: Overloaded", False,
         )
         ec, out, to = self._spawn()
@@ -140,7 +140,7 @@ class SpawnWaitLoop(unittest.TestCase):
         self.assertEqual(self.sleeps, [])
 
     def test_clean_run_never_waits(self):
-        a._spawn_claude_once = lambda argv, repo, timeout: (0, "DONE", False)
+        a._spawn_claude_once = lambda argv, repo, timeout, prompt: (0, "DONE", False)
         ec, out, to = self._spawn()
         self.assertEqual(ec, 0)
         self.assertEqual(self.sleeps, [])
@@ -148,12 +148,42 @@ class SpawnWaitLoop(unittest.TestCase):
     def test_timeout_is_not_exhaustion(self):
         # A timeout (timed_out=True) returns immediately even if the partial
         # output happens to mention a limit.
-        a._spawn_claude_once = lambda argv, repo, timeout: (
+        a._spawn_claude_once = lambda argv, repo, timeout, prompt: (
             -1, "usage limit reached", True,
         )
         ec, out, to = self._spawn()
         self.assertTrue(to)
         self.assertEqual(self.sleeps, [])
+
+
+class SpawnStdinPlumbing(unittest.TestCase):
+    """Large prompts go via stdin (no argv-length limit); small ones inline."""
+
+    def test_inline_argv_insertion(self):
+        # Prompt is inserted right after the `-p` flag.
+        self.assertEqual(
+            a._argv_with_inline_prompt(
+                ["claude", "-p", "--output-format", "stream-json"], "P",
+            ),
+            ["claude", "-p", "P", "--output-format", "stream-json"],
+        )
+
+    def test_threshold_under_os_limit(self):
+        self.assertGreater(a._PROMPT_ARG_MAX_BYTES, 0)
+        self.assertLess(a._PROMPT_ARG_MAX_BYTES, 128 * 1024)
+
+    def test_large_prompt_delivered_via_stdin(self):
+        # A >threshold prompt is fed to the child's stdin in full, with no
+        # pipe-buffer deadlock against our stdout reader.
+        import sys
+        reader = "import sys; d=sys.stdin.read(); sys.stdout.write('GOT %d\\n' % len(d))"
+        argv = [sys.executable, "-c", reader]
+        big = "A" * 200_000  # > _PROMPT_ARG_MAX_BYTES → stdin path
+        self.assertGreater(len(big.encode()), a._PROMPT_ARG_MAX_BYTES)
+        ec, out, to = a._spawn_claude_once(argv, Path("."), 30, big)
+        self.assertFalse(to)
+        self.assertEqual(ec, 0)
+        self.assertIn("GOT 200000", out)
 
 
 class ExhaustionConfig(unittest.TestCase):

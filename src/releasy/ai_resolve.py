@@ -367,12 +367,21 @@ def _model_effort_args(config: Config) -> list[str]:
     return args
 
 
+# A single argv string is capped by the OS (Linux MAX_ARG_STRLEN = 128 KiB).
+# Prompts at/under this go inline as `-p <prompt>` (proven path); larger ones
+# are fed via stdin (`claude -p` reads the prompt from stdin) so there is no
+# size limit. Kept well under 128 KiB for headroom.
+_PROMPT_ARG_MAX_BYTES = 96 * 1024
+
+
 def _build_claude_argv(
-    config: Config, prompt: str, allowed_tools: list[str] | None = None,
+    config: Config, allowed_tools: list[str] | None = None,
 ) -> list[str]:
+    """Base print-mode argv WITHOUT the prompt — the prompt is supplied at
+    spawn time (inline for small prompts, via stdin for large ones)."""
     cmd = [
         config.ai_resolve.command,
-        "-p", prompt,
+        "-p",
         "--output-format", "stream-json",
         "--verbose",
     ]
@@ -382,6 +391,11 @@ def _build_claude_argv(
     cmd += _model_effort_args(config)
     cmd += list(config.ai_resolve.extra_args)
     return cmd
+
+
+def _argv_with_inline_prompt(base_argv: list[str], prompt: str) -> list[str]:
+    """Insert ``prompt`` right after the ``-p`` flag (small-prompt path)."""
+    return base_argv[:2] + [prompt] + base_argv[2:]
 
 
 def _fmt_elapsed(seconds: float) -> str:
@@ -564,6 +578,7 @@ def _interruptible_sleep(seconds: float) -> None:
 def _spawn_claude(
     argv: list[str], repo_path: Path, timeout: int,
     *,
+    prompt: str,
     exhaustion_wait: bool = True,
     exhaustion_max_wait_seconds: int = _DEFAULT_EXHAUSTION_MAX_WAIT_SECONDS,
     exhaustion_poll_seconds: int = _DEFAULT_EXHAUSTION_POLL_SECONDS,
@@ -583,7 +598,9 @@ def _spawn_claude(
     )
     waited = 0.0
     while True:
-        exit_code, output, timed_out = _spawn_claude_once(argv, repo_path, timeout)
+        exit_code, output, timed_out = _spawn_claude_once(
+            argv, repo_path, timeout, prompt,
+        )
         if not wait_enabled or timed_out or exit_code == 0:
             return exit_code, output, timed_out
         reason = _find_session_exhausted(output, exhaustion_extra_patterns)
@@ -609,7 +626,7 @@ def _spawn_claude(
 
 
 def _spawn_claude_once(
-    argv: list[str], repo_path: Path, timeout: int,
+    argv: list[str], repo_path: Path, timeout: int, prompt: str,
 ) -> tuple[int, str, bool]:
     """Run claude as a subprocess, streaming stdout/stderr to the console.
 
@@ -619,11 +636,18 @@ def _spawn_claude_once(
     process group (claude + ninja + whatever else it spawned) and
     re-raises ``KeyboardInterrupt``.
 
+    The prompt goes inline as ``-p <prompt>`` when small, or via stdin when it
+    would overflow the OS arg limit (``_PROMPT_ARG_MAX_BYTES``). ``argv`` is
+    the base print-mode argv (no prompt) from :func:`_build_claude_argv`.
+
     Returns (exit_code, combined_output, timed_out).
     """
+    use_stdin = len(prompt.encode("utf-8")) > _PROMPT_ARG_MAX_BYTES
+    full_argv = argv if use_stdin else _argv_with_inline_prompt(argv, prompt)
+
     console.print(
-        f"    [dim]$ {escape(shlex.join(argv[:2]))} <prompt…> "
-        f"{escape(shlex.join(argv[3:]))}[/dim]"
+        f"    [dim]$ {escape(shlex.join(argv))}"
+        f"{' <prompt via stdin>' if use_stdin else ' <prompt…>'}[/dim]"
     )
     console.print("    [dim](press Ctrl-C to abort claude)[/dim]")
 
@@ -633,15 +657,29 @@ def _spawn_claude_once(
     #   1. it does NOT receive the terminal's Ctrl-C (we control it),
     #   2. we can kill the entire tree (claude + nested tools) at once.
     proc = subprocess.Popen(
-        argv,
+        full_argv,
         cwd=repo_path,
         env=env,
+        stdin=subprocess.PIPE if use_stdin else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
         start_new_session=True,
     )
+
+    # Feed a large prompt via stdin in a thread so a >pipe-buffer write can't
+    # deadlock against us reading stdout. Broken pipe (claude exited early /
+    # was killed) is benign.
+    if use_stdin:
+        def _feed() -> None:
+            try:
+                assert proc.stdin is not None
+                proc.stdin.write(prompt)
+                proc.stdin.close()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+        threading.Thread(target=_feed, daemon=True).start()
 
     collected: list[str] = []
     start = time.monotonic()
@@ -1193,7 +1231,7 @@ def _invoke_claude_with_retries(
     spawn_timeout = (
         timeout if timeout is not None else config.ai_resolve.timeout_seconds
     )
-    argv = _build_claude_argv(config, prompt, allowed_tools)
+    argv = _build_claude_argv(config, allowed_tools)
     max_attempts = max(1, config.ai_resolve.api_retries + 1)
     backoff = max(0, config.ai_resolve.api_retry_backoff_seconds)
 
@@ -1215,7 +1253,8 @@ def _invoke_claude_with_retries(
                 raise
 
         exit_code, output, timed_out = _spawn_claude(
-            argv, repo_path, spawn_timeout, **_exhaustion_kwargs(config),
+            argv, repo_path, spawn_timeout, prompt=prompt,
+            **_exhaustion_kwargs(config),
         )
         last_exit_code, last_output, last_timed_out = exit_code, output, timed_out
 
@@ -1479,7 +1518,7 @@ def synthesize_text(
 
     argv = [
         command,
-        "-p", prompt,
+        "-p",
         "--output-format", "stream-json",
         "--verbose",
         # Explicit empty allowed-tools list keeps Claude in pure
@@ -1499,7 +1538,8 @@ def synthesize_text(
     with tempfile.TemporaryDirectory(prefix="releasy-ai-text-") as td:
         try:
             exit_code, output, timed_out = _spawn_claude(
-                argv, Path(td), timeout_seconds, **_exhaustion_kwargs(config),
+                argv, Path(td), timeout_seconds, prompt=prompt,
+                **_exhaustion_kwargs(config),
             )
         except KeyboardInterrupt:
             raise
@@ -1814,7 +1854,7 @@ def verify_ai_resolution(
 
     argv = [
         config.ai_resolve.command,
-        "-p", prompt,
+        "-p",
         "--output-format", "stream-json",
         "--verbose",
         "--allowedTools", ",".join(_VERIFY_ALLOWED_TOOLS),
@@ -1830,7 +1870,7 @@ def verify_ai_resolution(
     try:
         exit_code, output, timed_out = _spawn_claude(
             argv, repo_path, config.ai_resolve.verify_timeout_seconds,
-            **_exhaustion_kwargs(config),
+            prompt=prompt, **_exhaustion_kwargs(config),
         )
     except KeyboardInterrupt:
         raise

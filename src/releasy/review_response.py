@@ -873,7 +873,7 @@ def address_review(
         ai_model = config.ai_model
         ai_effort = config.ai_effort
 
-    argv = _build_claude_argv(_ConfigShim, prompt)  # type: ignore[arg-type]
+    argv = _build_claude_argv(_ConfigShim)  # type: ignore[arg-type]
 
     console.print(
         f"\n[magenta]\U0001f916 invoking "
@@ -885,7 +885,7 @@ def address_review(
 
     exit_code, output, timed_out = _spawn_claude(
         argv, repo_path, config.review_response.timeout_seconds,
-        **_exhaustion_kwargs(config),
+        prompt=prompt, **_exhaustion_kwargs(config),
     )
     cost_usd = _extract_cost_usd(output)
 
