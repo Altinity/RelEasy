@@ -95,30 +95,65 @@ def run_build(config: Config, repo_path: Path) -> tuple[int, bool]:
     return (proc.returncode, False)
 
 
-def _build_log_excerpt(repo_path: Path, tail_lines: int) -> str:
-    """Last ``tail_lines`` of the build log, plus grepped error/FAILED lines.
+# The excerpt is embedded into the fix-build prompt, which is passed as a
+# single argv string to `claude`; Linux caps one arg at 128 KiB
+# (MAX_ARG_STRLEN). Keep the excerpt well under that — compiler lines can be
+# huge (template types, full paths), so cap both per-line and total bytes.
+_MAX_EXCERPT_BYTES = 48 * 1024
+_MAX_LINE_CHARS = 2000
 
-    ninja keeps compiling past the first error, so the earliest real cause
-    can sit well above a plain tail — surface the grepped lines too.
+
+def _cap_line(ln: str) -> str:
+    return ln if len(ln) <= _MAX_LINE_CHARS else ln[:_MAX_LINE_CHARS] + " …(truncated)"
+
+
+def _tail_bytes(text: str, budget: int) -> tuple[str, bool]:
+    """Last ``budget`` bytes of ``text`` (whole UTF-8 chars), and whether cut."""
+    if budget <= 0:
+        return "", True
+    raw = text.encode("utf-8")
+    if len(raw) <= budget:
+        return text, False
+    return raw[-budget:].decode("utf-8", errors="ignore"), True
+
+
+def _build_log_excerpt(repo_path: Path, tail_lines: int) -> str:
+    """Grepped error/FAILED lines + the tail of the build log, byte-bounded.
+
+    ninja compiles past the first error, so the real cause can sit above a
+    plain tail — surface the grepped lines too. Bounded to stay under the OS
+    arg limit (see ``_MAX_EXCERPT_BYTES``).
     """
     log_path = repo_path / _BUILD_LOG
     try:
         text = log_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return "(build log unavailable)"
-    lines = text.splitlines()
-    tail = lines[-tail_lines:]
+    raw_lines = text.splitlines()
+    # Grep on the uncapped lines (so a long line still matches), then cap each
+    # selected line for display.
     error_lines = [
-        ln for ln in lines
+        ln for ln in raw_lines
         if re.search(r"\berror:|^FAILED:|^ninja: build stopped", ln)
     ]
-    # Cap the grepped block — the first few errors are the ones that matter.
-    if len(error_lines) > 60:
-        error_lines = error_lines[:60] + [f"... (+{len(error_lines) - 60} more)"]
-    parts: list[str] = []
+    extra = len(error_lines) - 60
+    error_lines = [_cap_line(ln) for ln in error_lines[:60]]
+    if extra > 0:
+        error_lines.append(f"... (+{extra} more)")
+
+    # The grepped errors are the cause — keep them first, capped to half the
+    # budget; the tail fills whatever's left.
+    err_block = ""
     if error_lines:
-        parts.append("# Grepped error: / FAILED: lines\n" + "\n".join(error_lines))
-    parts.append(f"# Last {len(tail)} lines of {_BUILD_LOG}\n" + "\n".join(tail))
+        err_block = "# Grepped error: / FAILED: lines\n" + "\n".join(error_lines)
+        err_block, _ = _tail_bytes(err_block, _MAX_EXCERPT_BYTES // 2)
+
+    budget = _MAX_EXCERPT_BYTES - len(err_block.encode("utf-8"))
+    tail = [_cap_line(ln) for ln in raw_lines[-tail_lines:]]
+    tail_text, cut = _tail_bytes("\n".join(tail), budget)
+    header = f"# Tail of {_BUILD_LOG}" + (" (truncated)" if cut else "")
+
+    parts = [p for p in (err_block, f"{header}\n{tail_text}") if p.strip()]
     return "\n\n".join(parts)
 
 

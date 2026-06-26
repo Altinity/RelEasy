@@ -230,6 +230,49 @@ class TestDetection(unittest.TestCase):
         self.assertIn("ci/jobs", hints)
 
 
+class BuildLogExcerpt(unittest.TestCase):
+    """The excerpt must stay under the OS arg limit (the crash this fixes)."""
+
+    def _excerpt(self, lines: list[str]) -> str:
+        d = tempfile.mkdtemp()
+        try:
+            p = Path(d) / bv._BUILD_LOG
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("\n".join(lines), encoding="utf-8")
+            return bv._build_log_excerpt(Path(d), 500)
+        finally:
+            import shutil
+            shutil.rmtree(d)
+
+    def test_huge_log_stays_under_arg_limit(self):
+        # Thousands of very long lines must not produce a >128 KiB arg.
+        lines = [
+            f"/src/Foo.cpp:{i}: error: " + "X" * 9000 if i % 3 == 0
+            else f"FAILED: link step {i}"
+            for i in range(4000)
+        ]
+        exc = self._excerpt(lines)
+        self.assertLess(len(exc.encode("utf-8")), 128 * 1024)
+        self.assertLessEqual(len(exc.encode("utf-8")), bv._MAX_EXCERPT_BYTES + 4096)
+        self.assertIn("FAILED:", exc)  # the failing-target line survives
+
+    def test_realistic_log_surfaces_markers(self):
+        lines = [
+            f"/src/Storages/Foo.cpp:{i}:12: error: no member named bar"
+            if i % 50 == 0 else f"[{i}/3000] Building CXX object x/{i}.o"
+            for i in range(3000)
+        ]
+        exc = self._excerpt(lines)
+        self.assertIn("error:", exc)
+        self.assertLess(len(exc.encode("utf-8")), 128 * 1024)
+
+    def test_missing_log(self):
+        self.assertEqual(
+            bv._build_log_excerpt(Path(tempfile.mkdtemp()), 500),
+            "(build log unavailable)",
+        )
+
+
 class MarkerParsing(unittest.TestCase):
     """`_last_marker` finds the final verdict, tolerating backticks/order."""
 
