@@ -383,6 +383,15 @@ notifications:
 #   auto_add_prerequisite_prs:
 #     enabled: false
 #     max_prereq_depth: 7
+#     # When a discovered prereq lives in the origin repo AND the PR that
+#     # needs it is also in origin, require the prereq to carry the
+#     # configured selection labels (match a pr_sources.by_labels entry,
+#     # no exclude_labels) — the same labels our own discovery selects on.
+#     # An in-origin prereq without them is out of scope: the dive aborts
+#     # (detection-only) and you must label it or list it in include_prs.
+#     # Cross-repo prereqs (forward-port / backport sources) are never
+#     # gated. No-op when no by_labels selection is configured. Default true.
+#     require_origin_prereq_label: true
 #   # Post-resolve verifier: a read-only second AI pass auditing the
 #   # resolution. Findings → `verify_label` + PR comment. Never rolls
 #   # back. Roughly doubles AI cost on conflicted PRs.

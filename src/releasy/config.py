@@ -510,9 +510,22 @@ class AutoAddPrerequisitePRsConfig:
 
     Off by default: detection-only mode still applies (the prereq is just
     labelled and reported, no recursive porting).
+
+    ``require_origin_prereq_label`` (default true): when a discovered
+    prereq lives in the origin repo *and* the PR that needs it also lives
+    in origin, the prereq must carry the configured selection labels
+    (i.e. it must match at least one ``pr_sources.by_labels`` entry and
+    none of ``exclude_labels``) — the same labels our own discovery
+    selects on. An in-origin prereq without those labels is treated as
+    out of scope: the dive aborts (detection-only) and the user must
+    either label it or list it explicitly in ``include_prs``. Prereqs on
+    a different repo than origin (forward-port / backport sources) are
+    never gated, and the gate is a no-op when no ``by_labels`` selection
+    is configured.
     """
     enabled: bool = False
     max_prereq_depth: int = 7
+    require_origin_prereq_label: bool = True
 
 
 @dataclass
@@ -1175,6 +1188,9 @@ def load_config(config_path: Path | None = None) -> Config:
         auto_add_prerequisite_prs = AutoAddPrerequisitePRsConfig(
             enabled=bool(auto_prereq_raw.get("enabled", False)),
             max_prereq_depth=int(auto_prereq_raw.get("max_prereq_depth", 7)),
+            require_origin_prereq_label=bool(
+                auto_prereq_raw.get("require_origin_prereq_label", True)
+            ),
         )
     else:
         raise ValueError(
@@ -1644,6 +1660,8 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         ai.auto_add_prerequisite_prs.enabled != auto_prereq_defaults.enabled
         or ai.auto_add_prerequisite_prs.max_prereq_depth
         != auto_prereq_defaults.max_prereq_depth
+        or ai.auto_add_prerequisite_prs.require_origin_prereq_label
+        != auto_prereq_defaults.require_origin_prereq_label
     ):
         # Always emit the canonical mapping form on write-back so the on-disk
         # config doesn't quietly switch shapes between runs even when the
@@ -1651,6 +1669,8 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         ai_data["auto_add_prerequisite_prs"] = {
             "enabled": ai.auto_add_prerequisite_prs.enabled,
             "max_prereq_depth": ai.auto_add_prerequisite_prs.max_prereq_depth,
+            "require_origin_prereq_label":
+                ai.auto_add_prerequisite_prs.require_origin_prereq_label,
         }
     if ai_data:
         data["ai_resolve"] = ai_data

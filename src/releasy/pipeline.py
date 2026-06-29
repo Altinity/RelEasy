@@ -3300,6 +3300,36 @@ def _process_feature_unit(
                 )
                 return "continue"
 
+            # Origin-label gate: an in-origin prereq must carry the
+            # configured selection labels (or be listed explicitly).
+            # An unlabeled one is out of scope — abort the dive and fall
+            # back to detection-only labelling rather than auto-porting it.
+            unlabeled = _reject_unlabeled_origin_prereqs(
+                config, outcome.failed_pr, prereq_infos,
+            )
+            if unlabeled:
+                console.print(
+                    f"    [yellow]![/yellow] {len(unlabeled)} discovered "
+                    "prereq(s) are in origin but lack the configured "
+                    "selection labels — falling back to detection-only "
+                    "(label them or add to include_prs to port):"
+                )
+                for pi in unlabeled:
+                    console.print(
+                        f"      • {pr_ref_label(pi.repo_slug, pi.number, origin_slug)}"
+                        f" {pi.url}"
+                    )
+                _handle_missing_prereqs_no_dive(
+                    config, repo_path, state, unit, new_branch, base_branch,
+                    base_ref, onto, outcome, pr_meta,
+                    fs_dynamic_prereq_urls=fs_dynamic_prereq_urls,
+                    fs_prereq_trail=fs_prereq_trail,
+                    prereq_discovery_depth=prereq_discovery_depth,
+                    exit_reason={"reason": "unlabeled_origin_prereq",
+                                 "unlabeled_urls": [pi.url for pi in unlabeled]},
+                )
+                return "continue"
+
             prereq_discovery_depth += 1
             new_dynamic_urls = [pi.url for pi in prereq_infos]
             fs_dynamic_prereq_urls = new_dynamic_urls + fs_dynamic_prereq_urls
@@ -4442,6 +4472,66 @@ def _is_prereq_already_in_base(
     return answer is True
 
 
+def _matches_config_labels(config: Config, pr: PRInfo) -> bool:
+    """True if ``pr`` carries the configured selection labels.
+
+    Mirrors ``search_prs_by_labels`` selection semantics: the PR matches
+    when it holds ALL labels of at least one ``pr_sources.by_labels``
+    entry and none of ``pr_sources.exclude_labels`` (case-insensitive).
+    In other words, it's True iff our own label-based discovery would
+    have picked this PR up.
+    """
+    pr_labels = {(lbl or "").lower() for lbl in (pr.labels or [])}
+    exclude = {lbl.lower() for lbl in config.pr_sources.exclude_labels}
+    if pr_labels & exclude:
+        return False
+    for entry in config.pr_sources.by_labels:
+        wanted = {lbl.lower() for lbl in entry.labels}
+        if wanted and wanted <= pr_labels:
+            return True
+    return False
+
+
+def _reject_unlabeled_origin_prereqs(
+    config: Config,
+    triggering_pr: PRInfo | None,
+    prereq_infos: list[PRInfo],
+) -> list[PRInfo]:
+    """Return discovered prereqs that are in origin but lack the config labels.
+
+    Implements ``auto_add_prerequisite_prs.require_origin_prereq_label``:
+    when a discovered prereq lives in the origin repo AND the PR that
+    needs it also lives in origin, the prereq must carry the configured
+    selection labels (see :func:`_matches_config_labels`) — otherwise it
+    is out of scope and must be listed explicitly (``include_prs`` /
+    ``groups``, which the queued-elsewhere guard catches before we ever
+    dive). Prereqs on a different repo than origin (forward-port /
+    backport sources) are never gated.
+
+    No-op (returns ``[]``) when the gate is disabled, no ``by_labels``
+    selection is configured, the origin slug is undeterminable, or the
+    triggering PR is itself cross-repo.
+    """
+    auto_cfg = config.ai_resolve.auto_add_prerequisite_prs
+    if not auto_cfg.require_origin_prereq_label:
+        return []
+    if not config.pr_sources.by_labels:
+        return []
+    origin_slug = get_origin_repo_slug(config)
+    if not origin_slug:
+        return []
+    # Gate only fires when the PR that needs the prereq is itself in origin.
+    if triggering_pr is not None and triggering_pr.repo_slug != origin_slug:
+        return []
+    rejected: list[PRInfo] = []
+    for pr in prereq_infos:
+        if pr.repo_slug != origin_slug:
+            continue  # cross-repo prereq — not gated
+        if not _matches_config_labels(config, pr):
+            rejected.append(pr)
+    return rejected
+
+
 def _fetch_prereq_prs(
     config: Config, urls: list[str],
 ) -> tuple[list[PRInfo], list[str]]:
@@ -4534,6 +4624,10 @@ def _print_prereq_dive_failure(
             "Auto-prereq dive aborted: all discovered prereqs are already "
             "merged into base_branch."
         ),
+        "unlabeled_origin_prereq": (
+            "Auto-prereq dive aborted: an in-origin prereq lacks the "
+            "configured selection labels (out of scope)."
+        ),
     }
     headline = headline_map.get(reason, "Auto-prereq dive aborted.")
     console.print(f"    [red]✗[/red] {headline}")
@@ -4584,6 +4678,16 @@ def _print_prereq_dive_failure(
     elif reason == "fetch_failed":
         for url in exit_reason.get("failed_urls", []):
             console.print(f"      • could not fetch {url}")
+    elif reason == "unlabeled_origin_prereq":
+        for url in exit_reason.get("unlabeled_urls", []):
+            console.print(f"      • unlabeled (in origin): {url}")
+        console.print(
+            "    [dim]Action: add the configured selection label(s) to the "
+            "prereq PR(s), or list them in pr_sources.include_prs, then "
+            "re-run releasy. Set "
+            "ai_resolve.auto_add_prerequisite_prs.require_origin_prereq_label: "
+            "false to disable this gate.[/dim]"
+        )
 
 
 def _handle_missing_prereqs_no_dive(
