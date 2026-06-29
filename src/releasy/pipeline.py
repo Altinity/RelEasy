@@ -4397,6 +4397,15 @@ def _find_already_queued_prereqs(
             ref = _normalize(url)
             if ref and ref not in index:
                 index[ref] = (fid, fs.rebase_pr_url)
+        # Also key on releasy's OWN port PR for this feature. A missing-
+        # prereq report can name the in-flight port PR (the branch where
+        # the prereq's code currently lives on the target) instead of the
+        # upstream source PR. Without this key the dive re-ports that
+        # branch into a combined PR, duplicating an already-open port PR.
+        if fs.rebase_pr_url:
+            ref = _normalize(fs.rebase_pr_url)
+            if ref and ref not in index:
+                index[ref] = (fid, fs.rebase_pr_url)
 
     out: list[dict] = []
     seen: set[tuple[str, str, int]] = set()
