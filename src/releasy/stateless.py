@@ -421,38 +421,71 @@ def _pr_title(
     return f"Cherry-pick from {slug}"
 
 
-def _pr_body(
-    kind: SourceKind, source_url: str, pr_info: PRInfo | None,
-    *,
-    extra_section: str | None = None,
-) -> str:
-    """Compose the rebase PR body.
+def _read_pr_template(repo_path: Path, target_ref: str) -> str | None:
+    """The target branch's ``.github/PULL_REQUEST_TEMPLATE.md`` (or ``None``)."""
+    res = run_git(
+        ["show", f"{target_ref}:.github/PULL_REQUEST_TEMPLATE.md"],
+        repo_path, check=False,
+    )
+    return res.stdout if res.returncode == 0 else None
 
-    Starts with a one-line "cherry-picked from <url>" so reviewers can
-    jump back to the source, then folds the source title / body in
-    when we have it. Body is truncated for non-PR commits to avoid
-    pasting in a 1000-line conventional-commit dump. ``extra_section``
-    is appended verbatim.
+
+def _ci_options_section(template_text: str | None) -> str:
+    """The target template's ``CI/CD Options`` heading + everything below it,
+    verbatim. Falls back to the bundled default block when the template is
+    missing or has no such section."""
+    from releasy.pipeline import _DEFAULT_CI_CD_OPTIONS_BLOCK
+
+    if template_text:
+        lines = template_text.splitlines()
+        target = FORMATTING_SECTION_HEADER.strip().lower()
+        for i, line in enumerate(lines):
+            m = _HEADER_RE.match(line)
+            if m and m.group(2).strip().lower() == target:
+                return "\n".join(lines[i:]).rstrip()
+    return _DEFAULT_CI_CD_OPTIONS_BLOCK.rstrip()
+
+
+def _build_changelog_block_for_pr(pr_info: PRInfo | None) -> str | None:
+    """Source PR's Changelog category + entry with a ``(<url> by @author)``
+    attribution suffix. ``None`` for sources without changelog metadata
+    (plain commits / tags)."""
+    if pr_info is None:
+        return None
+    from releasy.pipeline import (
+        _extract_changelog_category,
+        _extract_changelog_entry,
+        render_changelog_block,
+    )
+
+    body = pr_info.body or ""
+    return render_changelog_block(
+        _extract_changelog_category(body),
+        _extract_changelog_entry(body),
+        [pr_info],
+    )
+
+
+def _pr_body(
+    source_url: str, pr_info: PRInfo | None, ci_section: str,
+) -> str:
+    """Compose the rebase PR body, respecting the target's PR template.
+
+    Provenance line, then the source PR's Changelog category + entry with
+    a ``(<url> by @author)`` attribution suffix, then the ``CI/CD Options``
+    section verbatim. The raw upstream body is deliberately not pasted in —
+    it carries upstream's own template/CI section, which ``ci_section``
+    replaces.
     """
     lines: list[str] = [f"Cherry-picked from {source_url}."]
-    if pr_info is not None:
-        if pr_info.title:
-            lines.append("")
-            lines.append(f"**{pr_info.title}**")
-        body = (pr_info.body or "").strip()
-        if body:
-            lines.append("")
-            lines.append("---")
-            lines.append("")
-            if kind != "pr" and len(body) > 4000:
-                body = body[:4000] + "\n\n_(truncated)_"
-            lines.append(body)
-    if extra_section:
+    changelog = _build_changelog_block_for_pr(pr_info)
+    if changelog:
         lines.append("")
-        lines.append("---")
+        lines.append(changelog)
+    if ci_section:
         lines.append("")
-        lines.append(extra_section)
-    return "\n".join(lines)
+        lines.append(ci_section)
+    return "\n".join(lines).rstrip() + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +574,7 @@ def run_stateless_cherry_pick(opts: StatelessOptions) -> StatelessResult:
         )
 
     target_ref = f"{remote}/{opts.target}"
+    template_text = _read_pr_template(repo_path, target_ref)
     branch = opts.branch_name or _default_branch_name(kind, ident)
     console.print(
         f"\nBranching [cyan]{branch}[/cyan] off [cyan]{target_ref}[/cyan]"
@@ -632,14 +666,21 @@ def run_stateless_cherry_pick(opts: StatelessOptions) -> StatelessResult:
                 "[yellow]![/yellow] --with-pr requires push; skipping PR creation."
             )
         else:
-            extra_section: str | None = None
+            # CI/CD Options: --formatting-example PR overrides; otherwise the
+            # target branch's own PR template (falling back to the bundled
+            # default block when the template lacks the section).
+            ci_section = _ci_options_section(template_text)
             if opts.formatting_example_url:
-                extra_section, err = _fetch_formatting_section(
+                override, err = _fetch_formatting_section(
                     config, opts.formatting_example_url,
                 )
                 if err:
-                    console.print(f"[yellow]![/yellow] {err}")
+                    console.print(
+                        f"[yellow]![/yellow] {err} — using target template's "
+                        f"{FORMATTING_SECTION_HEADER!r} instead"
+                    )
                 else:
+                    ci_section = override
                     console.print(
                         f"[green]✓[/green] Copied "
                         f"{FORMATTING_SECTION_HEADER!r} section from "
@@ -647,10 +688,7 @@ def run_stateless_cherry_pick(opts: StatelessOptions) -> StatelessResult:
                         f"formatting example[/link]"
                     )
             title = _pr_title(kind, slug, ident, pr_info)
-            body = _pr_body(
-                kind, opts.source_url, pr_info,
-                extra_section=extra_section,
-            )
+            body = _pr_body(opts.source_url, pr_info, ci_section)
             pr_url = create_pull_request(
                 config, branch, opts.target, title, body,
             )

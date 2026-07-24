@@ -578,6 +578,15 @@ pushes, and opens a PR back to `--target`. **Persists nothing** — no
 config / state / lock / board. Re-running makes a brand-new branch each
 time (pin it with `--branch-name`).
 
+The opened PR **respects the target branch's PR template**: its body is a
+provenance line, the source PR's `Changelog category` + `Changelog entry`
+with a ` (<source-PR-url> by @<author>)` attribution suffix, and the
+`CI/CD Options` section copied verbatim from the target branch's
+`.github/PULL_REQUEST_TEMPLATE.md` (falling back to a bundled default block
+if the template lacks one). The raw upstream body is not pasted in — it
+would carry upstream's own template. `--formatting-example` overrides just
+the `CI/CD Options` section.
+
 ```bash
 releasy cherry-pick --origin <url> --target <branch> --commit <github-url>
                     [--branch-name <name>] [--push | --no-push] [--with-pr]
@@ -603,7 +612,7 @@ releasy cherry-pick --origin <url> --target <branch> --commit <github-url>
 | `--prompt-file <path>` | AI-resolve prompt template. | bundled |
 | `--timeout <s>` | Per-attempt Claude timeout (seconds). | `7200` |
 | `--max-iterations <n>` | Max build attempts per resolve. | `5` |
-| `--formatting-example <pr-url>` | Append that PR's "CI/CD Options" section to the new PR body (needs `--with-pr`). | — |
+| `--formatting-example <pr-url>` | Override the "CI/CD Options" section with this origin-repo PR's instead of the target template's (needs `--with-pr`). | target PR template |
 | `--work-dir <path>` | Working dir for git ops. | cwd |
 
 ### `releasy project-backport`

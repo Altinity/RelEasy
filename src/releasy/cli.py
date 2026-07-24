@@ -459,9 +459,9 @@ def run(
     "--formatting-example",
     "formatting_example_url",
     default=None,
-    help="URL of a PR in the origin repo whose 'CI/CD Options' section "
-         "should be appended to the new PR body. The rest of that PR's "
-         "body is ignored. Requires --with-pr.",
+    help="Override the 'CI/CD Options' section with the one from this "
+         "origin-repo PR instead of the target branch's PR template. The "
+         "rest of that PR's body is ignored. Requires --with-pr.",
 )
 def cherry_pick_cmd(
     origin: str,
