@@ -6,6 +6,7 @@ Uses subprocess for full control over cherry-pick/conflict detection.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -632,3 +633,43 @@ def commit_date(repo_path: Path, ref: str) -> str | None:
         return None
     lines = [ln for ln in (result.stdout or "").splitlines() if ln.strip()]
     return lines[0].strip() if lines else None
+
+
+# GitHub-generated mainline commit subjects: a merge-commit
+# ("Merge pull request #N from …") or a squash-merge ("<title> (#N)").
+_MERGE_PR_RE = re.compile(r"^Merge pull request #(\d+)\b")
+_SQUASH_PR_RE = re.compile(r"\(#(\d+)\)\s*$")
+
+
+def pr_number_from_subject(subject: str) -> int | None:
+    """Origin PR number from a mainline commit subject, or ``None``.
+
+    Matches GitHub's ``Merge pull request #N from …`` merge commits and the
+    trailing ``(#N)`` of squash-merges. Subjects with no such reference (plain
+    ``Merge branch …``, direct pushes) return ``None``.
+    """
+    m = _MERGE_PR_RE.match(subject) or _SQUASH_PR_RE.search(subject)
+    return int(m.group(1)) if m else None
+
+
+def first_parent_pr_numbers(
+    repo_path: Path, from_ref: str, to_ref: str,
+) -> list[int]:
+    """Origin PR numbers on the first-parent chain of ``from_ref..to_ref``,
+    ascending and de-duplicated.
+
+    First-parent so a PR's own merged-in history isn't counted as a top-level
+    PR. Rebase-merged PRs carry no subject reference and aren't detected.
+    """
+    result = run_git(
+        ["log", "--first-parent", "--format=%s", f"{from_ref}..{to_ref}"],
+        repo_path, check=False,
+    )
+    if result.returncode != 0:
+        return []
+    seen: set[int] = set()
+    for line in (result.stdout or "").splitlines():
+        n = pr_number_from_subject(line)
+        if n is not None:
+            seen.add(n)
+    return sorted(seen)

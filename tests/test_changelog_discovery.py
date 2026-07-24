@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 
 import releasy.changelog as cl
+from releasy.git_ops import first_parent_pr_numbers, pr_number_from_subject
 from releasy.github_ops import PRInfo, build_merged_base_query
 
 
@@ -31,17 +36,21 @@ class BuildMergedBaseQuery(unittest.TestCase):
         self.assertEqual(q, "repo:o/r is:pr is:merged base:antalya-26.3")
 
     def test_window_both_bounds(self):
+        # Single range qualifier — two comparison qualifiers on one field make
+        # GitHub Search silently drop the date filter (returns everything).
         q = build_merged_base_query(
             "o/r", "b", merged_from="2025-01-01T00:00:00+00:00",
             merged_to="2025-06-01T00:00:00+00:00",
         )
-        # Lower bound EXCLUSIVE (avoids double-counting the --from boundary).
-        self.assertIn("merged:>2025-01-01T00:00:00+00:00", q)
-        self.assertIn("merged:<=2025-06-01T00:00:00+00:00", q)
+        self.assertIn(
+            "merged:2025-01-01T00:00:00+00:00..2025-06-01T00:00:00+00:00", q,
+        )
+        # Exactly one merged: term (guards against a revert to the dual form).
+        self.assertEqual(q.count("merged:"), 1)
 
     def test_window_lower_only(self):
         q = build_merged_base_query("o/r", "b", merged_from="2025-01-01")
-        self.assertIn("merged:>2025-01-01", q)
+        self.assertIn("merged:>=2025-01-01", q)
 
     def test_window_upper_only(self):
         q = build_merged_base_query("o/r", "b", merged_to="2025-06-01")
@@ -53,6 +62,111 @@ class BuildMergedBaseQuery(unittest.TestCase):
         )
         self.assertIn('-label:"forwardport"', q)
         self.assertIn('-label:"forward port"', q)
+
+
+class PrNumberFromSubject(unittest.TestCase):
+    def test_merge_commit(self):
+        self.assertEqual(
+            pr_number_from_subject(
+                "Merge pull request #2011 from Altinity/backports/24.8.14/99119"
+            ),
+            2011,
+        )
+
+    def test_squash_commit_trailing_paren(self):
+        self.assertEqual(
+            pr_number_from_subject("Fix a nasty crash in the parser (#1234)"),
+            1234,
+        )
+
+    def test_merge_branch_not_matched(self):
+        # A target-branch merge is not a PR reference.
+        self.assertIsNone(
+            pr_number_from_subject(
+                "Merge branch 'customizations/24.8.14' into backports/24.8/79147"
+            )
+        )
+
+    def test_direct_push_not_matched(self):
+        self.assertIsNone(pr_number_from_subject("Bump version to 24.8.14.10547"))
+
+    def test_mid_subject_hash_not_matched(self):
+        # Only a *trailing* (#N) counts — an inline "#N" mention doesn't.
+        self.assertIsNone(
+            pr_number_from_subject("Backport #93016 to 24.8 Altinity Stable")
+        )
+
+    def test_merge_prefix_wins_over_trailing_paren(self):
+        # The merge-commit number is the PR; a trailing (#M) doesn't override it.
+        self.assertEqual(
+            pr_number_from_subject("Merge pull request #10 from x/y (#20)"), 10,
+        )
+
+    def test_revert_squash_matched(self):
+        # A reverted-via-PR squash subject is a real merged PR.
+        self.assertEqual(
+            pr_number_from_subject('Revert "Broken change" (#77)'), 77,
+        )
+
+
+class FirstParentPrNumbers(unittest.TestCase):
+    """Integration test over a real temp git repo (first-parent + dedup + sort)."""
+
+    def _git(self, *args):
+        return subprocess.run(
+            ["git", *args], cwd=self.repo, check=True,
+            capture_output=True, text=True, env=self.env,
+        ).stdout.strip()
+
+    def _commit(self, subject):
+        # -c commit.gpgsign=false works on every git; GIT_CONFIG_* isolation
+        # (below) needs 2.32+, so keep both.
+        self._git("-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", subject)
+        return self._git("rev-parse", "HEAD")
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)  # runs even if setUp raises
+        self.repo = Path(self._tmp.name)
+        # Isolate from the host: drop git's repo-redirecting vars and pin
+        # config to /dev/null so global gpgsign / hooks can't interfere.
+        self.env = {
+            k: v for k, v in os.environ.items()
+            if k not in {
+                "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+            }
+        }
+        self.env.update({
+            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+            "HOME": str(self.repo),
+        })
+        # No -b/--initial-branch (needs git 2.28); read the default branch back.
+        self._git("init", "-q")
+        self.main = self._git("symbolic-ref", "--short", "HEAD")
+        self.base = self._commit("base")
+
+    def test_first_parent_only_dedup_sorted(self):
+        # A side branch whose inner commit references #999 — must be excluded
+        # because it lives on second-parent history.
+        self._git("checkout", "-q", "-b", "feature")
+        self._commit("inner work (#999)")
+        self._git("checkout", "-q", self.main)
+        self._git(
+            "merge", "--no-ff", "-m", "Merge pull request #30 from feature",
+            "feature",
+        )
+        self._commit("Direct push, no PR")
+        self._commit("A squash-merged change (#10)")
+        to = self._commit("Merge branch 'main' of origin")  # not a PR
+
+        nums = first_parent_pr_numbers(self.repo, self.base, to)
+        # #999 excluded (second-parent), non-PR commits ignored, ascending.
+        self.assertEqual(nums, [10, 30])
+
+    def test_empty_range(self):
+        self.assertEqual(first_parent_pr_numbers(self.repo, self.base, self.base), [])
 
 
 class IsForwardPort(unittest.TestCase):

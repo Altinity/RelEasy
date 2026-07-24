@@ -1,10 +1,12 @@
-"""Generate a release changelog from PRs merged into the target branch.
+"""Generate a release changelog from the PRs in a ``--from``..``--to`` range.
 
-Queries the origin repo (one Search-API call) for PRs whose base is the
-target branch and that merged within the ``--from``..``--to`` window,
-drops forward-ports, and renders a categorised markdown changelog
-matching the Altinity release-notes convention. An explicit PR set can
-be supplied instead, bypassing discovery.
+When ``--from`` is an ancestor of ``--to`` (the usual same-branch release)
+the commit range is walked directly — its first-parent PRs are the exact
+delta. Otherwise (e.g. ``--from`` is an upstream fork tag not on the branch)
+it falls back to a date-window Search-API query for PRs whose base is the
+target branch. Either way forward-ports are dropped and the result is
+rendered as categorised markdown in the Altinity release-notes convention.
+An explicit PR set (``--prs`` / ``--prs-file``) bypasses discovery entirely.
 
 Output goes either to a file (``-o``) or to a draft GitHub release on
 the origin repo.
@@ -15,13 +17,16 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
-from releasy.config import Config
+from releasy.config import Config, get_github_token
 from releasy.git_ops import (
     commit_date,
     ensure_remote,
     ensure_work_repo,
+    first_parent_pr_numbers,
+    is_ancestor,
     is_tag_ref,
     resolve_ref,
     run_git,
@@ -31,6 +36,7 @@ from releasy.github_ops import (
     create_draft_release,
     fetch_pr_by_number,
     fetch_pr_by_url,
+    fetch_prs_by_numbers,
     get_origin_repo_slug,
     search_merged_prs_by_base,
 )
@@ -866,10 +872,12 @@ def build_changelog(
     base_branch: str | None = None,
     explicit_prs: list[str] | None = None,
 ) -> tuple[str, str, bool] | None:
-    """Collect PRs merged into the target branch and render the changelog.
+    """Collect the PRs in ``from_ref``..``to_ref`` and render the changelog.
 
-    By default queries origin for PRs whose base is ``base_branch`` (the
-    target branch) and that merged in the ``from_ref``..``to_ref`` window.
+    When ``from_ref`` is an ancestor of ``to_ref`` the commit range is walked
+    (its first-parent PRs are the exact delta; ``base_branch`` is not used).
+    Otherwise it falls back to a date-window search for PRs whose base is
+    ``base_branch`` (the target branch) that merged in the window.
     ``explicit_prs`` (URLs) bypasses discovery and uses exactly that set.
 
     ``release_name`` is the GitHub release **tag** (e.g.
@@ -887,6 +895,12 @@ def build_changelog(
         console.print(
             f"[red]Could not parse origin remote URL: "
             f"{config.origin.remote}[/red]"
+        )
+        return None
+
+    if not get_github_token():
+        console.print(
+            "[red]RELEASY_GITHUB_TOKEN not set[/red] — cannot fetch PRs."
         )
         return None
 
@@ -997,8 +1011,11 @@ def build_changelog(
     packages_block = render_packages_block(release_name, docker_image_url)
     to_is_tag = is_tag_ref(repo_path, to_ref)
 
-    # Collect the PR set: an explicit override, or the PRs merged into
-    # the target branch within the from..to window (one Search query).
+    # Collect the PR set. Three paths, in priority order:
+    #   1. explicit --prs / --prs-file — exactly that set.
+    #   2. from_ref is an ancestor of to_ref — walk the commit range, which
+    #      IS the exact delta (--base is not consulted).
+    #   3. otherwise — approximate with a date-window search by base branch.
     upstream_cache: dict[tuple[str, int], PRInfo | None] = {}
     prs: list[PRInfo] = []
     if explicit_prs:
@@ -1022,21 +1039,75 @@ def build_changelog(
                 )
                 continue
             prs.append(pr)
+    elif ancestry := is_ancestor(repo_path, from_ref, to_ref):
+        # Same-line release: the commit range from_ref..to_ref is the exact
+        # set of changes. Walk its first-parent PRs (--base is not consulted).
+        if base_branch:
+            console.print("  [dim]--base ignored — walking the commit range[/dim]")
+        numbers = first_parent_pr_numbers(repo_path, from_ref, to_ref)
+        console.print(
+            f"Walking [cyan]{from_ref}..{to_ref}[/cyan] — "
+            f"[cyan]{len(numbers)}[/cyan] PR(s) merged onto the branch..."
+        )
+        fetched = fetch_prs_by_numbers(
+            config, numbers, slug=origin_slug, include_closed=True,
+        )
+        # value None = transient fetch failure (refuse — would ship incomplete);
+        # key absent = 404 / bad subject parse (skip). See fetch_prs_by_numbers.
+        failed = [n for n in numbers if n in fetched and fetched[n] is None]
+        if failed:
+            console.print(
+                f"[red]Could not fetch {len(failed)} PR(s) in the range: "
+                f"{', '.join(f'#{n}' for n in failed)}.[/red] "
+                "Refusing to draft an incomplete changelog."
+            )
+            return None
+        for n in numbers:
+            pr = fetched.get(n)
+            if pr is None:
+                console.print(
+                    f"  [yellow]![/yellow] #{n} is not a PR on {origin_slug} "
+                    "— skipping"
+                )
+                continue
+            if pr.state != "merged":
+                console.print(
+                    f"  [yellow]![/yellow] #{n} is {pr.state}, not merged "
+                    "— skipping"
+                )
+                continue
+            prs.append(pr)
     else:
+        # No clean commit range: --from isn't an ancestor of --to, or git
+        # couldn't tell. Approximate with a date-window search over PRs whose
+        # base is the target branch.
+        anc_unknown = ancestry is None
         base = base_branch or config.target_branch or to_ref
         from_date = commit_date(repo_path, from_ref)
         to_date = commit_date(repo_path, to_ref)
-        if from_date is None:
-            # Without a lower bound the query would scan the branch's entire
-            # history; refuse rather than emit a bogus whole-history changelog.
+        if from_date is None or to_date is None:
+            # Both bounds required — an unbounded window scans whole history.
+            missing = from_ref if from_date is None else to_ref
             console.print(
-                f"[red]Could not read the commit date of --from {from_ref!r}.[/red] "
+                f"[red]Could not read the commit date of {missing!r}.[/red] "
                 "Cannot bound the release window."
             )
             return None
+        if datetime.fromisoformat(from_date) > datetime.fromisoformat(to_date):
+            # A reversed window (--from newer than --to) yields a garbage /
+            # empty search rather than an error — refuse it up front.
+            console.print(
+                f"[red]--from {from_ref!r} is newer than --to {to_ref!r}[/red]; "
+                "the release window is reversed."
+            )
+            return None
+        reason = (
+            "could not determine --from/--to ancestry"
+            if anc_unknown else "--from is not an ancestor of --to"
+        )
         console.print(
-            f"Querying PRs merged into [cyan]{base}[/cyan] in "
-            f"[cyan]{from_ref}..{to_ref}[/cyan]..."
+            f"[yellow]{reason}[/yellow]; querying PRs merged into "
+            f"[cyan]{base}[/cyan] in [cyan]{from_ref}..{to_ref}[/cyan] by date..."
         )
         prs = search_merged_prs_by_base(
             config, base,
@@ -1050,6 +1121,15 @@ def build_changelog(
                 "cap; some PRs may be missing. Narrow the --from..--to window."
             )
     console.print(f"  [dim]Considering {len(prs)} PR(s)[/dim]")
+
+    if not prs:
+        # Empty range (from == to), a swallowed git error, or a genuinely empty
+        # window — never publish an empty changelog silently.
+        console.print(
+            f"[red]No PRs found in {from_ref}..{to_ref}.[/red] "
+            "Nothing to draft — check the --from / --to range."
+        )
+        return None
 
     entries: list[ChangelogEntry] = []
     for pr in prs:

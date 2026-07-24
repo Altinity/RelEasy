@@ -620,31 +620,9 @@ def fetch_pr_by_number(
 
         gh = Github(token)
         repo = gh.get_repo(slug)
-        pr = repo.get_pull(number)
-
-        if pr.merged:
-            pr_state = "merged"
-        elif pr.state == "open":
-            if merged_only:
-                return None
-            pr_state = "open"
-        elif include_closed and pr.state == "closed":
-            pr_state = "closed"
-        else:
-            return None
-
-        return PRInfo(
-            number=pr.number,
-            title=pr.title,
-            body=pr.body or "",
-            state=pr_state,
-            merge_commit_sha=pr.merge_commit_sha if pr.merged else None,
-            head_sha=pr.head.sha,
-            url=pr.html_url,
-            repo_slug=slug,
-            merged_at=pr.merged_at.isoformat() if pr.merged_at else None,
-            labels=[lbl.name for lbl in pr.labels],
-            author=_pr_author(pr),
+        return _pr_info_from_gh(
+            repo.get_pull(number), slug,
+            merged_only=merged_only, include_closed=include_closed,
         )
     except GithubException as exc:
         log.warning("Failed to fetch PR %s#%d: %s", slug, number, exc)
@@ -652,6 +630,100 @@ def fetch_pr_by_number(
     except Exception as exc:
         log.warning("Unexpected error fetching PR %s#%d: %s", slug, number, exc)
         return None
+
+
+def _pr_info_from_gh(
+    pr, slug: str, *, merged_only: bool = False, include_closed: bool = False,
+) -> PRInfo | None:  # noqa: ANN001 — pr is a PyGithub PullRequest
+    """PRInfo from a PyGithub pull, or None if its state is filtered out."""
+    if pr.merged:
+        pr_state = "merged"
+    elif pr.state == "open":
+        if merged_only:
+            return None
+        pr_state = "open"
+    elif include_closed and pr.state == "closed":
+        pr_state = "closed"
+    else:
+        return None
+    return PRInfo(
+        number=pr.number,
+        title=pr.title,
+        body=pr.body or "",
+        state=pr_state,
+        merge_commit_sha=pr.merge_commit_sha if pr.merged else None,
+        head_sha=pr.head.sha,
+        url=pr.html_url,
+        repo_slug=slug,
+        merged_at=pr.merged_at.isoformat() if pr.merged_at else None,
+        labels=[lbl.name for lbl in pr.labels],
+        author=_pr_author(pr),
+    )
+
+
+def fetch_prs_by_numbers(
+    config: Config,
+    numbers: list[int],
+    *,
+    slug: str | None = None,
+    include_closed: bool = False,
+) -> dict[int, PRInfo | None]:
+    """Fetch many PRs by number, reusing one client + repo handle.
+
+    Per number the result is: a ``PRInfo`` (found — state-filtered like
+    :func:`fetch_pr_by_number`); ``None`` if the fetch failed transiently;
+    or **absent** if the number is a 404 / filtered-out (i.e. not a usable
+    PR). Callers distinguish "abort — incomplete" (value None) from "skip —
+    not a real PR" (key absent). Avoids the per-call ``Github(token)`` +
+    ``get_repo`` a loop over :func:`fetch_pr_by_number` would repeat.
+    """
+    out: dict[int, PRInfo | None] = {}
+    if not numbers:
+        return out
+    token = get_github_token()
+    if not token:
+        log.warning("RELEASY_GITHUB_TOKEN not set — cannot fetch PRs")
+        return {n: None for n in numbers}
+    if slug is None:
+        slug = get_origin_repo_slug(config)
+        if not slug:
+            log.warning("Could not parse origin remote URL: %s", config.origin.remote)
+            return {n: None for n in numbers}
+
+    try:
+        from github import Github, GithubException, UnknownObjectException
+    except ImportError as exc:  # pragma: no cover — pygithub is a hard dep
+        log.warning("Could not import pygithub: %s", exc)
+        return {n: None for n in numbers}
+
+    gh = Github(token)
+    try:
+        repo = gh.get_repo(slug)
+    except Exception as exc:
+        log.warning("Could not resolve repo %s: %s", slug, exc)
+        return {n: None for n in numbers}
+
+    for n in numbers:
+        try:
+            info = _pr_info_from_gh(
+                repo.get_pull(n), slug, include_closed=include_closed,
+            )
+        except UnknownObjectException:
+            # 404 — the number isn't a PR on this repo (a bad subject parse).
+            log.warning("PR %s#%d not found", slug, n)
+            continue
+        except GithubException as exc:
+            log.warning("Failed to fetch PR %s#%d: %s", slug, n, exc)
+            out[n] = None
+            continue
+        except Exception as exc:
+            log.warning("Unexpected error fetching PR %s#%d: %s", slug, n, exc)
+            out[n] = None
+            continue
+        # Filtered-out (state excluded) → not a usable PR → leave absent.
+        if info is not None:
+            out[n] = info
+    return out
 
 
 def fetch_pr_by_url(
@@ -1205,17 +1277,17 @@ def build_merged_base_query(
 ) -> str:
     """Build the Search-API query for merged PRs whose base is ``base_branch``.
 
-    ``merged_from`` / ``merged_to`` are ISO timestamps bounding ``merged:``.
-    The lower bound is EXCLUSIVE (``merged:>from``) so a PR merged at exactly
-    the ``--from`` ref's timestamp isn't double-counted with the prior
-    release; the upper bound is inclusive. ``exclude_labels`` adds
-    ``-label:"<l>"`` terms (forward-ports are dropped here so they're never
-    even fetched).
+    ``merged_from`` / ``merged_to`` are ISO timestamps bounding ``merged:``
+    (inclusive). With both set we emit a single range qualifier ``merged:A..B``:
+    GitHub Search silently drops the date filter when two comparison
+    qualifiers share a field. ``exclude_labels`` adds ``-label:"<l>"`` terms.
     """
     q = f"repo:{slug} is:pr is:merged base:{base_branch}"
-    if merged_from:
-        q += f" merged:>{merged_from}"
-    if merged_to:
+    if merged_from and merged_to:
+        q += f" merged:{merged_from}..{merged_to}"
+    elif merged_from:
+        q += f" merged:>={merged_from}"
+    elif merged_to:
         q += f" merged:<={merged_to}"
     for lbl in exclude_labels or []:
         # Strip embedded quotes so a label can't break out of the term.

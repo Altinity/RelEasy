@@ -841,20 +841,25 @@ releasy release --base-tag <tag> --name <branch> [--strict] [--include-skipped] 
 
 ### `releasy draft-release`
 
-*Generate a release changelog from the PRs merged into the target branch.*
+*Generate a release changelog from the PRs in a `--from`..`--to` range.*
 
-Queries origin in **one Search call** for PRs whose base is `--base` (the
-target branch) and that merged in the `--from`..`--to` window — no
-per-PR fetch, no merge-commit walk. Forward-ports (`forwardport` /
-`forward-port` label or title) are dropped, each PR is classified by its
-Changelog category, and the result is rendered as Altinity's release-notes
-markdown. `--prs` / `--prs-file` supply an explicit PR set instead,
-bypassing discovery. With `-o` writes to disk and publishes nothing;
-without it, creates a **draft** GitHub release on origin (tag = `--name`,
-commitish = `--to`) and prints its URL.
+When `--from` is an **ancestor** of `--to` (the usual same-branch release),
+walks the commit range and collects its **first-parent** PRs — the exact
+delta. `--base` is not consulted in this mode. When `--from` is **not** an
+ancestor (e.g. an upstream fork tag not on the branch), falls back to a
+**date-window Search call** for PRs whose base is `--base` (the target
+branch) that merged in the `--from`..`--to` window. Either way, forward-ports
+(`forwardport` / `forward-port` label or title) are dropped, each PR is
+classified by its Changelog category, and the result is rendered as
+Altinity's release-notes markdown. `--prs` / `--prs-file` supply an explicit
+PR set instead, bypassing discovery. With `-o` writes to disk and publishes
+nothing; without it, creates a **draft** GitHub release on origin (tag =
+`--name`, commitish = `--to`) and prints its URL.
 
-`--from` / `--to` are resolved against a local clone only to derive the
-window dates and the comparison SHAs.
+The walk reads PR numbers from GitHub's merge-commit / squash-merge subjects,
+so rebase-merged PRs (which leave no PR reference) aren't detected — origin
+uses squash / merge-commit. `--from` / `--to` are resolved against a local
+clone.
 
 ```bash
 releasy draft-release --from <ref> --to <ref> [--base <branch>]
@@ -866,9 +871,9 @@ releasy draft-release --from <ref> --to <ref> [--base <branch>]
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--from <ref>` (required) | Window lower bound, **non-inclusive** by date (usually the previous release / upstream fork tag). | — |
-| `--to <ref>` (required) | Window upper bound (inclusive) and draft commitish (release-branch tip or the tag being cut). | — |
-| `--base <branch>` | Branch whose merged PRs are collected. | target branch → `--to` |
+| `--from <ref>` (required) | Range lower bound, **exclusive** (usually the previous release / upstream fork tag). | — |
+| `--to <ref>` (required) | Range upper bound (inclusive) and draft commitish (release-branch tip or the tag being cut). | — |
+| `--base <branch>` | Branch whose merged PRs are collected — **only used in the date-window fallback** (when `--from` isn't an ancestor of `--to`). | target branch → `--to` |
 | `--prs <url>` | Explicit PR URL to include (repeatable); bypasses discovery. | — |
 | `--prs-file <path>` | File of PR URLs (one per line, `#` comments ok); merged with `--prs`. | — |
 | `--name <tag>` | Release tag. Defaults to `--to` when it's a tag; left blank if `--to` is a commit / branch. | — |
