@@ -274,5 +274,105 @@ class BundleSplit(unittest.TestCase):
         self.assertEqual([e.upstream_prs[0].number for e in es], [101278, 102337])
 
 
+class InlineBundleSplit(unittest.TestCase):
+    """A manual port PR whose one entry section inlines ≥2 attributed backports."""
+
+    _CH = "https://github.com/ClickHouse/ClickHouse/pull"
+
+    def _entries(self, entry, category="Bug Fix"):
+        pr = _pr(2045, body=_body(category, entry),
+                 title="Backport #93016 to 24.8 Altinity Stable")
+        pr.url = "https://github.com/o/r/pull/2045"
+        return cl._entries_for_pr(None, pr, "o/r", {})
+
+    def test_two_inlined_entries_split(self):
+        entry = (
+            f"Fix sparse column mutation error.\n"
+            f"({self._CH}/93016 by @avogar)\n"
+            f"Rebuild projection on alter modify of its PK column.\n"
+            f"({self._CH}/75720 by @avogar)"
+        )
+        es = self._entries(entry)
+        self.assertEqual(len(es), 2)
+        self.assertEqual(
+            [e.description for e in es],
+            ["Fix sparse column mutation error.",
+             "Rebuild projection on alter modify of its PK column."],
+        )
+        self.assertEqual([e.upstream_prs[0].number for e in es], [93016, 75720])
+        # Both bullets share the PR's single category and point via one PR.
+        self.assertTrue(all(e.section == cl.SECTION_BUG_FIXES for e in es))
+        self.assertEqual(
+            cl._render_entry(es[0]),
+            f"* Fix sparse column mutation error. "
+            f"({self._CH}/93016 by @avogar via https://github.com/o/r/pull/2045)",
+        )
+        self.assertEqual(
+            cl._render_entry(es[1]),
+            f"* Rebuild projection on alter modify of its PK column. "
+            f"({self._CH}/75720 by @avogar via https://github.com/o/r/pull/2045)",
+        )
+
+    def test_single_inlined_entry_not_split(self):
+        # One attribution paren → normal single-entry path, not the splitter.
+        es = self._entries(f"Fix one thing. ({self._CH}/93016 by @avogar)")
+        self.assertEqual(len(es), 1)
+        self.assertEqual(es[0].description, "Fix one thing.")
+        self.assertEqual(es[0].upstream_prs[0].number, 93016)
+
+    def test_benign_parens_do_not_split(self):
+        # Parentheticals that name no upstream PR are not entry boundaries.
+        es = self._entries("Fix A (descending order). Fix B (edge case).")
+        self.assertEqual(len(es), 1)
+        self.assertEqual(
+            es[0].description, "Fix A (descending order). Fix B (edge case).")
+
+    def test_not_for_changelog_bundle_dropped(self):
+        entry = (
+            f"Fix A.\n({self._CH}/93016 by @avogar)\n"
+            f"Fix B.\n({self._CH}/75720 by @avogar)"
+        )
+        es = self._entries(entry, category="Not for Changelog")
+        self.assertEqual(es, [])
+
+
+class SplitInlineEntries(unittest.TestCase):
+    _CH = "https://github.com/ClickHouse/ClickHouse/pull"
+
+    def test_none_when_fewer_than_two(self):
+        self.assertIsNone(
+            cl._split_inline_entries(f"Fix. ({self._CH}/1 by @a)", "o/r"))
+        self.assertIsNone(cl._split_inline_entries("no parens here", "o/r"))
+
+    def test_crlf_section(self):
+        # Real PR bodies use CRLF; the split must survive it.
+        section = (
+            f"Fix A.\r\n({self._CH}/1 by @a)\r\n"
+            f"Fix B.\r\n({self._CH}/2 by @b)"
+        )
+        chunks = cl._split_inline_entries(section, "o/r")
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(chunks[0][0], "Fix A.")
+        self.assertEqual(chunks[0][1], [("ClickHouse/ClickHouse", 1, "a")])
+        self.assertEqual(chunks[1][1], [("ClickHouse/ClickHouse", 2, "b")])
+
+    def test_dangling_attribution_joins_previous(self):
+        # A back-to-back attribution with no description of its own attaches to
+        # the preceding entry rather than becoming a bullet with empty text.
+        section = (
+            f"Fix A. ({self._CH}/1 by @a) ({self._CH}/2 by @b) "
+            f"Fix B. ({self._CH}/3 by @c)"
+        )
+        chunks = cl._split_inline_entries(section, "o/r")
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(chunks[0][0], "Fix A.")
+        self.assertEqual(
+            chunks[0][1],
+            [("ClickHouse/ClickHouse", 1, "a"), ("ClickHouse/ClickHouse", 2, "b")],
+        )
+        self.assertEqual(chunks[1][0], "Fix B.")
+        self.assertEqual(chunks[1][1], [("ClickHouse/ClickHouse", 3, "c")])
+
+
 if __name__ == "__main__":
     unittest.main()

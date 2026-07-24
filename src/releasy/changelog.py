@@ -256,6 +256,26 @@ def _trailing_paren_group(text: str) -> tuple[int, str] | None:
     return None  # unbalanced
 
 
+def _iter_balanced_parens(text: str):
+    """Yield ``(start, end, inner)`` for each top-level balanced ``(...)`` group.
+
+    ``text[start:end]`` spans the group including its parens; ``inner`` is the
+    text between them (nested parens kept inside). Unbalanced leftovers are
+    ignored.
+    """
+    depth = 0
+    start = -1
+    for i, ch in enumerate(text):
+        if ch == "(":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == ")" and depth > 0:
+            depth -= 1
+            if depth == 0:
+                yield start, i + 1, text[start + 1:i]
+
+
 def _paren_names_upstream(inner: str, upstream_prs: list[PRInfo]) -> bool:
     """True if ``inner`` references any of ``upstream_prs`` by url or slug#N.
 
@@ -310,6 +330,52 @@ def _attribution_from_text(
         seen.add(key)
         out.append((slug, num, _author_for(end)))
     return out
+
+
+def _split_inline_entries(
+    section: str, origin_slug: str,
+) -> list[tuple[str, list[tuple[str, int, str | None]]]] | None:
+    """Split a Changelog-entry section that inlines ≥2 attributed backports.
+
+    Manually-authored port PRs (no ``Cherry-picked from`` line) sometimes
+    bundle several backports in one PR, writing one description followed by
+    its own ``(<upstream-url> by @author)`` attribution per backport::
+
+        Fix A.
+        (https://github.com/ClickHouse/ClickHouse/pull/93016 by @avogar)
+        Fix B.
+        (https://github.com/ClickHouse/ClickHouse/pull/75720 by @avogar)
+
+    Split on the attribution parens: each chunk pairs the description text
+    preceding an attribution paren with that paren's parsed refs. Returns
+    ``None`` when fewer than two attribution parens are present (leave the
+    single-entry case to the normal path).
+    """
+    if not section:
+        return None
+    text = re.sub(r"<!--.*?-->", "", section, flags=re.DOTALL)
+    marks: list[tuple[int, int, list[tuple[str, int, str | None]]]] = []
+    for start, end, inner in _iter_balanced_parens(text):
+        refs = _attribution_from_text(inner, origin_slug)
+        if refs:
+            marks.append((start, end, refs))
+    if len(marks) < 2:
+        return None
+
+    chunks: list[list] = []  # [description, refs]
+    cursor = 0
+    for start, end, refs in marks:
+        desc = _strip_template_chrome(text[cursor:start])
+        cursor = end
+        if desc:
+            chunks.append([desc, list(refs)])
+        elif chunks:
+            # Attribution with no preceding description → a further link for
+            # the previous entry (e.g. "Fix X (url1) (url2)").
+            chunks[-1][1].extend(refs)
+    if len(chunks) < 2:
+        return None
+    return [(desc, refs) for desc, refs in chunks]
 
 
 def _strip_redundant_upstream_parens(
@@ -429,6 +495,21 @@ def _classify_and_describe(
     return (section if section is not None else SECTION_IMPROVEMENTS), description
 
 
+def _stub_upstream_pr(slug: str, number: int, author: str | None) -> PRInfo:
+    """Minimal PRInfo for an upstream ref recovered from entry text.
+
+    Carries only what rendering needs (url, slug, author); body/title stay
+    empty because the description comes from the Altinity PR's own entry,
+    never re-read from the upstream PR.
+    """
+    return PRInfo(
+        number=number, title="", body="", state="merged",
+        merge_commit_sha=None, head_sha="",
+        url=f"https://github.com/{slug}/pull/{number}",
+        repo_slug=slug, author=author,
+    )
+
+
 def _entry_from_upstream(altinity_pr: PRInfo, u: PRInfo) -> ChangelogEntry | None:
     """One bullet sourced from an upstream backport PR's own changelog entry."""
     cd = _classify_and_describe(u, label=f"upstream #{u.number}")
@@ -461,17 +542,46 @@ def _entry_from_altinity(
         grp = _trailing_paren_group(description)
         if grp is not None:
             for slug, number, author in _attribution_from_text(grp[1], origin_slug):
-                upstream_prs.append(PRInfo(
-                    number=number, title="", body="", state="merged",
-                    merge_commit_sha=None, head_sha="",
-                    url=f"https://github.com/{slug}/pull/{number}",
-                    repo_slug=slug, author=author,
-                ))
+                upstream_prs.append(_stub_upstream_pr(slug, number, author))
 
     description = _strip_redundant_upstream_parens(description, upstream_prs)
     return ChangelogEntry(
         pr=pr, description=description, section=section, upstream_prs=upstream_prs,
     )
+
+
+def _entries_from_inline_split(
+    pr: PRInfo, origin_slug: str,
+) -> list[ChangelogEntry] | None:
+    """Bullets for a manually-bundled port PR (≥2 inlined attributed entries).
+
+    Recognises the shape handled by :func:`_split_inline_entries` — one
+    Changelog-entry section carrying several descriptions, each with its own
+    ``(<upstream-url> by @author)`` attribution and no ``Cherry-picked from``
+    line — and emits one bullet per attributed backport, each ``via`` this PR
+    and sharing the PR's single Changelog category. Returns ``None`` to defer
+    to the single-entry path when the section isn't of that shape; an empty
+    list when the shape matched but the category is ``Not for Changelog``.
+    """
+    chunks = _split_inline_entries(
+        _section_text(pr.body or "", "changelog entry") or "", origin_slug,
+    )
+    if not chunks:
+        return None
+    category = _classify_category(
+        _section_text(pr.body or "", "changelog category")
+    )
+    if category == SECTION_NOT_FOR_CHANGELOG:
+        console.print(f"  [dim]not for changelog: skipping #{pr.number}[/dim]")
+        return []
+    section = category if category is not None else SECTION_IMPROVEMENTS
+    return [
+        ChangelogEntry(
+            pr=pr, description=desc, section=section,
+            upstream_prs=[_stub_upstream_pr(s, n, a) for s, n, a in refs],
+        )
+        for desc, refs in chunks
+    ]
 
 
 def _entries_for_pr(
@@ -483,8 +593,10 @@ def _entries_for_pr(
     """Changelog bullets for one merged PR (0, 1, or N).
 
     A bundle of ≥2 upstream backports yields one bullet per upstream PR —
-    each from its own entry, attributed ``via`` this port PR. Otherwise a
-    single bullet from this PR's own entry. Drops forward-ports,
+    each from its own entry, attributed ``via`` this port PR. The same holds
+    for a manually-bundled port PR whose single Changelog-entry section
+    inlines several attributed descriptions (no ``Cherry-picked from`` line).
+    Otherwise a single bullet from this PR's own entry. Drops forward-ports,
     ``Not for Changelog`` PRs, and entries with no ``Changelog entry``.
     """
     if _is_forward_port(pr):
@@ -501,6 +613,13 @@ def _entries_for_pr(
         if entries:
             return entries
         # None had a usable entry → fall back to the bundle's own entry.
+
+    if len(upstream_prs) < 2:
+        # No ``Cherry-picked from`` bundle: the PR's own entry section may
+        # still inline several attributed backports (manual port PR).
+        split = _entries_from_inline_split(pr, origin_slug)
+        if split is not None:
+            return split
 
     e = _entry_from_altinity(pr, origin_slug, upstream_prs)
     return [e] if e is not None else []
