@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = "Apache-2.0"
 dependencies = [
+    "anthropic>=0.40",  # ai_backend: api
     "click>=8.1",
     "pyyaml>=6.0",
     "pygithub>=2.1",

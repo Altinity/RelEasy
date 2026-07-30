@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 import yaml
@@ -138,6 +138,7 @@ _VALID_GROUP_SORT = ("listed", "merged_at")
 # Config accepts all three; post-detection only the last two survive.
 _VALID_PORT_MODES = ("auto", "backport", "forward_port")
 _VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+_VALID_AI_BACKENDS = ("cli", "api")
 
 from typing import Literal  # noqa: E402
 PortMode = Literal["backport", "forward_port"]
@@ -490,6 +491,37 @@ class AIChangelogConfig:
     # into the synthesis prompt. Keeps the request payload bounded for
     # groups that drag in long source-PR descriptions.
     max_pr_body_chars: int = 3000
+
+
+@dataclass
+class AIApiConfig:
+    """Settings for ``ai_backend: api`` — talk to the Anthropic API directly.
+
+    In this mode RelEasy never spawns ``claude`` (or any other agent CLI):
+    it drives the Messages API with an API token and runs the tool calls
+    itself. The per-section ``command`` / ``extra_args`` settings are then
+    unused; ``allowed_tools`` and ``timeout_seconds`` still apply.
+    """
+    # Env var holding the token. Checked before ``api_key`` so the secret
+    # normally stays out of config.yaml.
+    api_key_env: str = "ANTHROPIC_API_KEY"
+    api_key: str | None = None
+    base_url: str | None = None  # gateway / proxy override
+    # Falls back to the global ``ai_model`` (alias-mapped) when unset.
+    model: str | None = None
+    max_tokens: int = 64000
+    # Hard cap on model round-trips per invocation — the API-mode analogue
+    # of "the CLI eventually gives up".
+    max_turns: int = 300
+    thinking: bool = True
+    # SDK-level retries for 429 / 5xx before the failure surfaces to the
+    # existing transient-retry + session-wait ladder.
+    max_retries: int = 5
+    request_timeout_seconds: int = 1800
+    bash_timeout_seconds: int = 3600
+    tool_output_max_chars: int = 30000
+    # Appended verbatim to the built-in system prompt.
+    system_prompt_extra: str = ""
 
 
 @dataclass
@@ -882,6 +914,12 @@ class Config:
     ai_model: str | None = None
     ai_effort: str | None = None
 
+    # How every AI invocation reaches the model:
+    #   "cli" (default) — spawn ``<section>.command`` (``claude -p …``)
+    #   "api"           — drive the Anthropic API with a token, in-process
+    ai_backend: str = "cli"
+    ai_api: AIApiConfig = field(default_factory=AIApiConfig)
+
     @property
     def repo_dir(self) -> Path:
         """Directory containing ``config.yaml``.
@@ -995,6 +1033,47 @@ def _parse_label_color(value: object, *, key: str, default: str) -> str:
     if not re.fullmatch(r"[0-9A-Fa-f]{6}", stripped):
         raise ValueError(f"{key} must be 6 hex digits (got {value!r})")
     return stripped.upper()
+
+
+def _parse_ai_api(raw: object) -> AIApiConfig:
+    """Parse the ``ai_api:`` block (used when ``ai_backend: api``)."""
+    if not isinstance(raw, dict):
+        raise ValueError("ai_api must be a mapping")
+    defaults = AIApiConfig()
+    unknown = set(raw) - {f.name for f in fields(AIApiConfig)}
+    if unknown:
+        raise ValueError(f"unknown ai_api keys: {sorted(unknown)}")
+    # Easy to mix up with ``api_key``: this one holds a variable NAME, and a
+    # token pasted here silently resolves to "no token found" at call time.
+    api_key_env = str(raw.get("api_key_env") or defaults.api_key_env)
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", api_key_env):
+        raise ValueError(
+            "ai_api.api_key_env must be the NAME of an environment variable "
+            f"(e.g. ANTHROPIC_API_KEY), got {api_key_env[:8]!r}… — to set a "
+            "literal token in config use ai_api.api_key instead"
+        )
+    return AIApiConfig(
+        api_key_env=api_key_env,
+        api_key=(str(raw["api_key"]) if raw.get("api_key") else None),
+        base_url=(str(raw["base_url"]) if raw.get("base_url") else None),
+        model=(str(raw["model"]) if raw.get("model") else None),
+        max_tokens=int(raw.get("max_tokens", defaults.max_tokens)),
+        max_turns=int(raw.get("max_turns", defaults.max_turns)),
+        thinking=bool(raw.get("thinking", defaults.thinking)),
+        max_retries=int(raw.get("max_retries", defaults.max_retries)),
+        request_timeout_seconds=int(
+            raw.get("request_timeout_seconds", defaults.request_timeout_seconds)
+        ),
+        bash_timeout_seconds=int(
+            raw.get("bash_timeout_seconds", defaults.bash_timeout_seconds)
+        ),
+        tool_output_max_chars=int(
+            raw.get("tool_output_max_chars", defaults.tool_output_max_chars)
+        ),
+        system_prompt_extra=str(
+            raw.get("system_prompt_extra") or defaults.system_prompt_extra
+        ),
+    )
 
 
 def load_config(config_path: Path | None = None) -> Config:
@@ -1443,6 +1522,14 @@ def load_config(config_path: Path | None = None) -> Config:
             f"ai_effort must be one of {_VALID_EFFORTS}, got {ai_effort!r}"
         )
 
+    ai_backend = str(raw.get("ai_backend") or "cli").strip().lower()
+    if ai_backend not in _VALID_AI_BACKENDS:
+        raise ValueError(
+            f"ai_backend must be one of {_VALID_AI_BACKENDS}, "
+            f"got {ai_backend!r}"
+        )
+    ai_api = _parse_ai_api(raw.get("ai_api") or {})
+
     from releasy.termlog import configure as _configure_term_log
 
     cfg = Config(
@@ -1475,6 +1562,8 @@ def load_config(config_path: Path | None = None) -> Config:
         session_file=session_file,
         ai_model=ai_model,
         ai_effort=ai_effort,
+        ai_backend=ai_backend,
+        ai_api=ai_api,
     )
     _configure_term_log(log_file)
     return cfg
@@ -1565,6 +1654,17 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         )
     if notif_data:
         data["notifications"] = notif_data
+
+    if config.ai_backend != "cli":
+        data["ai_backend"] = config.ai_backend
+    api_defaults = AIApiConfig()
+    api_data = {
+        f.name: getattr(config.ai_api, f.name)
+        for f in fields(AIApiConfig)
+        if getattr(config.ai_api, f.name) != getattr(api_defaults, f.name)
+    }
+    if api_data:
+        data["ai_api"] = api_data
 
     ai = config.ai_resolve
     ai_defaults = AIResolveConfig()
@@ -2468,6 +2568,8 @@ def make_stateless_config(
     ai_prompt_file: str | None = None,
     ai_timeout_seconds: int = 7200,
     ai_max_iterations: int = 5,
+    ai_backend: str = "cli",
+    ai_api: AIApiConfig | None = None,
 ) -> Config:
     """Build an in-memory ``Config`` for the stateless cherry-pick command.
 
@@ -2509,6 +2611,8 @@ def make_stateless_config(
         sequential=False,
         session=None,
         stateless=True,
+        ai_backend=ai_backend,
+        ai_api=ai_api or AIApiConfig(),
     )
 
 
@@ -2516,6 +2620,7 @@ def overlay_analyze_fails_overrides(
     config: Config,
     *,
     claude_command: str | None = None,
+    ai_backend: str | None = None,
     build_command: str | None = None,
     prompt_file: str | None = None,
     timeout_seconds: int | None = None,
@@ -2537,6 +2642,8 @@ def overlay_analyze_fails_overrides(
     af = config.analyze_fails
     if claude_command is not None:
         af.command = claude_command
+    if ai_backend is not None:
+        config.ai_backend = ai_backend
     if prompt_file is not None:
         af.prompt_file = prompt_file
     if timeout_seconds is not None:
@@ -2564,6 +2671,7 @@ def build_stateless_analyze_fails_config(
     origin_url: str,
     work_dir: Path | None = None,
     claude_command: str = "claude",
+    ai_backend: str = "cli",
     build_command: str = "",
     prompt_file: str | None = None,
     timeout_seconds: int = 7200,
@@ -2596,6 +2704,7 @@ def build_stateless_analyze_fails_config(
         ai_enabled=False,
         ai_command=claude_command,
         ai_build_command=build_command,
+        ai_backend=ai_backend,
     )
     base.analyze_fails = AnalyzeFailsConfig(
         command=claude_command,

@@ -1297,9 +1297,11 @@ def run_pipeline(
 
     ai_active = resolve_conflicts and config.ai_resolve.enabled
     if ai_active:
+        from releasy.ai_resolve import _backend_label
+
         console.print(
             f"[dim]AI conflict resolver: enabled "
-            f"(command='{config.ai_resolve.command}', "
+            f"(backend='{_backend_label(config, config.ai_resolve.command)}', "
             f"label='{config.ai_resolve.label}', "
             f"max_iterations={config.ai_resolve.max_iterations})[/dim]"
         )
@@ -1615,9 +1617,11 @@ def run_sequential(
 
     ai_active = resolve_conflicts and config.ai_resolve.enabled
     if ai_active:
+        from releasy.ai_resolve import _backend_label
+
         console.print(
             f"[dim]AI conflict resolver: enabled "
-            f"(command='{config.ai_resolve.command}', "
+            f"(backend='{_backend_label(config, config.ai_resolve.command)}', "
             f"label='{config.ai_resolve.label}', "
             f"max_iterations={config.ai_resolve.max_iterations})[/dim]"
         )

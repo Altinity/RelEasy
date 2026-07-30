@@ -110,8 +110,10 @@ Options live in `config.yaml` unless marked **(session)**.
 | `sequential` | One PR per invocation, gated on the previous rebase PR merging. See [Sequential mode](commands.md#sequential-mode). Incompatible with `pr_sources.groups`. | `false` |
 | `update_existing_prs` | Reuse existing PR and overwrite its title/body. | `false` |
 | `upstream.remote` | Optional fetch-only upstream remote (URL). Used **only** for `git log -S` prereq detection during AI resolve — never pushed to, never read for code. Sub-keys `upstream.remote_name` (`upstream`), `upstream.branch` (`master`). | unset |
-| `ai_model` | `claude --model` for **every** AI call (resolve, changelog, review, analyze-fails, graph). Alias or full id (`opus`, `sonnet`, `claude-opus-4-8`). | claude CLI default |
-| `ai_effort` | `claude --effort` for every AI call. One of `low`/`medium`/`high`/`xhigh`/`max`. | claude CLI default |
+| `ai_model` | Model for **every** AI call (resolve, changelog, review, analyze-fails, graph). Alias or full id (`opus`, `sonnet`, `claude-opus-4-8`). | claude CLI default |
+| `ai_effort` | Reasoning effort for every AI call. One of `low`/`medium`/`high`/`xhigh`/`max`. | claude CLI default |
+| `ai_backend` | How every AI call reaches the model: `cli` spawns the agent binary (`<section>.command`), `api` talks to the Anthropic API with a token. See [AI backends](#ai-backends). | `cli` |
+| `ai_api.*` | Settings for `ai_backend: api`. See [AI backends](#ai-backends). | — |
 | `ai_resolve.enabled` | Master switch for the AI conflict resolver. When off, conflicts always stop the pipeline. | `false` |
 | `ai_resolve.build_command` | Shell command for the build. RelEasy runs it (deterministic flow), or Claude runs it (legacy). | `cd build && ninja` |
 | `ai_resolve.deterministic_build` | Claude resolves only; RelEasy builds + runs the PR's tests, looping fresh-context build fixes. `false` = legacy single-session resolve+build. | `true` |
@@ -197,6 +199,64 @@ Options live in `config.yaml` unless marked **(session)**.
 | `features[].depends_on` **(session)** | Feature ids that must port first. | `[]` |
 | `features[].ai_context` **(session)** | Hint on porting conflicts. | `""` |
 
+## AI backends
+
+Every AI call — conflict resolve, build fixes, run-tests, verify, review
+response, analyze-fails, changelog synthesis, graph discovery — goes through
+one of two backends, selected by `ai_backend`.
+
+**`cli` (default)** spawns the agent binary named by the section's `command`
+(`ai_resolve.command`, `analyze_fails.command`, …) as `claude -p
+--output-format stream-json`. It uses whatever credentials that CLI is
+logged in with (subscription or `ANTHROPIC_API_KEY`), and `extra_args` is
+passed through to it.
+
+**`api`** drops the subprocess: RelEasy talks to the Anthropic Messages API
+with a token and runs the tool calls itself. The `anthropic` SDK ships as a
+regular dependency, so all it needs is a token:
+
+```sh
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+```yaml
+ai_backend: api
+
+ai_api:
+  model: claude-opus-5      # falls back to ai_model, then claude-opus-5
+  max_turns: 300            # cap on model round-trips per invocation
+```
+
+What carries over unchanged in API mode: `allowed_tools` (same
+Claude-Code syntax — `Read`, `Bash(git:*)`; enforced locally, and unlike the
+CLI compound commands are allowed as long as every segment's head is in the
+list), `timeout_seconds`, `api_retries` / `api_retry_backoff_seconds`, the
+session-exhaustion wait, per-run cost reporting, and every prompt template.
+What is ignored: `command` and `extra_args` (no process is spawned).
+
+Tools available to the model: `Bash`, `Read`, `Write`, `Edit`, `Glob`,
+`Grep`, plus Anthropic's server-side `WebSearch` / `WebFetch` when the
+section's `allowed_tools` grants them (`analyze_fails` does by default).
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `ai_api.api_key_env` | Env var holding the token. Checked before `api_key`. | `ANTHROPIC_API_KEY` |
+| `ai_api.api_key` | Inline token. Only used when the env var is unset — prefer the env var. | unset |
+| `ai_api.base_url` | Gateway / proxy base URL. | Anthropic API |
+| `ai_api.model` | Model id. Overrides `ai_model`. | `claude-opus-5` |
+| `ai_api.max_tokens` | Output cap per model response. | `64000` |
+| `ai_api.max_turns` | Hard cap on model round-trips per invocation. | `300` |
+| `ai_api.thinking` | Adaptive extended thinking. | `true` |
+| `ai_api.max_retries` | SDK-level retries for 429/5xx before the failure reaches RelEasy's own retry ladder. | `5` |
+| `ai_api.request_timeout_seconds` | Per-request HTTP timeout. | `1800` |
+| `ai_api.bash_timeout_seconds` | Default cap for one `Bash` tool call (also bounded by `timeout_seconds`). | `3600` |
+| `ai_api.tool_output_max_chars` | Tool results are middle-truncated past this. | `30000` |
+| `ai_api.system_prompt_extra` | Appended to the built-in system prompt. | `""` |
+
+`--ai-backend cli|api` overrides `ai_backend` on `refresh`, `analyze-fails`,
+`cherry-pick`, and `project-backport` (the last two have no config file, so
+API mode there uses these defaults plus `$ANTHROPIC_API_KEY`).
+
 ## Environment variables
 
 | Variable | Purpose |
@@ -204,6 +264,7 @@ Options live in `config.yaml` unless marked **(session)**.
 | `RELEASY_GITHUB_TOKEN` | GitHub PAT — PR discovery, PR creation, Project sync. |
 | `RELEASY_SSH_KEY_PATH` | SSH key for git. Optional; defaults to agent. |
 | `RELEASY_STATE_DIR` | Override state + lock dir. Default: `${XDG_STATE_HOME:-~/.local/state}/releasy`. |
+| `ANTHROPIC_API_KEY` | Anthropic token for `ai_backend: api` (rename via `ai_api.api_key_env`). |
 
 ## Per-PR / per-group `ai_context`
 

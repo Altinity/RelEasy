@@ -103,6 +103,11 @@ and runs the PR's tests, retrying build fixes in fresh context. A
 resolution that won't build yet is parked on a local branch as
 `build_failed` and retried on the next `releasy run`.)
 
+By default the AI work runs through the `claude` CLI. To use an API token
+instead — no CLI install, no subscription — set `ai_backend: api` and
+`export ANTHROPIC_API_KEY=...`; see
+[AI backends](docs/configuration.md#ai-backends).
+
 **Keep open PRs healthy** as the target branch moves and CI runs:
 
 ```bash

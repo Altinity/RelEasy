@@ -28,7 +28,6 @@ the end if Claude appended commits.
 from __future__ import annotations
 
 import re
-import shutil
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,11 +37,13 @@ if TYPE_CHECKING:
     from releasy.pipeline import OnlyFilter
 
 from releasy.ai_resolve import (
+    _build_api_spec,
     _build_claude_argv,
     _exhaustion_kwargs,
     _extract_assistant_text,
     _extract_cost_usd,
     _find_transient_api_error,
+    _resolve_backend,
     _spawn_claude,
     _write_build_script,
 )
@@ -616,11 +617,14 @@ def _invoke_claude(
         ai_resolve = _ResolveShim
         ai_model = config.ai_model
         ai_effort = config.ai_effort
+        ai_backend = config.ai_backend
+        ai_api = config.ai_api
 
     argv = _build_claude_argv(_ConfigShim)  # type: ignore[arg-type]
+    api = _build_api_spec(_ConfigShim)  # type: ignore[arg-type]
     exit_code, output, timed_out = _spawn_claude(
         argv, repo_path, config.analyze_fails.timeout_seconds,
-        prompt=prompt, **_exhaustion_kwargs(config),
+        prompt=prompt, api=api, **_exhaustion_kwargs(config),
     )
     cost = _extract_cost_usd(output)
     return exit_code, output, timed_out, cost
@@ -845,10 +849,14 @@ def _process_pr(
         result.error = f"Could not write build wrapper: {exc}"
         return result
 
-    if shutil.which(config.analyze_fails.command) is None:
+    _api, backend_error = _resolve_backend(
+        config, config.analyze_fails.command,
+        list(config.analyze_fails.allowed_tools),
+    )
+    if backend_error:
         result.error = (
-            f"'{config.analyze_fails.command}' not found on PATH — "
-            "install Claude Code or adjust analyze_fails.command."
+            f"{backend_error} — install Claude Code, adjust "
+            "analyze_fails.command, or fix the ai_api settings."
         )
         return result
 

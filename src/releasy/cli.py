@@ -433,6 +433,15 @@ def run(
     help="Executable used to invoke Claude.",
 )
 @click.option(
+    "--ai-backend",
+    "ai_backend",
+    type=click.Choice(["cli", "api"]),
+    default="cli",
+    show_default=True,
+    help="How to reach the model: 'cli' spawns --claude-command, 'api' "
+         "talks to the Anthropic API directly using $ANTHROPIC_API_KEY.",
+)
+@click.option(
     "--prompt-file",
     "prompt_file",
     default=None,
@@ -475,6 +484,7 @@ def cherry_pick_cmd(
     mode: str,
     build_command: str,
     claude_command: str,
+    ai_backend: str,
     prompt_file: str | None,
     timeout_seconds: int,
     max_iterations: int,
@@ -522,6 +532,7 @@ def cherry_pick_cmd(
         mode=mode,
         build_command=build_command,
         claude_command=claude_command,
+        ai_backend=ai_backend,
         prompt_file=prompt_file,
         timeout_seconds=timeout_seconds,
         max_iterations=max_iterations,
@@ -589,6 +600,15 @@ def cherry_pick_cmd(
          "compiles. Required when --resolve-conflicts is set.",
 )
 @click.option("--claude-command", "claude_command", default="claude", show_default=True)
+@click.option(
+    "--ai-backend",
+    "ai_backend",
+    type=click.Choice(["cli", "api"]),
+    default="cli",
+    show_default=True,
+    help="How to reach the model: 'cli' spawns --claude-command, 'api' "
+         "talks to the Anthropic API directly using $ANTHROPIC_API_KEY.",
+)
 @click.option("--prompt-file", "prompt_file", default=None)
 @click.option("--timeout", "timeout_seconds", type=int, default=7200, show_default=True)
 @click.option("--max-iterations", "max_iterations", type=int, default=5, show_default=True)
@@ -616,6 +636,7 @@ def project_backport_cmd(
     resolve_conflicts: bool,
     build_command: str,
     claude_command: str,
+    ai_backend: str,
     prompt_file: str | None,
     timeout_seconds: int,
     max_iterations: int,
@@ -658,6 +679,7 @@ def project_backport_cmd(
         resolve_conflicts=resolve_conflicts,
         build_command=build_command,
         claude_command=claude_command,
+        ai_backend=ai_backend,
         prompt_file=prompt_file,
         timeout_seconds=timeout_seconds,
         max_iterations=max_iterations,
@@ -1226,6 +1248,15 @@ def graph_update_cmd(
          "Overrides ai_resolve.command in config.",
 )
 @click.option(
+    "--ai-backend",
+    "ai_backend_cli",
+    type=click.Choice(["cli", "api"]),
+    default=None,
+    help="How to reach the model: 'cli' spawns the agent binary, 'api' "
+         "talks to the Anthropic API directly using $ANTHROPIC_API_KEY. "
+         "Overrides ai_backend in config.",
+)
+@click.option(
     "--prompt-file",
     "prompt_file_cli",
     default=None,
@@ -1333,6 +1364,7 @@ def refresh(
     origin_url: str | None,
     build_command_cli: str | None,
     claude_command: str | None,
+    ai_backend_cli: str | None,
     prompt_file_cli: str | None,
     timeout_seconds: int | None,
     max_iterations_cli: int | None,
@@ -1475,6 +1507,7 @@ def refresh(
                 auto_pr=False,
                 ai_enabled=ai_resolve_flag,
                 ai_command=claude_command or "claude",
+                ai_backend=ai_backend_cli or "cli",
                 ai_build_command=build_command_cli or "",
                 ai_prompt_file=None,
                 ai_timeout_seconds=(
@@ -1500,6 +1533,8 @@ def refresh(
                 config.origin.remote = origin_url
             if claude_command is not None:
                 config.ai_resolve.command = claude_command
+            if ai_backend_cli is not None:
+                config.ai_backend = ai_backend_cli
             if build_command_cli is not None:
                 config.ai_resolve.build_command = build_command_cli
             if prompt_file_cli is not None:
@@ -1639,6 +1674,15 @@ def refresh(
          "Overrides analyze_fails.command in config.",
 )
 @click.option(
+    "--ai-backend",
+    "ai_backend_cli",
+    type=click.Choice(["cli", "api"]),
+    default=None,
+    help="How to reach the model: 'cli' spawns the agent binary, 'api' "
+         "talks to the Anthropic API directly using $ANTHROPIC_API_KEY. "
+         "Overrides ai_backend in config.",
+)
+@click.option(
     "--prompt-file",
     "prompt_file_cli",
     default=None,
@@ -1691,6 +1735,7 @@ def analyze_fails_cmd(
     origin_url: str | None,
     build_command_cli: str | None,
     claude_command: str | None,
+    ai_backend_cli: str | None,
     prompt_file_cli: str | None,
     timeout_seconds: int | None,
     max_iterations_cli: int | None,
@@ -1805,6 +1850,7 @@ def analyze_fails_cmd(
                 origin_url=effective_origin,
                 work_dir=wd,
                 claude_command=claude_command or "claude",
+                ai_backend=ai_backend_cli or "cli",
                 build_command=build_command_cli or "",
                 prompt_file=prompt_file_cli,
                 timeout_seconds=(
@@ -1824,6 +1870,7 @@ def analyze_fails_cmd(
             overlay_analyze_fails_overrides(
                 config,
                 claude_command=claude_command,
+                ai_backend=ai_backend_cli,
                 build_command=build_command_cli,
                 prompt_file=prompt_file_cli,
                 timeout_seconds=timeout_seconds,

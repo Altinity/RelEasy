@@ -83,6 +83,9 @@ class StatelessOptions:
     mode: PortMode = "backport"
     build_command: str = ""
     claude_command: str = "claude"
+    # "cli" spawns ``claude_command``; "api" drives the Anthropic API with
+    # $ANTHROPIC_API_KEY instead (no config.yaml needed).
+    ai_backend: str = "cli"
     prompt_file: str | None = None
     timeout_seconds: int = 7200
     max_iterations: int = 5
@@ -540,6 +543,7 @@ def run_stateless_cherry_pick(opts: StatelessOptions) -> StatelessResult:
         ai_prompt_file=opts.prompt_file,
         ai_timeout_seconds=opts.timeout_seconds,
         ai_max_iterations=opts.max_iterations,
+        ai_backend=opts.ai_backend,
     )
 
     wd = config.resolve_work_dir(opts.work_dir)

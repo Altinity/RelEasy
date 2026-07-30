@@ -49,7 +49,11 @@ if TYPE_CHECKING:
 
 from releasy.termlog import console
 
-from releasy.ai_resolve import AIResolveContext, attempt_ai_resolve
+from releasy.ai_resolve import (
+    AIResolveContext,
+    _backend_label,
+    attempt_ai_resolve,
+)
 from releasy.config import (
     Config, PortMode, get_github_token, lookup_pr_ai_context,
 )
@@ -267,7 +271,7 @@ def refresh_tracked_prs(
         if ai_active:
             console.print(
                 f"[dim]AI conflict resolver: enabled "
-                f"(command='{config.ai_resolve.command}', "
+                f"(backend='{_backend_label(config, config.ai_resolve.command)}', "
                 f"prompt='{config.ai_resolve.merge_prompt_file}', "
                 f"max_iterations={config.ai_resolve.max_iterations})[/dim]"
             )
@@ -1229,7 +1233,7 @@ def resolve_conflicts_for_pr(
         if ai_active:
             console.print(
                 f"[dim]AI conflict resolver: enabled "
-                f"(command='{config.ai_resolve.command}', "
+                f"(backend='{_backend_label(config, config.ai_resolve.command)}', "
                 f"prompt='{config.ai_resolve.merge_prompt_file}', "
                 f"max_iterations={config.ai_resolve.max_iterations})[/dim]"
             )

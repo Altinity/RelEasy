@@ -38,18 +38,20 @@ are dropped at fetch time, before the prompt is rendered.
 from __future__ import annotations
 
 import re
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
 from releasy.termlog import console
 
 from releasy.ai_resolve import (
+    _backend_label,
+    _build_api_spec,
     _build_claude_argv,
     _exhaustion_kwargs,
     _extract_assistant_text,
     _extract_cost_usd,
     _find_transient_api_error,
+    _resolve_backend,
     _spawn_claude,
     _write_build_script,
 )
@@ -816,12 +818,16 @@ def address_review(
             "(PR branch moved since fetch).[/yellow]"
         )
 
-    if shutil.which(config.review_response.command) is None:
+    _api, backend_error = _resolve_backend(
+        config, config.review_response.command,
+        list(config.review_response.allowed_tools),
+    )
+    if backend_error:
         return AddressReviewResult(
             success=False,
             error=(
-                f"'{config.review_response.command}' not found on PATH — "
-                "install Claude Code or adjust review_response.command."
+                f"{backend_error} — install Claude Code, adjust "
+                "review_response.command, or fix the ai_api settings."
             ),
         )
 
@@ -872,12 +878,15 @@ def address_review(
         ai_resolve = _ResolveShim
         ai_model = config.ai_model
         ai_effort = config.ai_effort
+        ai_backend = config.ai_backend
+        ai_api = config.ai_api
 
     argv = _build_claude_argv(_ConfigShim)  # type: ignore[arg-type]
+    api = _build_api_spec(_ConfigShim)  # type: ignore[arg-type]
 
     console.print(
         f"\n[magenta]\U0001f916 invoking "
-        f"{config.review_response.command} "
+        f"{_backend_label(config, config.review_response.command)} "
         f"(timeout {config.review_response.timeout_seconds}s, "
         f"max {config.review_response.max_iterations} iterations)"
         "[/magenta]"
@@ -885,7 +894,7 @@ def address_review(
 
     exit_code, output, timed_out = _spawn_claude(
         argv, repo_path, config.review_response.timeout_seconds,
-        prompt=prompt, **_exhaustion_kwargs(config),
+        prompt=prompt, api=api, **_exhaustion_kwargs(config),
     )
     cost_usd = _extract_cost_usd(output)
 

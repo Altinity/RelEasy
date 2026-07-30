@@ -281,13 +281,37 @@ notifications:
   github_project: https://github.com/orgs/Altinity/projects/1
 
 # ── Global AI model / effort (optional) ─────────────────────────────
-# Applied to EVERY claude invocation (conflict resolve, changelog,
+# Applied to EVERY AI invocation (conflict resolve, changelog,
 # review response, analyze-fails, graph). Leave unset to use the claude
 # CLI defaults.
 #   ai_model:  model alias or full id (e.g. opus, sonnet, claude-opus-4-8)
 #   ai_effort: low | medium | high | xhigh | max
 # ai_model: opus
 # ai_effort: high
+
+# ── AI backend (optional) ───────────────────────────────────────────
+# How every AI invocation reaches the model:
+#   cli (default) — spawn the agent binary (`<section>.command`, i.e.
+#                   `claude -p …`) and use whatever it is logged in with.
+#   api           — talk to the Anthropic API directly with a token; no
+#                   subprocess, RelEasy runs the tool calls itself.
+#                   Needs: export ANTHROPIC_API_KEY=sk-ant-...
+# allowed_tools / timeout_seconds / api_retries / the session-exhaustion
+# wait all still apply in api mode; `command` and `extra_args` don't.
+# ai_backend: api
+# ai_api:
+#   api_key_env: ANTHROPIC_API_KEY   # env var holding the token
+#   # api_key: sk-ant-...            # inline (env var wins; prefer the env)
+#   # base_url: https://my-gateway    # gateway / proxy
+#   model: claude-opus-5             # overrides ai_model
+#   max_tokens: 64000                # output cap per response
+#   max_turns: 300                   # cap on model round-trips per run
+#   thinking: true                   # adaptive extended thinking
+#   max_retries: 5                   # SDK retries for 429 / 5xx
+#   request_timeout_seconds: 1800
+#   bash_timeout_seconds: 3600       # per Bash tool call
+#   tool_output_max_chars: 30000     # tool results truncated past this
+#   # system_prompt_extra: "Project-specific guidance for the agent."
 
 # ── AI conflict resolver (Claude) ───────────────────────────────────
 # Optional. When enabled, releasy invokes `claude` to resolve cherry-

@@ -79,6 +79,8 @@ class ProjectBackportOptions:
     resolve_conflicts: bool = False
     build_command: str = ""
     claude_command: str = "claude"
+    # "cli" spawns ``claude_command``; "api" drives the Anthropic API.
+    ai_backend: str = "cli"
     prompt_file: str | None = None
     timeout_seconds: int = 7200
     max_iterations: int = 5
@@ -262,6 +264,7 @@ def _build_config(opts: ProjectBackportOptions) -> Config:
         ai_prompt_file=opts.prompt_file,
         ai_timeout_seconds=opts.timeout_seconds,
         ai_max_iterations=opts.max_iterations,
+        ai_backend=opts.ai_backend,
     )
     # Upstream is fetch-only; declaring it lets the AI resolver detect
     # missing prerequisites against ClickHouse/ClickHouse history.

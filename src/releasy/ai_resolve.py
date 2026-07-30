@@ -18,18 +18,21 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from rich.markup import escape
 
 from releasy.termlog import console
 
-from releasy.config import Config, PortMode
+from releasy.config import AIApiConfig, Config, PortMode
 from releasy.git_ops import (
     is_operation_in_progress,
     run_git,
 )
 from releasy.github_ops import PRInfo
+
+if TYPE_CHECKING:
+    from releasy.api_agent import ApiAgentSpec
 
 
 # What kind of conflicted git operation Claude is being asked to drive to
@@ -398,6 +401,78 @@ def _argv_with_inline_prompt(base_argv: list[str], prompt: str) -> list[str]:
     return base_argv[:2] + [prompt] + base_argv[2:]
 
 
+# ---------------------------------------------------------------------------
+# Backend selection (CLI subprocess vs Anthropic API token)
+# ---------------------------------------------------------------------------
+
+
+def _api_backend_selected(config: Config) -> bool:
+    return str(getattr(config, "ai_backend", "cli") or "cli").lower() == "api"
+
+
+def _build_api_spec(
+    config: Config, allowed_tools: list[str] | None = None,
+) -> "ApiAgentSpec | None":
+    """API-backend spec for this invocation, or ``None`` in CLI mode.
+
+    Counterpart of :func:`_build_claude_argv`: it reads the same
+    ``config.ai_resolve.allowed_tools`` view, so the per-command shims in
+    ``analyze_fails`` / ``review_response`` keep selecting their own tool
+    set, plus the global ``ai_api`` block.
+    """
+    if not _api_backend_selected(config):
+        return None
+
+    from releasy.api_agent import DEFAULT_MODEL, ApiAgentSpec
+
+    api = getattr(config, "ai_api", None) or AIApiConfig()
+    tools = (
+        list(allowed_tools) if allowed_tools is not None
+        else list(config.ai_resolve.allowed_tools)
+    )
+    return ApiAgentSpec(
+        model=api.model or config.ai_model or DEFAULT_MODEL,
+        effort=config.ai_effort,
+        max_tokens=api.max_tokens,
+        max_turns=api.max_turns,
+        thinking=api.thinking,
+        allowed_tools=tools,
+        api_key=(os.environ.get(api.api_key_env) or api.api_key or None),
+        base_url=api.base_url,
+        max_retries=api.max_retries,
+        request_timeout_seconds=api.request_timeout_seconds,
+        bash_timeout_seconds=api.bash_timeout_seconds,
+        tool_output_max_chars=api.tool_output_max_chars,
+        system_prompt_extra=api.system_prompt_extra,
+    )
+
+
+def _resolve_backend(
+    config: Config, command: str, allowed_tools: list[str] | None = None,
+) -> tuple["ApiAgentSpec | None", str | None]:
+    """Pick the backend and check it can run.
+
+    Returns ``(api_spec, error)``: ``api_spec`` is ``None`` in CLI mode,
+    ``error`` is a user-facing reason the backend is unusable (missing
+    binary / missing token / missing SDK) or ``None`` when it's good to go.
+    """
+    spec = _build_api_spec(config, allowed_tools)
+    if spec is not None:
+        from releasy.api_agent import check_available
+        return spec, check_available(spec)
+    if shutil.which(command) is None:
+        return None, f"'{command}' not found on PATH"
+    return None, None
+
+
+def _backend_label(config: Config, command: str) -> str:
+    """How to name the backend in progress output."""
+    spec = _build_api_spec(config, allowed_tools=[])
+    if spec is None:
+        return command
+    return f"anthropic api ({spec.resolved_model()})"
+
+
 def _fmt_elapsed(seconds: float) -> str:
     s = int(seconds)
     if s < 60:
@@ -579,16 +654,20 @@ def _spawn_claude(
     argv: list[str], repo_path: Path, timeout: int,
     *,
     prompt: str,
+    api: "ApiAgentSpec | None" = None,
     exhaustion_wait: bool = True,
     exhaustion_max_wait_seconds: int = _DEFAULT_EXHAUSTION_MAX_WAIT_SECONDS,
     exhaustion_poll_seconds: int = _DEFAULT_EXHAUSTION_POLL_SECONDS,
     exhaustion_extra_patterns: tuple[str, ...] = (),
 ) -> tuple[int, str, bool]:
-    """Run claude, waiting out an exhausted usage session.
+    """Run the agent, waiting out an exhausted usage session.
 
-    Wraps :func:`_spawn_claude_once`: on a session-exhaustion failure (not a
-    transient API error — those retry one level up), sleep and re-prompt
-    until Claude works or the wait cap is hit, then return the last result.
+    Wraps :func:`_spawn_claude_once` (or :func:`_run_api_agent_once` when
+    ``api`` is set — the API backend produces the same stream-json
+    transcript, so the wait / retry ladder is backend-agnostic): on a
+    session-exhaustion failure (not a transient API error — those retry one
+    level up), sleep and re-prompt until it works or the wait cap is hit,
+    then return the last result.
     """
     # A non-positive poll interval would busy-loop; treat it as "disabled".
     wait_enabled = (
@@ -598,9 +677,14 @@ def _spawn_claude(
     )
     waited = 0.0
     while True:
-        exit_code, output, timed_out = _spawn_claude_once(
-            argv, repo_path, timeout, prompt,
-        )
+        if api is not None:
+            exit_code, output, timed_out = _run_api_agent_once(
+                api, repo_path, timeout, prompt,
+            )
+        else:
+            exit_code, output, timed_out = _spawn_claude_once(
+                argv, repo_path, timeout, prompt,
+            )
         if not wait_enabled or timed_out or exit_code == 0:
             return exit_code, output, timed_out
         reason = _find_session_exhausted(output, exhaustion_extra_patterns)
@@ -623,6 +707,39 @@ def _spawn_claude(
         )
         _interruptible_sleep(exhaustion_poll_seconds)
         waited += exhaustion_poll_seconds
+
+
+def _run_api_agent_once(
+    api: "ApiAgentSpec", repo_path: Path, timeout: int, prompt: str,
+) -> tuple[int, str, bool]:
+    """API-backend twin of :func:`_spawn_claude_once`.
+
+    Runs the agent loop in-process against the Messages API and renders its
+    stream-json events through :func:`_render_event`, so the console output
+    and the returned transcript are indistinguishable from the CLI path.
+    """
+    from releasy.api_agent import run_agent
+
+    start = time.monotonic()
+    console.print(
+        f"    [dim]$ anthropic api {escape(api.resolved_model())}"
+        f"{' effort=' + api.effort if api.effort else ''} "
+        f"<prompt via messages>[/dim]"
+    )
+    console.print("    [dim](press Ctrl-C to abort)[/dim]")
+
+    def _render(line: str) -> None:
+        rendered = _render_event(line, start)
+        if not rendered:
+            return
+        try:
+            console.print(f"    {rendered}")
+        except Exception:
+            # Same belt-and-suspenders as the CLI path: a Rich markup
+            # error must never abort a healthy run.
+            console.print(f"    {rendered}", markup=False, highlight=False)
+
+    return run_agent(api, repo_path, timeout, prompt, _render)
 
 
 def _spawn_claude_once(
@@ -1232,6 +1349,7 @@ def _invoke_claude_with_retries(
         timeout if timeout is not None else config.ai_resolve.timeout_seconds
     )
     argv = _build_claude_argv(config, allowed_tools)
+    api = _build_api_spec(config, allowed_tools)
     max_attempts = max(1, config.ai_resolve.api_retries + 1)
     backoff = max(0, config.ai_resolve.api_retry_backoff_seconds)
 
@@ -1253,7 +1371,7 @@ def _invoke_claude_with_retries(
                 raise
 
         exit_code, output, timed_out = _spawn_claude(
-            argv, repo_path, spawn_timeout, prompt=prompt,
+            argv, repo_path, spawn_timeout, prompt=prompt, api=api,
             **_exhaustion_kwargs(config),
         )
         last_exit_code, last_output, last_timed_out = exit_code, output, timed_out
@@ -1282,11 +1400,9 @@ def resolve_with_claude(
     config: Config, repo_path: Path, ctx: AIResolveContext,
 ) -> AIResolveResult:
     """Render the prompt, run claude, and verify post-conditions."""
-    if shutil.which(config.ai_resolve.command) is None:
-        return AIResolveResult(
-            success=False,
-            error=f"'{config.ai_resolve.command}' not found on PATH",
-        )
+    _api, backend_error = _resolve_backend(config, config.ai_resolve.command)
+    if backend_error:
+        return AIResolveResult(success=False, error=backend_error)
 
     # In resolve-only mode build_verify owns the build wrapper.
     if not ctx.skip_build:
@@ -1307,7 +1423,8 @@ def resolve_with_claude(
         else f"max {config.ai_resolve.max_iterations} build attempts"
     )
     console.print(
-        f"    [magenta]\U0001f916 invoking {config.ai_resolve.command} "
+        f"    [magenta]\U0001f916 invoking "
+        f"{_backend_label(config, config.ai_resolve.command)} "
         f"(timeout {config.ai_resolve.timeout_seconds}s, {build_note}, "
         f"up to {config.ai_resolve.api_retries} API-error retries)[/magenta]"
     )
@@ -1398,7 +1515,8 @@ def resolve_with_claude(
         pass_no += 1
         console.print(
             f"    [yellow]↻ postcondition '{err_kind}' failed — asking "
-            f"{config.ai_resolve.command} to correct it in place "
+            f"{_backend_label(config, config.ai_resolve.command)} "
+            "to correct it in place "
             f"(pass {pass_no}/{fix_passes})[/yellow]"
         )
 
@@ -1510,26 +1628,25 @@ def synthesize_text(
     interesting to write into even if the model misinterprets the
     no-tools constraint.
     """
-    if shutil.which(command) is None:
-        return AITextResult(
-            success=False,
-            error=f"'{command}' not found on PATH",
-        )
+    # Empty allow-list keeps this call in pure text-generation mode on both
+    # backends (``--allowedTools ""`` for the CLI, no tool definitions for
+    # the API).
+    api, backend_error = _resolve_backend(config, command, allowed_tools=[])
+    if backend_error:
+        return AITextResult(success=False, error=backend_error)
 
     argv = [
         command,
         "-p",
         "--output-format", "stream-json",
         "--verbose",
-        # Explicit empty allowed-tools list keeps Claude in pure
-        # text-generation mode for this call.
         "--allowedTools", "",
     ]
     argv += _model_effort_args(config)
 
     console.print(
         f"    [magenta]\U0001f916 synthesizing text via "
-        f"{command} for [cyan]{label}[/cyan] "
+        f"{_backend_label(config, command)} for [cyan]{label}[/cyan] "
         f"(timeout {timeout_seconds}s)[/magenta]"
     )
 
@@ -1538,7 +1655,7 @@ def synthesize_text(
     with tempfile.TemporaryDirectory(prefix="releasy-ai-text-") as td:
         try:
             exit_code, output, timed_out = _spawn_claude(
-                argv, Path(td), timeout_seconds, prompt=prompt,
+                argv, Path(td), timeout_seconds, prompt=prompt, api=api,
                 **_exhaustion_kwargs(config),
             )
         except KeyboardInterrupt:
@@ -1841,11 +1958,11 @@ def verify_ai_resolution(
     config: Config, repo_path: Path, ctx: VerifyContext,
 ) -> VerifyResult:
     """Run the advisory verifier; never mutates the repo or remote."""
-    if shutil.which(config.ai_resolve.command) is None:
-        return VerifyResult(
-            success=False,
-            error=f"'{config.ai_resolve.command}' not found on PATH",
-        )
+    api, backend_error = _resolve_backend(
+        config, config.ai_resolve.command, list(_VERIFY_ALLOWED_TOOLS),
+    )
+    if backend_error:
+        return VerifyResult(success=False, error=backend_error)
 
     try:
         prompt = _render_verify_prompt(config, repo_path, ctx)
@@ -1870,7 +1987,7 @@ def verify_ai_resolution(
     try:
         exit_code, output, timed_out = _spawn_claude(
             argv, repo_path, config.ai_resolve.verify_timeout_seconds,
-            prompt=prompt, **_exhaustion_kwargs(config),
+            prompt=prompt, api=api, **_exhaustion_kwargs(config),
         )
     except KeyboardInterrupt:
         raise
