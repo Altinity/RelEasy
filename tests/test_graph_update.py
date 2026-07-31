@@ -309,6 +309,110 @@ class CollapseComponentsToGroups(unittest.TestCase):
         self.assertEqual(gids, ["auto-grp-o-r-pr-100", "auto-grp-u-s-pr-100"])
         self.assertEqual(len(gids), 2)           # two distinct groups, no clobber
 
+    def test_growing_auto_group_keeps_its_id(self):
+        # An auto group that absorbs a newly-traced unit must keep its id,
+        # not nest into auto-grp-auto-grp-… (which orphans its cache branch).
+        grp = d.DAGNode("auto-grp-pr-1", False, [URL(1), URL(2)], ["t", "t"],
+                        "2026-01-01T00:00:00+00:00", [], "grouped")
+        new = d.DAGNode("pr-3", False, [URL(3)], ["t"],
+                        "2026-01-05T00:00:00+00:00", ["auto-grp-pr-1"], "git-graph")
+        nodes = {n.unit_id: n for n in (grp, new)}
+        comp = d.DAGComponent("wcc-1", ["auto-grp-pr-1", "pr-3"], [],
+                              [("pr-3", "auto-grp-pr-1")])
+        d._collapse_components_to_groups(nodes, [comp], [])
+        self.assertIn("auto-grp-pr-1", nodes)
+        self.assertNotIn("auto-grp-auto-grp-pr-1", nodes)
+        self.assertEqual(nodes["auto-grp-pr-1"].pr_urls, [URL(1), URL(2), URL(3)])
+
+
+class AutoGroupId(unittest.TestCase):
+    def test_prefixes_plain_unit_id(self):
+        self.assertEqual(d._auto_group_id("pr-7"), "auto-grp-pr-7")
+
+    def test_idempotent(self):
+        self.assertEqual(d._auto_group_id("auto-grp-pr-7"), "auto-grp-pr-7")
+
+
+class OverlayGroupRoundTrip(unittest.TestCase):
+    """An auto group written to the deps overlay must survive being read back.
+
+    Regression: re-reading the overlay used to mark the group
+    ``is_user_group``, after which the overlay writer skipped it and the
+    session reconciler couldn't find it — the group vanished from both files
+    ``run`` reads and every member ported as its own PR.
+    """
+
+    def _unit(self, uid, *nums, group=False, auto=False):
+        from releasy.pipeline import FeatureUnit
+        from releasy.github_ops import PRInfo
+        prs = [
+            PRInfo(number=n, title=f"t{n}", body="", state="merged",
+                   merge_commit_sha=f"s{n}", head_sha="h", url=URL(n),
+                   repo_slug="o/r", merged_at=f"2026-01-{n:02d}T00:00:00+00:00")
+            for n in nums
+        ]
+        return FeatureUnit(
+            feature_id=uid, prs=prs, if_exists="skip", is_group=group,
+            group_id=uid if group else None, auto_discovered=auto,
+        )
+
+    def _cfg(self):
+        return Config(
+            name="n", origin=OriginConfig(remote="git@github.com:o/r.git"),
+            project="p",
+        )
+
+    def test_overlay_group_is_not_user_declared(self):
+        units = [
+            self._unit("auto-grp-pr-1", 1, 2, group=True, auto=True),
+            self._unit("G", 3, 4, group=True),   # hand-curated session group
+            self._unit("pr-5", 5),
+        ]
+        by_id = {
+            cu.unit_id: cu
+            for cu in d._build_candidate_unit_set(units, self._cfg())
+        }
+        auto = by_id["auto-grp-pr-1"]
+        self.assertTrue(auto.is_group)        # still a combined cherry-pick
+        self.assertFalse(auto.is_user_group)  # but ours to rewrite
+        user = by_id["G"]
+        self.assertTrue(user.is_group)
+        self.assertTrue(user.is_user_group)
+        solo = by_id["pr-5"]
+        self.assertFalse(solo.is_group)
+        self.assertFalse(solo.is_user_group)
+
+    def test_reread_auto_group_stays_in_overlay(self):
+        cu = d._build_candidate_unit_set(
+            [self._unit("auto-grp-pr-1", 1, 2, group=True, auto=True)],
+            self._cfg(),
+        )[0]
+        rpt = report([d._make_node(cu, deps=[], method="grouped",
+                                   conflict_files=[])])
+        tmp = Path(tempfile.mkdtemp())
+        overlay = tmp / "b.session.deps.yaml"
+        d._write_session_overlay(rpt, overlay)
+        disk = yaml.safe_load(overlay.read_text())
+        by_id = {g["id"]: g for g in disk.get("groups", [])}
+        self.assertIn("auto-grp-pr-1", by_id)
+        self.assertEqual(by_id["auto-grp-pr-1"]["prs"], [URL(1), URL(2)])
+        self.assertTrue(by_id["auto-grp-pr-1"]["auto_discovered"])
+        self.assertEqual(by_id["auto-grp-pr-1"]["sort"], "listed")
+
+    def test_user_group_stays_out_of_overlay(self):
+        cu = d._build_candidate_unit_set(
+            [self._unit("G", 3, 4, group=True)], self._cfg(),
+        )[0]
+        rpt = report([d._make_node(cu, deps=[], method="trial-clean",
+                                   conflict_files=[])])
+        tmp = Path(tempfile.mkdtemp())
+        overlay = tmp / "b.session.deps.yaml"
+        d._write_session_overlay(rpt, overlay)
+        disk = yaml.safe_load(overlay.read_text())
+        self.assertEqual(
+            [g["id"] for g in disk.get("groups", [])], [],
+        )
+
 
 class IsReusableUnit(unittest.TestCase):
     """Incremental discovery reuses only standalone, cached, unchanged units."""
@@ -319,8 +423,9 @@ class IsReusableUnit(unittest.TestCase):
         pr = PRInfo(number=num, title=f"t{num}", body="", state="merged",
                     merge_commit_sha=f"s{num}", head_sha="h", url=URL(num),
                     repo_slug="o/r", merged_at="2026-01-01T00:00:00+00:00")
-        return d._CandidateUnit(f"pr-{num}", False, [pr], pr.merged_at,
-                                FeatureUnit(feature_id=f"pr-{num}", prs=[pr], if_exists="skip"))
+        return d._CandidateUnit(
+            f"pr-{num}", False, False, [pr], pr.merged_at,
+            FeatureUnit(feature_id=f"pr-{num}", prs=[pr], if_exists="skip"))
 
     def _node(self, urls, *, deps=None, cached=True, shas=None):
         return d.DAGNode("pr-x", False, urls, ["t"] * len(urls),
@@ -438,7 +543,7 @@ class BuildGroupCacheBranches(unittest.TestCase):
         ]
         by_id = {
             f"pr-{p.number}": d._CandidateUnit(
-                f"pr-{p.number}", False, [p], p.merged_at,
+                f"pr-{p.number}", False, False, [p], p.merged_at,
                 FeatureUnit(feature_id=f"pr-{p.number}", prs=[p], if_exists="skip"))
             for p in prs
         }
@@ -558,13 +663,21 @@ class ReconcileSessionUserGroups(unittest.TestCase):
         rpt = report([node("G", 1, group=True)])
         self.assertEqual(d._reconcile_session_user_groups(cfg, rpt, []), 0)
 
-    def test_missing_group_warns(self):
+    def test_missing_group_is_created(self):
+        # A user group with no session entry must be materialised: the
+        # overlay refuses to carry user groups, so skipping it would leave
+        # the group in the report only and every member would port solo.
         tmp = Path(tempfile.mkdtemp())
         cfg, _ = self._cfg_with_group(tmp)
-        rpt = report([node("GHOST", 9, group=True)])
+        rpt = report([node("GHOST", 9, 10, group=True)])
         w = []
-        self.assertEqual(d._reconcile_session_user_groups(cfg, rpt, w), 0)
-        self.assertTrue(any("no matching session group" in x for x in w))
+        self.assertEqual(d._reconcile_session_user_groups(cfg, rpt, w), 1)
+        self.assertTrue(any("created it in the session" in x for x in w))
+        disk = yaml.safe_load((tmp / "b.session.yaml").read_text())
+        by_id = {g["id"]: g for g in disk["pr_sources"]["groups"]}
+        self.assertEqual(by_id["GHOST"]["prs"], [URL(9), URL(10)])
+        # Inherits pr_policy rather than pinning PRGroupConfig's "skip".
+        self.assertEqual(by_id["GHOST"]["if_exists"], cfg.pr_policy.if_exists)
 
 
 class UpstreamPrereqRecursion(unittest.TestCase):
@@ -594,7 +707,8 @@ class UpstreamPrereqRecursion(unittest.TestCase):
     def _cu(self, slug, num):
         pr = self._pr(slug, num)
         fu = self._FeatureUnit(feature_id=f"pr-{num}", prs=[pr], if_exists="skip")
-        return d._CandidateUnit(f"pr-{num}", False, [pr], "2026-01-01T00:00:00+00:00", fu)
+        return d._CandidateUnit(
+            f"pr-{num}", False, False, [pr], "2026-01-01T00:00:00+00:00", fu)
 
     def test_is_cross_repo(self):
         origin = "Altinity/ClickHouse"

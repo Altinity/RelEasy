@@ -159,6 +159,12 @@ class FeatureUnit:
     title_prefix: str = ""        # used for both single-PR and group titles
     is_group: bool = False
     group_id: str | None = None   # filled when is_group
+    # True when this group came from the deps_file overlay (``graph
+    # discover`` owns the entry) rather than a hand-curated
+    # ``pr_sources.groups`` entry. Kept distinct so re-reading the overlay
+    # doesn't promote an auto group to user-declared — see
+    # ``dag_discovery._CandidateUnit.is_user_group``.
+    auto_discovered: bool = False
     # Free-form note appended to the AI conflict-resolver prompt for
     # every cherry-pick step in this unit. Populated from the matching
     # ``pr_sources.by_labels[].ai_context`` (singletons) or
@@ -502,6 +508,7 @@ def _build_group_units(
             title_prefix=group.description,
             is_group=True,
             group_id=group.id,
+            auto_discovered=group.auto_discovered,
             ai_context=group.ai_context,
             per_pr_ai_context=dict(group.pr_ai_contexts),
             depends_on=list(group.depends_on),

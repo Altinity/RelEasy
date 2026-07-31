@@ -104,13 +104,21 @@ class _PickOutcome:
 
 @dataclass
 class _CandidateUnit:
-    """A unit (singleton or user-declared group) under consideration.
+    """A unit (singleton or group) under consideration.
 
     Wraps a :class:`FeatureUnit` with bookkeeping fields that only matter
     during dep discovery (e.g. earliest merge timestamp for the latest →
     oldest queue order).
+
+    ``is_group`` = the unit cherry-picks several PRs as one. ``is_user_group``
+    = that group entry is hand-curated in ``pr_sources.groups``, so this code
+    must not rewrite it. The two differ for overlay groups (``graph discover``
+    owns those): keeping them apart is what stops an auto group from being
+    mistaken for user-declared when the overlay is read back, which would
+    strand it in neither file.
     """
     unit_id: str
+    is_group: bool
     is_user_group: bool
     prs: list[PRInfo]
     earliest_merged_at: str | None
@@ -535,7 +543,7 @@ def run_discover_deps(
             outcome = _trial_pick_unit(
                 scratch, cu, target_ref,
                 cache_branch=cache_branch,
-                is_group=cu.is_user_group,
+                is_group=cu.is_group,
                 origin_slug=origin_slug,
             )
             cache_kept = False  # decided below
@@ -866,7 +874,9 @@ def _build_candidate_unit_set(
         earliest = min(merged) if merged else None
         out.append(_CandidateUnit(
             unit_id=u.feature_id,
-            is_user_group=u.is_group,
+            is_group=u.is_group,
+            # An overlay group is ours to rewrite, not the user's.
+            is_user_group=u.is_group and not u.auto_discovered,
             prs=list(u.prs),
             earliest_merged_at=earliest,
             feature_unit=u,
@@ -1088,6 +1098,22 @@ def _close_scratch_worktree(repo_path: Path, scratch: Path) -> None:
         ["worktree", "remove", "--force", str(scratch)],
         repo_path, check=False,
     )
+
+
+_AUTO_GRP_PREFIX = "auto-grp-"
+
+
+def _auto_group_id(lead_unit_id: str) -> str:
+    """Group id derived from the lead (prereq-most) member's unit id.
+
+    Idempotent: when the lead is already an auto group that grew by
+    absorbing new units, its id is kept rather than nested into
+    ``auto-grp-auto-grp-…`` (which would orphan its cache branch and
+    state entry).
+    """
+    if lead_unit_id.startswith(_AUTO_GRP_PREFIX):
+        return lead_unit_id
+    return f"{_AUTO_GRP_PREFIX}{lead_unit_id}"
 
 
 def _cache_branch_name(base_branch: str, unit_id: str) -> str:
@@ -1677,7 +1703,7 @@ def _pull_upstream_prereq(
     feature_id = f"{owner}-{repo}-pr-{number}"
     fu = FeatureUnit(feature_id=feature_id, prs=[pr], if_exists="skip", is_group=False)
     cu = _CandidateUnit(
-        unit_id=feature_id, is_user_group=False, prs=[pr],
+        unit_id=feature_id, is_group=False, is_user_group=False, prs=[pr],
         earliest_merged_at=pr.merged_at, feature_unit=fu,
     )
     by_unit_id[feature_id] = cu
@@ -2038,7 +2064,7 @@ def _reusable_prior_groups(
                 member_uids.append(uid)
         if not ok or len(member_uids) < 2:
             continue
-        gid = f"auto-grp-{member_uids[0]}"
+        gid = _auto_group_id(member_uids[0])
         prior_group_pr_urls[gid] = list(g.pr_urls)
         reused_member_ids.update(member_uids)
         for i in range(1, len(member_uids)):
@@ -2107,7 +2133,7 @@ def _collapse_components_to_groups(
                 merged_ats.append(n.earliest_merged_at)
         # Key the group id on the lead (prereq-most) unit id, which is
         # globally unique — `auto-grp-<min PR number>` collides across repos.
-        gid = f"auto-grp-{auto_ids[0]}"
+        gid = _auto_group_id(auto_ids[0])
         for uid in auto_ids:
             del nodes[uid]
             folded.add(uid)
@@ -2210,12 +2236,13 @@ def _build_group_cache_branches(
             continue
         group_cu = _CandidateUnit(
             unit_id=node.unit_id,
-            is_user_group=True,
+            is_group=True,
+            is_user_group=False,  # we minted this group; the overlay owns it
             prs=prs,
             earliest_merged_at=node.earliest_merged_at,
             feature_unit=FeatureUnit(
                 feature_id=node.unit_id, prs=prs, if_exists="skip",
-                is_group=True, group_id=node.unit_id,
+                is_group=True, group_id=node.unit_id, auto_discovered=True,
             ),
         )
         outcome = _trial_pick_unit(
@@ -3005,21 +3032,36 @@ def _reconcile_session_user_groups(
     config: Config, report: DiscoveryReport, warnings_acc: list[str],
 ) -> int:
     """Write member edits to user-declared groups back into session.groups[]
-    (the overlay skips user groups). Returns the count changed; saves if any."""
+    (the overlay skips user groups). Returns the count changed; saves if any.
+
+    A flagged user group with no session entry is created rather than
+    skipped: the overlay refuses to carry user groups, so warning and
+    moving on would leave the group in the report (and the issue) but in
+    neither file ``run`` reads — every member would port as its own PR.
+    """
     if config.session is None:
         return 0
-    groups_by_id = {g.id: g for g in config.session.pr_sources.groups}
+    from releasy.config import PRGroupConfig
+
+    ps = config.session.pr_sources
+    groups_by_id = {g.id: g for g in ps.groups}
     changed = 0
     for n in report.nodes:
         if not n.is_user_group:
             continue
         g = groups_by_id.get(n.unit_id)
         if g is None:
-            warnings_acc.append(
-                f"graph update: {n.unit_id!r} is flagged a user group but no "
-                "matching session group exists; its edits were not applied"
+            # if_exists must track pr_policy, as the session loader would
+            # have applied it — a bare PRGroupConfig would pin "skip".
+            g = PRGroupConfig(
+                id=n.unit_id, prs=[], if_exists=config.pr_policy.if_exists,
             )
-            continue
+            ps.groups.append(g)
+            groups_by_id[n.unit_id] = g
+            warnings_acc.append(
+                f"graph update: {n.unit_id!r} was flagged a user group with no "
+                "matching session group; created it in the session"
+            )
         new_prs = list(n.pr_urls)
         new_deps = list(n.deps)
         if g.prs != new_prs or g.depends_on != new_deps:

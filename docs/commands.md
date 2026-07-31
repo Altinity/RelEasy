@@ -313,6 +313,10 @@ upstream commit can't be fetched — it's flagged `missing-prerequisites`.
 - Groups are emitted as multi-PR `auto_discovered` entries (`sort: listed`,
   prerequisite first). Move an entry into the main session (drop
   `auto_discovered:`) to make it permanent.
+- An `auto_discovered` group read back on a later run stays auto-owned (it is
+  re-emitted to the overlay, and may grow if a new PR traces into it). Session
+  groups are never rewritten here; `graph update` reconciles those in place,
+  creating the session entry if it's missing.
 - Re-running rewrites the deps file from scratch — hand-edits are lost; use
   `--no-write` / `--deps-file <path>` to redirect.
 
