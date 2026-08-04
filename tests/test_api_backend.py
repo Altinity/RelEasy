@@ -241,6 +241,27 @@ class Tools(unittest.TestCase):
         self.assertTrue(err)
         self.assertIn("not found", out)
 
+    def test_malformed_numeric_args_are_coerced(self):
+        (self.repo / "f.txt").write_text("1\n2\n3\n4\n")
+        # The model sometimes emits junk like "3, " for offset.
+        out, err = self._run(
+            "Read", {"file_path": "f.txt", "offset": "3, ", "limit": "1"},
+        )
+        self.assertFalse(err, out)
+        self.assertEqual(out, "3\t3")
+        out, err = self._run(
+            "Read", {"file_path": "f.txt", "offset": "abc", "limit": 2},
+        )
+        self.assertFalse(err, out)
+        self.assertEqual(out.splitlines(), ["1\t1", "2\t2"])
+
+    def test_handler_crash_is_reported_not_raised(self):
+        out, err = self._run("Read", {"file_path": None, "offset": object()})
+        self.assertTrue(err)
+        out, err = self._run("Read", "not-a-dict")
+        self.assertTrue(err)
+        self.assertIn("must be an object", out)
+
     def test_edit_requires_a_unique_match(self):
         (self.repo / "f.txt").write_text("a\na\n")
         out, err = self._run(

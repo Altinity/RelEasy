@@ -402,6 +402,16 @@ def _resolve_path(repo_path: Path, raw: str) -> Path:
     return p if p.is_absolute() else (repo_path / p)
 
 
+def _as_int(value: Any, default: int) -> int:
+    """Coerce a model-supplied numeric argument, e.g. ``"65, "`` -> 65."""
+    if isinstance(value, bool) or value is None or value == "":
+        return default
+    if isinstance(value, (int, float)):
+        return int(value)
+    match = re.search(r"-?\d+", str(value))
+    return int(match.group()) if match else default
+
+
 def _run_bash(
     command: str, repo_path: Path, timeout: int, limit: int,
 ) -> tuple[str, bool]:
@@ -460,8 +470,8 @@ def _do_read(inp: dict, repo_path: Path, limit: int) -> tuple[str, bool]:
     except OSError as exc:
         return f"could not read {path}: {exc}", True
     lines = text.splitlines()
-    offset = max(1, int(inp.get("offset") or 1))
-    count = int(inp.get("limit") or 2000)
+    offset = max(1, _as_int(inp.get("offset"), 1))
+    count = max(1, _as_int(inp.get("limit"), 2000))
     chunk = lines[offset - 1: offset - 1 + count]
     if not chunk:
         return f"[{path} has {len(lines)} lines; offset {offset} is past the end]", False
@@ -569,7 +579,7 @@ def _do_grep(inp: dict, repo_path: Path, limit: int) -> tuple[str, bool]:
             return f"bad regex: {pattern}", True
     lines = out.splitlines()
     if head:
-        lines = lines[: int(head)]
+        lines = lines[: max(1, _as_int(head, len(lines)))]
     if not lines:
         return "[no matches]", False
     return _truncate("\n".join(lines), limit), False
@@ -614,7 +624,25 @@ def _execute_tool(
     name: str, inp: dict, repo_path: Path, spec: ApiAgentSpec,
     prefixes: list[str] | None, deadline: float,
 ) -> tuple[str, bool]:
-    """Run one tool call. Returns ``(result_text, is_error)``."""
+    """Run one tool call. Returns ``(result_text, is_error)``.
+
+    A handler crash is reported back to the model, not raised: a malformed
+    tool argument must not abort the run.
+    """
+    if not isinstance(inp, dict):
+        return f"{name}: input must be an object", True
+    try:
+        return _dispatch_tool(name, inp, repo_path, spec, prefixes, deadline)
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:  # noqa: BLE001 - report, don't kill the run
+        return f"{name} failed: {type(exc).__name__}: {exc}", True
+
+
+def _dispatch_tool(
+    name: str, inp: dict, repo_path: Path, spec: ApiAgentSpec,
+    prefixes: list[str] | None, deadline: float,
+) -> tuple[str, bool]:
     limit = spec.tool_output_max_chars
     if name == "Bash":
         command = str(inp.get("command", "")).strip()
@@ -623,7 +651,7 @@ def _execute_tool(
         denial = _check_bash(command, prefixes)
         if denial:
             return denial, True
-        budget = int(inp.get("timeout") or spec.bash_timeout_seconds)
+        budget = max(1, _as_int(inp.get("timeout"), spec.bash_timeout_seconds))
         remaining = int(max(1, deadline - time.monotonic()))
         return _run_bash(command, repo_path, min(budget, remaining), limit)
     if name == "Read":
