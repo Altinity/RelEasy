@@ -81,6 +81,137 @@ class AttemptCounterPersistence(unittest.TestCase):
         self.assertEqual(feats["f1"].partial_continue_attempts, 0)
 
 
+class PartialContinueAllowed(unittest.TestCase):
+    """Resume-vs-redo policy: keep partial work, redo only terminal cases."""
+
+    def _config(self, cap: int = 2):
+        from releasy.config import Config, OriginConfig
+
+        cfg = Config(
+            name="proj",
+            origin=OriginConfig(remote="git@github.com:acme/repo.git"),
+            project="acme",
+        )
+        cfg.pr_policy.max_partial_continue_attempts = cap
+        return cfg
+
+    def _partial(self) -> FeatureState:
+        return FeatureState(
+            status="conflict", partial_pr_count=2, failed_step_index=2,
+            rebase_pr_url="https://github.com/acme/repo/pull/9",
+        )
+
+    def test_recreate_still_resumes_a_partial_group(self):
+        # The point of the policy: an exhausted resolver keeps its work
+        # even though if_exists says "rebuild from base".
+        self.assertTrue(p._partial_continue_allowed(
+            self._config(), self._partial(), "recreate", True,
+        ))
+
+    def test_skip_resumes_too(self):
+        self.assertTrue(p._partial_continue_allowed(
+            self._config(), self._partial(), "skip", True,
+        ))
+
+    def test_append_uses_its_own_resume_path(self):
+        self.assertFalse(p._partial_continue_allowed(
+            self._config(), self._partial(), "append", True,
+        ))
+
+    def test_closed_rebase_pr_is_redone_not_resumed(self):
+        # What the merge-status sweep leaves behind for a PR closed
+        # without merging: terminal status, partial markers cleared.
+        closed = FeatureState(
+            status="closed", partial_pr_count=None, failed_step_index=None,
+            skip_reason="rebase PR closed without merging",
+        )
+        self.assertFalse(p._partial_continue_allowed(
+            self._config(), closed, "recreate", True,
+        ))
+
+    def test_first_pick_conflict_has_nothing_to_resume(self):
+        nothing = FeatureState(status="conflict", partial_pr_count=0)
+        self.assertFalse(p._partial_continue_allowed(
+            self._config(), nothing, "recreate", True,
+        ))
+
+    def test_cap_zero_opts_out(self):
+        self.assertFalse(p._partial_continue_allowed(
+            self._config(cap=0), self._partial(), "recreate", True,
+        ))
+
+    def test_no_retry_failed_opts_out(self):
+        self.assertFalse(p._partial_continue_allowed(
+            self._config(), self._partial(), "recreate", False,
+        ))
+
+    def test_untracked_unit_is_a_fresh_port(self):
+        self.assertFalse(p._partial_continue_allowed(
+            self._config(), None, "recreate", True,
+        ))
+
+
+class ClosedPRClearsPartialMarkers(unittest.TestCase):
+    """The sweep is what routes a manually-closed PR to the redo path."""
+
+    def setUp(self):
+        import releasy.pipeline as pipeline
+
+        self._real = pipeline.fetch_pr_by_url
+        self.pr_state = "closed"
+        pipeline.fetch_pr_by_url = (  # type: ignore[assignment]
+            lambda cfg, url, include_closed=False: type(
+                "I", (), {"state": self.pr_state},
+            )()
+        )
+
+    def tearDown(self):
+        import releasy.pipeline as pipeline
+
+        pipeline.fetch_pr_by_url = self._real  # type: ignore[assignment]
+
+    def _state_with_partial(self):
+        from releasy.state import PipelineState
+
+        st = PipelineState()
+        st.features["grp"] = FeatureState(
+            status="conflict", partial_pr_count=2, failed_step_index=2,
+            rebase_pr_url="https://github.com/acme/repo/pull/9",
+        )
+        return st
+
+    def test_closed_pr_becomes_terminal_and_loses_partial_markers(self):
+        from releasy.config import Config, OriginConfig
+
+        cfg = Config(
+            name="proj",
+            origin=OriginConfig(remote="git@github.com:acme/repo.git"),
+            project="acme",
+        )
+        st = self._state_with_partial()
+        changed = p._refresh_all_merge_status_from_github(cfg, st)
+        fs = st.features["grp"]
+        self.assertEqual(changed, 1)
+        self.assertEqual(fs.status, "closed")
+        self.assertIsNone(fs.partial_pr_count)
+        self.assertFalse(p._partial_continue_allowed(cfg, fs, "recreate", True))
+
+    def test_still_open_pr_keeps_its_partial_markers(self):
+        from releasy.config import Config, OriginConfig
+
+        cfg = Config(
+            name="proj",
+            origin=OriginConfig(remote="git@github.com:acme/repo.git"),
+            project="acme",
+        )
+        self.pr_state = "open"
+        st = self._state_with_partial()
+        self.assertEqual(p._refresh_all_merge_status_from_github(cfg, st), 0)
+        fs = st.features["grp"]
+        self.assertEqual(fs.partial_pr_count, 2)
+        self.assertTrue(p._partial_continue_allowed(cfg, fs, "recreate", True))
+
+
 class MaxPartialContinueAttemptsConfig(unittest.TestCase):
     """``pr_policy.max_partial_continue_attempts`` default, disable, round-trip."""
 

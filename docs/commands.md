@@ -112,6 +112,17 @@ A **partial-group draft PR** is auto-resumed on the next `run` (with
 up to `pr_policy.max_partial_continue_attempts` (default 2) before it's
 left for manual help. No need to set `if_exists: append` by hand.
 
+Resuming takes precedence over `if_exists: recreate` — an exhausted or
+timed-out resolver is not a reason to discard the PRs that did land. The
+redo cases are the terminal ones: a rebase PR **closed without merging**
+becomes `status: closed` and is rebuilt from base on a renumbered branch
+(`pr_policy.recreate_closed_prs`), and a conflict on the *first*
+cherry-pick has nothing to keep. Set
+`pr_policy.max_partial_continue_attempts: 0` to opt out and get plain
+`if_exists` handling back. A `build_failed` branch (resolution landed, the
+build/test loop didn't pass) resumes on the same terms, bounded by
+`ai_resolve.max_verify_resume_attempts`.
+
 For PRs with an existing rebase PR, `run` doesn't rebuild — it routes
 through the same merge-target flow [`refresh`](#releasy-refresh) uses:
 clean merge → leave alone; conflict → AI-resolve and plain push (never

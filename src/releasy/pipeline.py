@@ -2823,6 +2823,30 @@ def _is_partial_group(fs: FeatureState | None) -> bool:
     )
 
 
+def _partial_continue_allowed(
+    config: Config,
+    prev_state: FeatureState | None,
+    if_exists: str,
+    retry_failed: bool,
+) -> bool:
+    """True when a prior run's partial group should be resumed this run.
+
+    Resuming beats redoing whenever real work survives on the branch — an
+    exhausted / timed-out resolver is not a reason to throw it away, so
+    this holds for ``if_exists: recreate`` too. The redo cases don't reach
+    here: a rebase PR closed without merging is promoted to ``closed``
+    (partial markers cleared) by the merge-status sweep, and a first-pick
+    conflict never was partial. ``if_exists: append`` has its own resume
+    path, and ``max_partial_continue_attempts: 0`` opts out entirely.
+    """
+    return (
+        retry_failed
+        and config.pr_policy.max_partial_continue_attempts > 0
+        and _is_partial_group(prev_state)
+        and if_exists != "append"
+    )
+
+
 def _process_feature_unit(
     config: Config,
     repo_path: Path,
@@ -2930,11 +2954,14 @@ def _process_feature_unit(
     # --- Resume a build_failed branch ---
     # Re-run the build/test loop on the existing resolution (no re-resolve),
     # bounded by max_verify_resume_attempts; falls through to a fresh port if
-    # the local branch is gone.
+    # the local branch is gone. A parked build_failed unit has no PR (see
+    # _park_build_failed), so there's nothing a reviewer could have closed:
+    # resuming is always the right call, ``if_exists: recreate`` included.
+    # Set max_verify_resume_attempts: 0 to rebuild from base instead.
     if (
         is_build_failed_prev and retry_failed
         and config.ai_resolve.deterministic_build
-        and unit.if_exists not in ("append", "recreate")
+        and unit.if_exists != "append"
     ):
         resumed = _resume_build_failed_unit(
             config, repo_path, state, unit, prev_state,
@@ -2944,21 +2971,29 @@ def _process_feature_unit(
             return resumed
 
     # --- Auto-continue a partially-applied group ---
-    # A prior run cherry-picked part of a group, then a conflict (often an
-    # AI token/budget exhaustion) stopped it mid-way, leaving a draft PR
-    # labelled ai-needs-attention. With retry_failed on (the default),
-    # resume where it left off — re-route through the append flow so the
-    # not-yet-applied PRs are cherry-picked + re-resolved on top of the
-    # existing branch — instead of skipping ("rebase PR already open").
-    # Bounded by pr_policy.max_partial_continue_attempts so an unwinnable
-    # conflict doesn't re-burn budget on every run. An explicit
-    # if_exists (append already resumes; recreate is a deliberate rebuild)
-    # is left untouched.
+    # A prior run cherry-picked part of a group, then a conflict (usually
+    # the resolver running out of iterations / budget / wall-clock) stopped
+    # it mid-way, leaving a draft PR labelled ai-needs-attention. With
+    # retry_failed on (the default), resume where it left off — re-route
+    # through the append flow so the not-yet-applied PRs are cherry-picked
+    # + re-resolved on top of the existing branch — instead of skipping
+    # ("rebase PR already open") or throwing the work away.
+    #
+    # Preserving that work wins over ``if_exists: recreate``: an exhausted
+    # resolver is not a signal to redo from base. The redo cases are
+    # terminal ones — a rebase PR closed without merging is promoted to
+    # ``status: closed`` (which also clears the partial markers) by the
+    # merge-status sweep, so it lands on the recreate_closed_prs path below
+    # and rebuilds on a renumbered branch. ``if_exists: append`` already
+    # resumes on its own. Bounded by
+    # pr_policy.max_partial_continue_attempts (0 disables the resume and
+    # restores plain if_exists handling) so an unwinnable conflict doesn't
+    # re-burn budget on every run.
     cap = config.pr_policy.max_partial_continue_attempts
-    if (
-        is_failed_prev and retry_failed and cap > 0
-        and _is_partial_group(prev_state)
-        and unit.if_exists not in ("append", "recreate")
+    configured_if_exists = unit.if_exists
+    auto_continued = False
+    if _partial_continue_allowed(
+        config, prev_state, unit.if_exists, retry_failed,
     ):
         attempts = prev_state.partial_continue_attempts
         if attempts >= cap:
@@ -2973,6 +3008,7 @@ def _process_feature_unit(
             return "continue"
         unit.if_exists = "append"
         unit.partial_continue_attempts = attempts + 1
+        auto_continued = True
         console.print(
             f"\n    [yellow]↻[/yellow]  [cyan]{canonical_branch}[/cyan] "
             f"({label}) — resuming partial group from a prior run "
@@ -3084,7 +3120,21 @@ def _process_feature_unit(
             decision = _decide_append(
                 repo_path, base_ref, new_branch, unit, origin_slug,
             )
-            if not decision.feasible:
+            if not decision.feasible and auto_continued:
+                # We only switched to append to salvage a partial group.
+                # Salvage is off the table, so honour what the unit was
+                # actually configured with rather than silently skipping it.
+                console.print(
+                    f"\n    [yellow]![/yellow] [cyan]{new_branch}[/cyan] "
+                    f"({label}) — cannot resume the partial group: "
+                    f"{decision.reason}; falling back to "
+                    f"[cyan]if_exists: {configured_if_exists}[/cyan]"
+                )
+                unit.if_exists = configured_if_exists
+                unit.partial_continue_attempts = (
+                    prev_state.partial_continue_attempts if prev_state else 0
+                )
+            elif not decision.feasible:
                 console.print(
                     f"\n    [yellow]![/yellow] [cyan]{new_branch}[/cyan] "
                     f"({label}) — append not feasible: {decision.reason}; "
@@ -3094,7 +3144,7 @@ def _process_feature_unit(
                     config, state, unit, new_branch, base_branch,
                 )
                 return "continue"
-            if decision.missing_count == 0:
+            elif decision.missing_count == 0:
                 console.print(
                     f"\n    [cyan]{new_branch}[/cyan] ({label}) — every "
                     "declared PR is already on the branch; nothing to append"
@@ -3103,16 +3153,17 @@ def _process_feature_unit(
                     config, state, unit, new_branch, base_branch,
                 )
                 return "continue"
-            unit.applied_pr_urls = decision.applied_urls
-            append_active = True
-            cherry_pick_base = run_git(
-                ["rev-parse", "--verify", new_branch], repo_path,
-            ).stdout.strip()
-            console.print(
-                f"\n    [yellow]+[/yellow] [cyan]{new_branch}[/cyan] "
-                f"({label}) — appending {decision.missing_count} new PR(s) "
-                f"on top of {len(decision.applied_urls)} already applied"
-            )
+            else:
+                unit.applied_pr_urls = decision.applied_urls
+                append_active = True
+                cherry_pick_base = run_git(
+                    ["rev-parse", "--verify", new_branch], repo_path,
+                ).stdout.strip()
+                console.print(
+                    f"\n    [yellow]+[/yellow] [cyan]{new_branch}[/cyan] "
+                    f"({label}) — appending {decision.missing_count} new PR(s) "
+                    f"on top of {len(decision.applied_urls)} already applied"
+                )
 
     # ---------------------------------------------------------------
     # Branch-disposition decision matrix (no longer gated on force_retry):
