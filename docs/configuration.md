@@ -88,6 +88,10 @@ pr_sources:
 # Labels applied to every rebase PR opened this session (auto-created on
 # origin; `refresh` reconciles them onto tracked PRs that are missing one).
 # pr_labels: ["antalya-26.3"]
+
+# Extra labels applied only to ports of a given mode (see `mode` below).
+# pr_labels_by_mode:
+#   forward_port: ["forwardport"]
 ```
 
 If a PR URL appears in two of `include_prs` / `exclude_prs` / a group's
@@ -192,6 +196,7 @@ Options live in `config.yaml` unless marked **(session)**.
 | `pr_sources.groups[].ai_context` **(session)** | Hint for every cherry-pick step in the group. | `""` |
 | `pr_sources.groups[].depends_on` **(session)** | Other unit IDs that must port/merge first. | `[]` |
 | `pr_labels` **(session)** | Labels applied to every rebase PR opened this session (auto-created on origin). | `[]` |
+| `pr_labels_by_mode` **(session)** | Extra labels per detected port mode (`forward_port` / `backport`). A PR of unknown mode gets `pr_labels` only. | `{}` |
 | `features[].id` **(session)** | Feature id → branch suffix. | — |
 | `features[].source_branch` **(session)** | Branch holding the commits. | — |
 | `features[].description` **(session)** | PR title + board text. | — |

@@ -140,7 +140,7 @@ _VALID_PORT_MODES = ("auto", "backport", "forward_port")
 _VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 _VALID_AI_BACKENDS = ("cli", "api")
 
-from typing import Literal  # noqa: E402
+from typing import Literal, get_args  # noqa: E402
 PortMode = Literal["backport", "forward_port"]
 
 
@@ -826,6 +826,11 @@ class SessionConfig:
     # first time it's needed. ``releasy refresh`` also reconciles them
     # onto tracked PRs that are missing one or more.
     pr_labels: list[str] = field(default_factory=list)
+    # Extra labels applied only to PRs whose detected port mode matches.
+    # Keyed by ``PortMode`` (``forward_port`` / ``backport``); merged with
+    # ``pr_labels`` at apply time. A PR of unknown mode gets ``pr_labels``
+    # only — never a mode label.
+    pr_labels_by_mode: dict[str, list[str]] = field(default_factory=dict)
     session_path: Path | None = None
     # Non-fatal issues encountered while loading, e.g. a deps_file overlay
     # entry whose id collided with the main session. Surfaced once at CLI
@@ -2282,10 +2287,34 @@ def load_session(
             "pr_labels must be a list of non-empty strings"
         )
 
+    raw_by_mode = raw.get("pr_labels_by_mode", {}) or {}
+    if not isinstance(raw_by_mode, dict):
+        raise ValueError(
+            "pr_labels_by_mode must be a mapping of port mode → label list"
+        )
+    pr_labels_by_mode: dict[str, list[str]] = {}
+    for mode, names in raw_by_mode.items():
+        if mode not in get_args(PortMode):
+            raise ValueError(
+                f"pr_labels_by_mode key {mode!r} is not a port mode "
+                f"({' / '.join(get_args(PortMode))})"
+            )
+        if isinstance(names, str):
+            names = [names]
+        if not isinstance(names, list) or not all(
+            isinstance(x, str) and x.strip() for x in names
+        ):
+            raise ValueError(
+                f"pr_labels_by_mode[{mode!r}] must be a list of "
+                "non-empty strings"
+            )
+        pr_labels_by_mode[mode] = [x.strip() for x in names]
+
     return SessionConfig(
         features=features,
         pr_sources=pr_sources,
         pr_labels=[x.strip() for x in raw_pr_labels],
+        pr_labels_by_mode=pr_labels_by_mode,
         session_path=path,
         load_warnings=overlay_warnings,
     )
@@ -2545,6 +2574,13 @@ def save_session(session: SessionConfig, path: Path | None = None) -> None:
 
     if session.pr_labels:
         data["pr_labels"] = list(session.pr_labels)
+
+    if session.pr_labels_by_mode:
+        data["pr_labels_by_mode"] = {
+            mode: list(names)
+            for mode, names in session.pr_labels_by_mode.items()
+            if names
+        }
 
     target.parent.mkdir(parents=True, exist_ok=True)
     with open(target, "w") as f:

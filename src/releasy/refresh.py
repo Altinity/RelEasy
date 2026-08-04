@@ -365,23 +365,23 @@ def refresh_tracked_prs(
     # Session labels: add any missing ones to in-scope rebase PRs.
     # Cheap N-GET pass; only writes when a PR is short a label.
     from releasy.pipeline import (
-        _pr_number_from_url, _session_pr_labels,
+        _all_session_label_names, _pr_number_from_url,
         reconcile_session_labels_on_prs,
     )
-    session_labels = _session_pr_labels(config)
+    session_labels = _all_session_label_names(config)
     if session_labels:
         console.print(
             f"\n[bold]Reconciling session labels[/bold] "
             f"([cyan]{', '.join(session_labels)}[/cyan]) "
             f"across {len(candidates)} tracked PR(s)…"
         )
-        pr_refs: list[tuple[str, int]] = []
+        pr_refs: list[tuple[str, int, PortMode | None]] = []
         for _fid, fs in candidates:
             if not fs.rebase_pr_url:
                 continue
             num = _pr_number_from_url(fs.rebase_pr_url)
             if num is not None:
-                pr_refs.append((fs.rebase_pr_url, num))
+                pr_refs.append((fs.rebase_pr_url, num, fs.mode))
         added_per_pr = reconcile_session_labels_on_prs(config, pr_refs)
         if added_per_pr:
             for pr_url, labels in added_per_pr:
@@ -1252,16 +1252,20 @@ def resolve_conflicts_for_pr(
 
     # Session labels: add any missing ones to this PR.
     from releasy.pipeline import (
-        _session_pr_labels, reconcile_session_labels_on_prs,
+        _all_session_label_names, reconcile_session_labels_on_prs,
     )
-    session_labels = _session_pr_labels(config)
+    session_labels = _all_session_label_names(config)
     if session_labels:
         console.print(
             f"\n[bold]Reconciling session labels[/bold] "
             f"([cyan]{', '.join(session_labels)}[/cyan]) on the PR…"
         )
         added_per_pr = reconcile_session_labels_on_prs(
-            config, [(rebase_pr.url, rebase_pr.number)],
+            config,
+            [(
+                rebase_pr.url, rebase_pr.number,
+                _tracked_port_mode(config, rebase_pr.url),
+            )],
         )
         if added_per_pr:
             for pr_url_, labels_ in added_per_pr:
@@ -1365,6 +1369,22 @@ def _pr_url_in_state_scope(config: Config, pr_url: str) -> bool:
     except Exception:  # pragma: no cover — bad state file
         return False
     return find_feature_by_pr_url(state, pr_url) is not None
+
+
+def _tracked_port_mode(config: Config, pr_url: str) -> PortMode | None:
+    """Persisted port mode of the entry tracking ``pr_url`` (None if none).
+
+    Lets the URL-driven flow apply mode-conditional session labels
+    (``pr_labels_by_mode``) without re-running the detection ladder.
+    """
+    if getattr(config, "stateless", False):
+        return None
+    try:
+        state = load_state(config)
+    except Exception:  # pragma: no cover — bad state file
+        return None
+    fs = find_feature_by_pr_url(state, pr_url)
+    return fs.mode if fs is not None else None
 
 
 def _maybe_update_tracked_state(

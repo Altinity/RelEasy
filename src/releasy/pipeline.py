@@ -1296,10 +1296,10 @@ def run_pipeline(
         ensure_label(
             config, RELEASY_LABEL, RELEASY_LABEL_COLOR, RELEASY_LABEL_DESCRIPTION,
         )
-        for sess_label in _session_pr_labels(config):
+        for sess_label in _all_session_label_names(config):
             ensure_label(
                 config, sess_label, RELEASY_LABEL_COLOR,
-                "Session label (session.pr_labels)",
+                "Session label (releasy session config)",
             )
 
     ai_active = resolve_conflicts and config.ai_resolve.enabled
@@ -1616,10 +1616,10 @@ def run_sequential(
         ensure_label(
             config, RELEASY_LABEL, RELEASY_LABEL_COLOR, RELEASY_LABEL_DESCRIPTION,
         )
-        for sess_label in _session_pr_labels(config):
+        for sess_label in _all_session_label_names(config):
             ensure_label(
                 config, sess_label, RELEASY_LABEL_COLOR,
-                "Session label (session.pr_labels)",
+                "Session label (releasy session config)",
             )
 
     ai_active = resolve_conflicts and config.ai_resolve.enabled
@@ -3736,7 +3736,7 @@ def _ensure_pr_for_existing_remote_branch(
         fs.rebase_pr_url = pr_url
         fs.status = "needs_review"
         _apply_releasy_label_to_pr(config, pr_url)
-        _apply_session_labels_to_pr(config, pr_url)
+        _apply_session_labels_to_pr(config, pr_url, mode=unit.mode)
         if fs.ai_resolved:
             _apply_ai_label_to_pr(config, pr_url)
         if needs_recovery:
@@ -3955,7 +3955,9 @@ def _finish_clean_unit(
             state.features[unit.feature_id].rebase_pr_url = rebase_pr_url
             state.features[unit.feature_id].status = "needs_review"
             _apply_releasy_label_to_pr(config, rebase_pr_url)
-            _apply_session_labels_to_pr(config, rebase_pr_url)
+            _apply_session_labels_to_pr(
+                config, rebase_pr_url, mode=unit.mode,
+            )
             if ai_used:
                 _apply_ai_label_to_pr(config, rebase_pr_url)
             if has_auto_prereqs:
@@ -3987,6 +3989,7 @@ def _finish_clean_unit(
             )
             _apply_session_labels_to_pr(
                 config, existing.url, pr_number=existing.number,
+                mode=unit.mode,
             )
             if ai_used:
                 _apply_ai_label_to_pr(
@@ -4188,22 +4191,52 @@ def _apply_releasy_label_to_pr(
     add_label_to_pr(config, pr_number, RELEASY_LABEL)
 
 
-def _session_pr_labels(config: Config) -> list[str]:
-    """Session-defined labels to apply to every rebase PR (may be empty)."""
+def _session_pr_labels(
+    config: Config, mode: PortMode | None = None,
+) -> list[str]:
+    """Session labels for a rebase PR of port mode ``mode`` (may be empty).
+
+    ``session.pr_labels`` unconditionally, plus the
+    ``session.pr_labels_by_mode[mode]`` bucket. ``mode=None`` (unknown
+    mode) gets the unconditional labels only.
+    """
     if config.session is None:
         return []
-    return list(config.session.pr_labels)
+    labels = list(config.session.pr_labels)
+    if mode is not None:
+        for name in config.session.pr_labels_by_mode.get(mode, []):
+            if name not in labels:
+                labels.append(name)
+    return labels
+
+
+def _all_session_label_names(config: Config) -> list[str]:
+    """Every session label name, mode-conditional ones included.
+
+    Used for the up-front ``ensure_label`` pass: a label has to exist on
+    origin before any unit that might carry it is ported.
+    """
+    if config.session is None:
+        return []
+    names = list(config.session.pr_labels)
+    for bucket in config.session.pr_labels_by_mode.values():
+        for name in bucket:
+            if name not in names:
+                names.append(name)
+    return names
 
 
 def _apply_session_labels_to_pr(
     config: Config, pr_url: str, pr_number: int | None = None,
+    mode: PortMode | None = None,
 ) -> None:
-    """Best-effort: attach every ``session.pr_labels`` label to the PR.
+    """Best-effort: attach this PR's session labels (see
+    :func:`_session_pr_labels`).
 
     Idempotent — ``add_label_to_pr`` is a no-op for labels the PR
     already carries.
     """
-    labels = _session_pr_labels(config)
+    labels = _session_pr_labels(config, mode)
     if not labels:
         return
     if pr_number is None:
@@ -4216,23 +4249,27 @@ def _apply_session_labels_to_pr(
 
 def reconcile_session_labels_on_prs(
     config: Config,
-    pr_refs: list[tuple[str, int]],
+    pr_refs: list[tuple[str, int, PortMode | None]],
 ) -> list[tuple[str, list[str]]]:
-    """Ensure every PR in ``pr_refs`` carries every session pr_label.
+    """Ensure every PR in ``pr_refs`` carries its session labels.
 
-    ``pr_refs`` is ``[(pr_url, pr_number), …]``. Reads each PR's current
-    labels via ``fetch_pr_by_url`` (one GET per PR) and only adds the
-    missing ones — so a fully-labelled set costs N GETs and zero writes.
-    Returns ``[(pr_url, [added_labels])]`` for every PR where at least
-    one label was added — so the caller can render per-PR detail.
+    ``pr_refs`` is ``[(pr_url, pr_number, port_mode), …]`` — the mode
+    selects the ``pr_labels_by_mode`` bucket, ``None`` means unknown (see
+    :func:`_session_pr_labels`). Reads each PR's current labels via
+    ``fetch_pr_by_url`` (one GET per PR) and only adds the missing ones —
+    so a fully-labelled set costs N GETs and zero writes. Returns
+    ``[(pr_url, [added_labels])]`` for every PR where at least one label
+    was added — so the caller can render per-PR detail.
     """
     from releasy.github_ops import fetch_pr_by_url
 
-    labels = _session_pr_labels(config)
     result: list[tuple[str, list[str]]] = []
-    if not labels or not pr_refs:
+    if not _all_session_label_names(config) or not pr_refs:
         return result
-    for pr_url, pr_number in pr_refs:
+    for pr_url, pr_number, mode in pr_refs:
+        labels = _session_pr_labels(config, mode)
+        if not labels:
+            continue
         info = fetch_pr_by_url(config, pr_url, include_closed=True)
         current = {
             (l or "").lower() for l in ((info.labels if info else None) or [])
@@ -5000,6 +5037,7 @@ def _handle_unresolved_conflict(
             )
             _apply_session_labels_to_pr(
                 config, rebase_pr_url, pr_number=existing.number,
+                mode=unit.mode,
             )
             if unit.verify_needs_attention:
                 _apply_verify_label_to_pr(
@@ -5018,7 +5056,9 @@ def _handle_unresolved_conflict(
                     f"[dim](label: {config.ai_resolve.needs_attention_label})[/dim]"
                 )
                 _apply_releasy_label_to_pr(config, rebase_pr_url)
-                _apply_session_labels_to_pr(config, rebase_pr_url)
+                _apply_session_labels_to_pr(
+                    config, rebase_pr_url, mode=unit.mode,
+                )
                 if unit.verify_needs_attention:
                     _apply_verify_label_to_pr(config, rebase_pr_url)
             else:
@@ -5460,7 +5500,7 @@ def _open_pr_for_resolved(
         # runs that predated label-based identification.
         _apply_releasy_label_to_pr(config, fs.rebase_pr_url, pr_number=pr_num)
         _apply_session_labels_to_pr(
-            config, fs.rebase_pr_url, pr_number=pr_num,
+            config, fs.rebase_pr_url, pr_number=pr_num, mode=fs.mode,
         )
         if fs.ai_resolved:
             _apply_ai_label_to_pr(
@@ -5498,7 +5538,7 @@ def _open_pr_for_resolved(
         fs.status = "needs_review"
         state.features[_feature_id_from_branch(state, branch)] = fs
         _apply_releasy_label_to_pr(config, pr_url)
-        _apply_session_labels_to_pr(config, pr_url)
+        _apply_session_labels_to_pr(config, pr_url, mode=fs.mode)
         if fs.ai_resolved:
             _apply_ai_label_to_pr(config, pr_url)
 
