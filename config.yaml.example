@@ -504,7 +504,7 @@ notifications:
 #   # timeout_seconds: 7200
 
 # ─────────────────────────────────────────────────────────────────────
-# DEPENDENCY GRAPH  (`releasy graph discover` / `graph update`)
+# DEPENDENCY GRAPH  (`releasy graph discover` / `graph update` / `graph sync`)
 #
 # All optional; defaults are sensible.
 # graph:
@@ -515,6 +515,7 @@ notifications:
 #   trusted_reviewers: [alice]
 #   issue_labels: [releasy]         # + the target-branch name; created if missing
 #   post_comment: true              # summary comment after each update
+#   sync_progress: true             # refresh issue checkboxes after run / refresh
 #   apply_exclusions: true          # enforce vetoes via exclude_prs
 #   minimize_addressed_comments: true  # collapse addressed comments as Outdated
 #   # command: claude

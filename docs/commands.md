@@ -14,6 +14,7 @@ config they read, see [configuration.md](configuration.md).
   [`refresh`](#releasy-refresh) ·
   [`graph discover`](#releasy-graph-discover) ·
   [`graph update`](#releasy-graph-update) ·
+  [`graph sync`](#releasy-graph-sync) ·
   [`analyze-fails`](#releasy-analyze-fails) ·
   [`continue`](#releasy-continue) ·
   [Sequential mode](#sequential-mode) ·
@@ -89,7 +90,9 @@ One-liners:
 
 [`graph discover`](#releasy-graph-discover) is a read-only diagnostic
 sibling of `run` — see its section. [`graph update`](#releasy-graph-update)
-refines that graph from issue comments (no git).
+refines that graph from issue comments (no git);
+[`graph sync`](#releasy-graph-sync) pushes port progress back to the issue
+as checkboxes (`run` / `refresh` do it for you).
 
 The rest ([`skip`](#releasy-skip), [`abort`](#releasy-abort),
 [`status`](#releasy-status), board-sync, release, feature) never touch git
@@ -259,9 +262,11 @@ resolved trivially at run time. Writes a deps overlay at
 that [`run`](#releasy-run) picks up. Main session is never modified.
 
 With `--open-issue` it posts the result as a GitHub issue on origin — each
-group shown as a numbered apply sequence — so the team can review and steer it
-via [`graph update`](#releasy-graph-update). Re-running `--open-issue` updates
-the same issue, not a duplicate.
+group shown as a numbered apply sequence, every entry with a progress
+checkbox — so the team can review and steer it via
+[`graph update`](#releasy-graph-update) and track what's ported via
+[`graph sync`](#releasy-graph-sync). Re-running `--open-issue` updates the
+same issue, not a duplicate, and keeps the checkboxes.
 
 Declared `pr_sources.groups[]` are treated as **single super-nodes** —
 discovery never subdivides or auto-merges them (it only warns if one shares a
@@ -403,6 +408,48 @@ trial-pick-verified — re-run `graph discover` for verified deps.
 
 Exit: `0` on success or clean no-op; `1` on fetch error, malformed reply,
 dependency cycle, or a session edit that couldn't be applied.
+
+### `releasy graph sync`
+
+*Refresh the graph issue's progress checkboxes from the pipeline state.*
+
+Re-renders the issue from [`graph discover
+--open-issue`](#releasy-graph-discover) with live progress: every unit and
+every PR inside a group gets a checkbox, annotated with the unit's status and
+a link to the port PR releasy opened. **No git, no AI, no comment ingest** —
+cheap enough to run any time.
+
+```bash
+releasy graph sync [--onto <ver>] [--dry-run]
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--onto <ver>` | Base branch; must match the `graph discover` value. | `target_branch` |
+| `--dry-run` | Show what would be posted; don't touch the issue. | off |
+
+**A box is ticked once releasy has opened the port PR** — including the draft
+PR of a partially-applied group, where the group's member PRs are ticked up to
+the pick that conflicted (`🔴 conflict · 1/3 picked`). A `closed` (unmerged)
+PR unticks the box again; `superseded` counts as done. Markers:
+
+| Marker | Meaning |
+|--------|---------|
+| `✅ merged` | Port PR merged into the target branch |
+| `🟡 in review` | Port PR open |
+| `🟠 branch pushed, no PR yet` | Branch on origin, PR not opened |
+| `🚧 build failed` | Resolved locally; build/tests retried next run |
+| `🔴 conflict` | Unresolved (`· n/m picked` for a partial group) |
+| `⏸ blocked` | Waiting on `depends_on` units (named inline) |
+| `⛔ PR closed unmerged` · `♻ superseded` · `⏭ skipped` | Terminal |
+| `⬜ not started` | No state entry yet |
+
+`run` and `refresh` do this automatically at the end — set
+`graph.sync_progress: false` to turn that off and drive it manually. Ticking a
+box by hand in the GitHub UI is not read back; the next sync overwrites it.
+
+Exit: `0` on success; `1` when there is no graph report, the graph has no
+issue, or the issue edit failed.
 
 ### `releasy analyze-fails`
 

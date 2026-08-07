@@ -642,6 +642,9 @@ class GraphConfig:
     issue_labels: list[str] = field(default_factory=lambda: ["releasy"])
     # Post a summary comment on the issue after a successful update.
     post_comment: bool = True
+    # Refresh the graph issue's progress checkboxes at the end of
+    # ``releasy run`` / ``releasy refresh`` (same as `releasy graph sync`).
+    sync_progress: bool = True
     # Enforce vetoes by adding the PR to exclude_prs (else record-only).
     apply_exclusions: bool = True
     # Collapse (mark Outdated) the comments an update actually addressed;
@@ -1487,6 +1490,7 @@ def load_config(config_path: Path | None = None) -> Config:
         trusted_reviewers=gr_reviewers,
         issue_labels=[s.strip() for s in gr_labels_raw if s.strip()],
         post_comment=bool(gr_raw.get("post_comment", True)),
+        sync_progress=bool(gr_raw.get("sync_progress", True)),
         apply_exclusions=bool(gr_raw.get("apply_exclusions", True)),
         minimize_addressed_comments=bool(
             gr_raw.get("minimize_addressed_comments", True)

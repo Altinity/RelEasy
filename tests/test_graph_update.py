@@ -20,6 +20,7 @@ from releasy.config import (
     PRSourcesConfig,
     SessionConfig,
 )
+from releasy.state import FeatureState, PipelineState
 
 URL = "https://github.com/o/r/pull/{}".format
 
@@ -769,8 +770,8 @@ class IssueBodyAndRoundTrip(unittest.TestCase):
         self.assertNotIn("mermaid", body)            # DAG is gone
         self.assertIn(d._issue_marker("b"), body)
         self.assertIn("Groups (port together", body)
-        self.assertIn("1. [#1]", body)               # numbered apply order
-        self.assertIn("2. [#2]", body)
+        self.assertIn("1. [ ] [#1]", body)           # numbered apply order
+        self.assertIn("2. [ ] [#2]", body)
         self.assertIn("Standalone PRs", body)
         self.assertIn("Excluded", body)
         self.assertIn("#7", body)
@@ -848,6 +849,188 @@ class OpenOrUpdateIssue(unittest.TestCase):
         d.open_or_update_graph_issue(self._cfg(), r, title="t")
         self.assertEqual(used["labels"], ["releasy", "antalya-26.4"])
         self.assertEqual(set(ensured), {"releasy", "antalya-26.4"})
+
+
+class ProgressCheckboxes(unittest.TestCase):
+    """Issue checkboxes fed from pipeline state (`releasy graph sync`)."""
+
+    def _state(self, **features):
+        return PipelineState(features=features)
+
+    def _body(self, nodes, state, **kw):
+        r = report(nodes, **kw)
+        return d.render_graph_issue_body(r, d.build_progress_map(r, state))
+
+    def test_untracked_units_are_unticked(self):
+        body = self._body([node("pr-1", 1)], self._state())
+        self.assertIn("- [ ] [#1]", body)
+        self.assertIn("⬜ not started", body)
+        self.assertIn("**Progress: 0/1 unit(s) ported**", body)
+
+    def test_merged_unit_ticked_with_port_pr_link(self):
+        fs = FeatureState(status="merged", rebase_pr_url=URL(50))
+        body = self._body([node("pr-1", 1)], self._state(**{"pr-1": fs}))
+        self.assertIn(f"- [x] [#1]({URL(1)}) t1 — ✅ merged [#50]({URL(50)})", body)
+        self.assertIn("**Progress: 1/1 unit(s) ported**", body)
+
+    def test_open_pr_counts_as_ported(self):
+        fs = FeatureState(status="needs_review", rebase_pr_url=URL(51))
+        body = self._body([node("pr-1", 1)], self._state(**{"pr-1": fs}))
+        self.assertIn("- [x] [#1]", body)
+        self.assertIn("🟡 in review [#51]", body)
+
+    def test_conflict_without_pr_unticked(self):
+        fs = FeatureState(status="conflict")
+        body = self._body([node("pr-1", 1)], self._state(**{"pr-1": fs}))
+        self.assertIn("- [ ] [#1]", body)
+        self.assertIn("🔴 conflict", body)
+        self.assertIn("**Progress: 0/1 unit(s) ported**", body)
+
+    def test_partial_group_ticks_landed_picks_only(self):
+        # 1 of 3 picks committed, draft PR opened → unit counts as ported,
+        # but only the first member PR's box is ticked.
+        grp = d.DAGNode("grp", False, [URL(1), URL(2), URL(3)],
+                        ["t1", "t2", "t3"], "2026-01-01T00:00:00+00:00",
+                        [], "grouped")
+        fs = FeatureState(
+            status="conflict", rebase_pr_url=URL(60),
+            partial_pr_count=1, failed_step_index=1,
+        )
+        body = self._body([grp], self._state(grp=fs))
+        self.assertIn("- [x] **`grp`** — 🔴 conflict · 1/3 picked [#60]", body)
+        self.assertIn("1. [x] [#1]", body)
+        self.assertIn("2. [ ] [#2]", body)
+        self.assertIn("3. [ ] [#3]", body)
+
+    def test_group_with_full_pr_ticks_every_member(self):
+        grp = d.DAGNode("grp", False, [URL(1), URL(2)], ["t1", "t2"],
+                        "2026-01-01T00:00:00+00:00", [], "grouped")
+        fs = FeatureState(status="needs_review", rebase_pr_url=URL(61))
+        body = self._body([grp], self._state(grp=fs))
+        self.assertIn("1. [x] [#1]", body)
+        self.assertIn("2. [x] [#2]", body)
+
+    def test_blocked_names_its_blockers(self):
+        fs = FeatureState(status="blocked", blocked_by=["pr-9"])
+        body = self._body([node("pr-1", 1)], self._state(**{"pr-1": fs}))
+        self.assertIn("- [ ] [#1]", body)
+        self.assertIn("⏸ blocked by `pr-9`", body)
+
+    def test_skipped_shows_reason_and_stays_unticked(self):
+        fs = FeatureState(status="skipped", skip_reason="already in target")
+        body = self._body([node("pr-1", 1)], self._state(**{"pr-1": fs}))
+        self.assertIn("- [ ] [#1]", body)
+        self.assertIn("⏭ skipped: already in target", body)
+
+    def test_closed_pr_is_not_ported(self):
+        fs = FeatureState(status="closed", rebase_pr_url=URL(62))
+        body = self._body([node("pr-1", 1)], self._state(**{"pr-1": fs}))
+        self.assertIn("- [ ] [#1]", body)
+        self.assertIn("⛔ PR closed unmerged [#62]", body)
+
+    def test_superseded_counts_without_own_pr(self):
+        fs = FeatureState(status="superseded")
+        body = self._body([node("pr-1", 1)], self._state(**{"pr-1": fs}))
+        self.assertIn("- [x] [#1]", body)
+        self.assertIn("♻ superseded", body)
+
+    def test_progress_map_falls_back_to_pr_urls(self):
+        # Tracked under a different feature id — matched via its source PR.
+        fs = FeatureState(status="merged", pr_url=URL(1), rebase_pr_url=URL(70))
+        r = report([node("renamed-unit", 1)])
+        self.assertEqual(
+            d.build_progress_map(r, self._state(**{"other-id": fs})),
+            {"renamed-unit": fs},
+        )
+
+    def test_progress_map_prefers_unit_id_match(self):
+        by_id = FeatureState(status="merged")
+        by_url = FeatureState(status="conflict", pr_url=URL(1))
+        r = report([node("pr-1", 1)])
+        got = d.build_progress_map(
+            r, self._state(**{"pr-1": by_id, "other": by_url}),
+        )
+        self.assertIs(got["pr-1"], by_id)
+
+    def test_summary_counts_every_status(self):
+        r = report([node("a", 1), node("b", 2), node("c", 3)])
+        state = self._state(
+            a=FeatureState(status="merged", rebase_pr_url=URL(80)),
+            b=FeatureState(status="conflict"),
+        )
+        line = d._progress_summary(r, d.build_progress_map(r, state))
+        self.assertIn("**Progress: 1/3 unit(s) ported**", line)
+        self.assertIn("✅ merged: 1", line)
+        self.assertIn("🔴 conflict: 1", line)
+        self.assertIn("⬜ not started: 1", line)
+
+
+class SyncGraphProgress(unittest.TestCase):
+    """`releasy graph sync` — report/issue preconditions and the happy path."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._update, self._create, self._ensure, self._load_state = (
+            d.update_issue, d.create_issue, d.ensure_label, d.load_state,
+        )
+        d.ensure_label = lambda *a, **k: True  # offline
+        d.load_state = lambda config: PipelineState(
+            features={"pr-1": FeatureState(
+                status="merged", rebase_pr_url=URL(50),
+            )},
+        )
+        self.posted: dict = {}
+        d.update_issue = lambda config, n, **k: (
+            self.posted.update(number=n, **k) or True
+        )
+        d.create_issue = lambda *a, **k: self.fail("must not create")
+
+    def tearDown(self):
+        d.update_issue, d.create_issue, d.ensure_label, d.load_state = (
+            self._update, self._create, self._ensure, self._load_state,
+        )
+
+    def _cfg(self):
+        return Config(
+            name="n", origin=OriginConfig(remote="git@github.com:o/r.git"),
+            project="p", target_branch="b",
+            config_path=self.tmp / "config.yaml",
+        )
+
+    def _write_graph(self, **kw):
+        d._write_report(report([node("pr-1", 1)], **kw), self.tmp / "graph.b.yaml")
+
+    def test_missing_report_errors(self):
+        self.assertEqual(d.sync_graph_progress(self._cfg()), 1)
+
+    def test_missing_report_is_silent_when_quiet(self):
+        self.assertEqual(d.sync_graph_progress(self._cfg(), quiet=True), 0)
+
+    def test_report_without_issue_errors(self):
+        self._write_graph()
+        self.assertEqual(d.sync_graph_progress(self._cfg()), 1)
+        self.assertEqual(d.sync_graph_progress(self._cfg(), quiet=True), 0)
+
+    def test_posts_checked_box_for_ported_unit(self):
+        self._write_graph(issue_number=42, issue_url="u")
+        self.assertEqual(d.sync_graph_progress(self._cfg()), 0)
+        self.assertEqual(self.posted["number"], 42)
+        self.assertIn("- [x] [#1]", self.posted["body"])
+        self.assertIn("**Progress: 1/1 unit(s) ported**", self.posted["body"])
+
+    def test_transient_failure_returns_nonzero(self):
+        self._write_graph(issue_number=42, issue_url="u")
+        d.update_issue = lambda *a, **k: False
+        self.assertEqual(d.sync_graph_progress(self._cfg()), 1)
+
+    def test_recreated_issue_number_persisted(self):
+        self._write_graph(issue_number=42, issue_url="u")
+        d.update_issue = lambda *a, **k: None  # 404
+        d.create_issue = lambda *a, **k: (99, "newurl")
+        self.assertEqual(d.sync_graph_progress(self._cfg()), 0)
+        self.assertEqual(
+            d.load_report(self.tmp / "graph.b.yaml").issue_number, 99,
+        )
 
 
 if __name__ == "__main__":

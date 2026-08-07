@@ -323,6 +323,7 @@ def run(
                 only=only_filter,
                 force_merge=merge_target,
             )
+            _maybe_sync_graph_progress(config, onto)
             return
 
         state = run_pipeline(
@@ -332,6 +333,7 @@ def run(
             only=only_filter,
             force_merge=merge_target,
         )
+        _maybe_sync_graph_progress(config, onto)
 
         # Scope the conflict-exit check to whatever the user filtered on
         # — otherwise --only / --pr on a single unit could exit non-zero
@@ -1183,6 +1185,63 @@ def graph_update_cmd(
         raise SystemExit(code)
 
 
+@graph_cmd.command(
+    name="sync",
+    short_help="Refresh the graph issue's progress checkboxes from state.",
+)
+@click.option(
+    "--onto", default=None,
+    help="Base branch (defaults to config.target_branch). Must match the "
+         "value used for `graph discover`.",
+)
+@click.option(
+    "--dry-run", is_flag=True, default=False,
+    help="Show what would be posted; don't touch the issue.",
+)
+@click.pass_context
+def graph_sync_cmd(
+    ctx: click.Context, onto: str | None, dry_run: bool,
+) -> None:
+    """Refresh the graph issue's progress checkboxes from pipeline state.
+
+    Re-renders the issue opened by ``graph discover --open-issue``: each
+    unit's box is ticked once releasy has opened its port PR (a
+    partially-applied group counts — its draft PR is linked), annotated
+    with the unit's status and a link to the PR. No git, no AI, no
+    comment ingest — cheap enough to run any time.
+
+    ``releasy run`` and ``releasy refresh`` do this automatically unless
+    ``graph.sync_progress: false``.
+    """
+    from releasy.dag_discovery import sync_graph_progress
+
+    with _locked_config(ctx, session="optional") as config:
+        if dry_run:
+            config.dry_run = True
+        code = sync_graph_progress(config, onto=onto)
+    if code != 0:
+        raise SystemExit(code)
+
+
+def _maybe_sync_graph_progress(
+    config: Config, onto: str | None = None,
+) -> None:
+    """Post-``run`` / post-``refresh`` hook: refresh the graph issue.
+
+    Best-effort and non-fatal — a missing graph report, a missing issue
+    or a GitHub hiccup must never fail the command that just did the
+    real work.
+    """
+    if not config.graph.sync_progress:
+        return
+    from releasy.dag_discovery import sync_graph_progress
+
+    try:
+        sync_graph_progress(config, onto=onto, quiet=True)
+    except Exception as e:  # noqa: BLE001 — never fail the caller
+        click.echo(f"warning: graph issue sync failed: {e}", err=True)
+
+
 @cli.command(
     short_help=(
         "Sync status; optionally merge / analyze CI / address review."
@@ -1569,14 +1628,18 @@ def refresh(
     if pr_url is None:
         with _locked_config(ctx, session="optional") as config:
             config.dry_run = dry_run
-            if not refresh_tracked_prs(
+            ok = refresh_tracked_prs(
                 config, wd, resolve_conflicts=ai_resolve_flag,
                 only=only_filter, force_merge=merge_target,
                 address_review=address_review_flag,
                 analyze_fails=analyze_fails_flag,
                 no_flaky_check=no_flaky_check,
                 post_comment=post_comment_flag,
-            ):
+            )
+            # Sync before the exit check: a partly-failed refresh still
+            # moved ports forward, and the issue should say so.
+            _maybe_sync_graph_progress(config)
+            if not ok:
                 raise SystemExit(1)
         return
 

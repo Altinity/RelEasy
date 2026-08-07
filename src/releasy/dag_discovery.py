@@ -76,7 +76,7 @@ from releasy.pipeline import (
     _SOURCE_PR_URL_RE,
     discover_feature_units,
 )
-from releasy.state import PipelineState, load_state
+from releasy.state import FeatureState, PipelineState, load_state
 from releasy.termlog import get_console
 
 console = get_console()
@@ -2541,9 +2541,135 @@ def _issue_marker(base_branch: str) -> str:
 # Marker on RelEasy's own comments so graph update skips them on ingest.
 _GRAPH_BOT_MARKER = "<!-- releasy-graph-bot -->"
 
+# Marker shown after a unit's entry, per tracked status.
+_PROGRESS_MARKER: dict[str, str] = {
+    "needs_review": "🟡 in review",
+    "branch_created": "🟠 branch pushed, no PR yet",
+    "conflict": "🔴 conflict",
+    "build_failed": "🚧 build failed",
+    "skipped": "⏭ skipped",
+    "merged": "✅ merged",
+    "blocked": "⏸ blocked",
+    "closed": "⛔ PR closed unmerged",
+    "superseded": "♻ superseded",
+}
 
-def render_graph_issue_body(report: DiscoveryReport) -> str:
-    """Render a DiscoveryReport as a GitHub issue body (markdown)."""
+# Order the progress summary lists status counts in.
+_PROGRESS_SUMMARY_ORDER: tuple[str, ...] = (
+    "merged", "needs_review", "branch_created", "build_failed",
+    "conflict", "blocked", "closed", "superseded", "skipped",
+)
+
+_NOT_STARTED_MARKER = "⬜ not started"
+
+
+def build_progress_map(
+    report: DiscoveryReport, state: PipelineState,
+) -> dict[str, FeatureState]:
+    """Map each graph unit to its tracked state entry (units with none omitted).
+
+    Matches on ``unit_id`` first — graph unit IDs and state feature IDs
+    are the same namespace — then falls back to source-PR URLs so a unit
+    tracked under a different ID (renamed group, hand-edited session)
+    still shows its progress.
+    """
+    by_pr: dict[tuple, FeatureState] = {}
+    for fs in state.features.values():
+        for url in ([fs.pr_url] if fs.pr_url else []) + list(fs.pr_urls):
+            key = parse_pr_url(url) if url else None
+            if key is not None:
+                by_pr.setdefault(key, fs)
+
+    out: dict[str, FeatureState] = {}
+    for n in report.nodes:
+        fs = state.features.get(n.unit_id)
+        if fs is None:
+            for url in n.pr_urls:
+                key = parse_pr_url(url)
+                if key is not None and key in by_pr:
+                    fs = by_pr[key]
+                    break
+        if fs is not None:
+            out[n.unit_id] = fs
+    return out
+
+
+def _unit_ported(fs: FeatureState | None) -> bool:
+    """True once releasy has opened a port PR for the unit.
+
+    Includes the draft PR of a partially-applied group. ``closed``
+    doesn't count (the PR was rejected — work is back on the table);
+    ``superseded`` does (another PR already carries the change).
+    """
+    if fs is None:
+        return False
+    if fs.status == "superseded":
+        return True
+    return bool(fs.rebase_pr_url) and fs.status != "closed"
+
+
+def _picks_landed(fs: FeatureState | None, total: int) -> int:
+    """How many of a unit's PRs are committed on its port branch."""
+    if fs is None:
+        return 0
+    if fs.status == "conflict":
+        return min(fs.partial_pr_count or 0, total)
+    if fs.status in ("merged", "needs_review", "branch_created",
+                     "build_failed", "superseded"):
+        return total
+    return 0  # skipped / blocked / closed
+
+
+def _progress_note(fs: FeatureState | None, total: int) -> str:
+    """`` — <marker> [#N](url)`` suffix for a unit's line in the issue."""
+    if fs is None:
+        return f" — {_NOT_STARTED_MARKER}"
+    marker = _PROGRESS_MARKER.get(fs.status, fs.status)
+    if fs.status == "blocked" and fs.blocked_by:
+        marker += f" by {', '.join(f'`{b}`' for b in fs.blocked_by)}"
+    elif fs.status == "skipped" and fs.skip_reason:
+        marker += f": {fs.skip_reason}"
+    elif fs.status == "conflict" and total > 1:
+        marker += f" · {_picks_landed(fs, total)}/{total} picked"
+    note = f" — {marker}"
+    if fs.rebase_pr_url:
+        note += f" [{_pr_short(fs.rebase_pr_url)}]({fs.rebase_pr_url})"
+    return note
+
+
+def _progress_summary(
+    report: DiscoveryReport, progress: dict[str, FeatureState],
+) -> str:
+    """One-line tally: ported / total, then a per-status breakdown."""
+    counts: dict[str, int] = {}
+    ported = 0
+    for n in report.nodes:
+        fs = progress.get(n.unit_id)
+        if _unit_ported(fs):
+            ported += 1
+        counts[fs.status if fs else ""] = counts.get(fs.status if fs else "", 0) + 1
+    bits = [
+        f"{_PROGRESS_MARKER.get(s, s)}: {counts[s]}"
+        for s in _PROGRESS_SUMMARY_ORDER if counts.get(s)
+    ]
+    if counts.get(""):
+        bits.append(f"{_NOT_STARTED_MARKER}: {counts['']}")
+    total = len(report.nodes)
+    line = f"**Progress: {ported}/{total} unit(s) ported**"
+    return line + (" — " + " · ".join(bits) if bits else "")
+
+
+def render_graph_issue_body(
+    report: DiscoveryReport,
+    progress: dict[str, FeatureState] | None = None,
+) -> str:
+    """Render a DiscoveryReport as a GitHub issue body (markdown).
+
+    ``progress`` (from :func:`build_progress_map`) ticks the checkbox of
+    every unit releasy has already opened a port PR for and annotates it
+    with its status and PR link. Omitted / empty → every box unticked.
+    """
+    progress = progress or {}
     lines: list[str] = [_issue_marker(report.base_branch)]
     lines.append(f"## Port dependency graph — `{report.base_branch}`")
     lines.append("")
@@ -2560,19 +2686,36 @@ def render_graph_issue_body(report: DiscoveryReport) -> str:
         "combined PR, cherry-picked in the listed order (prerequisite first)."
     )
     lines.append("")
+    lines.append(_progress_summary(report, progress))
+    lines.append("")
+    lines.append(
+        "_A box is ticked once releasy has opened the port PR (a "
+        "partially-applied group counts — its draft PR is linked). Run "
+        "`releasy graph sync` to refresh._"
+    )
+    lines.append("")
 
     def _title_of(n: DAGNode, i: int) -> str:
         return n.pr_titles[i] if i < len(n.pr_titles) and n.pr_titles[i] else ""
+
+    def _box(done: bool) -> str:
+        return "[x]" if done else "[ ]"
 
     # --- Groups (port together, in order) ---
     if groups:
         lines.append("### Groups (port together, in apply order)")
         lines.append("")
         for n in groups:
-            lines.append(f"**`{n.unit_id}`**")
+            fs = progress.get(n.unit_id)
+            landed = _picks_landed(fs, len(n.pr_urls))
+            lines.append(
+                f"- {_box(_unit_ported(fs))} **`{n.unit_id}`**"
+                f"{_progress_note(fs, len(n.pr_urls))}"
+            )
             for i, url in enumerate(n.pr_urls):
                 lines.append(
-                    f"{i + 1}. [{_pr_short(url)}]({url}) {_title_of(n, i)}".rstrip()
+                    f"  {i + 1}. {_box(i < landed)} [{_pr_short(url)}]({url}) "
+                    f"{_title_of(n, i)}".rstrip()
                 )
             lines.append("")
 
@@ -2582,7 +2725,11 @@ def render_graph_issue_body(report: DiscoveryReport) -> str:
         lines.append("")
         for n in singles:
             url = n.pr_urls[0]
-            lines.append(f"- [{_pr_short(url)}]({url}) {_title_of(n, 0)}".rstrip())
+            fs = progress.get(n.unit_id)
+            lines.append(
+                f"- {_box(_unit_ported(fs))} [{_pr_short(url)}]({url}) "
+                f"{_title_of(n, 0)}".rstrip() + _progress_note(fs, 1)
+            )
         lines.append("")
 
     # --- Excluded ---
@@ -2619,13 +2766,17 @@ def _pr_short(url: str) -> str:
 
 def open_or_update_graph_issue(
     config: Config, report: DiscoveryReport, *, title: str,
+    progress: dict[str, FeatureState] | None = None,
 ) -> tuple[int, str] | None:
     """Create the graph issue on origin, or update its body if it exists.
 
     Sets report.issue_number/issue_url on create. Returns (number, url) or
-    None on failure/dry-run.
+    None on failure/dry-run. ``progress`` defaults to the current pipeline
+    state, so every writer of the issue body keeps the checkboxes intact.
     """
-    body = render_graph_issue_body(report)
+    if progress is None:
+        progress = build_progress_map(report, load_state(config))
+    body = render_graph_issue_body(report, progress)
     if report.issue_number is not None:
         res = update_issue(config, report.issue_number, body=body)
         if res is True:
@@ -3251,6 +3402,88 @@ def run_graph_update(
             "manually (e.g. `releasy pr add/remove`)."
         )
         return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# `releasy graph sync` — push port progress to the graph issue
+# ---------------------------------------------------------------------------
+
+
+def sync_graph_progress(
+    config: Config, *, onto: str | None = None, quiet: bool = False,
+) -> int:
+    """Re-render the graph issue with progress from the pipeline state.
+
+    No git, no AI, no comment ingest — reads the saved graph plus
+    ``state.yaml`` and edits the issue body in place. ``quiet`` silences
+    the "no graph / no issue" cases (the automatic post-``run`` /
+    post-``refresh`` hook, where they just mean "not using the issue").
+    Returns an exit code.
+    """
+    try:
+        base_branch = _resolve_base_branch(config, onto)
+    except ValueError as e:
+        if quiet:
+            return 0
+        console.print(f"[red]graph sync: {e}[/red]")
+        return 1
+
+    report_path = _default_report_path(config, base_branch)
+    if not report_path.exists():
+        if quiet:
+            return 0
+        console.print(
+            f"[red]No graph report at {report_path}.[/red] Run "
+            "`releasy graph discover --open-issue` first."
+        )
+        return 1
+    try:
+        report = load_report(report_path)
+    except (OSError, ValueError, yaml.YAMLError) as e:
+        if quiet:
+            return 0
+        console.print(f"[red]graph sync: unreadable graph report: {e}[/red]")
+        return 1
+
+    if report.issue_number is None:
+        if quiet:
+            return 0
+        console.print(
+            "[red]The saved graph has no issue.[/red] Run "
+            "`releasy graph discover --open-issue` to open one first."
+        )
+        return 1
+
+    progress = build_progress_map(report, load_state(config))
+    prior_number = report.issue_number
+    if config.dry_run and not quiet:
+        console.print(
+            render_graph_issue_body(report, progress),
+            markup=False, highlight=False,
+        )
+    res = open_or_update_graph_issue(
+        config, report, title=f"Port graph for {base_branch}",
+        progress=progress,
+    )
+    if res is None:
+        console.print(
+            f"  [yellow]warning:[/yellow] failed to update graph issue "
+            f"#{prior_number}"
+        )
+        return 1
+    # The issue was 404 and got recreated — persist the new number.
+    if report.issue_number != prior_number and not config.dry_run:
+        _write_report(report, report_path)
+
+    ported = sum(
+        1 for n in report.nodes if _unit_ported(progress.get(n.unit_id))
+    )
+    verb = "would refresh" if config.dry_run else "refreshed"
+    console.print(
+        f"  [green]✓[/green] {verb} graph issue #{report.issue_number} — "
+        f"{ported}/{len(report.nodes)} unit(s) ported"
+    )
     return 0
 
 
