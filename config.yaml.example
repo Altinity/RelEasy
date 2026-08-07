@@ -351,6 +351,8 @@ notifications:
 #   deterministic_build: true
 #   max_build_attempts: 5             # consecutive build-fix attempts per run
 #   max_verify_resume_attempts: 2     # cross-run resumes of build_failed; 0 disables
+#   max_resume_base_drift: 50         # re-port instead of resuming a branch this
+#                                     # far behind base; 0 disables the check
 #   max_verify_iterations: 12         # cap on build↔test iterations per pass
 #   build_log_tail_lines: 500         # log tail fed to the fix-build prompt
 #   build_timeout_seconds: 7200       # cap for one build subprocess

@@ -11,6 +11,7 @@ Stdlib unittest (no pytest dependency). Run:
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -158,6 +159,7 @@ class AIResolveBuildKnobs(unittest.TestCase):
         self.assertTrue(c.deterministic_build)
         self.assertEqual(c.max_build_attempts, 5)
         self.assertEqual(c.max_verify_resume_attempts, 2)
+        self.assertEqual(c.max_resume_base_drift, 50)
         self.assertEqual(c.build_log_tail_lines, 500)
         self.assertTrue(c.run_pr_tests)
         self.assertEqual(c.test_file_globs, _default_test_file_globs())
@@ -168,6 +170,7 @@ class AIResolveBuildKnobs(unittest.TestCase):
             "  deterministic_build: false\n"
             "  max_build_attempts: 8\n"
             "  max_verify_resume_attempts: 0\n"
+            "  max_resume_base_drift: 120\n"
             "  run_pr_tests: false\n"
             "  test_file_globs:\n"
             "    - 'tests/foo/**'\n"
@@ -176,6 +179,7 @@ class AIResolveBuildKnobs(unittest.TestCase):
         self.assertFalse(ai.deterministic_build)
         self.assertEqual(ai.max_build_attempts, 8)
         self.assertEqual(ai.max_verify_resume_attempts, 0)
+        self.assertEqual(ai.max_resume_base_drift, 120)
         self.assertFalse(ai.run_pr_tests)
         self.assertEqual(ai.test_file_globs, ["tests/foo/**"])
 
@@ -310,6 +314,212 @@ class MarkerParsing(unittest.TestCase):
         self.assertIsNone(
             bv._last_marker("no verdict here", ("FIXED", "CANNOT FIX")),
         )
+
+
+class BuildReachedCompiler(unittest.TestCase):
+    """A red build with no compile error is an environment fault."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self._tmp.name)
+        (self.repo / ".releasy").mkdir()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _log(self, text: str) -> None:
+        (self.repo / bv._BUILD_LOG).write_text(text, encoding="utf-8")
+
+    def test_compiler_error(self):
+        self._log("[1/2] Building X.cpp\nX.cpp:9:1: error: no member named 'y'\n")
+        self.assertTrue(bv.build_reached_compiler(self.repo))
+
+    def test_ninja_failed_line(self):
+        self._log("FAILED: src/x.o \nlink step blew up\n")
+        self.assertTrue(bv.build_reached_compiler(self.repo))
+
+    def test_ninja_stopped_line(self):
+        self._log("ninja: build stopped: subcommand failed.\n")
+        self.assertTrue(bv.build_reached_compiler(self.repo))
+
+    def test_missing_build_dir(self):
+        self._log(
+            "[releasy] build started at 2026-08-05T14:56:10Z\n"
+            ".releasy/build.sh: line 12: cd: build: No such file or directory\n"
+        )
+        self.assertFalse(bv.build_reached_compiler(self.repo))
+
+    def test_absent_log(self):
+        self.assertFalse(bv.build_reached_compiler(self.repo))
+
+
+class EnvironmentFaultShortCircuit(unittest.TestCase):
+    """A build that never compiles must not spend a fix attempt."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self._tmp.name)
+        (self.repo / ".releasy").mkdir()
+        (self.repo / bv._BUILD_LOG).write_text(
+            ".releasy/build.sh: line 12: cd: build: No such file or directory\n",
+            encoding="utf-8",
+        )
+        self._orig_build = bv.run_build
+        self._orig_script = bv._write_build_script
+        self._orig_claude = bv._invoke_claude_with_retries
+        self.claude_calls = 0
+
+        def _no_claude(*a, **kw):
+            self.claude_calls += 1
+            return (0, "FIXED", False, 0.0)
+
+        bv.run_build = lambda *a, **kw: (1, False)
+        bv._write_build_script = lambda *a, **kw: None
+        bv._invoke_claude_with_retries = _no_claude
+
+    def tearDown(self):
+        bv.run_build = self._orig_build
+        bv._write_build_script = self._orig_script
+        bv._invoke_claude_with_retries = self._orig_claude
+        self._tmp.cleanup()
+
+    def _config(self):
+        path = self.repo / "config.yaml"
+        path.write_text(
+            "name: test-proj\nproject: testp\n"
+            "origin:\n  remote: https://github.com/o/r.git\n",
+            encoding="utf-8",
+        )
+        return load_config(path)
+
+    def _pr(self):
+        from releasy.github_ops import PRInfo
+        return PRInfo(
+            number=1, title="t", body="", state="merged",
+            merge_commit_sha=None, head_sha="abc", url="https://x/1",
+            repo_slug="o/r",
+        )
+
+    def test_returns_error_outcome_without_calling_claude(self):
+        res = bv.verify_build_and_tests(
+            self._config(), self.repo, self._pr(),
+            port_branch="feature/b/1", base_branch="b", base_sha="deadbeef",
+        )
+        self.assertFalse(res.success)
+        self.assertEqual(res.outcome, "error")
+        self.assertEqual(res.build_attempts, 0)
+        self.assertEqual(self.claude_calls, 0)
+        self.assertIn("never reached the compiler", res.error)
+
+
+class ResumeDryRun(unittest.TestCase):
+    """``--dry-run`` must not check out a parked branch or start a build."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self._tmp.name)
+        self._prev = os.environ.get("RELEASY_STATE_DIR")
+        os.environ["RELEASY_STATE_DIR"] = self._tmp.name
+        self._git("init", "-b", "main")
+        self._git("config", "user.email", "t@t")
+        self._git("config", "user.name", "t")
+        (self.repo / "f.txt").write_text("x", encoding="utf-8")
+        self._git("add", "-A")
+        self._git("commit", "-m", "c0")
+        self._git("branch", "feature/b/1")
+        # Dirty worktree: stash_and_clean would wipe this.
+        (self.repo / "dirty.txt").write_text("keep me", encoding="utf-8")
+
+    def tearDown(self):
+        if self._prev is None:
+            os.environ.pop("RELEASY_STATE_DIR", None)
+        else:
+            os.environ["RELEASY_STATE_DIR"] = self._prev
+        self._tmp.cleanup()
+
+    def _git(self, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(self.repo), *args],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    def _config(self, **ai):
+        path = self.repo / "config.yaml"
+        block = "".join(f"  {k}: {v}\n" for k, v in ai.items())
+        path.write_text(
+            "name: test-proj\nproject: testp\n"
+            "origin:\n  remote: https://github.com/o/r.git\n"
+            + ("ai_resolve:\n" + block if block else ""),
+            encoding="utf-8",
+        )
+        return load_config(path)
+
+    def _resume(self, cfg):
+        """Call the resume path; return (outcome, verify_phase_call_count)."""
+        import releasy.pipeline as pl
+        from releasy.github_ops import PRInfo
+
+        unit = pl.FeatureUnit(
+            feature_id="f1",
+            prs=[PRInfo(
+                number=1, title="t", body="", state="merged",
+                merge_commit_sha=None, head_sha="abc", url="https://x/1",
+                repo_slug="o/r",
+            )],
+            if_exists="recreate",
+        )
+        prev = FeatureState(
+            status="build_failed", branch_name="feature/b/1",
+            base_commit=self._git("rev-parse", "feature/b/1"),
+        )
+        built = []
+        orig = pl._run_verify_phase
+        pl._run_verify_phase = lambda *a, **kw: built.append(1)
+        try:
+            out = pl._resume_build_failed_unit(
+                cfg, self.repo, PipelineState(base_branch="b"), unit, prev,
+                "feature/b/1", "b", "main", "lbl",
+            )
+        finally:
+            pl._run_verify_phase = orig
+        return out, len(built)
+
+    def _advance_main(self, n: int) -> None:
+        for i in range(n):
+            (self.repo / f"m{i}.txt").write_text("x", encoding="utf-8")
+            self._git("add", "-A")
+            self._git("commit", "-m", f"m{i}")
+
+    def test_dry_run_no_checkout_no_build(self):
+        cfg = self._config()
+        cfg.dry_run = True
+        out, built = self._resume(cfg)
+        self.assertEqual(out, "continue")
+        self.assertEqual(built, 0)
+        self.assertEqual(self._git("rev-parse", "--abbrev-ref", "HEAD"), "main")
+        self.assertTrue((self.repo / "dirty.txt").exists())
+
+    def test_near_base_resumes(self):
+        self._advance_main(2)
+        cfg = self._config(max_resume_base_drift=5)
+        cfg.dry_run = True
+        out, _ = self._resume(cfg)
+        self.assertEqual(out, "continue")  # resumed, not re-ported
+
+    def test_drifted_branch_reports_from_base(self):
+        self._advance_main(6)
+        cfg = self._config(max_resume_base_drift=5)
+        cfg.dry_run = True
+        out, built = self._resume(cfg)
+        self.assertIsNone(out)  # falls through to a fresh port
+        self.assertEqual(built, 0)
+
+    def test_drift_check_disabled_by_zero(self):
+        self._advance_main(99)
+        cfg = self._config(max_resume_base_drift=0)
+        cfg.dry_run = True
+        out, _ = self._resume(cfg)
+        self.assertEqual(out, "continue")
 
 
 if __name__ == "__main__":

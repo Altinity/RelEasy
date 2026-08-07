@@ -117,6 +117,27 @@ def _tail_bytes(text: str, budget: int) -> tuple[str, bool]:
     return raw[-budget:].decode("utf-8", errors="ignore"), True
 
 
+# A red build whose log holds none of these never reached the compiler.
+_COMPILE_ERROR_RE = re.compile(r"\berror:|^FAILED:|^ninja: build stopped")
+
+
+def build_reached_compiler(repo_path: Path) -> bool:
+    """True when the build log holds a real compile/link failure.
+
+    A non-zero build with no such line means the harness died before the
+    compiler ran — a missing build dir, a broken toolchain, a failed
+    submodule fetch. No code edit can fix that, so the fix-build loop must
+    not spend an attempt on it.
+    """
+    try:
+        text = (repo_path / _BUILD_LOG).read_text(
+            encoding="utf-8", errors="replace",
+        )
+    except OSError:
+        return False
+    return any(_COMPILE_ERROR_RE.search(ln) for ln in text.splitlines())
+
+
 def _build_log_excerpt(repo_path: Path, tail_lines: int) -> str:
     """Grepped error/FAILED lines + the tail of the build log, byte-bounded.
 
@@ -132,10 +153,7 @@ def _build_log_excerpt(repo_path: Path, tail_lines: int) -> str:
     raw_lines = text.splitlines()
     # Grep on the uncapped lines (so a long line still matches), then cap each
     # selected line for display.
-    error_lines = [
-        ln for ln in raw_lines
-        if re.search(r"\berror:|^FAILED:|^ninja: build stopped", ln)
-    ]
+    error_lines = [ln for ln in raw_lines if _COMPILE_ERROR_RE.search(ln)]
     extra = len(error_lines) - 60
     error_lines = [_cap_line(ln) for ln in error_lines[:60]]
     if extra > 0:
@@ -339,6 +357,27 @@ def verify_build_and_tests(
             )
 
         if rc != 0:
+            if not build_reached_compiler(repo_path):
+                # The build died before compiling anything — nothing in the
+                # port can fix it. Report it as an environment fault so the
+                # caller neither burns a fix attempt nor spends a cross-run
+                # resume on it.
+                console.print(
+                    f"    [red]✗ build never reached the compiler[/red] "
+                    f"[dim](no error:/FAILED: line in {_BUILD_LOG} — "
+                    "environment fault, not a code fix)[/dim]"
+                )
+                return VerifyResult(
+                    success=False, outcome="error",
+                    build_attempts=consecutive_build_failures,
+                    iterations=iterations,
+                    error=(
+                        "build never reached the compiler (no compile error "
+                        f"in {_BUILD_LOG}) — check the build environment "
+                        "(ai_resolve.build_command, build dir, toolchain)"
+                    ),
+                    cost_usd=cost_total, new_head=_head_sha(repo_path),
+                )
             consecutive_build_failures += 1
             if consecutive_build_failures > max_build:
                 return VerifyResult(

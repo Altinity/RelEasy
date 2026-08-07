@@ -151,6 +151,93 @@ class PartialContinueAllowed(unittest.TestCase):
         ))
 
 
+class ApiAbortedNotAResolverVerdict(unittest.TestCase):
+    """An outage must not spend a ``max_partial_continue_attempts`` slot."""
+
+    def setUp(self):
+        import releasy.ai_resolve as ar
+
+        self.ar = ar
+        self._real_invoke = ar._invoke_claude_with_retries
+        self._real_prompt = ar._render_prompt
+        ar._render_prompt = lambda cfg, repo, ctx: "prompt"  # type: ignore[assignment]
+        self.reply = (1, "", False, None)
+        ar._invoke_claude_with_retries = (  # type: ignore[assignment]
+            lambda cfg, repo, prompt, **kw: self.reply
+        )
+
+    def tearDown(self):
+        self.ar._invoke_claude_with_retries = self._real_invoke  # type: ignore[assignment]
+        self.ar._render_prompt = self._real_prompt  # type: ignore[assignment]
+
+    def _resolve(self):
+        from releasy.config import Config, OriginConfig
+
+        cfg = Config(
+            name="proj",
+            origin=OriginConfig(remote="git@github.com:acme/repo.git"),
+            project="acme",
+        )
+        cfg.ai_resolve.command = "true"  # a real binary, so the CLI gate passes
+        ctx = self.ar.AIResolveContext(
+            port_branch="b", base_branch="base", source_pr=None,
+            conflict_files=["f.cpp"], operation="cherry-pick", skip_build=True,
+        )
+        return self.ar.resolve_with_claude(cfg, Path("."), ctx)
+
+    def test_transient_api_error_is_an_abort(self):
+        self.reply = (1, "API Error: Overloaded\n", False, None)
+        res = self._resolve()
+        self.assertFalse(res.success)
+        self.assertTrue(res.api_aborted)
+
+    def test_exit_with_no_billed_work_is_an_abort(self):
+        self.reply = (1, "[runner] something died\n", False, None)
+        res = self._resolve()
+        self.assertTrue(res.api_aborted)
+
+    def test_unresolved_verdict_is_not_an_abort(self):
+        self.reply = (0, "…work…\nUNRESOLVED\n", False, 1.25)
+        res = self._resolve()
+        self.assertFalse(res.success)
+        self.assertFalse(res.api_aborted)
+        self.assertEqual(res.error, "claude reported UNRESOLVED")
+
+    def test_timeout_is_not_an_abort(self):
+        # A timeout burned the whole wall-clock budget — that's a real try.
+        self.reply = (1, "", True, None)
+        res = self._resolve()
+        self.assertTrue(res.timed_out)
+        self.assertFalse(res.api_aborted)
+
+    def test_missing_backend_is_an_abort(self):
+        from releasy.config import Config, OriginConfig
+
+        cfg = Config(
+            name="proj",
+            origin=OriginConfig(remote="git@github.com:acme/repo.git"),
+            project="acme",
+        )
+        cfg.ai_resolve.command = "definitely-not-on-path-xyz"
+        ctx = self.ar.AIResolveContext(
+            port_branch="b", base_branch="base", source_pr=None,
+            conflict_files=["f.cpp"], operation="cherry-pick", skip_build=True,
+        )
+        res = self.ar.resolve_with_claude(cfg, Path("."), ctx)
+        self.assertTrue(res.api_aborted)
+
+    def test_outcome_plumbing_carries_the_flag(self):
+        # _AIStepOutcome → _CherryPickOutcome is what the unit-level
+        # refund in _process_feature_unit reads.
+        step = p._AIStepOutcome(handled=False, api_aborted=True)
+        self.assertTrue(
+            p._CherryPickOutcome(
+                kind="unresolved", api_aborted=step.api_aborted,
+            ).api_aborted
+        )
+        self.assertFalse(p._CherryPickOutcome(kind="unresolved").api_aborted)
+
+
 class ClosedPRClearsPartialMarkers(unittest.TestCase):
     """The sweep is what routes a manually-closed PR to the redo path."""
 

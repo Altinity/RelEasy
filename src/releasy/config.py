@@ -739,6 +739,11 @@ class AIResolveConfig:
     max_build_attempts: int = 5  # consecutive build-fix attempts per run
     # Resumes of a parked build_failed branch on later runs; 0 disables.
     max_verify_resume_attempts: int = 2
+    # Re-port from base instead of resuming when a parked branch has fallen
+    # this many commits behind base — building it would compile stale code
+    # and feed the fixer errors from a base that no longer exists.
+    # 0 disables the check (always resume, however old the branch).
+    max_resume_base_drift: int = 50
     max_verify_iterations: int = 12  # cap on build↔test iterations per pass
     build_log_tail_lines: int = 500  # log tail fed to the fix-build prompt
     # RelEasy's own wall-clock cap for one build subprocess.
@@ -1307,6 +1312,9 @@ def load_config(config_path: Path | None = None) -> Config:
         max_verify_resume_attempts=int(
             ai_raw.get("max_verify_resume_attempts", 2) or 0
         ),
+        max_resume_base_drift=int(
+            ai_raw.get("max_resume_base_drift", 50) or 0
+        ),
         max_verify_iterations=int(ai_raw.get("max_verify_iterations", 12)),
         build_log_tail_lines=int(ai_raw.get("build_log_tail_lines", 500)),
         build_timeout_seconds=int(ai_raw.get("build_timeout_seconds", 7200)),
@@ -1700,6 +1708,8 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         ai_data["max_build_attempts"] = ai.max_build_attempts
     if ai.max_verify_resume_attempts != ai_defaults.max_verify_resume_attempts:
         ai_data["max_verify_resume_attempts"] = ai.max_verify_resume_attempts
+    if ai.max_resume_base_drift != ai_defaults.max_resume_base_drift:
+        ai_data["max_resume_base_drift"] = ai.max_resume_base_drift
     if ai.max_verify_iterations != ai_defaults.max_verify_iterations:
         ai_data["max_verify_iterations"] = ai.max_verify_iterations
     if ai.build_log_tail_lines != ai_defaults.build_log_tail_lines:

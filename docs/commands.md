@@ -121,7 +121,11 @@ cherry-pick has nothing to keep. Set
 `pr_policy.max_partial_continue_attempts: 0` to opt out and get plain
 `if_exists` handling back. A `build_failed` branch (resolution landed, the
 build/test loop didn't pass) resumes on the same terms, bounded by
-`ai_resolve.max_verify_resume_attempts`.
+`ai_resolve.max_verify_resume_attempts` — unless it has fallen more than
+`ai_resolve.max_resume_base_drift` commits behind base, which re-ports it
+from base rather than building stale code. A build that never reaches the
+compiler (missing build dir, broken toolchain) is an environment fault: it
+spends no fix attempt and no resume.
 
 For PRs with an existing rebase PR, `run` doesn't rebuild — it routes
 through the same merge-target flow [`refresh`](#releasy-refresh) uses:

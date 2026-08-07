@@ -561,6 +561,60 @@ def _config(**kw) -> Config:
     )
 
 
+class ErrorLineClassification(unittest.TestCase):
+    """``_api_error_line`` wording drives ai_resolve's retry / wait decision."""
+
+    def _exc(self, body, status):
+        import anthropic
+
+        class Err(anthropic.APIStatusError):
+            def __init__(self):
+                self.status_code = status
+                self.message = str(body)
+                Exception.__init__(self, self.message)
+
+        return Err()
+
+    def _err_body(self, kind, message="boom"):
+        return {
+            "type": "error",
+            "error": {"details": None, "type": kind, "message": message},
+            "request_id": "req_test",
+        }
+
+    def test_overloaded_inside_a_200_is_retryable(self):
+        # The API reports overload as an error event in an otherwise-200
+        # response; classifying on status alone made this fatal.
+        line = ag._api_error_line(
+            self._exc(self._err_body("overloaded_error", "Overloaded"), 200),
+        )
+        self.assertIsNotNone(a._find_transient_api_error(line))
+
+    def test_internal_api_error_inside_a_200_is_retryable(self):
+        line = ag._api_error_line(self._exc(self._err_body("api_error"), 200))
+        self.assertIsNotNone(a._find_transient_api_error(line))
+
+    def test_rate_limit_body_routes_to_the_exhaustion_wait(self):
+        line = ag._api_error_line(
+            self._exc(self._err_body("rate_limit_error"), 200),
+        )
+        self.assertIsNotNone(a._find_session_exhausted(line))
+
+    def test_invalid_request_is_never_retried(self):
+        line = ag._api_error_line(
+            self._exc(self._err_body("invalid_request_error"), 400),
+        )
+        self.assertIsNone(a._find_transient_api_error(line))
+        self.assertIsNone(a._find_session_exhausted(line))
+
+    def test_status_paths_still_classify(self):
+        for status in (500, 502, 529):
+            line = ag._api_error_line(self._exc(self._err_body("api_error"), status))
+            self.assertIsNotNone(a._find_transient_api_error(line), status)
+        line = ag._api_error_line(self._exc(self._err_body("rate_limit_error"), 429))
+        self.assertIsNotNone(a._find_session_exhausted(line))
+
+
 class BackendSelection(unittest.TestCase):
     def setUp(self):
         self._prev_key = os.environ.get("ANTHROPIC_API_KEY")

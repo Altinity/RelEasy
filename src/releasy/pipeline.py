@@ -1464,6 +1464,8 @@ def run_pipeline(
                 ("skip-existing-pr",            "skip — open rebase PR (use `releasy refresh`)"),
                 ("open-pr-for-existing-branch", "would open PR for already-pushed branch"),
                 ("record-existing-branch-state","would record state for existing branch"),
+                ("resume-build-failed",         "would resume build/test on a parked branch"),
+                ("skip-build-failed-exhausted", "skip — build_failed, resume cap reached"),
                 ("blocked-by-deps",             "blocked by unmet deps (no action)"),
                 ("skip-conflict-retry-off",     "skip — prior conflict, retry-off"),
                 ("skip-merged",                 "skip — already merged"),
@@ -2954,7 +2956,9 @@ def _process_feature_unit(
     # --- Resume a build_failed branch ---
     # Re-run the build/test loop on the existing resolution (no re-resolve),
     # bounded by max_verify_resume_attempts; falls through to a fresh port if
-    # the local branch is gone. A parked build_failed unit has no PR (see
+    # the local branch is gone or has drifted more than
+    # max_resume_base_drift commits behind base. A parked build_failed unit
+    # has no PR (see
     # _park_build_failed), so there's nothing a reviewer could have closed:
     # resuming is always the right call, ``if_exists: recreate`` included.
     # Set max_verify_resume_attempts: 0 to rebuild from base instead.
@@ -2965,7 +2969,7 @@ def _process_feature_unit(
     ):
         resumed = _resume_build_failed_unit(
             config, repo_path, state, unit, prev_state,
-            canonical_branch, base_branch, label,
+            canonical_branch, base_branch, base_ref, label,
         )
         if resumed is not None:
             return resumed
@@ -3426,6 +3430,14 @@ def _process_feature_unit(
 
         # outcome.kind == "unresolved"
         # Plain unresolved conflict — flag for manual review and stop.
+        if outcome.api_aborted and unit.partial_continue_attempts:
+            # The attempt was claimed before the resolver ran; it never
+            # judged the conflict, so don't spend it on an outage.
+            unit.partial_continue_attempts -= 1
+            console.print(
+                "    [dim]resolver never ran (API/backend failure) — "
+                "auto-continue attempt not counted[/dim]"
+            )
         _handle_unresolved_conflict(
             config, repo_path, state, unit, new_branch, base_branch,
             base_ref, onto, outcome.failed_idx, outcome.failed_pr,
@@ -3466,6 +3478,9 @@ class _CherryPickOutcome:
     missing_prereq_prs: list[str] = field(default_factory=list)
     missing_prereq_note: str | None = None
     already_in_target_urls: list[str] = field(default_factory=list)
+    # Set on ``"unresolved"`` when the AI step died before judging the
+    # conflict (see AIResolveResult.api_aborted).
+    api_aborted: bool = False
 
 
 def _attempt_cherry_picks(
@@ -3599,6 +3614,7 @@ def _attempt_cherry_picks(
             failed_idx=idx,
             failed_pr=pr,
             conflict_files=cp_result.conflict_files,
+            api_aborted=ai_outcome is not None and ai_outcome.api_aborted,
         )
 
     # Loop completed without hitting a real conflict. If every PR landed
@@ -3854,13 +3870,29 @@ def _park_build_failed(
     )
 
 
+def _commits_behind(repo_path: Path, branch: str, base_ref: str) -> int:
+    """Commits ``base_ref`` has that ``branch`` doesn't. 0 when unknowable."""
+    res = run_git(
+        ["rev-list", "--count", f"{branch}..{base_ref}"], repo_path,
+        check=False,
+    )
+    if res.returncode != 0:
+        return 0
+    try:
+        return int(res.stdout.strip())
+    except ValueError:
+        return 0
+
+
 def _resume_build_failed_unit(
     config: Config, repo_path: Path, state: PipelineState, unit: "FeatureUnit",
-    prev_state: FeatureState, branch: str, base_branch: str, label: str,
+    prev_state: FeatureState, branch: str, base_branch: str, base_ref: str,
+    label: str,
 ) -> str | None:
     """Resume a parked ``build_failed`` branch: re-run build/tests without
     re-resolving. Returns ``"continue"`` when handled, or ``None`` to fall
-    back to a fresh port (the local branch/base is gone)."""
+    back to a fresh port (the local branch/base is gone, or the parked
+    resolution has drifted too far behind base to be worth building)."""
     cap = config.ai_resolve.max_verify_resume_attempts
     attempts = prev_state.verify_resume_attempts
     if cap <= 0 or attempts >= cap:
@@ -3876,6 +3908,30 @@ def _resume_build_failed_unit(
     onto = prev_state.base_commit
     if not onto or not local_branch_exists(repo_path, branch):
         return None  # branch/base gone — re-port from scratch
+
+    # Resuming preserves an expensive resolution, but only while it still
+    # sits near base. Far enough behind and the build compiles stale code
+    # and hands the fixer errors from a base that no longer exists.
+    drift_cap = config.ai_resolve.max_resume_base_drift
+    behind = _commits_behind(repo_path, branch, base_ref) if drift_cap else 0
+    if drift_cap and behind > drift_cap:
+        console.print(
+            f"\n    [yellow]↺[/yellow]  [cyan]{branch}[/cyan] ({label}) — "
+            f"parked resolution is {behind} commits behind {base_ref} "
+            f"(cap {drift_cap}); re-porting from base instead of building "
+            "stale code [dim](ai_resolve.max_resume_base_drift)[/dim]"
+        )
+        return None  # the fresh-port path below records the dry-run action
+
+    if config.dry_run:
+        # Everything below mutates the worktree and starts a real build.
+        console.print(
+            f"\n    [magenta]·[/magenta] [cyan]{branch}[/cyan] ({label}) — "
+            f"would resume build/test on the existing resolution "
+            f"(resume attempt {attempts + 1}/{cap})"
+        )
+        _dry_record(state, "resume-build-failed")
+        return "continue"
 
     stash_and_clean(repo_path)
     co = run_git(["checkout", branch], repo_path, check=False)
@@ -3906,9 +3962,17 @@ def _resume_build_failed_unit(
         )
         return "continue"
 
+    if vres.outcome == "error":
+        # The build never reached the compiler, so the resolution was never
+        # judged — don't spend a resume on a broken environment (same rule
+        # as the auto-continue counter above).
+        console.print(
+            "    [dim]build never ran (environment fault) — resume attempt "
+            "not counted[/dim]"
+        )
     _park_build_failed(
         config, repo_path, state, unit, branch, onto, vres,
-        resume_attempts=attempts + 1,
+        resume_attempts=attempts if vres.outcome == "error" else attempts + 1,
     )
     return "continue"
 
@@ -5260,6 +5324,7 @@ def _try_ai_resolve_step(
             handled=False,
             missing_prereq_prs=list(result.missing_prereq_prs or []),
             missing_prereq_note=result.missing_prereq_note,
+            api_aborted=result.api_aborted,
         )
 
     unit.ai_resolved_count += 1
@@ -5374,6 +5439,8 @@ class _AIStepOutcome:
     handled: bool
     missing_prereq_prs: list[str] = field(default_factory=list)
     missing_prereq_note: str | None = None
+    # The resolver never reached a verdict (see AIResolveResult.api_aborted).
+    api_aborted: bool = False
 
 
 # ---------------------------------------------------------------------------

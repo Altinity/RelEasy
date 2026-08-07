@@ -728,6 +728,20 @@ def _blocks_to_json(content: Any) -> list[dict]:
     return out
 
 
+# Retryable error *types* from the response body, in match order. The API
+# can report one of these as an error event inside an otherwise-200
+# response, where the status code says nothing about retryability — so the
+# body has to be classified too. Each maps to the wording the transient /
+# exhaustion detectors in ai_resolve look for.
+_RETRYABLE_BODY_ERRORS = (
+    ("overloaded_error", "Overloaded"),
+    ("rate_limit_error", "429 rate limit reached"),
+    ("timeout_error", "Request timed out"),
+    # Anthropic's generic "unexpected internal error"; retryable per docs.
+    ("api_error", "500 internal error"),
+)
+
+
 def _api_error_line(exc: Exception) -> str:
     """Map an SDK exception to a transcript line.
 
@@ -735,7 +749,8 @@ def _api_error_line(exc: Exception) -> str:
     transient-retry (5xx / connection / timeout) and session-exhaustion
     (429) detectors match on, so API-mode failures get the same backoff /
     wait treatment as CLI-mode ones. Errors that must NOT be retried
-    (400/401/403/404) are reported without that prefix.
+    (400/401/403/404, invalid_request_error) are reported without that
+    prefix.
     """
     import anthropic
 
@@ -750,6 +765,10 @@ def _api_error_line(exc: Exception) -> str:
     if isinstance(status, int) and status >= 500:
         overloaded = " Overloaded" if status == 529 else ""
         return f"API Error: {status}{overloaded}: {msg}"
+    lowered = msg.lower()
+    for needle, wording in _RETRYABLE_BODY_ERRORS:
+        if needle in lowered:
+            return f"API Error: {wording}: {msg}"
     return f"[runner] anthropic error ({status or type(exc).__name__}): {msg}"
 
 

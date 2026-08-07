@@ -113,6 +113,12 @@ class AIResolveResult:
     # branch into detection-only labelling or auto-recovery.
     missing_prereq_prs: list[str] = field(default_factory=list)
     missing_prereq_note: str | None = None
+    # True when the run died before the model could work on the conflict —
+    # a transient API error that outlived the retries, an unusable backend,
+    # a missing prompt file. The resolver reached no verdict, so callers
+    # must not spend a retry budget (``max_partial_continue_attempts``) on
+    # it. A timeout is NOT this: that one burned the whole wall-clock.
+    api_aborted: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -1402,7 +1408,9 @@ def resolve_with_claude(
     """Render the prompt, run claude, and verify post-conditions."""
     _api, backend_error = _resolve_backend(config, config.ai_resolve.command)
     if backend_error:
-        return AIResolveResult(success=False, error=backend_error)
+        return AIResolveResult(
+            success=False, error=backend_error, api_aborted=True,
+        )
 
     # In resolve-only mode build_verify owns the build wrapper.
     if not ctx.skip_build:
@@ -1411,12 +1419,13 @@ def resolve_with_claude(
         except OSError as exc:
             return AIResolveResult(
                 success=False, error=f"could not write build wrapper: {exc}",
+                api_aborted=True,
             )
 
     try:
         prompt = _render_prompt(config, repo_path, ctx)
     except FileNotFoundError as exc:
-        return AIResolveResult(success=False, error=str(exc))
+        return AIResolveResult(success=False, error=str(exc), api_aborted=True)
 
     build_note = (
         "resolve only, no build" if ctx.skip_build
@@ -1481,10 +1490,12 @@ def resolve_with_claude(
             if transient
             else ""
         )
+        no_billed_work = not iterations and not cost_usd_total
         return AIResolveResult(
             success=False, iterations=iterations,
             error=f"claude exited with code {exit_code}{suffix}\n{tail_str}",
             cost_usd=cost_usd_total,
+            api_aborted=bool(transient) or no_billed_work,
         )
 
     ok, new_head, err, err_kind = _verify_postconditions(config, repo_path, ctx)
