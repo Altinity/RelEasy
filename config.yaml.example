@@ -123,9 +123,11 @@ name: antalya-26.3
 
 # ── Session log (optional) ───────────────────────────────────────
 # Append a full transcript of the process (stdout and stderr: Rich
-# output, ``click`` messages, ``logging`` warnings, tracebacks) to a file
-# for post-run analysis. Relative paths resolve against the directory
-# that contains this config file.
+# output, ``click`` messages, tracebacks) to a file for post-run
+# analysis. Setting this also records timestamped INFO-and-above
+# ``logging`` output (GitHub API side-effects, project-board changes,
+# dry-run decisions) that never reaches the terminal. Relative paths
+# resolve against the directory that contains this config file.
 # log_file: .releasy/releasy.log
 
 # ── Origin (required) ──────────────────────────────────────────────

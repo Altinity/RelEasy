@@ -5,13 +5,19 @@ When :func:`configure` is called with a path (typically from config
 everything the Rich console, Click, the logging module, and tracebacks
 emit is appended to that file in addition to the real terminal. When
 ``configure(None)`` runs, wrappers are removed and the file is closed.
+
+:func:`configure` also attaches the ``releasy`` logger's handlers, so
+``log.info`` / ``log.debug`` calls reach the log file — without them the
+stdlib drops every record below WARNING.
 """
 
 from __future__ import annotations
 
 import atexit
 import io
+import logging
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
@@ -26,6 +32,11 @@ _real_stderr: TextIO = sys.stderr
 _log_fp: TextIO | None = None
 _patched: bool = False
 _console: Console | None = None
+_log_handlers: list[logging.Handler] = []
+
+# Every module logs through ``logging.getLogger(__name__)``, so this is the
+# common ancestor of all of them.
+_LOGGER_NAME = "releasy"
 
 
 class _TeeIO(io.TextIOBase):
@@ -64,12 +75,59 @@ def _reset_console() -> None:
     _console = None
 
 
+def _install_log_handlers(fp: TextIO) -> None:
+    """Route the ``releasy`` logger to ``fp`` (INFO+) and the terminal (WARNING+).
+
+    Nothing configures ``logging``, so the root logger sits at WARNING with
+    no handlers: every ``log.info`` is discarded and only
+    ``logging.lastResort`` puts warnings on stderr. Two handlers replace
+    that, on the ``releasy`` logger rather than the root one so enabling
+    INFO doesn't also unleash urllib3's per-request chatter.
+
+    The file handler writes to ``fp`` directly instead of the tee'd
+    ``sys.stderr``, and the terminal handler to the pre-tee stderr, so a
+    warning is written to the log file exactly once.
+    """
+    to_file = logging.StreamHandler(fp)
+    to_file.setLevel(logging.INFO)
+    file_fmt = logging.Formatter(
+        "%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%SZ",
+    )
+    file_fmt.converter = time.gmtime  # match the UTC session header
+    to_file.setFormatter(file_fmt)
+
+    # Bare message, as lastResort rendered it — the terminal output users
+    # already know stays byte-for-byte the same.
+    to_term = logging.StreamHandler(_real_stderr)
+    to_term.setLevel(logging.WARNING)
+    to_term.setFormatter(logging.Formatter("%(message)s"))
+
+    logger = logging.getLogger(_LOGGER_NAME)
+    logger.setLevel(logging.INFO)
+    for handler in (to_file, to_term):
+        logger.addHandler(handler)
+        _log_handlers.append(handler)
+
+
+def _remove_log_handlers() -> None:
+    """Detach our handlers and hand WARNING+ back to ``logging.lastResort``."""
+    logger = logging.getLogger(_LOGGER_NAME)
+    for handler in _log_handlers:
+        logger.removeHandler(handler)
+        handler.close()  # StreamHandler.close() leaves the stream open
+    _log_handlers.clear()
+    logger.setLevel(logging.NOTSET)
+
+
 def _teardown() -> None:
     global _log_fp, _patched
     if _patched:
         sys.stdout = _real_stdout
         sys.stderr = _real_stderr
         _patched = False
+    # Before closing the file the handler writes to.
+    _remove_log_handlers()
     if _log_fp is not None:
         _log_fp.close()
         _log_fp = None
@@ -82,10 +140,12 @@ atexit.register(_teardown)
 def configure(log_file: Path | str | None) -> None:
     """Enable or disable file mirroring. Safe to call repeatedly.
 
-    * ``log_file is None`` — remove tees and close the log file.
+    * ``log_file is None`` — remove tees + log handlers, close the log file.
     * Otherwise — open the file in append mode, tee stdout/stderr, write a
-      short session header. The path should already be absolute (as after
-      :func:`~releasy.config.load_config` resolves ``log_file:`` in YAML).
+      short session header, and attach the ``releasy`` logger's handlers
+      (see :func:`_install_log_handlers`). The path should already be
+      absolute (as after :func:`~releasy.config.load_config` resolves
+      ``log_file:`` in YAML).
     """
     _teardown()
     if not log_file:
@@ -102,6 +162,7 @@ def configure(log_file: Path | str | None) -> None:
     sys.stdout = _TeeIO(_real_stdout, _log_fp)
     sys.stderr = _TeeIO(_real_stderr, _log_fp)
     _patched = True
+    _install_log_handlers(_log_fp)
     _reset_console()
 
 
