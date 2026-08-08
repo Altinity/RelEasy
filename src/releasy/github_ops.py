@@ -3552,6 +3552,13 @@ def _project_item_body(
 ) -> str:
     """Render the body for a draft-issue project card."""
     body_parts = [f"**Status:** {status}"]
+    if fs is not None and fs.stall is not None:
+        # The status says what the card is; the stall says why it is stuck
+        # and whether the next run will even try again.
+        stuck = f"**Why:** {fs.stall.summary()}"
+        if fs.stall.runs > 1:
+            stuck += f" _(unchanged for {fs.stall.runs} runs)_"
+        body_parts.append(stuck)
     if state.onto:
         body_parts.append(f"**Onto:** `{state.onto}`")
     if state.base_branch:

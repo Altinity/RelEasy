@@ -243,6 +243,13 @@ class PRPolicyConfig:
     # 0 disables auto-continue (old behaviour: leave it until the user sets
     # if_exists: append by hand).
     max_partial_continue_attempts: int = 2
+    # Skip a unit whose recorded stall cannot clear on its own — one waiting
+    # for another unit's PR to merge, for a missing prereq to be queued, or
+    # one that has spent its attempt cap. Re-resolving those reaches the same
+    # verdict at full token price. The stall is dropped (and the unit
+    # retried) as soon as what it waits on changes. Set false to always
+    # re-attempt; `releasy run --ignore-stalls` overrides it per run.
+    honor_stall_reasons: bool = True
 
 
 @dataclass
@@ -923,6 +930,10 @@ class Config:
     # accurate.
     dry_run: bool = False
 
+    # Set by ``--ignore-stalls`` on ``releasy run``: re-attempt every parked
+    # unit this run, whatever ``pr_policy.honor_stall_reasons`` says.
+    ignore_stalls: bool = False
+
     # Global claude --model / --effort applied to every AI invocation.
     ai_model: str | None = None
     ai_effort: str | None = None
@@ -1179,6 +1190,7 @@ def load_config(config_path: Path | None = None) -> Config:
         max_partial_continue_attempts=int(
             pp_raw.get("max_partial_continue_attempts", 2) or 0
         ),
+        honor_stall_reasons=bool(pp_raw.get("honor_stall_reasons", True)),
     )
 
     notif_raw = raw.get("notifications", {}) or {}
@@ -1655,6 +1667,8 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         pp_data["max_partial_continue_attempts"] = (
             pp.max_partial_continue_attempts
         )
+    if pp.honor_stall_reasons != pp_defaults.honor_stall_reasons:
+        pp_data["honor_stall_reasons"] = pp.honor_stall_reasons
     if pp_data:
         data["pr_policy"] = pp_data
 

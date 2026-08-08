@@ -65,7 +65,16 @@ from releasy.github_ops import (
     sync_project,
     update_pull_request,
 )
-from releasy.state import FeatureState, PipelineState, load_state, save_state
+from releasy.state import (
+    BLOCKING_STALL_KINDS,
+    FeatureState,
+    PipelineState,
+    StallReason,
+    clear_conflict_markers,
+    load_state,
+    make_stall,
+    save_state,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -829,15 +838,11 @@ def _refresh_all_merge_status_from_github(
             continue
         if info.state == "merged":
             fs.status = "merged"
-            fs.conflict_files = []
-            fs.failed_step_index = None
-            fs.partial_pr_count = None
+            clear_conflict_markers(fs)
             changed += 1
         elif info.state == "closed":
             fs.status = "closed"
-            fs.conflict_files = []
-            fs.failed_step_index = None
-            fs.partial_pr_count = None
+            clear_conflict_markers(fs)
             fs.skip_reason = "rebase PR closed without merging"
             changed += 1
     return changed
@@ -1031,9 +1036,7 @@ def _refresh_all_superseded_status_from_github(
         if port_evidence:
             fs = state.features[fid]
             fs.status = "superseded"
-            fs.conflict_files = []
-            fs.failed_step_index = None
-            fs.partial_pr_count = None
+            clear_conflict_markers(fs)
             where, ref = port_evidence
             fs.skip_reason = f"superseded by {where} {ref}"
             changed += 1
@@ -1057,9 +1060,7 @@ def _refresh_all_superseded_status_from_github(
             continue
         fs = state.features[fid]
         fs.status = "superseded"
-        fs.conflict_files = []
-        fs.failed_step_index = None
-        fs.partial_pr_count = None
+        clear_conflict_markers(fs)
         if len(evidence) == 1:
             where, ref = evidence[0]
             fs.skip_reason = f"superseded by {where} {ref}"
@@ -1191,14 +1192,10 @@ def _refresh_dep_states_from_github(
             continue
         if info.state == "merged":
             dep_fs.status = "merged"
-            dep_fs.conflict_files = []
-            dep_fs.failed_step_index = None
-            dep_fs.partial_pr_count = None
+            clear_conflict_markers(dep_fs)
         elif info.state == "closed":
             dep_fs.status = "closed"
-            dep_fs.conflict_files = []
-            dep_fs.failed_step_index = None
-            dep_fs.partial_pr_count = None
+            clear_conflict_markers(dep_fs)
             dep_fs.skip_reason = "rebase PR closed without merging"
 
 
@@ -1466,7 +1463,10 @@ def run_pipeline(
                 ("record-existing-branch-state","would record state for existing branch"),
                 ("resume-build-failed",         "would resume build/test on a parked branch"),
                 ("skip-build-failed-exhausted", "skip — build_failed, resume cap reached"),
+                ("skip-partial-continue-exhausted",
+                                                "skip — partial group, auto-continue cap reached"),
                 ("blocked-by-deps",             "blocked by unmet deps (no action)"),
+                ("skip-stalled",                "skip — stalled on something outside the unit"),
                 ("skip-conflict-retry-off",     "skip — prior conflict, retry-off"),
                 ("skip-merged",                 "skip — already merged"),
                 ("skip-skipped",                "skip — user-marked skipped"),
@@ -1790,7 +1790,7 @@ def run_sequential(
                 raise SystemExit(1)
 
             fs.status = "merged"
-            fs.conflict_files = []
+            clear_conflict_markers(fs)
             console.print(
                 f"    [green]✓[/green] PR merged — advancing the queue"
             )
@@ -2456,6 +2456,7 @@ def _unit_body(
     auto_prereq_urls: list[str] | None = None,
     auto_prereq_trail: list[dict] | None = None,
     dropped_items: list[str] | None = None,
+    stall: StallReason | None = None,
 ) -> str:
     """Build the PR body. Optional banners cover the partial-group
     intervention case, auto-ported prerequisites, and dropped scope."""
@@ -2471,10 +2472,14 @@ def _unit_body(
         lines.append(
             "> **This PR needs manual intervention.**"
         )
+        why = (
+            stall.summary() if stall is not None
+            else "AI resolver was disabled, exhausted its iteration "
+                 "budget, or gave up"
+        )
         lines.append(
             f"> Cherry-pick of {failed_ref} could not be resolved "
-            "automatically (AI resolver was disabled, exhausted its "
-            "iteration budget, or gave up)."
+            f"automatically — {why}."
         )
         lines.append(
             f"> The branch contains the first {applied} commit(s) of "
@@ -2849,6 +2854,82 @@ def _partial_continue_allowed(
     )
 
 
+# A unit whose port PR reached one of these carries no more work: anything
+# waiting on it can stop waiting.
+_LANDED_STATUSES = frozenset({"merged", "superseded"})
+
+
+def _stall_still_blocks(
+    config: Config, state: PipelineState, stall: StallReason,
+) -> bool:
+    """True when nothing has changed that could get ``stall`` unstuck.
+
+    Only the kinds in ``BLOCKING_STALL_KINDS`` are ever gated — every other
+    stall is worth another shot (base has moved, the resolver may do better).
+    A blocking stall clears the moment what it waits on moves:
+
+    * ``waiting_for_merge`` — one of the units it waits on merged (or left
+      the session, so we can no longer tell).
+    * ``missing_prereq`` — the prereq is now queued somewhere releasy knows
+      about, so the dive has somewhere to go.
+    """
+    if stall.kind == "waiting_for_merge":
+        if not stall.waiting_on_units:
+            return False
+        return all(
+            (fs := state.features.get(uid)) is not None
+            and fs.status not in _LANDED_STATUSES
+            for uid in stall.waiting_on_units
+        )
+    if stall.kind == "missing_prereq":
+        if not stall.waiting_on_prs:
+            return False
+        return not _find_already_queued_prereqs(
+            config, state, list(stall.waiting_on_prs),
+        )
+    return False
+
+
+def _skip_for_stall(
+    config: Config,
+    state: PipelineState,
+    prev_state: FeatureState | None,
+    canonical_branch: str,
+    label: str,
+) -> bool:
+    """Honour a recorded stall: skip the unit, or drop a stall that cleared.
+
+    Returns True when the caller should leave the unit untouched this run.
+    Re-resolving a unit that waits on somebody else's merge costs a full
+    resolution and reaches the same verdict, so the default is to wait.
+    """
+    from rich.markup import escape
+
+    stall = prev_state.stall if prev_state is not None else None
+    if (
+        stall is None
+        or config.ignore_stalls
+        or not config.pr_policy.honor_stall_reasons
+        or stall.kind not in BLOCKING_STALL_KINDS
+    ):
+        return False
+    if not _stall_still_blocks(config, state, stall):
+        # What it waited on moved — let the unit back into the normal flow.
+        prev_state.stall = None
+        return False
+
+    runs = stall.runs + 1
+    stall.runs = runs
+    console.print(
+        f"\n    [yellow]⏳[/yellow] [cyan]{canonical_branch}[/cyan] "
+        f"({label}) — {escape(stall.summary())}; not re-resolving "
+        f"[dim](run {runs} in this state; --ignore-stalls to force)[/dim]"
+    )
+    _persist_state(config, state)
+    _dry_record(state, "skip-stalled")
+    return True
+
+
 def _process_feature_unit(
     config: Config,
     repo_path: Path,
@@ -2929,6 +3010,12 @@ def _process_feature_unit(
             blocked_state.failed_step_index = None
             blocked_state.partial_pr_count = None
             blocked_state.prereq_recovery_exhausted = False
+            blocked_state.stall = make_stall(
+                "waiting_for_merge",
+                detail="declared depends_on",
+                waiting_on_units=list(unmet),
+                prior=prev_state,
+            )
             state.features[unit.feature_id] = blocked_state
             _persist_state(config, state)
             _dry_record(state, "blocked-by-deps")
@@ -2938,6 +3025,7 @@ def _process_feature_unit(
         if prev_state and prev_state.status == "blocked":
             prev_state.status = "needs_review"
             prev_state.blocked_by = []
+            prev_state.stall = None
 
     if (is_failed_prev or is_build_failed_prev) and not retry_failed:
         # User opted out of retries — leave the conflicted / build-failed
@@ -2951,6 +3039,12 @@ def _process_feature_unit(
             "--no-retry-failed)[/dim]"
         )
         _dry_record(state, "skip-conflict-retry-off")
+        return "continue"
+
+    # --- Stall gate: don't pay for a retry that cannot get anywhere yet ---
+    # A unit parked waiting on somebody else's merge (or on a prereq nobody
+    # ports) reaches the same verdict for the same money until that changes.
+    if _skip_for_stall(config, state, prev_state, canonical_branch, label):
         return "continue"
 
     # --- Resume a build_failed branch ---
@@ -3008,6 +3102,12 @@ def _process_feature_unit(
                 "[dim](bump pr_policy.max_partial_continue_attempts to retry, "
                 "or finish it by hand)[/dim]"
             )
+            prev_state.stall = make_stall(
+                "retries_exhausted",
+                detail=f"auto-continue {attempts}/{cap}",
+                prior=prev_state,
+            )
+            _persist_state(config, state)
             _dry_record(state, "skip-partial-continue-exhausted")
             return "continue"
         unit.if_exists = "append"
@@ -3443,6 +3543,7 @@ def _process_feature_unit(
             base_ref, onto, outcome.failed_idx, outcome.failed_pr,
             outcome.conflict_files, pr_meta,
             ai_attempted=ai_active,
+            api_aborted=outcome.api_aborted,
             dynamic_prereq_urls=fs_dynamic_prereq_urls,
             prereq_trail=fs_prereq_trail,
             prereq_discovery_depth=prereq_discovery_depth,
@@ -3802,6 +3903,7 @@ def _ensure_pr_for_existing_remote_branch(
     if pr_url:
         fs.rebase_pr_url = pr_url
         fs.status = "needs_review"
+        clear_conflict_markers(fs)
         _apply_releasy_label_to_pr(config, pr_url)
         _apply_session_labels_to_pr(config, pr_url, mode=unit.mode)
         if fs.ai_resolved:
@@ -3859,6 +3961,11 @@ def _park_build_failed(
     fs.build_attempts = result.build_attempts
     fs.verify_resume_attempts = resume_attempts
     fs.last_verify_error = result.error
+    fs.stall = make_stall(
+        "build_unfixed",
+        detail=result.error or "",
+        prior=state.features.get(unit.feature_id),
+    )
     if unit.ai_cost_usd_total is not None:
         fs.ai_cost_usd = unit.ai_cost_usd_total
     state.features[unit.feature_id] = fs
@@ -3902,6 +4009,16 @@ def _resume_build_failed_unit(
             "local branch for manual help. [dim](bump "
             "ai_resolve.max_verify_resume_attempts, or fix it by hand)[/dim]"
         )
+        prev_state.stall = make_stall(
+            "retries_exhausted",
+            detail=(
+                f"build resume {attempts}/{cap}"
+                + (f" — {prev_state.last_verify_error}"
+                   if prev_state.last_verify_error else "")
+            ),
+            prior=prev_state,
+        )
+        _persist_state(config, state)
         _dry_record(state, "skip-build-failed-exhausted")
         return "continue"
 
@@ -4853,6 +4970,99 @@ def _print_prereq_dive_failure(
         )
 
 
+def _queued_stall(
+    queued: list[dict], *, prior: FeatureState | None,
+) -> StallReason:
+    """``waiting_for_merge`` naming the units that already port the prereq."""
+    return make_stall(
+        "waiting_for_merge",
+        waiting_on_units=[
+            str(q.get("queued_in")) for q in queued if q.get("queued_in")
+        ],
+        waiting_on_prs=[
+            str(q.get("prereq_url")) for q in queued if q.get("prereq_url")
+        ],
+        prior=prior,
+    )
+
+
+def _prereq_stall(
+    config: Config,
+    state: PipelineState,
+    unit: FeatureUnit,
+    exit_reason: dict,
+    discovered: list[str],
+    auto_cfg,  # noqa: ANN001 — AutoAddPrereqConfig, imported lazily elsewhere
+    depth: int,
+    *,
+    prior: FeatureState | None,
+) -> StallReason:
+    """Map a ``_decide_prereq_dive`` exit reason onto a stall.
+
+    ``waiting_for_merge`` is the one that pays for itself: the prereq is
+    already being ported by another unit, so the next run skips this one
+    until that unit's PR merges instead of re-running the resolver to be
+    told the same thing.
+    """
+    reason = exit_reason.get("reason")
+    if reason == "queued_elsewhere":
+        return _queued_stall(exit_reason.get("queued") or [], prior=prior)
+    if reason == "depth_exhausted":
+        return make_stall(
+            "prereq_search_exhausted",
+            detail=f"depth {depth}/{auto_cfg.max_prereq_depth}",
+            waiting_on_prs=list(discovered),
+            prior=prior,
+        )
+    if reason == "cycle":
+        return make_stall(
+            "prereq_search_exhausted",
+            detail="prereq cycle — the dive pointed back into the unit",
+            waiting_on_prs=list(discovered),
+            prior=prior,
+        )
+    if reason == "fetch_failed":
+        return make_stall(
+            "prereq_search_exhausted",
+            detail="could not fetch the discovered prereq PR(s)",
+            waiting_on_prs=list(exit_reason.get("failed_urls") or discovered),
+            prior=prior,
+        )
+    if reason == "all_already_in_base":
+        return make_stall(
+            "prereq_search_exhausted",
+            detail="every discovered prereq is already in base",
+            waiting_on_prs=list(discovered),
+            prior=prior,
+        )
+    if reason == "unlabeled_origin_prereq":
+        return make_stall(
+            "missing_prereq",
+            detail="prereq is in origin but lacks the selection label(s)",
+            waiting_on_prs=list(
+                exit_reason.get("unlabeled_urls") or discovered
+            ),
+            prior=prior,
+        )
+    # "detection_only" and anything new. The dive never ran, so the
+    # queued-elsewhere check never ran either: do it now, so a prereq some
+    # other unit already carries parks this one as waiting-for-merge rather
+    # than as a prereq nobody ports.
+    queued = _find_already_queued_prereqs(
+        config, state, discovered, exclude_feature_id=unit.feature_id,
+    )
+    if queued:
+        return _queued_stall(queued, prior=prior)
+    return make_stall(
+        "missing_prereq",
+        detail=(
+            "auto-recovery off" if reason == "detection_only" else str(reason)
+        ),
+        waiting_on_prs=list(discovered),
+        prior=prior,
+    )
+
+
 def _handle_missing_prereqs_no_dive(
     config: Config,
     repo_path: Path,
@@ -4944,6 +5154,11 @@ def _handle_missing_prereqs_no_dive(
         prereq_trail=list(fs_prereq_trail),
         prereq_recovery_exhausted=exhausted,
         queued_prereq_units=list(exit_reason.get("queued") or []),
+        stall=_prereq_stall(
+            config, state, unit, exit_reason, final_discovered, auto_cfg,
+            prereq_discovery_depth,
+            prior=state.features.get(unit.feature_id),
+        ),
         **pr_meta,
     )
     state.features[unit.feature_id] = fs
@@ -5024,6 +5239,7 @@ def _handle_unresolved_conflict(
     pr_meta: dict,
     *,
     ai_attempted: bool,
+    api_aborted: bool = False,
     dynamic_prereq_urls: list[str] | None = None,
     prereq_trail: list[dict] | None = None,
     prereq_discovery_depth: int = 0,
@@ -5062,6 +5278,25 @@ def _handle_unresolved_conflict(
         "AI resolver gave up" if ai_attempted
         else "AI resolver disabled"
     )
+    prior_state = state.features.get(unit.feature_id)
+    if not ai_attempted:
+        stall = make_stall(
+            "resolver_unavailable", detail="AI resolution disabled",
+            prior=prior_state,
+        )
+    elif api_aborted:
+        stall = make_stall(
+            "resolver_unavailable",
+            detail="backend failed before judging the conflict",
+            prior=prior_state,
+        )
+    else:
+        n_files = len(conflict_files)
+        stall = make_stall(
+            "unresolvable",
+            detail=f"{ref}, {n_files} conflicted file(s)",
+            prior=prior_state,
+        )
 
     if idx == 0:
         # Nothing to keep — drop the branch entirely.
@@ -5089,6 +5324,7 @@ def _handle_unresolved_conflict(
             dynamic_prereq_urls=list(dynamic_prereq_urls or []),
             prereq_trail=list(prereq_trail or []),
             prereq_discovery_depth=prereq_discovery_depth,
+            stall=stall,
             **pr_meta,
         )
         _persist_state(config, state)
@@ -5122,6 +5358,7 @@ def _handle_unresolved_conflict(
             failed_pr=failed_pr,
             conflict_files=conflict_files,
             dropped_items=dropped_items,
+            stall=stall,
         )
         # On a retry of a previously-failed unit a draft PR may already
         # exist for this branch — `create_pull_request` would 422 in that
@@ -5184,9 +5421,8 @@ def _handle_unresolved_conflict(
 
     # Carry the prior verify_comment_posted across the FeatureState
     # rebuild below so re-runs don't stack duplicate comments.
-    prior_fs = state.features.get(unit.feature_id)
     verify_comment_posted = bool(
-        prior_fs and prior_fs.verify_comment_posted
+        prior_state and prior_state.verify_comment_posted
     )
     if (
         unit.verify_needs_attention
@@ -5217,6 +5453,7 @@ def _handle_unresolved_conflict(
         dynamic_prereq_urls=list(dynamic_prereq_urls or []),
         prereq_trail=list(prereq_trail or []),
         prereq_discovery_depth=prereq_discovery_depth,
+        stall=stall,
         **pr_meta,
     )
     if rebase_pr_url:
@@ -5503,7 +5740,7 @@ def continue_branch(config: Config, branch_name: str) -> bool:
     state.features[feat.id].status = _success_status(
         state.features[feat.id].rebase_pr_url
     )
-    state.features[feat.id].conflict_files = []
+    clear_conflict_markers(state.features[feat.id])
     _persist_state(config, state)
     console.print(
         f"[green]✓[/green] Feature [cyan]{feat.id}[/cyan] "
@@ -5998,7 +6235,7 @@ def skip_branch(config: Config, branch_name: str) -> bool:
         return False
 
     state.features[feat.id].status = "skipped"
-    state.features[feat.id].conflict_files = []
+    clear_conflict_markers(state.features[feat.id])
     _persist_state(config, state)
     console.print(f"[yellow]⏭[/yellow] Feature [cyan]{feat.id}[/cyan] skipped")
     return True
@@ -6218,6 +6455,7 @@ def print_status(config: Config) -> None:
     One sub-table per status section (in :data:`STATUS_DISPLAY_ORDER`),
     so the most-attention-needing entries (conflicts) surface at the top.
     """
+    from rich.markup import escape
     from rich.table import Table
     from releasy.state import STATUS_DISPLAY_ORDER
     from releasy.status import STATUS_HEADINGS, STATUS_ICONS
@@ -6299,6 +6537,11 @@ def print_status(config: Config) -> None:
             table.add_column("Blocked By", style="yellow")
         if status == "skipped":
             table.add_column("Reason", style="yellow")
+        # Why the port stopped where it did — only for statuses that can
+        # carry one (a clean port has no stall).
+        show_why = any(fs.stall is not None for _, fs in rows)
+        if show_why:
+            table.add_column("Why", style="yellow")
         for fid, fs in rows:
             feat = next((f for f in config.features if f.id == fid), None)
             label = fs.branch_name or (feat.source_branch if feat else None) or fid
@@ -6332,6 +6575,11 @@ def print_status(config: Config) -> None:
                 row.append(", ".join(blockers))
             if status == "skipped":
                 row.append(fs.skip_reason or "")
+            if show_why:
+                why = escape(fs.stall.summary()) if fs.stall else ""
+                if fs.stall and fs.stall.runs > 1:
+                    why += f" [dim](×{fs.stall.runs} runs)[/dim]"
+                row.append(why)
             table.add_row(*row)
         console.print()
         console.print(table)

@@ -272,6 +272,17 @@ def cli(
          "reality. Cannot predict cherry-pick conflicts — shows "
          "intended actions only.",
 )
+@click.option(
+    "--ignore-stalls",
+    "ignore_stalls",
+    is_flag=True,
+    default=False,
+    help="Re-attempt units parked on a stall that cannot clear by itself "
+         "(waiting for another unit's PR to merge, or on a prereq nobody "
+         "ports). Those are skipped by default because re-resolving them "
+         "reaches the same verdict at full token price — see "
+         "pr_policy.honor_stall_reasons.",
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -283,6 +294,7 @@ def run(
     pr_url: str | None,
     merge_target: bool,
     dry_run: bool,
+    ignore_stalls: bool,
 ) -> None:
     """Discover and port new PRs onto the base branch (cherry-pick + open PR)."""
     from releasy.pipeline import (
@@ -314,6 +326,7 @@ def run(
             if retry_failed is None else retry_failed
         )
         config.dry_run = dry_run
+        config.ignore_stalls = ignore_stalls
 
         if config.sequential:
             run_sequential(

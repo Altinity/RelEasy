@@ -114,6 +114,53 @@ by `pr_policy.detect_superseded`). AI involvement is signalled by
 For per-PR hints to the resolver, see
 [`ai_context`](configuration.md#per-pr--per-group-ai_context).
 
+## Stall reasons
+
+`status` says *what* a parked unit is; a **stall** says *why* it stopped and
+whether re-running could change that. It is recorded on the state entry
+(`stall:`) on every non-clean exit, and cleared the moment the unit lands,
+merges, is skipped, or has its conflict resolved.
+
+A stall is a generic `kind` plus the specifics — a short `detail`, the units
+and PRs it waits on, when it was first seen, and how many consecutive runs
+have ended in it:
+
+```yaml
+stall:
+  kind: waiting_for_merge
+  waiting_on_units: [auto-grp-pr-1687]
+  waiting_on_prs: [https://github.com/Altinity/ClickHouse/pull/1687]
+  since: "2026-08-05T09:14:02+00:00"
+  runs: 3
+```
+
+| Kind | Meaning | Blocks a retry? |
+|------|---------|-----------------|
+| `waiting_for_merge` | A prerequisite is queued in another unit (or a `depends_on` gate is unmet) — nothing to try until that PR merges. | yes |
+| `missing_prereq` | A prerequisite PR was identified but nobody ports it: add it to the session, or merge it upstream. | yes |
+| `retries_exhausted` | An attempt cap was spent (`max_partial_continue_attempts`, `max_verify_resume_attempts`). | the cap does |
+| `unresolvable` | The resolver judged the conflict and could not fix it. | no |
+| `prereq_search_exhausted` | The auto-prereq dive hit its depth cap, a cycle, or a fetch failure. | no |
+| `resolver_unavailable` | AI resolution is off, or the backend died before reaching a verdict. | no |
+| `build_unfixed` | The resolution landed but the build/tests never went green. | no |
+
+**Blocking stalls skip the unit** on the next [`run`](commands.md#releasy-run)
+instead of paying for a resolution that can only reach the same verdict. The
+skip is not permanent — it lasts exactly as long as the thing being waited on:
+a `waiting_for_merge` clears when one of its units reaches `merged` /
+`superseded` (or leaves the session), a `missing_prereq` clears once the
+prereq is queued somewhere releasy knows about. `retries_exhausted` isn't
+gated here because the caps are re-read from config every run, so raising one
+takes effect immediately.
+
+Set [`pr_policy.honor_stall_reasons:
+false`](configuration.md#configyaml-stable-infrastructure) to always
+re-attempt, or pass `run --ignore-stalls` for a single run.
+
+Stalls surface in `releasy status` (a **Why** column), on the graph issue
+([`graph sync`](commands.md#releasy-graph-sync)), on the project board card,
+and in the draft PR's "needs manual intervention" banner.
+
 ## PR title & labels
 
 Rebase PR title: `"<Project> <version>: <subject>"` — e.g.

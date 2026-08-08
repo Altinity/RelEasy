@@ -75,6 +75,7 @@ from releasy.github_ops import (
 from releasy.state import (
     FeatureState,
     PipelineState,
+    clear_conflict_markers,
     find_feature_by_pr_url,
     load_state,
     save_state,
@@ -858,9 +859,9 @@ def _process_one(
         fs.status = "needs_review"
         # Clear the cherry-pick-failure markers if they were left over
         # from an earlier ``releasy run`` that punted into conflict
-        # state — once the PR is mergeable they no longer apply.
-        fs.failed_step_index = None
-        fs.partial_pr_count = None
+        # state — once the PR is mergeable they no longer apply. Same for
+        # the stall: whatever it was waiting for, the PR is clean now.
+        clear_conflict_markers(fs)
     if outcome.ai_used:
         fs.ai_resolved = True
         if outcome.ai_iterations:
@@ -1428,8 +1429,7 @@ def _maybe_update_tracked_state(
         matched.conflict_files = []
         if matched.status == "conflict":
             matched.status = "needs_review"
-            matched.failed_step_index = None
-            matched.partial_pr_count = None
+            clear_conflict_markers(matched)
         if outcome.ai_used:
             matched.ai_resolved = True
             if outcome.ai_iterations:

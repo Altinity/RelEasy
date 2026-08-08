@@ -130,6 +130,13 @@ from base rather than building stale code. A build that never reaches the
 compiler (missing build dir, broken toolchain) is an environment fault: it
 spends no fix attempt and no resume.
 
+A unit parked on a **[stall](concepts.md#stall-reasons)** that cannot clear on
+its own — waiting for another unit's PR to merge, or on a prereq nobody ports
+— is skipped rather than re-resolved: the verdict would be the same at full
+token price. The skip lifts by itself once what it waits on moves. Use
+`--ignore-stalls` (or `pr_policy.honor_stall_reasons: false`) to force the
+retry anyway.
+
 For PRs with an existing rebase PR, `run` doesn't rebuild — it routes
 through the same merge-target flow [`refresh`](#releasy-refresh) uses:
 clean merge → leave alone; conflict → AI-resolve and plain push (never
@@ -142,7 +149,7 @@ releasy run [--onto <ver>] [--work-dir <path>]
             [--retry-failed | --no-retry-failed]
             [--merge-target | --no-merge-target]
             [--only <url-or-id> | --pr <URL>]
-            [--dry-run]
+            [--ignore-stalls] [--dry-run]
 ```
 
 | Option | Description | Default |
@@ -154,6 +161,7 @@ releasy run [--onto <ver>] [--work-dir <path>]
 | `--merge-target` / `--no-merge-target` | Push a merge commit on PRs even without conflicts. Never force-pushes. | off |
 | `--only <url-or-id>` | Single PR URL **or** group/singleton id. Drops everything else. **Non-zero** if nothing matches. Mutex with `--pr`. | — |
 | `--pr <URL>` | Single PR by URL. Exits **cleanly (0)** when the PR isn't in session scope. Use from webhook/cron callers. Mutex with `--only`. | — |
+| `--ignore-stalls` | Re-attempt units parked on a [stall](concepts.md#stall-reasons) that can't clear by itself (waiting for another unit's PR to merge, or on a prereq nobody ports). | off |
 | `--dry-run` | No writes anywhere (state / git / GitHub). Read-only fetches still happen; cannot predict cherry-pick conflicts. | off |
 
 Exit: `1` on any `conflict` (in scope), else `0`.
@@ -443,6 +451,21 @@ PR unticks the box again; `superseded` counts as done. Markers:
 | `⏸ blocked` | Waiting on `depends_on` units (named inline) |
 | `⛔ PR closed unmerged` · `♻ superseded` · `⏭ skipped` | Terminal |
 | `⬜ not started` | No state entry yet |
+
+**Each group is a foldable `<details>` block** headed by its unit ID, PR count
+and status marker. Merged (and `superseded`) groups are folded shut — the work
+is done, there's nothing to read; everything else stays expanded. Standalone
+PRs are one line each and stay plain checkboxes.
+
+A unit that stopped short also carries **why**, after the port-PR link:
+
+```
+🔴 conflict · 1/3 picked #2146 · ⏳ waiting for `auto-grp-pr-1687` to merge
+```
+
+That is the [stall reason](concepts.md#stall-reasons) from the pipeline state,
+with `(×N runs)` once it has survived more than one run. `⏸ blocked` and
+`⏭ skipped` already spell their reason out in the marker and don't repeat it.
 
 `run` and `refresh` do this automatically at the end — set
 `graph.sync_progress: false` to turn that off and drive it manually. Ticking a
@@ -767,6 +790,10 @@ releasy rebase --target <branch> [--pr <url>] [--only <url-or-id>]
 Rich-text per-status sub-tables, ordered with conflicts first (see
 `STATUS_DISPLAY_ORDER` in [`src/releasy/state.py`](../src/releasy/state.py)).
 Reads state only — no git, no network.
+
+Parked entries get a **Why** column carrying their
+[stall reason](concepts.md#stall-reasons) — what the unit is waiting on, and
+`(×N runs)` once it has been stuck for more than one run.
 
 ```bash
 releasy status

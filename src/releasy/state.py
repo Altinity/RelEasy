@@ -19,6 +19,7 @@ command).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,6 +56,190 @@ BranchStatus = Literal[
     "superseded",
 ]
 PipelinePhase = Literal["init", "ports_done"]
+
+
+# ---------------------------------------------------------------------------
+# Stall reasons — why a port stopped short of a mergeable PR
+# ---------------------------------------------------------------------------
+#
+# ``status`` says WHAT a unit is (conflict / build_failed / …); a stall says
+# WHY it got stuck and whether re-running could possibly change that. The
+# generic ``kind`` is what code branches on; ``detail`` and the ``waiting_on_*``
+# lists carry the specifics a human needs to read.
+
+StallKind = Literal[
+    # A prerequisite is already queued in another releasy unit — nothing to
+    # try until that unit's PR merges into the base branch.
+    "waiting_for_merge",
+    # A prerequisite PR was identified but is not ported anywhere: the user
+    # has to add it to the session (or merge it upstream) first.
+    "missing_prereq",
+    # An attempt cap was hit (auto-continue / build-resume). Only a config
+    # bump or a manual fix moves this.
+    "retries_exhausted",
+    # The resolver judged the conflict and could not fix it.
+    "unresolvable",
+    # The auto-prereq dive stopped on its depth cap, a cycle, or a fetch
+    # failure — the search itself ran out, not the conflict.
+    "prereq_search_exhausted",
+    # No verdict was reached: AI resolution is off, or the backend died.
+    "resolver_unavailable",
+    # The resolution landed but the build / tests never went green.
+    "build_unfixed",
+]
+
+# Stalls that no amount of re-running fixes on its own: the thing being
+# waited for lives outside the unit. ``run`` skips these instead of paying
+# for a resolution that can only reach the same verdict — see
+# :func:`releasy.pipeline._stall_still_blocks`. ``retries_exhausted`` is
+# deliberately absent: the attempt caps are re-read from config on every
+# run, so raising one has to take effect immediately.
+BLOCKING_STALL_KINDS: frozenset[str] = frozenset(
+    {"waiting_for_merge", "missing_prereq"}
+)
+
+# Generic one-liner per kind. ``{targets}`` is filled from waiting_on_*.
+_STALL_LABEL: dict[str, str] = {
+    "waiting_for_merge": "waiting for {targets} to merge",
+    "missing_prereq": "missing prereq {targets}",
+    "retries_exhausted": "retries exhausted",
+    "unresolvable": "resolver gave up",
+    "prereq_search_exhausted": "prereq search exhausted",
+    "resolver_unavailable": "resolver unavailable",
+    "build_unfixed": "build still failing",
+}
+
+_STALL_PR_NUMBER_RE = re.compile(r"/pull/(\d+)")
+
+
+def _pr_ref(url: str) -> str:
+    """``#N`` for a PR URL, the URL itself when it doesn't parse."""
+    m = _STALL_PR_NUMBER_RE.search(url or "")
+    return f"#{m.group(1)}" if m else (url or "?")
+
+
+@dataclass
+class StallReason:
+    """Why a unit is parked, in a form both code and humans can read."""
+
+    kind: StallKind
+    # Short free-form specifics ("3/3 attempts", "depth 2/2", a build error).
+    detail: str = ""
+    # Tracked feature IDs whose port PR must merge before a retry is useful.
+    waiting_on_units: list[str] = field(default_factory=list)
+    # Source PR URLs that must land (merged upstream, or ported by releasy).
+    waiting_on_prs: list[str] = field(default_factory=list)
+    # ISO-8601 UTC of the run that first recorded this stall, and how many
+    # consecutive runs have ended in it. Both survive re-records of the same
+    # stall so `releasy status` can show "stuck here since …".
+    since: str | None = None
+    runs: int = 1
+
+    def targets(self) -> str:
+        """What this stall waits on, named as briefly as possible.
+
+        Units win over PRs: when a prereq is queued in another unit, that
+        unit's ID is the thing the reader acts on — repeating the source PR
+        it carries just makes the line longer.
+        """
+        bits = (
+            [f"`{u}`" for u in self.waiting_on_units] if self.waiting_on_units
+            else [_pr_ref(u) for u in self.waiting_on_prs]
+        )
+        return ", ".join(bits) or "an external change"
+
+    def summary(self, *, max_detail: int = 90) -> str:
+        """One short line: the generic label plus its specifics."""
+        label = _STALL_LABEL.get(self.kind, self.kind)
+        if "{targets}" in label:
+            label = label.format(targets=self.targets())
+        detail = " ".join((self.detail or "").split())
+        if len(detail) > max_detail:
+            detail = detail[: max_detail - 1].rstrip() + "…"
+        return f"{label}: {detail}" if detail else label
+
+    def same_wait_as(self, other: "StallReason") -> bool:
+        """True when ``other`` is the same stall, not just the same kind."""
+        return (
+            self.kind == other.kind
+            and self.waiting_on_units == other.waiting_on_units
+            and self.waiting_on_prs == other.waiting_on_prs
+        )
+
+    def to_dict(self) -> dict:
+        out: dict = {"kind": self.kind}
+        if self.detail:
+            out["detail"] = self.detail
+        if self.waiting_on_units:
+            out["waiting_on_units"] = list(self.waiting_on_units)
+        if self.waiting_on_prs:
+            out["waiting_on_prs"] = list(self.waiting_on_prs)
+        if self.since:
+            out["since"] = self.since
+        if self.runs != 1:
+            out["runs"] = self.runs
+        return out
+
+    @classmethod
+    def from_dict(cls, raw: object) -> "StallReason | None":
+        """Parse a serialized stall; ``None`` for anything unusable."""
+        if not isinstance(raw, dict):
+            return None
+        kind = raw.get("kind")
+        if not kind or not isinstance(kind, str):
+            return None
+        return cls(
+            kind=kind,  # type: ignore[arg-type]
+            detail=str(raw.get("detail") or ""),
+            waiting_on_units=[str(x) for x in (raw.get("waiting_on_units") or [])],
+            waiting_on_prs=[str(x) for x in (raw.get("waiting_on_prs") or [])],
+            since=raw.get("since"),
+            runs=int(raw.get("runs", 1) or 1),
+        )
+
+
+def clear_conflict_markers(fs: FeatureState) -> None:
+    """Retire the bookkeeping of a conflict that no longer applies.
+
+    Call this wherever an entry leaves ``conflict`` for a status that
+    describes finished (or abandoned) work — merged, closed, superseded,
+    skipped, resolved. The stall goes with it: a merged unit that still
+    claims to be waiting for something reads as a bug in every report.
+    """
+    fs.conflict_files = []
+    fs.failed_step_index = None
+    fs.partial_pr_count = None
+    fs.stall = None
+
+
+def make_stall(
+    kind: StallKind,
+    *,
+    detail: str = "",
+    waiting_on_units: list[str] | None = None,
+    waiting_on_prs: list[str] | None = None,
+    prior: "FeatureState | None" = None,
+) -> StallReason:
+    """Build a :class:`StallReason`, ageing it against ``prior``'s stall.
+
+    Re-recording the *same* stall keeps its original ``since`` and bumps
+    ``runs``; a different one starts fresh. Pass the feature's pre-existing
+    state as ``prior`` — most pipeline exit paths build a new
+    :class:`FeatureState` from scratch, so the age would otherwise reset on
+    every run.
+    """
+    stall = StallReason(
+        kind=kind,
+        detail=detail,
+        waiting_on_units=list(waiting_on_units or []),
+        waiting_on_prs=list(waiting_on_prs or []),
+        since=datetime.now(timezone.utc).isoformat(),
+    )
+    old = prior.stall if prior is not None else None
+    if old is not None and old.same_wait_as(stall):
+        stall.since = old.since or stall.since
+        stall.runs = old.runs + 1
+    return stall
 
 
 # Order in which status groups are shown to humans (``releasy status``
@@ -217,6 +402,11 @@ class FeatureState:
     # and surfaced by ``releasy status``. ``None`` for skips that predate
     # the field or were applied without a reason.
     skip_reason: str | None = None
+    # Why this unit stopped short of a mergeable PR (see :class:`StallReason`).
+    # Set on every non-clean exit path, cleared once the unit lands. Read by
+    # the run gate (skip a retry that cannot succeed yet), `releasy status`
+    # and the graph issue.
+    stall: StallReason | None = None
 
 
 @dataclass
@@ -290,6 +480,7 @@ def _parse_features(raw_features: dict) -> dict[str, FeatureState]:
             blocked_by=list(fraw.get("blocked_by", []) or []),
             merged_label_applied=bool(fraw.get("merged_label_applied", False)),
             skip_reason=fraw.get("skip_reason"),
+            stall=StallReason.from_dict(fraw.get("stall")),
         )
     return features
 
@@ -422,6 +613,8 @@ def save_state(state: PipelineState, config: Config) -> None:
             entry["merged_label_applied"] = True
         if fs.skip_reason:
             entry["skip_reason"] = fs.skip_reason
+        if fs.stall is not None:
+            entry["stall"] = fs.stall.to_dict()
         features_data[fid] = entry
 
     data: dict = {

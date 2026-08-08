@@ -20,7 +20,7 @@ from releasy.config import (
     PRSourcesConfig,
     SessionConfig,
 )
-from releasy.state import FeatureState, PipelineState
+from releasy.state import FeatureState, PipelineState, StallReason
 
 URL = "https://github.com/o/r/pull/{}".format
 
@@ -897,7 +897,11 @@ class ProgressCheckboxes(unittest.TestCase):
             partial_pr_count=1, failed_step_index=1,
         )
         body = self._body([grp], self._state(grp=fs))
-        self.assertIn("- [x] **`grp`** — 🔴 conflict · 1/3 picked [#60]", body)
+        self.assertIn(
+            "<summary>☑ <b><code>grp</code></b> · 3 PRs — 🔴 conflict · "
+            f'1/3 picked <a href="{URL(60)}">#60</a></summary>',
+            body,
+        )
         self.assertIn("1. [x] [#1]", body)
         self.assertIn("2. [ ] [#2]", body)
         self.assertIn("3. [ ] [#3]", body)
@@ -951,6 +955,93 @@ class ProgressCheckboxes(unittest.TestCase):
             r, self._state(**{"pr-1": by_id, "other": by_url}),
         )
         self.assertIs(got["pr-1"], by_id)
+
+    # --- Foldable groups -------------------------------------------------
+
+    def _grp(self, n=2):
+        return d.DAGNode(
+            "grp", False, [URL(i + 1) for i in range(n)],
+            [f"t{i + 1}" for i in range(n)],
+            "2026-01-01T00:00:00+00:00", [], "grouped",
+        )
+
+    def test_group_renders_as_details_block(self):
+        body = self._body([self._grp()], self._state())
+        self.assertIn("<details open>", body)
+        self.assertIn("</details>", body)
+        # A blank line after <summary> — without it GitHub keeps parsing
+        # raw HTML and the member checkboxes never render.
+        self.assertIn("</summary>\n\n1. [ ] [#1]", body)
+
+    def test_merged_group_is_folded(self):
+        fs = FeatureState(status="merged", rebase_pr_url=URL(60))
+        body = self._body([self._grp()], self._state(grp=fs))
+        self.assertIn("<details>\n<summary>☑", body)
+        self.assertNotIn("<details open>", body)
+
+    def test_superseded_group_is_folded(self):
+        fs = FeatureState(status="superseded")
+        body = self._body([self._grp()], self._state(grp=fs))
+        self.assertIn("<details>\n<summary>☑", body)
+
+    def test_unfinished_group_stays_open(self):
+        for status in ("needs_review", "conflict", "blocked", "skipped"):
+            with self.subTest(status=status):
+                fs = FeatureState(status=status, rebase_pr_url=URL(60))
+                body = self._body([self._grp()], self._state(grp=fs))
+                self.assertIn("<details open>", body)
+
+    def test_untracked_group_stays_open_and_unticked(self):
+        body = self._body([self._grp()], self._state())
+        self.assertIn("<details open>", body)
+        self.assertIn("<summary>☐ <b><code>grp</code></b>", body)
+
+    def test_standalone_entries_stay_plain_checkboxes(self):
+        body = self._body([node("pr-1", 1)], self._state())
+        self.assertIn("- [ ] [#1]", body)
+        self.assertNotIn("<details", body)
+
+    # --- Stall reasons ---------------------------------------------------
+
+    def test_draft_pr_with_stall_states_the_reason(self):
+        fs = FeatureState(
+            status="conflict", rebase_pr_url=URL(60), partial_pr_count=1,
+            stall=StallReason(
+                kind="waiting_for_merge", waiting_on_units=["auto-grp-2"],
+            ),
+        )
+        body = self._body([node("pr-1", 1)], self._state(**{"pr-1": fs}))
+        self.assertIn("⏳ waiting for `auto-grp-2` to merge", body)
+
+    def test_stall_in_group_summary_is_html_escaped(self):
+        fs = FeatureState(
+            status="conflict", rebase_pr_url=URL(60), partial_pr_count=1,
+            stall=StallReason(kind="waiting_for_merge",
+                              waiting_on_units=["auto-grp-2"]),
+        )
+        body = self._body([self._grp()], self._state(grp=fs))
+        # Inside <summary> the markdown parser is off — backticks become tags.
+        self.assertIn("⏳ waiting for <code>auto-grp-2</code> to merge", body)
+        self.assertNotIn("`auto-grp-2`", body)
+
+    def test_stall_repeat_count_shown_after_the_first_run(self):
+        fs = FeatureState(
+            status="conflict", rebase_pr_url=URL(60),
+            stall=StallReason(kind="retries_exhausted",
+                              detail="auto-continue 2/2", runs=3),
+        )
+        body = self._body([node("pr-1", 1)], self._state(**{"pr-1": fs}))
+        self.assertIn("⏳ retries exhausted: auto-continue 2/2 (×3 runs)", body)
+
+    def test_blocked_and_skipped_do_not_repeat_their_reason(self):
+        blocked = FeatureState(
+            status="blocked", blocked_by=["pr-9"],
+            stall=StallReason(kind="waiting_for_merge",
+                              waiting_on_units=["pr-9"]),
+        )
+        body = self._body([node("pr-1", 1)], self._state(**{"pr-1": blocked}))
+        self.assertIn("⏸ blocked by `pr-9`", body)
+        self.assertNotIn("⏳", body)
 
     def test_summary_counts_every_status(self):
         r = report([node("a", 1), node("b", 2), node("c", 3)])

@@ -2562,6 +2562,10 @@ _PROGRESS_SUMMARY_ORDER: tuple[str, ...] = (
 
 _NOT_STARTED_MARKER = "⬜ not started"
 
+# Statuses whose group is folded shut in the issue: the port landed, there
+# is nothing left to look at. Everything else stays expanded.
+_FOLDED_STATUSES: frozenset[str] = frozenset({"merged", "superseded"})
+
 
 def build_progress_map(
     report: DiscoveryReport, state: PipelineState,
@@ -2620,21 +2624,61 @@ def _picks_landed(fs: FeatureState | None, total: int) -> int:
     return 0  # skipped / blocked / closed
 
 
-def _progress_note(fs: FeatureState | None, total: int) -> str:
-    """`` — <marker> [#N](url)`` suffix for a unit's line in the issue."""
+def _stall_note(fs: FeatureState) -> str:
+    """`` · <why>`` for a unit that stopped short, else ``""``.
+
+    The point is the stalled-with-a-draft-PR case: the PR link alone says
+    "somebody look at this" without saying what releasy is waiting for.
+    ``blocked`` and ``skipped`` already spell their reason out in the
+    marker, so they don't repeat it here.
+    """
+    if fs.stall is None or fs.status in ("blocked", "skipped"):
+        return ""
+    why = fs.stall.summary(max_detail=60)
+    if fs.stall.runs > 1:
+        why += f" (×{fs.stall.runs} runs)"
+    return f" · ⏳ {why}"
+
+
+def _progress_note(fs: FeatureState | None, total: int, *, html: bool = False) -> str:
+    """`` — <marker> [#N](url) · <why>`` suffix for a unit's issue entry.
+
+    ``html`` renders the PR link as an ``<a>`` tag for use inside a
+    ``<summary>``: that content sits in a raw HTML block, where GitHub does
+    not run the markdown parser.
+    """
     if fs is None:
         return f" — {_NOT_STARTED_MARKER}"
     marker = _PROGRESS_MARKER.get(fs.status, fs.status)
     if fs.status == "blocked" and fs.blocked_by:
-        marker += f" by {', '.join(f'`{b}`' for b in fs.blocked_by)}"
+        marker += f" by {', '.join(_code(b, html) for b in fs.blocked_by)}"
     elif fs.status == "skipped" and fs.skip_reason:
         marker += f": {fs.skip_reason}"
     elif fs.status == "conflict" and total > 1:
         marker += f" · {_picks_landed(fs, total)}/{total} picked"
     note = f" — {marker}"
     if fs.rebase_pr_url:
-        note += f" [{_pr_short(fs.rebase_pr_url)}]({fs.rebase_pr_url})"
-    return note
+        short = _pr_short(fs.rebase_pr_url)
+        note += (
+            f' <a href="{fs.rebase_pr_url}">{short}</a>' if html
+            else f" [{short}]({fs.rebase_pr_url})"
+        )
+    stall = _stall_note(fs)
+    return note + (_to_html_inline(stall) if html else stall)
+
+
+def _code(text: str, html: bool) -> str:
+    return f"<code>{text}</code>" if html else f"`{text}`"
+
+
+def _to_html_inline(text: str) -> str:
+    """Turn the little markdown we emit inside ``<summary>`` into HTML.
+
+    Only backtick spans and ``&``/``<``/``>`` — a stall summary is a short
+    phrase with unit IDs in it, nothing richer.
+    """
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
 
 
 def _progress_summary(
@@ -2690,8 +2734,8 @@ def render_graph_issue_body(
     lines.append("")
     lines.append(
         "_A box is ticked once releasy has opened the port PR (a "
-        "partially-applied group counts — its draft PR is linked). Run "
-        "`releasy graph sync` to refresh._"
+        "partially-applied group counts — its draft PR is linked). Merged "
+        "groups are folded shut. Run `releasy graph sync` to refresh._"
     )
     lines.append("")
 
@@ -2707,16 +2751,26 @@ def render_graph_issue_body(
         lines.append("")
         for n in groups:
             fs = progress.get(n.unit_id)
-            landed = _picks_landed(fs, len(n.pr_urls))
+            total = len(n.pr_urls)
+            landed = _picks_landed(fs, total)
+            # Folded once the port is done; open while it still needs eyes.
+            folded = fs is not None and fs.status in _FOLDED_STATUSES
+            glyph = "☑" if _unit_ported(fs) else "☐"
+            lines.append("<details>" if folded else "<details open>")
             lines.append(
-                f"- {_box(_unit_ported(fs))} **`{n.unit_id}`**"
-                f"{_progress_note(fs, len(n.pr_urls))}"
+                f"<summary>{glyph} <b><code>{n.unit_id}</code></b> "
+                f"· {total} PRs{_progress_note(fs, total, html=True)}</summary>"
             )
+            # The blank line ends the raw-HTML block, so what follows is
+            # parsed as markdown (checkboxes and links included).
+            lines.append("")
             for i, url in enumerate(n.pr_urls):
                 lines.append(
-                    f"  {i + 1}. {_box(i < landed)} [{_pr_short(url)}]({url}) "
+                    f"{i + 1}. {_box(i < landed)} [{_pr_short(url)}]({url}) "
                     f"{_title_of(n, i)}".rstrip()
                 )
+            lines.append("")
+            lines.append("</details>")
             lines.append("")
 
     # --- Standalone PRs ---
