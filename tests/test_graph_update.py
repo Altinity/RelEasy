@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 import yaml
@@ -58,6 +59,19 @@ def report(nodes, *, excluded=None, **kw):
 
 def fence(yaml_text):
     return "rationale here\n```yaml\n" + yaml_text + "\n```\n"
+
+
+@contextmanager
+def _patched(module, **attrs):
+    """Temporarily swap module attributes (stub out network calls)."""
+    saved = {k: getattr(module, k) for k in attrs}
+    for k, v in attrs.items():
+        setattr(module, k, v)
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            setattr(module, k, v)
 
 
 class ParseGraphSpec(unittest.TestCase):
@@ -163,6 +177,121 @@ class BuildReportFromSpec(unittest.TestCase):
         ids = {n.unit_id for n in new.nodes}
         self.assertEqual(ids, {"u1", "u2"})
         self.assertTrue(any("is new" in x for x in w))
+
+    def test_new_unit_marked_unanalysed(self):
+        """A unit added here was never trial-picked — its deps are a guess."""
+        prior = report([node("u1", 1)])
+        w = []
+        new = d._build_report_from_spec(
+            prior, {"units": [{"id": "u1", "prs": [URL(1)]}, {"id": "u2", "prs": [URL(2)]}]}, w
+        )
+        method = {n.unit_id: n.discovery_method for n in new.nodes}
+        self.assertEqual(method["u2"], "graph-update-unanalysed")
+        self.assertTrue(any("were NOT analysed" in x for x in w))
+
+    def test_new_pr_metadata_fetched(self):
+        """A PR no prior graph saw gets its title / date / SHA from GitHub."""
+        from releasy.github_ops import PRInfo
+        calls = []
+
+        def fake_fetch(cfg, url, include_closed=False):
+            calls.append(url)
+            return PRInfo(
+                number=2, title="Add commit info", body="", state="merged",
+                merge_commit_sha="deadbeef", head_sha="h", url=url,
+                repo_slug="o/r", merged_at="2026-07-22T11:54:20+00:00",
+            )
+
+        prior = report([node("u1", 1)])
+        with _patched(d, fetch_pr_by_url=fake_fetch):
+            new = d._build_report_from_spec(
+                prior,
+                {"units": [{"id": "u1", "prs": [URL(1)]},
+                           {"id": "u2", "prs": [URL(2)]}]},
+                [], config=object(),
+            )
+        self.assertEqual(calls, [URL(2)])
+        u2 = next(n for n in new.nodes if n.unit_id == "u2")
+        self.assertEqual(u2.pr_titles, ["Add commit info"])
+        self.assertEqual(u2.earliest_merged_at, "2026-07-22T11:54:20+00:00")
+        self.assertEqual(u2.merge_shas, ["deadbeef"])
+
+    def test_known_prs_are_not_refetched(self):
+        calls = []
+
+        def fake_fetch(cfg, url, include_closed=False):
+            calls.append(url)
+            return None
+
+        prior = report([node("u1", 1)])
+        with _patched(d, fetch_pr_by_url=fake_fetch):
+            d._build_report_from_spec(
+                prior, {"units": [{"id": "u1", "prs": [URL(1)]}]}, [],
+                config=object(),
+            )
+        self.assertEqual(calls, [])
+
+    def test_unfetchable_new_pr_warns_and_stays_blank(self):
+        prior = report([node("u1", 1)])
+        w = []
+        with _patched(d, fetch_pr_by_url=lambda *a, **k: None):
+            new = d._build_report_from_spec(
+                prior,
+                {"units": [{"id": "u1", "prs": [URL(1)]},
+                           {"id": "u2", "prs": [URL(2)]}]},
+                w, config=object(),
+            )
+        u2 = next(n for n in new.nodes if n.unit_id == "u2")
+        self.assertEqual(u2.pr_titles, [""])
+        self.assertEqual(u2.merge_shas, [])
+        self.assertTrue(any("could not fetch" in x for x in w))
+
+    def test_no_config_does_not_fetch(self):
+        """The pure-logic path stays network-free."""
+        def boom(*a, **k):
+            raise AssertionError("must not fetch without a config")
+
+        prior = report([node("u1", 1)])
+        with _patched(d, fetch_pr_by_url=boom):
+            new = d._build_report_from_spec(
+                prior, {"units": [{"id": "u2", "prs": [URL(2)]}]}, [],
+            )
+        self.assertEqual(new.nodes[0].pr_titles, [""])
+
+    def test_prior_merge_shas_preserved(self):
+        prior_node = node("u1", 1)
+        prior_node.merge_shas = ["cafe"]
+        new = d._build_report_from_spec(
+            report([prior_node]), {"units": [{"id": "u1", "prs": [URL(1)]}]}, [],
+        )
+        self.assertEqual(new.nodes[0].merge_shas, ["cafe"])
+
+    def test_partial_merge_shas_dropped(self):
+        """Consumers compare element-wise — one SHA per PR, or none."""
+        prior_node = node("u1", 1, 2)
+        prior_node.merge_shas = ["cafe", ""]
+        new = d._build_report_from_spec(
+            report([prior_node]),
+            {"units": [{"id": "u1", "prs": [URL(1), URL(2)]}]}, [],
+        )
+        self.assertEqual(new.nodes[0].merge_shas, [])
+
+    def test_carried_over_unit_keeps_its_discovery_method(self):
+        prior = report([node("u1", 1)])
+        new = d._build_report_from_spec(
+            prior, {"units": [{"id": "u1", "prs": [URL(1)]}]}, [],
+        )
+        self.assertEqual(new.nodes[0].discovery_method, "trial-clean")
+
+    def test_regrouped_known_prs_are_not_unanalysed(self):
+        """Moving known PRs between units is a regrouping, not new work."""
+        prior = report([node("u1", 1), node("u2", 2)])
+        new = d._build_report_from_spec(
+            prior, {"units": [{"id": "merged", "prs": [URL(1), URL(2)]}]}, [],
+        )
+        self.assertNotEqual(
+            new.nodes[0].discovery_method, "graph-update-unanalysed",
+        )
 
     def test_prior_veto_persists_when_not_restated(self):
         prior = report([node("u1", 1)], excluded=[{"url": URL(100), "reason": "old"}])
@@ -413,6 +542,94 @@ class OverlayGroupRoundTrip(unittest.TestCase):
         self.assertEqual(
             [g["id"] for g in disk.get("groups", [])], [],
         )
+
+
+def _cu(uid, *nums, body="", user_group=False, depends_on=None, slug="o/r"):
+    """A candidate unit; ``body`` goes on the first PR (the combined port)."""
+    from releasy.github_ops import PRInfo
+    from releasy.pipeline import FeatureUnit
+    prs = [
+        PRInfo(number=n, title=f"t{n}", body=body if i == 0 else "",
+               state="merged", merge_commit_sha=f"s{n}", head_sha="h",
+               url=f"https://github.com/{slug}/pull/{n}", repo_slug=slug,
+               merged_at="2026-01-01T00:00:00+00:00")
+        for i, n in enumerate(nums)
+    ]
+    fu = FeatureUnit(feature_id=uid, prs=prs, if_exists="skip",
+                     is_group=len(prs) > 1 or user_group,
+                     depends_on=list(depends_on or []))
+    return d._CandidateUnit(uid, fu.is_group, user_group, prs,
+                            prs[0].merged_at, fu)
+
+
+COMBINED = (
+    "Combined port of 2 PR(s) (group `g`). "
+    "Cherry-picked from #1388, #1618.\n"
+)
+
+
+class CarriedPrUrlIndex(unittest.TestCase):
+    """Combined ports make the PRs they carry findable by their own URL."""
+
+    def test_carried_prs_map_to_the_carrying_unit(self):
+        cands = [_cu("grp-1718", 1718, 1646, body=COMBINED)]
+        idx = d._carried_pr_url_index(cands, {URL(1718): "grp-1718"})
+        self.assertEqual(idx.get(URL(1388)), "grp-1718")
+        self.assertEqual(idx.get(URL(1618)), "grp-1718")
+
+    def test_listed_pr_is_not_shadowed(self):
+        """A unit listing the PR outright keeps it out of the carried map."""
+        cands = [_cu("grp-1718", 1718, body=COMBINED)]
+        idx = d._carried_pr_url_index(
+            cands, {URL(1718): "grp-1718", URL(1388): "pr-1388"},
+        )
+        self.assertNotIn(URL(1388), idx)
+
+    def test_first_carrier_wins(self):
+        cands = [
+            _cu("a", 10, body="Cherry-picked from #1388."),
+            _cu("b", 20, body="Cherry-picked from #1388."),
+        ]
+        self.assertEqual(
+            d._carried_pr_url_index(cands, {})[URL(1388)], "a",
+        )
+
+    def test_no_provenance_no_entries(self):
+        self.assertEqual(d._carried_pr_url_index([_cu("a", 1)], {}), {})
+
+
+class DeclaredEdges(unittest.TestCase):
+    """Hand-written ``depends_on`` survives a re-discovery."""
+
+    def _nodes(self, *uids):
+        return {u: node(u, 1) for u in uids}
+
+    def test_user_group_edge_applied(self):
+        cands = [_cu("pr-1832", 1832, user_group=True,
+                     depends_on=["auto-grp-pr-1718"])]
+        edges = d._declared_edges(
+            cands, self._nodes("pr-1832", "auto-grp-pr-1718"), [],
+        )
+        self.assertEqual(edges, {("pr-1832", "auto-grp-pr-1718")})
+
+    def test_auto_discovered_edge_not_replayed(self):
+        """Discovery's own overlay output must stay re-derivable."""
+        cands = [_cu("pr-1843", 1843, depends_on=["auto-grp-pr-1718"])]
+        edges = d._declared_edges(
+            cands, self._nodes("pr-1843", "auto-grp-pr-1718"), [],
+        )
+        self.assertEqual(edges, set())
+
+    def test_dep_outside_this_run_warns(self):
+        cands = [_cu("pr-1832", 1832, user_group=True, depends_on=["ghost"])]
+        w = []
+        edges = d._declared_edges(cands, self._nodes("pr-1832"), w)
+        self.assertEqual(edges, set())
+        self.assertTrue(any("ghost" in x for x in w))
+
+    def test_unit_absent_from_this_run_skipped(self):
+        cands = [_cu("pr-1832", 1832, user_group=True, depends_on=["dep"])]
+        self.assertEqual(d._declared_edges(cands, self._nodes("dep"), []), set())
 
 
 class IsReusableUnit(unittest.TestCase):

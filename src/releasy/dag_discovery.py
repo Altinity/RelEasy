@@ -67,6 +67,7 @@ from releasy.github_ops import (
     fetch_pr_by_url,
     get_origin_repo_slug,
     minimize_comment,
+    parse_cherry_picked_refs,
     parse_pr_url,
     slug_to_https_url,
     update_issue,
@@ -134,7 +135,9 @@ class DAGNode:
     earliest_merged_at: str | None
     deps: list[str]
     # "trial-clean" | "git-graph" | "git-graph+claude" |
-    # "ai-resolve" | "ai-resolve-clean" | "depth-cutoff"
+    # "ai-resolve" | "ai-resolve-clean" | "depth-cutoff" | "grouped" |
+    # "reused-group-member" | "graph-update" |
+    # "graph-update-unanalysed" (added from an issue comment, never picked)
     discovery_method: str
     conflict_files_at_discovery: list[str] = field(default_factory=list)
     # ``True`` iff a local port branch was preserved at
@@ -412,6 +415,8 @@ def run_discover_deps(
             "deps when their unit_id is referenced directly"
         )
 
+    carried_pr_url_to_unit = _carried_pr_url_index(candidates, pr_url_to_unit)
+
     # --- Run trial picks in scratch worktree ---
     nodes: dict[str, DAGNode] = {}
     edges: set[tuple[str, str]] = set()
@@ -587,6 +592,7 @@ def run_discover_deps(
                 candidate_merge_shas=list(merge_sha_to_unit.keys()),
                 merge_sha_to_unit=merge_sha_to_unit,
                 pr_url_to_unit=pr_url_to_unit,
+                carried_pr_url_to_unit=carried_pr_url_to_unit,
                 merge_containment=merge_containment_cache,
                 exclude_unit_ids={unit_id},
                 already_in_target_units=fully_merged_units,
@@ -620,7 +626,8 @@ def run_discover_deps(
                     fb = _ai_resolve_fallback(
                         config, scratch, base_branch, cu,
                         outcome.conflicting_pr_idx,
-                        pr_url_to_unit, fully_merged_units,
+                        pr_url_to_unit, carried_pr_url_to_unit,
+                        fully_merged_units,
                         outcome.conflict_files, warnings_acc,
                     )
                     ai_path_invoked = True
@@ -638,6 +645,7 @@ def run_discover_deps(
                         # on auto_add_prerequisite_prs.enabled + upstream +
                         # depth cap. The pulled unit is queued (depth+1) and
                         # grouped via the dependency edge.
+                        pulled: set[str] = set()
                         if (
                             fb.external_prereq_urls
                             and config.ai_resolve.auto_add_prerequisite_prs.enabled
@@ -653,6 +661,7 @@ def run_discover_deps(
                                 )
                                 if new_cu is None:
                                     continue
+                                pulled.add(ext_url)
                                 edges.add((unit_id, new_cu.unit_id))
                                 if new_cu.unit_id not in nodes:
                                     queue.append((new_cu.unit_id, depth + 1))
@@ -660,6 +669,26 @@ def run_discover_deps(
                                     f"  [dim]· {unit_id}: pulled upstream "
                                     f"prereq {new_cu.unit_id}[/dim]"
                                 )
+                        # Whatever the gate above declined to pull is a real
+                        # prerequisite nobody in the graph provides. Say so:
+                        # dropping it silently reads as "no dependency".
+                        unresolved = [
+                            u for u in fb.external_prereq_urls
+                            if u not in pulled
+                        ]
+                        if unresolved:
+                            warnings_acc.append(
+                                f"unit {unit_id!r}: prereq(s) "
+                                f"{', '.join(unresolved)} are in no unit and "
+                                "were not pulled in — the graph cannot order "
+                                "around them; add them to the session or "
+                                "merge them into the base branch"
+                            )
+                            console.print(
+                                f"  [yellow]![/yellow] {unit_id}: "
+                                f"{len(unresolved)} unprovided prereq(s): "
+                                f"{', '.join(unresolved)}"
+                            )
                 # In ``--no-write`` (no cache_branch), we skip the AI
                 # fallback entirely — without the conflict state
                 # preserved we'd have to recreate it, defeating the
@@ -714,6 +743,8 @@ def run_discover_deps(
         # Re-inject reused groups' prereq chains so the collapse rebuilds
         # them (and lets any new PR that conflicted into a member attach).
         edges |= preseeded_edges
+
+        edges |= _declared_edges(candidates, nodes, warnings_acc)
 
         # --- Collapse components into groups, then build + cache each
         # combined group branch while the scratch worktree is still open
@@ -885,6 +916,61 @@ def _build_candidate_unit_set(
         c.earliest_merged_at or "9999",
         c.prs[0].number if c.prs else 0,
     ))
+    return out
+
+
+def _carried_pr_url_index(
+    candidates: list[_CandidateUnit], pr_url_to_unit: dict[str, str],
+) -> dict[str, str]:
+    """PRs a candidate carries *inside* a combined port → its unit id.
+
+    A conflict or a prereq report names the PR that introduced the code
+    (#1388), while the unit that brings it here lists only the combined
+    port that cherry-picked it (#1718). ``pr_url_to_unit`` covers literal
+    listings; this covers what those listings carry, and never overrides
+    them — a unit that lists a PR outright wins.
+    """
+    out: dict[str, str] = {}
+    for cu in candidates:
+        for p in cu.prs:
+            for owner, repo, number in parse_cherry_picked_refs(
+                p.body, p.repo_slug,
+            ):
+                url = f"https://github.com/{owner}/{repo}/pull/{number}"
+                if url in pr_url_to_unit or url in out:
+                    continue
+                out[url] = cu.unit_id
+    return out
+
+
+def _declared_edges(
+    candidates: list[_CandidateUnit],
+    nodes: dict[str, DAGNode],
+    warnings_acc: list[str],
+) -> set[tuple[str, str]]:
+    """Edges a user hand-declared via ``groups[].depends_on``.
+
+    ``depends_on`` is an INPUT to discovery, not only an output: a user
+    group asserting a dependency keeps it even when this run found no
+    conflict to re-derive it from (the prereq may be semantic, or the
+    trial-pick may have stopped at an earlier member). Auto-discovered
+    overlay entries are deliberately excluded — replaying discovery's own
+    prior output would make an edge impossible to un-discover once the
+    prereq lands in the base branch.
+    """
+    out: set[tuple[str, str]] = set()
+    for cu in candidates:
+        if not cu.is_user_group or cu.unit_id not in nodes:
+            continue
+        for dep in cu.feature_unit.depends_on:
+            if dep in nodes:
+                out.add((cu.unit_id, dep))
+            else:
+                warnings_acc.append(
+                    f"user group {cu.unit_id!r} declares depends_on {dep!r}, "
+                    "which is not a unit in this run (merged, excluded, or a "
+                    "typo); edge not applied"
+                )
     return out
 
 
@@ -1315,6 +1401,7 @@ def _candidate_deps_for_conflict(
     candidate_merge_shas: list[str],
     merge_sha_to_unit: dict[str, str],
     pr_url_to_unit: dict[str, str],
+    carried_pr_url_to_unit: dict[str, str],
     merge_containment: dict[str, str],
     exclude_unit_ids: set[str],
     already_in_target_units: set[str],
@@ -1346,6 +1433,7 @@ def _candidate_deps_for_conflict(
                 repo_path, sha, candidate_merge_shas=cand_set,
                 merge_sha_to_unit=merge_sha_to_unit,
                 pr_url_to_unit=pr_url_to_unit,
+                carried_pr_url_to_unit=carried_pr_url_to_unit,
                 merge_containment=merge_containment,
             )
             if not unit_id:
@@ -1368,11 +1456,13 @@ def _classify_commit_to_unit(
     candidate_merge_shas: set[str],
     merge_sha_to_unit: dict[str, str],
     pr_url_to_unit: dict[str, str],
+    carried_pr_url_to_unit: dict[str, str],
     merge_containment: dict[str, str],
 ) -> str | None:
     """Three-rule precedence:
     1. ``sha`` is a candidate's merge_commit_sha → direct lookup.
-    2. Commit carries a ``Source-PR:`` trailer matching a candidate URL.
+    2. Commit carries a ``Source-PR:`` trailer matching a candidate URL —
+       either one a unit lists, or one it carries in a combined port.
     3. Commit is contained in one of the candidate merge commits (merge_containment).
     """
     # Rule 1: direct merge match
@@ -1394,6 +1484,8 @@ def _classify_commit_to_unit(
                 url = m.group(0)
                 if url in pr_url_to_unit:
                     return pr_url_to_unit[url]
+                if url in carried_pr_url_to_unit:
+                    return carried_pr_url_to_unit[url]
 
     # Rule 3: containment in a candidate merge commit
     enclosing = merge_containment.get(sha)
@@ -1451,6 +1543,14 @@ def _ask_claude_for_prereqs(
             continue
         for p in cu.prs:
             url_to_unit[p.url] = cuid
+            # Claude may answer with the PR that introduced the code rather
+            # than the combined port this unit lists; both mean this unit.
+            for owner, repo, number in parse_cherry_picked_refs(
+                p.body, p.repo_slug,
+            ):
+                url_to_unit.setdefault(
+                    f"https://github.com/{owner}/{repo}/pull/{number}", cuid,
+                )
         urls = ", ".join(p.url for p in cu.prs)
         titles = "; ".join(p.title for p in cu.prs)
         cand_block_lines.append(f"- `{cuid}` — {titles} ({urls})")
@@ -1547,6 +1647,7 @@ def _ai_resolve_fallback(
     unit: _CandidateUnit,
     conflicting_pr_idx: int,
     pr_url_to_unit: dict[str, str],
+    carried_pr_url_to_unit: dict[str, str],
     already_in_target_units: set[str],
     conflict_files: list[str],
     warnings_acc: list[str],
@@ -1609,6 +1710,17 @@ def _ai_resolve_fallback(
             seen: set[str] = set()
             for url in result.missing_prereq_prs:
                 uid = pr_url_to_unit.get(url)
+                if uid is None:
+                    # Nobody lists it — but a combined port in the set may
+                    # carry it (#1388 lives inside #1718). That's an in-set
+                    # dep, not an external prereq to pull from upstream.
+                    uid = carried_pr_url_to_unit.get(url)
+                    if uid is not None and uid != unit.unit_id:
+                        warnings_acc.append(
+                            f"unit {unit.unit_id!r}: prereq {url} is carried "
+                            f"by {uid!r} (combined port) — treating as an "
+                            "in-set dependency"
+                        )
                 if uid is None:
                     if url not in external:
                         external.append(url)
@@ -3057,26 +3169,82 @@ def _ask_claude_for_new_graph(
     return spec
 
 
+def _fetch_spec_pr_metadata(
+    config: Config,
+    spec: dict,
+    prior_urls: set[str],
+    warnings_acc: list[str],
+) -> dict[str, PRInfo]:
+    """Fetch the PRs a spec introduces that the prior graph never saw.
+
+    ``graph update`` runs no git and no trial-picks, so everything it knows
+    about a PR it copies from the prior graph. A PR a member asks for by
+    number is in no prior graph, and without this lands as a blank row —
+    no title, no merge date, no merge SHA. One fetch per genuinely new PR;
+    a failure degrades to that blank row rather than failing the update.
+    """
+    wanted: list[str] = []
+    seen: set[str] = set()
+    for u in spec.get("units", []) or []:
+        if not isinstance(u, dict):
+            continue
+        for raw_url in u.get("prs", []) or []:
+            url = str(raw_url).strip()
+            if url in prior_urls or url in seen or parse_pr_url(url) is None:
+                continue
+            seen.add(url)
+            wanted.append(url)
+    if not wanted:
+        return {}
+    console.print(
+        f"  [dim]fetching metadata for {len(wanted)} new PR(s)…[/dim]"
+    )
+    out: dict[str, PRInfo] = {}
+    for url in wanted:
+        pr = fetch_pr_by_url(config, url, include_closed=True)
+        if pr is None:
+            warnings_acc.append(
+                f"graph update: could not fetch {url} — it enters the graph "
+                "without a title or merge date"
+            )
+            continue
+        out[url] = pr
+    return out
+
+
 def _build_report_from_spec(
     prior: DiscoveryReport,
     spec: dict,
     warnings_acc: list[str],
+    config: Config | None = None,
 ) -> DiscoveryReport | None:
     """Build a new DiscoveryReport from Claude's spec + the prior graph.
 
     Validates URLs/deps, rejects cycles (returns None), recomputes
-    components. No git, no trial-picks.
+    components. No git, no trial-picks. With ``config``, PRs the prior
+    graph never saw are fetched for their title / merge date / merge SHA;
+    without it those fields stay blank (the pure-logic path used by tests).
     """
     title_map: dict[str, str] = {}
     merged_map: dict[str, str | None] = {}
+    sha_map: dict[str, str] = {}
     # Keep is_user_group for prior user-declared groups (overlay skips them).
     prior_user_groups = {n.unit_id for n in prior.nodes if n.is_user_group}
+    prior_methods = {n.unit_id: n.discovery_method for n in prior.nodes}
     for n in prior.nodes:
         for url, t in zip(n.pr_urls, n.pr_titles or []):
             title_map[url] = t
+        for url, sha in zip(n.pr_urls, n.merge_shas or []):
+            if sha:
+                sha_map[url] = sha
         for url in n.pr_urls:
             merged_map[url] = n.earliest_merged_at
     prior_urls = set(title_map)
+
+    fetched = (
+        _fetch_spec_pr_metadata(config, spec, prior_urls, warnings_acc)
+        if config is not None else {}
+    )
 
     units = spec.get("units", [])
     nodes: list[DAGNode] = []
@@ -3091,6 +3259,7 @@ def _build_report_from_spec(
             warnings_acc.append(f"graph update: duplicate unit id {uid!r}; skipping")
             continue
         prs: list[str] = []
+        has_new_pr = False
         for raw_url in u.get("prs", []) or []:
             url = str(raw_url).strip()
             if parse_pr_url(url) is None:
@@ -3106,9 +3275,13 @@ def _build_report_from_spec(
                 )
                 continue
             if url not in prior_urls:
+                has_new_pr = True
                 warnings_acc.append(
                     f"graph update: PR {url} is new (not in the prior graph) "
-                    f"— it will be added to the session and ported"
+                    f"— it will be added to the session and ported, but its "
+                    f"dependencies were NOT analysed (no trial-pick runs "
+                    f"here); run `releasy graph discover` before `run` unless "
+                    f"the update declared its depends_on"
                 )
             prs.append(url)
             declared_urls.add(url)
@@ -3116,18 +3289,41 @@ def _build_report_from_spec(
             warnings_acc.append(f"graph update: unit {uid!r} has no valid PRs; skipping")
             continue
         deps = [str(d).strip() for d in (u.get("depends_on", []) or [])]
+        # A unit holding a PR the graph has never seen was never trial-picked,
+        # so its (usually empty) deps are a guess. Mark it distinctly — same
+        # reason "depth-cutoff" exists — so the YAML reader can tell an
+        # unanalysed node from one discovery actually cleared. Units carried
+        # over unchanged keep whatever method discovered them.
+        if has_new_pr:
+            method = "graph-update-unanalysed"
+        else:
+            method = prior_methods.get(uid) or "graph-update"
+        # A freshly fetched PR knows its own title / merge date / SHA; for
+        # everything else the prior graph is the only source.
+        titles: list[str] = []
+        merged_ats: list[str] = []
+        shas: list[str] = []
+        for url in prs:
+            pr = fetched.get(url)
+            titles.append(pr.title if pr is not None else title_map.get(url, ""))
+            merged_at = pr.merged_at if pr is not None else merged_map.get(url)
+            if merged_at:
+                merged_ats.append(merged_at)
+            shas.append(
+                (pr.merge_commit_sha if pr is not None else sha_map.get(url))
+                or ""
+            )
         nodes.append(DAGNode(
             unit_id=uid,
             is_user_group=uid in prior_user_groups,
             pr_urls=prs,
-            pr_titles=[title_map.get(url, "") for url in prs],
-            earliest_merged_at=min(
-                (merged_map[url] for url in prs if merged_map.get(url)),
-                default=None,
-            ),
+            pr_titles=titles,
+            earliest_merged_at=min(merged_ats, default=None),
             deps=deps,
-            discovery_method="graph-update",
+            discovery_method=method,
             cached=False,
+            # Element-wise consumers need one SHA per PR or none at all.
+            merge_shas=shas if all(shas) else [],
         ))
         seen_ids.add(uid)
 
@@ -3351,7 +3547,9 @@ def run_graph_update(
         return 1
 
     build_warnings: list[str] = []
-    new_report = _build_report_from_spec(report, spec, build_warnings)
+    new_report = _build_report_from_spec(
+        report, spec, build_warnings, config=config,
+    )
     for w in build_warnings:
         console.print(f"  [yellow]warning:[/yellow] {w}")
     if new_report is None:

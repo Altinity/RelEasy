@@ -305,7 +305,10 @@ releasy graph discover [--onto <ver>] [--work-dir <path>]
 **Hybrid AI flow per conflict:**
 
 1. **Deterministic** — `git log target..source -- <file>` →
-   `Source-PR:` trailers + merge-containment → candidate unit IDs.
+   `Source-PR:` trailers + merge-containment → candidate unit IDs. A PR a
+   unit carries inside a combined port (its body's `Cherry-picked from …`)
+   resolves to that unit too, so a prereq naming the original PR — not the
+   port that brings it — still lands on the right dependency.
 2. **Candidates found** → ask Claude (text-only, no tools) to
    confirm/refine. `discovery_method: git-graph+claude`.
 3. **No candidates** → invoke full AI resolver (tools, builds). Outcomes:
@@ -347,6 +350,10 @@ upstream commit can't be fetched — it's flagged `missing-prerequisites`.
   creating the session entry if it's missing.
 - Re-running rewrites the deps file from scratch — hand-edits are lost; use
   `--no-write` / `--deps-file <path>` to redirect.
+- `depends_on` on a **session** group is an input as well as an output: the
+  edge is re-applied even when this run's trial-pick didn't re-derive it.
+  Overlay (`auto_discovered`) edges are not replayed — discovery must be able
+  to drop one once the prerequisite lands in the base branch.
 
 **Re-scanning for new PRs:** just re-run `graph discover` — there is no
 `graph refresh`. It re-queries `pr_sources` (labels etc.) fresh each run, so
@@ -387,6 +394,12 @@ A member can ask for any change in prose; Claude decides:
   `graph.apply_exclusions: false`) added to `exclude_prs` so
   [`run`](#releasy-run) skips it;
 - **regroup** into an atomic unit, or **reorder** via `depends_on`.
+
+A PR added here was never trial-picked, so its dependencies are whatever the
+reply declared — usually nothing. Such units are marked
+`discovery_method: graph-update-unanalysed` and warned about; run
+[`graph discover`](#releasy-graph-discover) before [`run`](#releasy-run) to
+analyse them, or declare `depends_on` in the comment.
 
 ```bash
 releasy graph update [--onto <ver>] [--since <iso>] [--work-dir <path>]
