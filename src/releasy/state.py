@@ -302,6 +302,11 @@ class FeatureState:
     pr_body: str | None = None
     pr_numbers: list[int] = field(default_factory=list)
     pr_urls: list[str] = field(default_factory=list)
+    # Source PRs the unit's own PRs say they cherry-picked (parsed from
+    # their ``Cherry-picked from …`` bodies). A combined port carries code
+    # from PRs that appear nowhere in ``pr_urls``; recording them lets the
+    # queued-elsewhere guard see that this unit already brings a prereq.
+    contained_pr_urls: list[str] = field(default_factory=list)
     # GitHub login of the (first) source PR's author. Used by the project
     # board sync to seed the ``Assignee Dev`` field once, when the card is
     # first created. Stored on state so re-runs and ``releasy continue``
@@ -371,10 +376,11 @@ class FeatureState:
     # ``queued_prereq_units`` — cross-references to other units (or
     # config entries) where the discovered prereq is already going to be
     # ported. Each entry is ``{prereq_url: str, queued_in: str,
-    # queued_in_pr_url: str | None}`` where ``queued_in`` is a human-
-    # readable identifier (feature_id, "config:include_prs",
-    # "config:groups[<id>]"). Drives the "merge unit X first" message;
-    # cleared once the unit lands cleanly.
+    # queued_in_pr_url: str | None, carried: bool}`` where ``queued_in``
+    # is a human-readable identifier (feature_id, "config:include_prs",
+    # "config:groups[<id>]") and ``carried`` marks a unit that brings the
+    # prereq inside a combined port rather than listing it. Drives the
+    # "merge unit X first" message; cleared once the unit lands cleanly.
     queued_prereq_units: list[dict] = field(default_factory=list)
     # ----- ``refresh --address-review`` tracking -----
     # ISO-8601 UTC timestamp of the most recent successful
@@ -445,6 +451,7 @@ def _parse_features(raw_features: dict) -> dict[str, FeatureState]:
             pr_body=fraw.get("pr_body"),
             pr_numbers=fraw.get("pr_numbers", []) or [],
             pr_urls=fraw.get("pr_urls", []) or [],
+            contained_pr_urls=fraw.get("contained_pr_urls", []) or [],
             pr_author=fraw.get("pr_author"),
             rebase_pr_url=fraw.get("rebase_pr_url"),
             ai_resolved=fraw.get("ai_resolved", False),
@@ -563,6 +570,8 @@ def save_state(state: PipelineState, config: Config) -> None:
             entry["pr_numbers"] = fs.pr_numbers
         if fs.pr_urls and len(fs.pr_urls) > 1:
             entry["pr_urls"] = fs.pr_urls
+        if fs.contained_pr_urls:
+            entry["contained_pr_urls"] = fs.contained_pr_urls
         if fs.pr_author:
             entry["pr_author"] = fs.pr_author
         if fs.rebase_pr_url:

@@ -557,7 +557,10 @@ class AutoAddPrerequisitePRsConfig:
     none of ``exclude_labels``) — the same labels our own discovery
     selects on. An in-origin prereq without those labels is treated as
     out of scope: the dive aborts (detection-only) and the user must
-    either label it or list it explicitly in ``include_prs``. Prereqs on
+    either label it or list it explicitly in ``include_prs``. The gate is
+    only reached when no unit already carries the prereq — one that some
+    unit's combined port brings in parks as ``waiting_for_merge`` first.
+    Prereqs on
     a different repo than origin (forward-port / backport sources) are
     never gated, and the gate is a no-op when no ``by_labels`` selection
     is configured.

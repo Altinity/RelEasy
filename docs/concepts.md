@@ -136,7 +136,7 @@ stall:
 
 | Kind | Meaning | Blocks a retry? |
 |------|---------|-----------------|
-| `waiting_for_merge` | A prerequisite is queued in another unit (or a `depends_on` gate is unmet) — nothing to try until that PR merges. | yes |
+| `waiting_for_merge` | A prerequisite is queued in another unit — listed there, or carried inside a combined port that unit brings — or a `depends_on` gate is unmet. Nothing to try until that PR merges. | yes |
 | `missing_prereq` | A prerequisite PR was identified but nobody ports it: add it to the session, or merge it upstream. | yes |
 | `retries_exhausted` | An attempt cap was spent (`max_partial_continue_attempts`, `max_verify_resume_attempts`). | the cap does |
 | `unresolvable` | The resolver judged the conflict and could not fix it. | no |

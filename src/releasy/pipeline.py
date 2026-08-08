@@ -55,6 +55,7 @@ from releasy.github_ops import (
     find_pr_for_branch,
     get_origin_repo_slug,
     mark_pr_ready_for_review,
+    parse_cherry_picked_refs,
     parse_pr_url,
     pr_has_label,
     pr_ref_label,
@@ -1870,8 +1871,29 @@ def _unit_pr_meta(unit: FeatureUnit) -> dict:
         "pr_body": primary.body,
         "pr_numbers": [pr.number for pr in unit.prs],
         "pr_urls": [pr.url for pr in unit.prs],
+        "contained_pr_urls": _contained_source_urls(unit),
         "pr_author": primary.author,
     }
+
+
+def _contained_source_urls(unit: FeatureUnit) -> list[str]:
+    """Source PRs the unit's own PRs say they cherry-picked.
+
+    A combined port (``Cherry-picked from #1388, #1405, …``) carries code
+    from PRs listed nowhere in the unit itself. Recorded on state so the
+    queued-elsewhere guard can match a prereq against the unit that
+    actually brings it, instead of only against literal ``prs:`` entries.
+    """
+    out: list[str] = []
+    seen: set[PRRef] = set()
+    for pr in unit.prs:
+        for ref in parse_cherry_picked_refs(pr.body, pr.repo_slug):
+            if ref in seen:
+                continue
+            seen.add(ref)
+            owner, repo, number = ref
+            out.append(f"https://github.com/{owner}/{repo}/pull/{number}")
+    return out
 
 
 _VERSION_TOKEN = r"v?\d+(?:\.\d+)+"
@@ -4661,6 +4683,7 @@ def _find_already_queued_prereqs(
             "prereq_url": "<the candidate URL>",
             "queued_in": "<feature_id | 'config:include_prs' | 'config:groups[<id>]'>",
             "queued_in_pr_url": "<rebase PR URL or None>",
+            "carried": <True when matched via combined-port provenance>,
         }
 
     Empty list when no candidate is already queued — the caller falls
@@ -4669,6 +4692,13 @@ def _find_already_queued_prereqs(
     ``exclude_feature_id`` skips state entries with that id, used so we
     don't flag a unit's own prior dynamic prereqs (which we already
     know about) as "queued elsewhere".
+
+    Matching runs in two tiers. A unit that lists the prereq outright
+    wins; failing that, a unit whose PRs say they cherry-picked it (see
+    ``contained_pr_urls``) claims it. The second tier is what recognises
+    a combined port: #1832's prereqs #1388 / #1618 are listed by no unit,
+    but the 26.3 combined port #1718 — which some unit does list — states
+    in its body that it carries both, so the prereq is queued after all.
 
     URL normalisation: candidates are matched against config / state by
     their parsed ``(owner, repo, number)`` tuple, so query strings,
@@ -4717,18 +4747,47 @@ def _find_already_queued_prereqs(
             if ref and ref not in index:
                 index[ref] = (fid, fs.rebase_pr_url)
 
+    # Second tier, built after every direct claim is in: PRs a unit's own
+    # PRs say they cherry-picked. Kept separate so a unit that lists the
+    # prereq outright always wins over one that merely carries it.
+    carried: dict[tuple[str, str, int], tuple[str, str | None]] = {}
+    for fid, fs in state.features.items():
+        if fid == exclude_feature_id:
+            continue
+        contained = list(fs.contained_pr_urls)
+        if not contained:
+            # State written before ``contained_pr_urls`` existed still has
+            # the primary PR's body — parse it so the fix applies without
+            # waiting for the unit to be re-processed.
+            primary_slug = None
+            primary_ref = _normalize(fs.pr_url or "")
+            if primary_ref:
+                primary_slug = f"{primary_ref[0]}/{primary_ref[1]}"
+            contained = [
+                f"https://github.com/{o}/{r}/pull/{n}"
+                for o, r, n in parse_cherry_picked_refs(
+                    fs.pr_body, primary_slug,
+                )
+            ]
+        for url in contained:
+            ref = _normalize(url)
+            if ref and ref not in index and ref not in carried:
+                carried[ref] = (fid, fs.rebase_pr_url)
+
     out: list[dict] = []
     seen: set[tuple[str, str, int]] = set()
     for url in candidate_urls:
         ref = _normalize(url)
         if ref is None or ref in seen:
             continue
-        if ref in index:
-            queued_in, queued_pr_url = index[ref]
+        hit = index.get(ref)
+        if hit is not None or ref in carried:
+            queued_in, queued_pr_url = hit if hit is not None else carried[ref]
             out.append({
                 "prereq_url": url,
                 "queued_in": queued_in,
                 "queued_in_pr_url": queued_pr_url,
+                "carried": hit is None,
             })
             seen.add(ref)
     return out
@@ -4948,8 +5007,9 @@ def _print_prereq_dive_failure(
             where = q.get("queued_in", "?")
             qpr = q.get("queued_in_pr_url")
             extra = f" → {qpr}" if qpr else ""
+            verb = "carried by" if q.get("carried") else "queued in"
             console.print(
-                f"      • {url} (queued in {where}{extra})"
+                f"      • {url} ({verb} {where}{extra})"
             )
         console.print(
             "    [dim]Action: wait for the queued unit's PR to merge, "
@@ -4973,12 +5033,18 @@ def _print_prereq_dive_failure(
 def _queued_stall(
     queued: list[dict], *, prior: FeatureState | None,
 ) -> StallReason:
-    """``waiting_for_merge`` naming the units that already port the prereq."""
+    """``waiting_for_merge`` naming the units that already port the prereq.
+
+    Units are deduped: one combined port routinely carries several of the
+    discovered prereqs, and repeating its id would read as "waiting for
+    `X`, `X` to merge".
+    """
+    units = dict.fromkeys(
+        str(q.get("queued_in")) for q in queued if q.get("queued_in")
+    )
     return make_stall(
         "waiting_for_merge",
-        waiting_on_units=[
-            str(q.get("queued_in")) for q in queued if q.get("queued_in")
-        ],
+        waiting_on_units=list(units),
         waiting_on_prs=[
             str(q.get("prereq_url")) for q in queued if q.get("prereq_url")
         ],

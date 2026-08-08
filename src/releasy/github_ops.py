@@ -529,6 +529,65 @@ def parse_pr_url(url: str) -> tuple[str, str, int] | None:
     return m.group(1), m.group(2), int(m.group(3))
 
 
+# RelEasy stamps the sources of every port PR into its body (see
+# ``pipeline._build_pr_body``) in one of two shapes:
+#
+#   Cherry-picked from #1832.
+#   Combined port of 12 PR(s) (group `apassos-3`). Cherry-picked from #1388, …
+#
+# The clause is therefore matched anywhere in a line, not anchored to its
+# start, and only up to the end of that line — the rest of the body carries
+# unrelated PR links (changelog attributions) we must not mistake for sources.
+_CHERRY_PICKED_CLAUSE_RE = re.compile(
+    r"Cherry-picked from\s+([^\n]+)", re.IGNORECASE,
+)
+# One PR reference: full URL, ``owner/repo#N``, or bare ``#N``. Ordered
+# alternation, so a URL never falls through to the bare-``#N`` branch.
+_PR_REF_RE = re.compile(
+    r"https?://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s)]+?)"
+    r"(?:\.git)?/pull/(?P<num>\d+)\b"
+    r"|(?P<slug_owner>[A-Za-z0-9_.-]+)/(?P<slug_repo>[A-Za-z0-9_.-]+)"
+    r"#(?P<slug_num>\d+)\b"
+    r"|(?<![\w/])#(?P<hash_num>\d+)\b",
+)
+
+
+def parse_cherry_picked_refs(
+    body: str | None, default_slug: str | None,
+) -> list[tuple[str, str, int]]:
+    """Source PRs named in a port PR body's ``Cherry-picked from`` clause.
+
+    Returns canonical ``(owner, repo, number)`` refs, deduped, in body
+    order. ``default_slug`` (``"owner/repo"``) resolves bare ``#N`` refs;
+    without it those are skipped rather than guessed. Empty list when the
+    body has no such clause — this is best-effort provenance, so callers
+    must treat a miss as "unknown", never as "carries nothing".
+    """
+    if not body:
+        return []
+    out: list[tuple[str, str, int]] = []
+    seen: set[tuple[str, str, int]] = set()
+    for clause in _CHERRY_PICKED_CLAUSE_RE.finditer(body):
+        for m in _PR_REF_RE.finditer(clause.group(1)):
+            if m.group("num"):
+                ref = (m.group("owner"), m.group("repo"), int(m.group("num")))
+            elif m.group("slug_num"):
+                ref = (
+                    m.group("slug_owner"),
+                    m.group("slug_repo"),
+                    int(m.group("slug_num")),
+                )
+            elif default_slug and "/" in default_slug:
+                owner, _, repo = default_slug.partition("/")
+                ref = (owner, repo, int(m.group("hash_num")))
+            else:
+                continue
+            if ref not in seen:
+                seen.add(ref)
+                out.append(ref)
+    return out
+
+
 def parse_source_url(
     url: str,
 ) -> tuple[str, str, str, str] | None:
@@ -3657,7 +3716,8 @@ def _render_prereq_body_block(fs: FeatureState) -> str | None:
             queued_pr = entry.get("queued_in_pr_url")
             link = _format_pr_url_as_link(url) if url else "(unknown PR)"
             extra = f" — already-open PR: {queued_pr}" if queued_pr else ""
-            lines.append(f"- {link} (queued in `{queued_in}`){extra}")
+            verb = "carried by" if entry.get("carried") else "queued in"
+            lines.append(f"- {link} ({verb} `{queued_in}`){extra}")
         return "\n".join(lines)
 
     if fs.prereq_recovery_exhausted and fs.prereq_trail:

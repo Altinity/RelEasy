@@ -202,6 +202,40 @@ class StallStillBlocks(unittest.TestCase):
             cfg(), state,
             StallReason(kind="missing_prereq", waiting_on_prs=[URL(9)])))
 
+    def test_missing_prereq_releases_once_carried_by_a_combined_port(self):
+        """The prereq is listed nowhere, but a unit's body says it brings it."""
+        state = self._state(other=FeatureState(
+            status="needs_review", pr_url=URL(1718),
+            contained_pr_urls=[URL(9)],
+        ))
+        self.assertFalse(p._stall_still_blocks(
+            cfg(), state,
+            StallReason(kind="missing_prereq", waiting_on_prs=[URL(9)])))
+
+
+class QueuedStall(unittest.TestCase):
+    """Building the ``waiting_for_merge`` stall from queued-prereq hits."""
+
+    def test_repeated_unit_named_once(self):
+        # One combined port routinely carries several discovered prereqs.
+        queued = [
+            {"prereq_url": URL(1388), "queued_in": "grp", "carried": True},
+            {"prereq_url": URL(1618), "queued_in": "grp", "carried": True},
+        ]
+        stall = p._queued_stall(queued, prior=None)
+        self.assertEqual(stall.waiting_on_units, ["grp"])
+        self.assertEqual(stall.waiting_on_prs, [URL(1388), URL(1618)])
+        self.assertEqual(stall.summary(), "waiting for `grp` to merge")
+
+    def test_distinct_units_kept_in_order(self):
+        queued = [
+            {"prereq_url": URL(1), "queued_in": "b"},
+            {"prereq_url": URL(2), "queued_in": "a"},
+        ]
+        self.assertEqual(
+            p._queued_stall(queued, prior=None).waiting_on_units, ["b", "a"],
+        )
+
 
 class SkipForStall(unittest.TestCase):
     """The run gate: skip, or drop a stall that has cleared."""
