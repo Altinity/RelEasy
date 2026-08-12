@@ -1384,8 +1384,8 @@ def _tracked_port_mode(config: Config, pr_url: str) -> PortMode | None:
         state = load_state(config)
     except Exception:  # pragma: no cover — bad state file
         return None
-    fs = find_feature_by_pr_url(state, pr_url)
-    return fs.mode if fs is not None else None
+    hit = find_feature_by_pr_url(state, pr_url)
+    return hit[1].mode if hit is not None else None
 
 
 def _maybe_update_tracked_state(

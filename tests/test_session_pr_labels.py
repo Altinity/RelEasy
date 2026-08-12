@@ -175,5 +175,54 @@ class Reconcile(unittest.TestCase):
         self.assertEqual(self.added, [])
 
 
+class TrackedPortMode(unittest.TestCase):
+    """``refresh --pr`` reads the persisted mode to pick mode-conditional labels."""
+
+    def _cfg_with_state(self, features):
+        import releasy.refresh as r
+        from releasy.state import PipelineState
+        cfg = _config()
+        state = PipelineState(features=features)
+        return r, cfg, state
+
+    def test_mode_read_off_the_matching_entry(self):
+        """Regression: the lookup returns (feature_id, FeatureState)."""
+        from releasy.state import FeatureState
+        r, cfg, state = self._cfg_with_state({
+            "grp": FeatureState(
+                pr_url="https://github.com/acme/repo/pull/1",
+                rebase_pr_url="https://github.com/acme/repo/pull/2",
+                mode="forward_port",
+            ),
+        })
+        saved = r.load_state
+        r.load_state = lambda c: state
+        try:
+            self.assertEqual(
+                r._tracked_port_mode(cfg, "https://github.com/acme/repo/pull/2"),
+                "forward_port",
+            )
+            self.assertIsNone(
+                r._tracked_port_mode(cfg, "https://github.com/acme/repo/pull/99"),
+            )
+        finally:
+            r.load_state = saved
+
+    def test_stateless_never_loads_state(self):
+        import releasy.refresh as r
+        cfg = _config()
+        cfg.stateless = True
+        saved = r.load_state
+
+        def boom(_c):
+            raise AssertionError("stateless must not load state")
+
+        r.load_state = boom
+        try:
+            self.assertIsNone(r._tracked_port_mode(cfg, "https://x/y/pull/1"))
+        finally:
+            r.load_state = saved
+
+
 if __name__ == "__main__":
     unittest.main()
