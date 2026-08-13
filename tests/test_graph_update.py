@@ -46,12 +46,13 @@ def report(nodes, *, excluded=None, **kw):
         generated_at="2026-05-31T00:00:00+00:00",
         candidate_unit_count=len(nodes),
         candidate_pr_count=sum(len(n.pr_urls) for n in nodes),
-        skipped_already_in_target=[],
+        skipped_already_in_target=kw.get("skipped_already_in_target", []),
         nodes=nodes,
         components=[],
         singletons=[],
         excluded=excluded or [],
-        **{k: v for k, v in kw.items() if k != "base_branch"},
+        **{k: v for k, v in kw.items()
+           if k not in ("base_branch", "skipped_already_in_target")},
     )
     r.components, r.singletons = d.recompute_components(r)
     return r
@@ -1137,23 +1138,90 @@ class ProgressCheckboxes(unittest.TestCase):
         self.assertIn("- [ ] [#1]", body)
         self.assertIn("⏸ blocked by `pr-9`", body)
 
-    def test_skipped_shows_reason_and_stays_unticked(self):
+    def test_skipped_moves_to_discarded_with_its_reason(self):
         fs = FeatureState(status="skipped", skip_reason="already in target")
         body = self._body([node("pr-1", 1)], self._state(**{"pr-1": fs}))
-        self.assertIn("- [ ] [#1]", body)
+        self.assertNotIn("Standalone PRs", body)
+        self.assertNotIn("- [ ] [#1]", body)          # no box in Discarded
+        self.assertIn("<summary>🗑 <b>Discarded</b> · 1 unit(s)", body)
         self.assertIn("⏭ skipped: already in target", body)
 
     def test_closed_pr_is_not_ported(self):
         fs = FeatureState(status="closed", rebase_pr_url=URL(62))
         body = self._body([node("pr-1", 1)], self._state(**{"pr-1": fs}))
-        self.assertIn("- [ ] [#1]", body)
+        # Moved out of "Standalone PRs" into the folded Discarded section:
+        # no checkbox, and it does not count as ported.
+        self.assertNotIn("Standalone PRs", body)
+        self.assertNotIn("- [ ] [#1]", body)
+        self.assertIn("<summary>🗑 <b>Discarded</b> · 1 unit(s)", body)
+        self.assertIn("- [#1](", body)
         self.assertIn("⛔ PR closed unmerged [#62]", body)
+        self.assertIn("**Progress: 0/1 unit(s) ported**", body)
 
-    def test_superseded_counts_without_own_pr(self):
-        fs = FeatureState(status="superseded")
+    def test_discarded_group_keeps_its_prs_listed(self):
+        fs = FeatureState(status="closed", rebase_pr_url=URL(63))
+        body = self._body([node("grp-1", 1, 2)], self._state(**{"grp-1": fs}))
+        self.assertNotIn("Groups (port together", body)
+        self.assertIn("<summary>🗑 <b>Discarded</b> · 1 unit(s)", body)
+        self.assertIn("- **`grp-1`** · 2 PRs — ⛔ PR closed unmerged", body)
+        self.assertIn("  1. [#1](", body)
+        self.assertIn("  2. [#2](", body)
+
+    def test_discarded_orders_closed_then_skipped_then_superseded(self):
+        body = self._body(
+            [node("pr-1", 1), node("pr-2", 2), node("pr-3", 3)],
+            self._state(**{
+                "pr-1": FeatureState(status="superseded"),
+                "pr-2": FeatureState(status="skipped", skip_reason="r"),
+                "pr-3": FeatureState(status="closed"),
+            }),
+        )
+        self.assertIn("<summary>🗑 <b>Discarded</b> · 3 unit(s)", body)
+        self.assertLess(body.index("[#3]"), body.index("[#2]"))
+        self.assertLess(body.index("[#2]"), body.index("[#1]"))
+
+    def test_discarded_lists_already_in_target_units(self):
+        # The report keeps unit IDs here, not PR URLs — render them as
+        # code spans, never as links.
+        r = report(
+            [node("pr-1", 1)],
+            skipped_already_in_target=["pr-1675", "auto-grp-pr-1687"],
+        )
+        body = d.render_graph_issue_body(r, {})
+        self.assertIn(
+            "<summary>🗑 <b>Discarded</b> · 0 unit(s) + 2 already in "
+            "target</summary>", body,
+        )
+        self.assertIn("Already in target at discovery time (never ported): "
+                      "`pr-1675` · `auto-grp-pr-1687`", body)
+        self.assertNotIn("(pr-1675)", body)
+
+    def test_discarded_sits_above_excluded_and_both_fold(self):
+        fs = FeatureState(status="closed", rebase_pr_url=URL(64))
+        r = report(
+            [node("pr-1", 1), node("pr-2", 2)],
+            excluded=[{"url": URL(9), "reason": "not wanted"}],
+        )
+        body = d.render_graph_issue_body(
+            r, d.build_progress_map(r, self._state(**{"pr-1": fs})),
+        )
+        discarded_at = body.index("<b>Discarded</b>")
+        excluded_at = body.index("<b>Excluded</b>")
+        self.assertLess(body.index("Standalone PRs"), discarded_at)
+        self.assertLess(discarded_at, excluded_at)
+        # Folded: plain <details>, never <details open>.
+        self.assertNotIn("<details open>", body[discarded_at - 40:])
+        self.assertIn("🚫 <b>Excluded</b> · 1 PR(s)", body)
+        self.assertIn("- [#9](", body)
+
+    def test_superseded_is_discarded_not_ported(self):
+        fs = FeatureState(status="superseded", skip_reason="superseded by merged #40")
         body = self._body([node("pr-1", 1)], self._state(**{"pr-1": fs}))
-        self.assertIn("- [x] [#1]", body)
-        self.assertIn("♻ superseded", body)
+        self.assertNotIn("- [x] [#1]", body)
+        self.assertIn("<summary>🗑 <b>Discarded</b> · 1 unit(s)", body)
+        # The reason restates the status — grafted on, not repeated.
+        self.assertIn("♻ superseded by merged #40", body)
+        self.assertIn("**Progress: 0/1 unit(s) ported**", body)
 
     def test_progress_map_falls_back_to_pr_urls(self):
         # Tracked under a different feature id — matched via its source PR.
@@ -1196,13 +1264,17 @@ class ProgressCheckboxes(unittest.TestCase):
         self.assertIn("<details>\n<summary>☑", body)
         self.assertNotIn("<details open>", body)
 
-    def test_superseded_group_is_folded(self):
-        fs = FeatureState(status="superseded")
-        body = self._body([self._grp()], self._state(grp=fs))
-        self.assertIn("<details>\n<summary>☑", body)
+    def test_discarded_group_leaves_the_groups_section(self):
+        for status in ("superseded", "skipped", "closed"):
+            with self.subTest(status=status):
+                fs = FeatureState(status=status)
+                body = self._body([self._grp()], self._state(grp=fs))
+                self.assertNotIn("<summary>☑", body)
+                self.assertNotIn("<details open>", body)
+                self.assertIn("<b>Discarded</b>", body)
 
     def test_unfinished_group_stays_open(self):
-        for status in ("needs_review", "conflict", "blocked", "skipped"):
+        for status in ("needs_review", "conflict", "blocked"):
             with self.subTest(status=status):
                 fs = FeatureState(status=status, rebase_pr_url=URL(60))
                 body = self._body([self._grp()], self._state(grp=fs))

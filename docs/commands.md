@@ -470,6 +470,22 @@ and status marker. Merged (and `superseded`) groups are folded shut — the work
 is done, there's nothing to read; everything else stays expanded. Standalone
 PRs are one line each and stay plain checkboxes.
 
+Two more foldables sit at the bottom, **both shut by default**:
+
+**🗑 Discarded** collects every unit releasy will do no more work on, moved
+out of the lists above and listed with the marker that says why — `⛔ PR
+closed unmerged`, then `⏭ skipped` (explicit `releasy skip`, or an implicit
+drop such as an empty cherry-pick), then `♻ superseded`. Entries carry no
+checkbox: nothing there is on the working list. None of them count as
+*ported* — that tally measures what releasy itself landed, and a superseded
+unit shipped via somebody else's PR — but they all still appear in the
+per-status breakdown, so the totals stay whole. Units that discovery dropped
+before they reached the graph (already present in the target branch) are
+listed as bare IDs at the end of the same section — the report keeps no PR
+URLs or titles for them — and counted separately in its header.
+
+**🚫 Excluded** is the PRs vetoed by members in issue comments.
+
 A unit that stopped short also carries **why**, after the port-PR link:
 
 ```
