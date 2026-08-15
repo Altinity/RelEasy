@@ -1820,8 +1820,9 @@ def analyze_fails_cmd(
 ) -> None:
     """Walk failed CI on a PR (or every tracked PR), debug + fix per test.
 
-    For each failed test that surfaces in a praktika JSON report
-    (Fast test / Stateless tests / Integration tests), Claude:
+    Every failed commit status is read: praktika JSON reports (Fast
+    test, Stateless, Integration, …) and the TestFlows regression
+    suites alike. For each failed test that surfaces, Claude:
 
     \b
     1. Reads the failure excerpt and the PR's diff.

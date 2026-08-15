@@ -1,20 +1,25 @@
-"""Discover failed CI checks on a PR and parse the human-readable JSON reports.
+"""Discover failed CI checks on a PR and parse the human-readable reports.
 
-Altinity ClickHouse CI surfaces test results in two ways:
+Altinity ClickHouse CI surfaces test results in three ways:
 
 1. **GitHub Actions check-runs** — opaque job logs (e.g. ``PR / Fast test
    (pull_request)``). These are the raw workflow output; we deliberately
    ignore them.
-2. **GitHub commit statuses** — one entry per logical task whose
-   ``target_url`` points at a hosted ``json.html`` viewer (the
-   ``praktika`` report). The viewer fetches a sibling ``result_<task>.json``
-   from the same S3 bucket and renders it; that JSON is the structured,
-   machine-readable form of "which tests passed / failed".
+2. **GitHub commit statuses** whose ``target_url`` points at a hosted
+   ``json.html`` viewer (the ``praktika`` report). The viewer fetches a
+   sibling ``result_<task>.json`` from the same S3 bucket and renders
+   it; that JSON is the structured, machine-readable form of "which
+   tests passed / failed".
+3. **GitHub commit statuses** whose ``target_url`` is a TestFlows
+   ``report.html`` — the ``Regression <arch> <suite>`` checks. Those
+   suites live in the separate ``Altinity/clickhouse-regression`` repo
+   and publish no praktika JSON; their machine-readable failure list is
+   the sibling ``fails.log.txt``.
 
-This module is the bridge between (2) and a list of failed-test records
-``analyze-fails`` can hand to Claude one by one. The shapes of the JSON
-report are not formally documented anywhere — what's encoded here is the
-result of reverse-engineering the live viewer code.
+This module is the bridge between (2)/(3) and a list of failed-test
+records ``analyze-fails`` can hand to Claude. Neither report shape is
+formally documented anywhere — what's encoded here is the result of
+reverse-engineering the live viewer code and the published artefacts.
 
 Pure functions only. No git, no Claude, no state. Network access is
 limited to the GitHub statuses API and an S3 bucket holding the
@@ -25,6 +30,7 @@ from __future__ import annotations
 
 import json
 import re
+import textwrap
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Iterable
@@ -127,30 +133,100 @@ def _artifact_locator_from_target_url(url: str) -> ArtifactLocator | None:
     )
 
 
-# Categories worth running per-test analysis on. Anything else with a
-# parseable artefact URL gets reported but skipped (e.g. Build statuses
-# expose a JSON report too, but a "Build failed" doesn't decompose into
-# per-test diagnostics).
-TestCategory = str  # "fasttest" | "stateless" | "integration"
+@dataclass
+class TestFlowsLocator:
+    """Coordinates of a TestFlows regression report directory in S3.
+
+    The ``Regression <arch> <suite>`` checks publish a rendered
+    ``report.html`` plus sibling artefacts, keyed by
+    ``REFs/<pr>/merge/<sha>/regression/<arch>/…/<suite>/``. Unlike
+    praktika there is no key to compose — the status ``target_url`` is
+    the report itself, so we just remember its directory and read
+    ``fails.log.txt`` next to it.
+    """
+    report_dir: str  # absolute URL, no trailing slash
+
+    def fails_log_url(self) -> str:
+        return f"{self.report_dir}/fails.log.txt"
+
+    def report_url(self) -> str:
+        return f"{self.report_dir}/report.html"
+
+
+def _testflows_locator_from_target_url(url: str) -> TestFlowsLocator | None:
+    """Parse a TestFlows ``…/report.html`` target URL into its directory."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
+    if not parts.scheme or not parts.netloc:
+        return None
+    if not parts.path.endswith("/report.html"):
+        return None
+    directory = parts.path[: -len("/report.html")]
+    return TestFlowsLocator(
+        report_dir=f"{parts.scheme}://{parts.netloc}{directory}",
+    )
+
+
+def locator_from_target_url(
+    url: str,
+) -> ArtifactLocator | TestFlowsLocator | None:
+    """Classify a status ``target_url`` into whichever report it points at.
+
+    ``None`` means we can't read this status's results at all (a raw
+    GitHub-Actions job log, an empty ``target_url``, …).
+    """
+    return (
+        _artifact_locator_from_target_url(url)
+        or _testflows_locator_from_target_url(url)
+    )
+
+
+# Every failed check gets processed. The category decides which
+# reproduction recipe and triage prior :mod:`releasy.analyze_fails`
+# hands Claude; checks we have no recipe for land in ``CATEGORY_OTHER``
+# and are handed over with instructions to find the runner first.
+TestCategory = str
+
+CATEGORY_OTHER: TestCategory = "other"
 
 
 _NAME_CATEGORY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("fasttest", re.compile(r"^Fast\s*test\b", re.IGNORECASE)),
     ("stateless", re.compile(r"^Stateless\s*tests?\b", re.IGNORECASE)),
     ("integration", re.compile(r"^Integration\s*tests?\b", re.IGNORECASE)),
+    ("regression", re.compile(r"^Regression\b", re.IGNORECASE)),
+    (
+        "quick_functional",
+        re.compile(r"^Quick\s*functional\s*tests?\b", re.IGNORECASE),
+    ),
 )
 
 
-def category_from_name(name: str) -> TestCategory | None:
-    """Classify a status context name into a known test category.
+# Processing / display order: cheap-and-broad first (one Fast test fix
+# routinely flips the rest green), regression last — it needs an
+# external repo and hours of docker to reproduce.
+CATEGORY_ORDER: dict[str, int] = {
+    "fasttest": 0,
+    "quick_functional": 1,
+    "stateless": 2,
+    "integration": 3,
+    "regression": 4,
+    CATEGORY_OTHER: 5,
+}
 
-    ``None`` for builds, regression suites, GitHub-Actions check-runs,
-    etc. — anything we don't have a per-test analyser for.
+
+def category_from_name(name: str) -> TestCategory:
+    """Classify a status context name into a test category.
+
+    Falls back to :data:`CATEGORY_OTHER` rather than ``None``: an
+    unrecognised check is still a failed check worth investigating.
     """
     for cat, pat in _NAME_CATEGORY_PATTERNS:
         if pat.search(name):
             return cat
-    return None
+    return CATEGORY_OTHER
 
 
 # ---------------------------------------------------------------------------
@@ -160,19 +236,34 @@ def category_from_name(name: str) -> TestCategory | None:
 
 @dataclass
 class FailedStatus:
-    """One failed CI status with enough context to fetch its parsed report.
+    """One failed CI status with enough context to fetch its report.
 
-    ``locator`` is ``None`` when the status's ``target_url`` doesn't point
-    at a praktika report (e.g. a raw GitHub Actions job log) — those are
-    surfaced for the operator to see but don't drive per-test analysis.
+    ``locator`` is ``None`` when the status's ``target_url`` points at
+    neither a praktika nor a TestFlows report (e.g. a raw GitHub Actions
+    job log) — those are surfaced for the operator to see but don't
+    drive per-test analysis.
     """
     context: str
     state: str  # "failure" | "error"
     target_url: str
     description: str
-    category: TestCategory | None
-    locator: ArtifactLocator | None
+    category: TestCategory
+    locator: ArtifactLocator | TestFlowsLocator | None
     updated_at: str | None = None
+
+    @property
+    def is_aggregate(self) -> bool:
+        """True for the workflow-level rolled-up report (the ``PR`` status).
+
+        Praktika publishes one report per job *plus* one for the whole
+        workflow; the latter carries no ``name_1`` and its tree contains
+        every job's failures. Walking it would duplicate every per-job
+        failure we already collect from the individual statuses.
+        """
+        return (
+            isinstance(self.locator, ArtifactLocator)
+            and not self.locator.name_1
+        )
 
 
 def _fetch_combined_statuses(
@@ -255,7 +346,7 @@ def fetch_failed_statuses(
         if state not in ("failure", "error"):
             continue
         target_url = entry.get("target_url") or ""
-        locator = _artifact_locator_from_target_url(target_url)
+        locator = locator_from_target_url(target_url)
         out.append(FailedStatus(
             context=ctx,
             state=state,
@@ -265,10 +356,8 @@ def fetch_failed_statuses(
             locator=locator,
             updated_at=entry.get("updated_at"),
         ))
-    # Stable display order: failed Fast → Stateless → Integration → others.
-    _category_order = {"fasttest": 0, "stateless": 1, "integration": 2}
     out.sort(key=lambda s: (
-        _category_order.get(s.category or "", 99),
+        CATEGORY_ORDER.get(s.category, 99),
         s.context,
     ))
     return out, None
@@ -438,6 +527,211 @@ def extract_failed_tests(
 
 
 # ---------------------------------------------------------------------------
+# TestFlows (regression suite) report fetching + parsing
+# ---------------------------------------------------------------------------
+
+
+def fetch_testflows_fails_log(
+    locator: TestFlowsLocator, *, timeout: int = 60,
+) -> tuple[str | None, str | None]:
+    """Fetch the TestFlows ``fails.log.txt`` sitting next to a report.
+
+    Returns ``(text, None)`` on success, ``(None, message)`` on failure.
+    """
+    url = locator.fails_log_url()
+    try:
+        resp = requests.get(url, timeout=timeout)
+    except Exception as exc:
+        return None, f"GET {url} failed: {exc}"
+    if resp.status_code in (403, 404):
+        return None, (
+            f"No fails.log.txt at {url}. The suite likely died before it "
+            "could write a report (infra / build failure, or the job was "
+            "still running), or the artefact has been pruned."
+        )
+    if resp.status_code != 200:
+        return None, (
+            f"GET {url} → HTTP {resp.status_code}; first 200 chars: "
+            f"{resp.text[:200]!r}"
+        )
+    return resp.text, None
+
+
+# TestFlows result names that mean "this test really failed".
+#
+# The ``X`` flavours (``XFail`` / ``XError`` / ``XNull``) are *expected*
+# failures: the suite annotated them as known-broken, usually with an
+# upstream issue link, and the report lists them under its ``Known``
+# section rather than ``Failing``. They are the TestFlows counterpart of
+# praktika's ``XFAIL``/``BROKEN`` and are muted here for the same
+# reason. ``Skip`` never ran at all.
+_FAILED_TESTFLOWS_STATUSES = frozenset({"FAIL", "ERROR", "NULL"})
+
+
+# ``fails.log.txt`` lists the same tests twice, in two shapes.
+#
+# Detail section — duration *before* the status bracket, bare path, then
+# an indented assertion / traceback block:
+#     ``✘ 1m 53s    [  Fail  ] /swarms/feature/node failure``
+_TF_DETAIL_RE = re.compile(
+    r"^✘\s+(?P<duration>\S.*?)\s+\[\s*(?P<status>\w+)\s*\]\s+(?P<path>/.*)$",
+)
+# Summary sections (``Known`` / ``Failing``) — status first, path quoted:
+#     ``✘ [ Fail ] '/swarms/feature/node failure' (11m 34s)``
+_TF_SUMMARY_RE = re.compile(
+    r"^✘\s+\[\s*(?P<status>\w+)\s*\]\s+'(?P<path>.+)'"
+    r"\s+\((?P<duration>[^)]*)\)\s*$",
+)
+
+
+@dataclass
+class TestFlowsEntry:
+    """One node of a TestFlows run as reported by ``fails.log.txt``."""
+    path: str
+    status: str
+    detail: str = ""
+
+
+def parse_testflows_fails_log(text: str) -> dict[str, TestFlowsEntry]:
+    """Parse a TestFlows ``fails.log.txt`` into ``{test path: entry}``.
+
+    Folds both shapes of the file into one entry per path, keeping the
+    detail block when the detail section carried one. Test names are
+    unambiguous keys: TestFlows escapes ``/`` and quotes inside a test
+    name with lookalike codepoints, so a raw ``/`` is always a path
+    separator.
+    """
+    entries: dict[str, TestFlowsEntry] = {}
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        # Summary first: its status bracket would otherwise let the
+        # detail pattern misparse a path containing a ``[``.
+        summary = _TF_SUMMARY_RE.match(line)
+        if summary is not None:
+            path = summary.group("path")
+            entries.setdefault(path, TestFlowsEntry(
+                path=path, status=summary.group("status").upper(),
+            ))
+            continue
+        detail_match = _TF_DETAIL_RE.match(line)
+        if detail_match is None:
+            continue
+        path = detail_match.group("path").rstrip()
+        status = detail_match.group("status").upper()
+        # Everything indented (or blank) underneath belongs to this
+        # entry; the next entry, or a section heading, is flush-left.
+        block: list[str] = []
+        while i < len(lines):
+            nxt = lines[i]
+            if nxt.strip() and not nxt[:1].isspace():
+                break
+            block.append(nxt)
+            i += 1
+        detail = textwrap.dedent("\n".join(block)).strip()
+        entry = entries.get(path)
+        if entry is None:
+            entries[path] = TestFlowsEntry(
+                path=path, status=status, detail=detail,
+            )
+        elif detail and not entry.detail:
+            entry.status = status
+            entry.detail = detail
+    return entries
+
+
+# A leaf whose own detail block is shorter than this is treated as
+# uninformative (``AssertionError`` and nothing else), which triggers
+# the ancestor-traceback lookup below.
+_TF_THIN_DETAIL = 200
+
+
+def _nearest_detailed_ancestor(
+    path: str, entries: dict[str, TestFlowsEntry],
+) -> TestFlowsEntry | None:
+    """Deepest ancestor of ``path`` carrying a substantial detail block."""
+    parts = path.split("/")
+    for cut in range(len(parts) - 1, 0, -1):
+        candidate = entries.get("/".join(parts[:cut]))
+        if candidate is not None and len(candidate.detail) >= _TF_THIN_DETAIL:
+            return candidate
+    return None
+
+
+def extract_regression_failures(
+    fails_log: str,
+    *,
+    category: TestCategory,
+    shard_context: str,
+    target_url: str,
+) -> list[FailedTest]:
+    """Collect the leaf failures from a TestFlows ``fails.log.txt``.
+
+    TestFlows reports every node on the path to a failure, so one broken
+    scenario surfaces as itself *plus* every enclosing feature and the
+    module. We keep only the deepest nodes — a failing path that no
+    other failing path extends — because the ancestors carry no
+    independent diagnostic value and would multiply the work.
+
+    The ancestors do often carry the *traceback*, though: TestFlows
+    prints the full assertion detail on the enclosing node and a bare
+    ``AssertionError`` on the leaf. When a leaf's own block is too thin
+    to act on, the nearest substantial ancestor block is attached — but
+    only to the first leaf under that ancestor, and labelled as
+    possibly belonging to a sibling. One enclosing node routinely spans
+    hundreds of leaves, so its single traceback is a representative
+    sample, not per-test truth, and repeating it verbatim on every leaf
+    would both mislead and swamp the prompt.
+    """
+    entries = parse_testflows_fails_log(fails_log)
+    failing = {
+        path: entry for path, entry in entries.items()
+        if entry.status in _FAILED_TESTFLOWS_STATUSES
+    }
+    leaves = [
+        entry for path, entry in failing.items()
+        if not any(other.startswith(path + "/") for other in failing)
+    ]
+
+    out: list[FailedTest] = []
+    borrowed: set[str] = set()
+    for entry in sorted(leaves, key=lambda e: e.path):
+        info = entry.detail
+        if len(info) < _TF_THIN_DETAIL:
+            ancestor = _nearest_detailed_ancestor(entry.path, entries)
+            if ancestor is None:
+                pass
+            elif ancestor.path in borrowed:
+                info = (
+                    f"{info}\n\n[releasy] no per-test detail; see the "
+                    f"enclosing node {ancestor.path!r} shown with the "
+                    "first test under it."
+                ).strip()
+            else:
+                borrowed.add(ancestor.path)
+                info = (
+                    f"{info}\n\n[releasy] detail reported on the enclosing "
+                    f"node {ancestor.path!r}. TestFlows prints one "
+                    "representative traceback there rather than one per "
+                    "leaf, so this may be a sibling scenario's failure:"
+                    f"\n{ancestor.detail}"
+                ).strip()
+        if len(info) > _INFO_EXCERPT_MAX:
+            info = info[:_INFO_EXCERPT_MAX] + "\n…(truncated)"
+        out.append(FailedTest(
+            name=entry.path,
+            status=entry.status,
+            category=category,
+            shard_context=shard_context,
+            target_url=target_url,
+            info_excerpt=info,
+        ))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # High-level: discover failures for one PR
 # ---------------------------------------------------------------------------
 
@@ -461,11 +755,16 @@ def discover_pr_failures(
     head_sha: str | None = None,
     head_ref: str | None = None,
     base_ref: str | None = None,
-    categories: tuple[TestCategory, ...] = (
-        "fasttest", "stateless", "integration",
-    ),
+    categories: tuple[TestCategory, ...] | None = None,
 ) -> tuple[PRFailures | None, str | None]:
     """Resolve a PR's head, list failed statuses, and parse each report.
+
+    ``categories`` restricts which categories are decomposed into
+    per-test records; ``None`` (the default) processes **every** failed
+    check. Statuses that can't be decomposed — the workflow-level
+    rolled-up report, a job-log ``target_url``, a report with no failing
+    leaf — land in ``skipped_status_warnings`` instead of being dropped
+    silently.
 
     Lookups are best-effort per status — a single broken artefact URL
     surfaces as a string in ``skipped_status_warnings`` rather than
@@ -497,40 +796,64 @@ def discover_pr_failures(
     if err:
         return None, err
 
-    cat_set = set(categories)
+    # An explicit category list is an opt-out, so filtered-away statuses
+    # stay silent; everything else is either decomposed or warned about.
+    cat_set = set(categories) if categories else None
     failed_tests: list[FailedTest] = []
     warnings: list[str] = []
     for st in statuses:
-        if st.category not in cat_set:
+        if cat_set is not None and st.category not in cat_set:
+            continue
+        if st.is_aggregate:
+            warnings.append(
+                f"{st.context}: workflow-level rolled-up report — the "
+                "per-job statuses cover the same failures; skipping"
+            )
             continue
         if st.locator is None:
             warnings.append(
-                f"{st.context}: target_url is not a praktika report "
-                f"({st.target_url or 'no target_url'}) — skipping"
+                f"{st.context}: target_url is neither a praktika nor a "
+                f"TestFlows report ({st.target_url or 'no target_url'}) "
+                "— skipping"
             )
             continue
-        if st.locator.pr is None and pr_url:
-            # Replace any missing PR coordinate with the one we know.
-            st.locator.pr = str(number)
-        report, ferr = fetch_report_json(st.locator)
-        if ferr or report is None:
-            warnings.append(f"{st.context}: {ferr or 'empty report'}")
-            continue
-        leaves = extract_failed_tests(
-            report,
-            category=st.category,
-            shard_context=st.context,
-            target_url=st.target_url,
-        )
+        if isinstance(st.locator, TestFlowsLocator):
+            fails_log, ferr = fetch_testflows_fails_log(st.locator)
+            if ferr or fails_log is None:
+                warnings.append(
+                    f"{st.context}: {ferr or 'empty fails.log.txt'}"
+                )
+                continue
+            leaves = extract_regression_failures(
+                fails_log,
+                category=st.category,
+                shard_context=st.context,
+                target_url=st.target_url,
+            )
+        else:
+            if st.locator.pr is None and pr_url:
+                # Replace any missing PR coordinate with the one we know.
+                st.locator.pr = str(number)
+            report, ferr = fetch_report_json(st.locator)
+            if ferr or report is None:
+                warnings.append(f"{st.context}: {ferr or 'empty report'}")
+                continue
+            leaves = extract_failed_tests(
+                report,
+                category=st.category,
+                shard_context=st.context,
+                target_url=st.target_url,
+            )
         if not leaves:
             # Status said failure but no per-test failures came through —
             # could be an infrastructure failure (e.g. job killed before
-            # the test phase). Surface as a warning so the operator
-            # knows we won't act on it.
+            # the test phase), or a check with nothing per-test to report
+            # (a build, a packaging or image check). Surface as a warning
+            # so the operator knows we won't act on it.
             warnings.append(
-                f"{st.context}: status is {st.state} but report has no "
-                "FAIL leaves — likely an infrastructure / build issue, "
-                "not a per-test failure."
+                f"{st.context}: status is {st.state} but the report has "
+                "no failing test leaves — likely an infrastructure / "
+                "build failure rather than a per-test failure."
             )
             continue
         failed_tests.extend(leaves)

@@ -157,6 +157,7 @@ Options live in `config.yaml` unless marked **(session)**.
 | `review_response.timeout_seconds` | Per-invocation Claude timeout. | `7200` |
 | `analyze_fails.command` | Claude executable. | `claude` |
 | `analyze_fails.prompt_file` | Prompt template. | `prompts/analyze_fails.md` |
+| `analyze_fails.categories` | Check categories to investigate; empty = every failed check. Known: `fasttest`, `quick_functional`, `stateless`, `integration`, `regression`, `other`. | `[]` |
 | `analyze_fails.timeout_seconds` | Per-invocation Claude timeout. | `7200` |
 | `analyze_fails.max_iterations` | Build attempts per failed test. | `6` |
 | `analyze_fails.max_prs_per_run` | Cap on tracked PRs when `--pr` omitted (0 = no cap). | `0` |

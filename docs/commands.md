@@ -182,9 +182,10 @@ into the PR branch via `git merge --no-ff`:
 - **conflict + AI resolves** → push, restore status, set `ai_resolved`
 - **conflict + AI gives up** → reset local, mark `conflict`
 
-**`--analyze-fails`** — for each tracked PR, walk failed praktika
-status entries on the PR's head SHA, bundle the failing tests per
-shard, and let Claude run the iterative fix-build-rerun loop. Same
+**`--analyze-fails`** — for each tracked PR, walk every failed status
+entry on the PR's head SHA (praktika and TestFlows regression reports
+alike), bundle the failing tests per shard, and let Claude run the
+iterative fix-build-rerun loop. Same
 machinery as the standalone [`analyze-fails`](#releasy-analyze-fails)
 command — see that section for outcome classifications, flaky-elsewhere
 heuristic, and config. Per-PR sub-flags: `--no-flaky-check`,
@@ -513,12 +514,33 @@ issue, or the issue edit failed.
 > bundled cron pass; reach for standalone `analyze-fails` when CI triage
 > is the only thing you're doing.
 
-Walks failed commit-status entries on the PR's head SHA whose `target_url`
-points at the praktika JSON viewer (GitHub-Actions job logs are
-deliberately ignored). Per failed shard, bundles all failures into a
-single Claude invocation that runs iteratively: triage → pick highest-
-leverage root cause → fix → build → re-run still-failing tests in one
-batch → repeat (up to `max_iterations`).
+Walks **every** failed commit-status entry on the PR's head SHA and reads
+whichever report its `target_url` points at:
+
+- the **praktika** JSON viewer (`json.html?…` → sibling
+  `result_<task>.json`) — Fast test, Quick functional tests, Stateless,
+  Integration, and every other in-repo job;
+- a **TestFlows** `report.html` — the `Regression <arch> <suite>` checks,
+  whose failures come from the sibling `fails.log.txt`. Only the deepest
+  failing scenarios are kept (TestFlows also reports every enclosing
+  feature and module), and `Known`/`XFail` entries are excluded.
+
+GitHub-Actions job logs have no machine-readable report and are still
+ignored. So is the workflow-level rolled-up `PR` status — the per-job
+statuses already cover it. Anything skipped is reported with the reason
+rather than dropped silently, including checks whose report has no
+failing test leaf (a build or packaging failure). Narrow the sweep with
+[`analyze_fails.categories`](configuration.md#key-options) — e.g. drop
+`regression`, which needs the external
+[`Altinity/clickhouse-regression`](https://github.com/Altinity/clickhouse-regression)
+repo to reproduce.
+
+Per failed shard, bundles all failures into a single Claude invocation
+that runs iteratively: triage → pick highest-leverage root cause → fix →
+build → re-run still-failing tests in one batch → repeat (up to
+`max_iterations`). Each shard's prompt carries a category-specific
+reproduction recipe and triage prior; categories with no recipe are
+handed over with instructions to find the job definition first.
 
 A **flaky-elsewhere map** cross-references failures across other tracked
 PRs (`flaky_elsewhere_threshold` default 2) so master-side flakes get

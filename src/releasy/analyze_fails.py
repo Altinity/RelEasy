@@ -48,6 +48,8 @@ from releasy.ai_resolve import (
     _write_build_script,
 )
 from releasy.ci_failures import (
+    CATEGORY_ORDER,
+    CATEGORY_OTHER,
     FailedTest,
     PRFailures,
     discover_pr_failures,
@@ -202,8 +204,9 @@ def _build_flaky_elsewhere_map(
     if cap > 0:
         pr_urls = pr_urls[:cap]
 
+    categories = _configured_categories(config)
     for url in pr_urls:
-        failures, err = discover_pr_failures(config, url)
+        failures, err = discover_pr_failures(config, url, categories=categories)
         if err or failures is None:
             warnings.append(f"flaky-elsewhere: {url}: {err}")
             continue
@@ -217,6 +220,11 @@ def _build_flaky_elsewhere_map(
 
 def _flaky_key(category: str, test_name: str) -> str:
     return f"{category}::{test_name}"
+
+
+def _configured_categories(config: Config) -> tuple[str, ...] | None:
+    """Category allowlist from config; ``None`` means every failed check."""
+    return tuple(config.analyze_fails.categories) or None
 
 
 # ---------------------------------------------------------------------------
@@ -234,9 +242,9 @@ def _flaky_key(category: str, test_name: str) -> str:
 #     PR broke it", and flaky-elsewhere evidence is more likely
 #     "several rebased PRs share a broken baseline" than "master-side
 #     flake".
-#   - Stateless / Integration tests hit real storage, docker, network
-#     — genuine flakes are common and flaky-elsewhere annotations are
-#     load-bearing UNRELATED evidence.
+#   - Stateless / Integration / Regression tests hit real storage,
+#     docker, network — genuine flakes are common and flaky-elsewhere
+#     annotations are load-bearing UNRELATED evidence.
 #
 # These priors *bias* the triage step; they don't override the
 # scoping rule ("only fix tests this PR broke" still stands). The
@@ -275,6 +283,40 @@ _CATEGORY_PRIORS: dict[str, str] = {
         "here — trust it. Default to CAN'T-TELL → NOT-THIS-PR when the "
         "diff has no plausible link to the failure surface."
     ),
+    "regression": (
+        "**Regression suites** are TestFlows scenario trees from the "
+        "separate `Altinity/clickhouse-regression` repo, run against "
+        "minio / localstack / multi-node clusters for hours. Two "
+        "consequences for triage:\n\n"
+        "- One broken step reports as dozens of failing scenarios. The "
+        "enclosing feature/module nodes have already been stripped from "
+        "the list below, but sibling scenarios failing in lockstep "
+        "almost always share one root cause — find the cause, don't "
+        "work the list.\n"
+        "- Storage / network jitter makes flakes common, so the "
+        "flaky-elsewhere annotation is **strong UNRELATED evidence** — "
+        "trust it.\n\n"
+        "These suites assert Altinity-specific behaviour (Iceberg "
+        "export, swarms, S3 export) that a rebase can genuinely break, "
+        "so do check the diff against the failing scenario's subject "
+        "before writing it off."
+    ),
+    "quick_functional": (
+        "**Quick functional tests** run a small deterministic query set "
+        "against a debug binary with no external storage. Flakes are "
+        "**rare** — treat a failure here much like Fast test: the prior "
+        "is that this PR caused it. Default to CAUSED-BY-THIS-PR unless "
+        "you can name a concrete non-PR cause."
+    ),
+    CATEGORY_OTHER: (
+        "This is a check RelEasy has no reproduction recipe for (stress "
+        "test, fuzzer, sqllogic, compatibility, packaging, …). Work out "
+        "what it actually exercises *before* judging relatedness — the "
+        "job definition and its script are in the repo (see the runner "
+        "section below). If you can't reproduce it locally, don't "
+        "guess: reason from the failure excerpt plus the PR diff, and "
+        "classify honestly."
+    ),
 }
 
 
@@ -291,10 +333,12 @@ def _category_prior_section(category: str) -> str:
 
 # Each entry is a small markdown block telling Claude how to invoke the
 # right test runner for the category. ``{tests_arg}`` is substituted
-# with a space-separated quoted list of the failing test names; Claude
-# is told that this is the ground truth for "what was failing" and that
-# it must re-invoke the runner with a (possibly shrinking) subset on
-# every iteration of the fix-build-rerun loop.
+# with a space-separated quoted list of the failing test names (for
+# regression: TestFlows ``--only`` patterns), ``{shard_context}`` with
+# the CI status context, and ``{repo_dir}`` with the absolute repo path.
+# Claude is told that the test list is the ground truth for "what was
+# failing" and that it must re-invoke the runner with a (possibly
+# shrinking) subset on every iteration of the fix-build-rerun loop.
 _CATEGORY_RUNNER_HINTS: dict[str, str] = {
     "fasttest": (
         "Fast test runs the bulk of stateless tests. Locally, the "
@@ -345,7 +389,88 @@ _CATEGORY_RUNNER_HINTS: dict[str, str] = {
         "is expected — wait it out, it's not the failure under "
         "investigation."
     ),
+    "regression": (
+        "**These tests are not in this repository.** The regression "
+        "suites live in `Altinity/clickhouse-regression`, which CI "
+        "clones fresh per run; `.github/workflows/regression.yml` and "
+        "`.github/workflows/regression-reusable-suite.yml` in this "
+        "checkout are the ground truth for how each suite is invoked.\n\n"
+        "The first path segment of each failing test is the suite "
+        "directory (`/swarms/…` → `swarms`, `/s3/…` → `s3`). Clone into "
+        "`ci/tmp/` (gitignored, so it can't dirty this branch), build "
+        "ClickHouse here first, then:\n\n"
+        "```bash\n"
+        "git clone --depth 1 https://github.com/Altinity/clickhouse-regression "
+        "{repo_dir}/ci/tmp/clickhouse-regression\n"
+        "cd {repo_dir}/ci/tmp/clickhouse-regression\n"
+        "python3 -u <suite>/regression.py \\\n"
+        "  --clickhouse {repo_dir}/build/programs/clickhouse \\\n"
+        "  --only {tests_arg} \\\n"
+        "  --test-to-end --no-colors --local --collect-service-logs \\\n"
+        "  --log raw.log\n"
+        "```\n\n"
+        "Test paths contain spaces — always quote each `--only` "
+        "pattern. Storage-flavoured shards need the extra arguments CI "
+        "passes (`--storage minio`, `--gcs-uri …`, `--use-keeper`, …); "
+        "look up `{shard_context}` in `regression.yml` for the exact "
+        "set. The report's own `fails.log.txt` also ends with a "
+        "**Debugging** section quoting a working `--only` for its first "
+        "failure — trust that over any guess.\n\n"
+        "Richer logs sit next to the report at `{report_dir}/`, and you "
+        "can fetch any of them directly:\n\n"
+        "- `fails.log.txt` — the failure list this bundle was built "
+        "from, ending in a working `--only` for its first failure.\n"
+        "- `nice-new-fails.log.txt` — full verbose log of the *new* "
+        "failures. This is where per-test detail lives when the "
+        "excerpts above only say `AssertionError`.\n"
+        "- `raw.log` — the complete TestFlows message stream (large).\n"
+        "- `_service_logs/` and `*/_instances/*/logs/` — ClickHouse, "
+        "keeper, minio and localstack server logs.\n\n"
+        "Standing this environment up is expensive (docker, minio, "
+        "localstack, an external repo). If you can't, say so plainly "
+        "and diagnose from the logs above plus the diff — that is a "
+        "valid outcome here. And note **fixes belong in this "
+        "repository**: if the real fix is in the regression suite "
+        "itself, do not try to commit it here; report it and classify "
+        "the shard."
+    ),
+    "quick_functional": (
+        "Quick functional tests run `ci/jobs/clickhouse_light.py` over "
+        "the queries in `ci/jobs/queries/` — **not** "
+        "`tests/clickhouse-test`:\n\n"
+        "```bash\n"
+        "python3 ./ci/jobs/clickhouse_light.py "
+        "--path {repo_dir}/build/programs/clickhouse\n"
+        "```\n\n"
+        "(CI points `--path` at the binary it downloaded into "
+        "`ci/tmp`; locally point it at your own build.) The script runs "
+        "the whole set — there is no per-test argument — so the failing "
+        "tests to watch for are:\n\n"
+        "```\n"
+        "{tests_arg}\n"
+        "```"
+    ),
 }
+
+
+# Fallback for a failed check with no recipe of its own. Deliberately
+# points at the job definition instead of guessing an invocation: in
+# praktika, ``Job.Config.command`` is verbatim what CI ran.
+_GENERIC_RUNNER_HINT = (
+    "RelEasy has no runner recipe for this check, so find the "
+    "invocation before touching any code. Strip the parenthesised "
+    "parameters from `{shard_context}` and look that job name up in "
+    "`ci/defs/job_configs.py` — its `command=` is exactly what CI ran, "
+    "and the script it names lives under `ci/jobs/`.\n\n"
+    "The failing tests in this shard are:\n\n"
+    "```\n"
+    "{tests_arg}\n"
+    "```\n\n"
+    "If the check has no per-test runner at all (a build, a packaging "
+    "or an image check), reproducing means running that whole command "
+    "locally. If you can't, diagnose from the excerpts plus the diff "
+    "and classify — do not guess at a fix."
+)
 
 
 def _quote_for_shell(name: str) -> str:
@@ -357,34 +482,69 @@ def _quote_for_shell(name: str) -> str:
     return "'" + name.replace("'", "'\\''") + "'"
 
 
+def _tests_arg(category: str, test_names: list[str]) -> str:
+    """Render failing test names as the runner's test arguments.
+
+    TestFlows selects by path pattern rather than by exact name, so
+    regression tests get the trailing ``/*`` its ``--only`` expects.
+    """
+    if category == "regression":
+        return " ".join(_quote_for_shell(f"{n}/*") for n in test_names)
+    return " ".join(_quote_for_shell(n) for n in test_names)
+
+
+# Appended when a regression shard has more failing paths than fit on a
+# command line. The other categories inline ``$(cat …)`` instead, which
+# only works because their test names contain no spaces — TestFlows
+# paths do, so they have to go through an array.
+_REGRESSION_OVERFLOW_NOTE = (
+    "_This shard has {count} failing test paths — more than fit on one "
+    "command line. All of them are in `.releasy/failed-tests.txt`, one "
+    "per line. Build the pattern list from that file rather than "
+    "retyping it:_\n\n"
+    "```bash\n"
+    "mapfile -t PATTERNS < <(sed 's|$|/*|' .releasy/failed-tests.txt)\n"
+    "# … --only \"${PATTERNS[@]}\" …\n"
+    "```"
+)
+
+
 def _category_runner_section(
     category: str, test_names: list[str], shard_context: str,
+    repo_path: Path, target_url: str = "",
     *, max_inline: int = 25,
 ) -> str:
-    template = _CATEGORY_RUNNER_HINTS.get(category)
-    if template is None:
-        return (
-            f"_(no per-category runner hint for category {category!r}; "
-            "find the right invocation under `ci/jobs/` or the "
-            "equivalent docs in the repo.)_"
-        )
+    template = _CATEGORY_RUNNER_HINTS.get(category, _GENERIC_RUNNER_HINT)
+    overflow_note = ""
     if len(test_names) <= max_inline:
-        tests_arg = " ".join(_quote_for_shell(n) for n in test_names)
+        tests_arg = _tests_arg(category, test_names)
+    elif category == "regression":
+        tests_arg = _tests_arg(category, test_names[:max_inline])
+        overflow_note = _REGRESSION_OVERFLOW_NOTE.replace(
+            "{count}", str(len(test_names)),
+        )
     else:
         # Too many to fit on one shell command line cleanly; tell
         # Claude to use a temp file. Inline the first few as a teaser
         # so the prompt reads sensibly without the file detour.
-        head = " ".join(_quote_for_shell(n) for n in test_names[:max_inline])
+        head = _tests_arg(category, test_names[:max_inline])
         tests_arg = (
             f"$(cat .releasy/failed-tests.txt)  # the full list lives "
             "in `.releasy/failed-tests.txt` (one test name per line); "
             f"the first {max_inline} are: {head}"
         )
-    return (
+    section = (
         template
         .replace("{tests_arg}", tests_arg)
         .replace("{shard_context}", shard_context)
+        .replace("{repo_dir}", str(repo_path))
+        # TestFlows artefacts are siblings of the report the status
+        # links to, so the report's directory is where to look.
+        .replace("{report_dir}", target_url.rsplit("/", 1)[0])
     )
+    if overflow_note:
+        section = f"{section}\n\n{overflow_note}"
+    return section
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +601,7 @@ def _render_failure_block(
         lines.append(info)
         lines.append(f"---END FAILURE EXCERPT #{index}---")
     else:
-        lines.append("_(no per-test info captured by the praktika report)_")
+        lines.append("_(no per-test info captured by the CI report)_")
     return "\n".join(lines)
 
 
@@ -488,7 +648,8 @@ def _render_shard_prompt(
         )
 
     runner_section = _category_runner_section(
-        category, [t.name for t in tests], shard_context,
+        category, [t.name for t in tests], shard_context, repo_path,
+        target_url,
     )
     category_prior = _category_prior_section(category)
 
@@ -711,9 +872,10 @@ def _group_failures_by_shard(
     """Bucket failures by ``(category, shard_context, target_url)``.
 
     Returns a list of ``(category, shard_context, target_url, tests)``
-    in stable order: fasttest first (single shard, broad blast radius),
-    then stateless, then integration, then anything else; within a
-    category, alphabetical by shard so the output is reproducible.
+    in :data:`CATEGORY_ORDER` — fasttest first (single shard, broad
+    blast radius), regression last (external repo, slowest to
+    reproduce) — and within a category alphabetical by shard, so the
+    output is reproducible.
     """
     groups: dict[
         tuple[str, str, str], list[FailedTest],
@@ -722,13 +884,12 @@ def _group_failures_by_shard(
         key = (ft.category, ft.shard_context, ft.target_url)
         groups.setdefault(key, []).append(ft)
 
-    _category_order = {"fasttest": 0, "stateless": 1, "integration": 2}
     return sorted(
         (
             (cat, ctx, url, tests)
             for (cat, ctx, url), tests in groups.items()
         ),
-        key=lambda x: (_category_order.get(x[0], 99), x[1]),
+        key=lambda x: (CATEGORY_ORDER.get(x[0], 99), x[1]),
     )
 
 
@@ -787,6 +948,7 @@ def _process_pr(
     failures, err = discover_pr_failures(
         config, pr_url,
         head_sha=head_sha, head_ref=head_ref, base_ref=base_ref,
+        categories=_configured_categories(config),
     )
     if err or failures is None:
         return PRRunResult(

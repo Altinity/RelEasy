@@ -668,9 +668,10 @@ class AnalyzeFailsConfig:
     """Claude-driven CI-failure investigator configuration.
 
     Drives ``releasy analyze-fails`` — an AI pass that walks failed CI
-    statuses on a PR's head commit, fetches the parsed praktika JSON
-    reports, and invokes Claude per failed test to reproduce + fix it
-    (or classify it as an unrelated flake).
+    statuses on a PR's head commit, fetches their reports (praktika JSON
+    for the in-repo suites, TestFlows ``fails.log.txt`` for the
+    regression suites), and invokes Claude per failed shard to reproduce
+    + fix the failures (or classify them as unrelated flakes).
 
     The build wrapper materialised inside the repo reuses
     ``ai_resolve.build_command`` (so a project that already configured
@@ -680,6 +681,13 @@ class AnalyzeFailsConfig:
     """
     command: str = "claude"
     prompt_file: str = "prompts/analyze_fails.md"
+    # Test categories to investigate; empty (the default) means every
+    # failed check. Known categories: fasttest, quick_functional,
+    # stateless, integration, regression, other (the catch-all for
+    # checks RelEasy has no reproduction recipe for). Narrow this to
+    # skip expensive suites — e.g. drop "regression", which needs the
+    # external Altinity/clickhouse-regression repo to reproduce.
+    categories: list[str] = field(default_factory=list)
     # Full build + per-test rerun cycles routinely take 30-60 minutes,
     # so 2h gives Claude headroom for one iteration plus a retry.
     timeout_seconds: int = 7200  # 2h
@@ -1443,11 +1451,19 @@ def load_config(config_path: Path | None = None) -> Config:
     )
 
     af_raw = raw.get("analyze_fails", {}) or {}
+    af_categories = af_raw.get("categories", []) or []
+    if not isinstance(af_categories, list) or not all(
+        isinstance(x, str) for x in af_categories
+    ):
+        raise ValueError(
+            "analyze_fails.categories must be a list of strings"
+        )
     analyze_fails = AnalyzeFailsConfig(
         command=af_raw.get("command", "claude"),
         prompt_file=af_raw.get(
             "prompt_file", "prompts/analyze_fails.md",
         ),
+        categories=[c.strip() for c in af_categories if c.strip()],
         timeout_seconds=int(af_raw.get("timeout_seconds", 7200)),
         max_iterations=int(af_raw.get("max_iterations", 6)),
         max_prs_per_run=int(af_raw.get("max_prs_per_run", 0)),
