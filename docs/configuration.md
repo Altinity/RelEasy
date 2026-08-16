@@ -136,6 +136,8 @@ Options live in `config.yaml` unless marked **(session)**.
 | `ai_resolve.session_exhaustion_max_wait_hours` | Cap on cumulative waiting for the session to reset. | `60` |
 | `ai_resolve.session_exhaustion_poll_minutes` | Sleep between re-prompts while waiting. | `30` |
 | `ai_resolve.session_exhaustion_extra_patterns` | Extra regexes (OR-ed with the built-ins) for recognising a limit message, for a CLI wording the defaults miss. | `[]` |
+| `ai_resolve.postcondition_retries` | Corrective Claude passes when a landed resolution trips a content-correctable postcondition (the append-only `SettingsChangesHistory.cpp` whitelist). `0` disables. | `2` |
+| `ai_resolve.warn_on_unfixed_postconditions` | Once those passes are spent and the check still fails: keep + push the resolution and flag it on the PR (comment + `verify_label`). `false` discards the resolution instead. | `true` |
 | `ai_resolve.label` | Label for AI-resolved PRs. | `ai-resolved` |
 | `ai_resolve.needs_attention_label` | Label for partial-group draft PRs. | `ai-needs-attention` |
 | `ai_resolve.prompt_file` | Prompt for cherry-pick conflicts. | `prompts/resolve_conflict.md` |

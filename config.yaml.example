@@ -411,6 +411,12 @@ notifications:
 #   # to trim the offending file in place (amend), instead of discarding
 #   # the whole resolution. 0 = old fail-and-reset behaviour.
 #   postcondition_retries: 2
+#   # What happens when those passes are spent and the check STILL fails.
+#   # true (default): keep the resolution, push it, and flag it on the PR
+#   # (warning comment + verify_label) — everything but that one registry
+#   # file is fine, so a human reviews a diff instead of redoing the
+#   # conflict. false: discard the resolution and reset (old behaviour).
+#   warn_on_unfixed_postconditions: true
 #   # When a conflict is identified as a MISSING PREREQUISITE (an
 #   # upstream PR the target lacks), optionally pull that prerequisite
 #   # PR in automatically before retrying. Accepts a bool (sugar) or

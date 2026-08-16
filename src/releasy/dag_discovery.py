@@ -1744,6 +1744,11 @@ def _ai_resolve_fallback(
 
         if result.success:
             # Resolved cleanly without prereqs → drift.
+            for w in result.warnings:
+                warnings_acc.append(
+                    f"unit {unit.unit_id!r}: cached AI resolution kept with "
+                    f"a failing postcondition: {' '.join(w.split())}"
+                )
             return _AIFallbackResult(
                 deps=[], resolved=True, method="ai-resolve-clean",
             )

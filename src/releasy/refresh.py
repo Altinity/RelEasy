@@ -53,6 +53,7 @@ from releasy.ai_resolve import (
     AIResolveContext,
     _backend_label,
     attempt_ai_resolve,
+    flag_resolution_warnings_on_pr,
 )
 from releasy.config import (
     Config, PortMode, get_github_token, lookup_pr_ai_context,
@@ -519,6 +520,10 @@ class MergeResolveOutcome:
     pushed: bool = False
     error: str | None = None
     ai_used: bool = False
+    # Postcondition complaints the resolver downgraded to warnings: the
+    # resolution was kept and pushed, and the PR carries a comment about
+    # them. Non-empty only with ``status="resolved"``.
+    ai_warnings: list[str] = field(default_factory=list)
 
 
 def run_merge_resolve(
@@ -760,12 +765,19 @@ def run_merge_resolve(
         f"    [green]✓[/green] AI resolved + pushed "
         f"[cyan]{head_branch}[/cyan]{iters}{cost}"
     )
+
+    # Kept-with-warnings resolutions are pushed like any other, but the
+    # reviewer has to be told what RelEasy could not fix.
+    if result.warnings:
+        flag_resolution_warnings_on_pr(config, rebase_pr_url, result.warnings)
+
     return MergeResolveOutcome(
         status="resolved",
         ai_iterations=result.iterations,
         ai_cost_usd=result.cost_usd,
         pushed=True,
         ai_used=True,
+        ai_warnings=list(result.warnings),
     )
 
 
@@ -867,6 +879,10 @@ def _process_one(
         if outcome.ai_iterations:
             prior = fs.ai_iterations or 0
             fs.ai_iterations = prior + outcome.ai_iterations
+    if outcome.ai_warnings:
+        # Resolution kept despite a failing postcondition — same "a human
+        # must look at this" flag the verifier raises.
+        fs.verify_needs_attention = True
     _persist(config, state)
     return "resolved"
 
@@ -1435,6 +1451,8 @@ def _maybe_update_tracked_state(
             if outcome.ai_iterations:
                 prior = matched.ai_iterations or 0
                 matched.ai_iterations = prior + outcome.ai_iterations
+        if outcome.ai_warnings:
+            matched.verify_needs_attention = True
         _persist(config, state)
         return
 

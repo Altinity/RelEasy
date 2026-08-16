@@ -307,8 +307,13 @@ def _try_ai_resolve(
     pr_info: PRInfo,
     conflict_files: list[str],
     mode: PortMode = "backport",
-) -> tuple[bool, str | None]:
-    """Invoke Claude on a conflicted cherry-pick. Returns ``(ok, error)``."""
+) -> tuple[bool, str | None, list[str]]:
+    """Invoke Claude on a conflicted cherry-pick.
+
+    Returns ``(ok, error, warnings)`` — ``warnings`` are postcondition
+    complaints the resolver kept the resolution despite, for the caller to
+    surface on the PR it opens.
+    """
     from releasy.ai_resolve import AIResolveContext, attempt_ai_resolve
 
     ctx = AIResolveContext(
@@ -331,12 +336,12 @@ def _try_ai_resolve(
             f" (iterations: {result.iterations})" if result.iterations else ""
         )
         console.print(f"    [green]✓[/green] AI resolved conflict{iters}")
-        return True, None
+        return True, None, list(result.warnings)
 
     reason = result.error or (
         "timed out" if result.timed_out else "unknown failure"
     )
-    return False, reason
+    return False, reason, []
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +594,9 @@ def run_stateless_cherry_pick(opts: StatelessOptions) -> StatelessResult:
     pr_info: PRInfo | None = None
     picked_sha: str | None = None
     cp_result: OperationResult
+    # Postcondition complaints the resolver kept the resolution despite;
+    # flagged on the PR below once it exists.
+    resolve_warnings: list[str] = []
 
     if kind == "pr":
         cp_result, pr_info = _fetch_and_pick_pr(
@@ -631,7 +639,7 @@ def run_stateless_cherry_pick(opts: StatelessOptions) -> StatelessResult:
             )
 
         if opts.resolve_conflicts and pr_info is not None:
-            ok, err = _try_ai_resolve(
+            ok, err, resolve_warnings = _try_ai_resolve(
                 config, repo_path, branch, opts.target, pr_info,
                 cp_result.conflict_files, opts.mode,
             )
@@ -700,6 +708,14 @@ def run_stateless_cherry_pick(opts: StatelessOptions) -> StatelessResult:
                 console.print(
                     f"[green]✓[/green] PR opened: [link={pr_url}]{pr_url}[/link]"
                 )
+                if resolve_warnings:
+                    from releasy.ai_resolve import (
+                        flag_resolution_warnings_on_pr,
+                    )
+
+                    flag_resolution_warnings_on_pr(
+                        config, pr_url, resolve_warnings,
+                    )
             else:
                 console.print(
                     "[yellow]![/yellow] Could not open PR (see warnings above). "

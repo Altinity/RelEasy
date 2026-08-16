@@ -32,7 +32,11 @@ if TYPE_CHECKING:
 
 from releasy.termlog import console
 
-from releasy.ai_resolve import AIResolveContext, attempt_ai_resolve
+from releasy.ai_resolve import (
+    AIResolveContext,
+    attempt_ai_resolve,
+    flag_resolution_warnings_on_pr,
+)
 from releasy.config import Config, get_github_token, lookup_pr_ai_context
 from releasy.git_ops import (
     abort_in_progress_op,
@@ -198,8 +202,12 @@ def _try_cherry_pick_path(
     source_pr: PRInfo,
     commits: list[str],
     ai_active: bool,
-) -> tuple[bool, str | None]:
-    """Cherry-pick each commit; AI-resolve any conflicts. Return ``(ok, err)``.
+) -> tuple[bool, str | None, list[str]]:
+    """Cherry-pick each commit; AI-resolve any conflicts.
+
+    Returns ``(ok, err, warnings)``; ``warnings`` are postcondition
+    complaints the resolver kept a resolution despite, for the caller to
+    flag on the PR it opens.
 
     Caller is responsible for putting HEAD on ``new_branch`` (already
     checked out off ``origin/<target_branch>``) before invoking this and
@@ -207,6 +215,7 @@ def _try_cherry_pick_path(
     branch in whatever shape the failure produced so the caller can pick
     a recovery strategy (try the diff fallback, etc.).
     """
+    warnings: list[str] = []
     for idx, sha in enumerate(commits, start=1):
         subject = _commit_subject(repo_path, sha)
         console.print(
@@ -237,7 +246,7 @@ def _try_cherry_pick_path(
             return False, (
                 f"cherry-pick of {sha[:12]} failed without conflict markers "
                 "(wrong tree state? merge commit?)"
-            )
+            ), warnings
 
         console.print(
             f"      [yellow]conflict in {len(conflict_files)} file(s)[/yellow]"
@@ -247,7 +256,7 @@ def _try_cherry_pick_path(
 
         if not ai_active:
             _abort_any(repo_path)
-            return False, "cherry-pick conflicted and AI resolver disabled"
+            return False, "cherry-pick conflicted and AI resolver disabled", warnings
 
         head = run_git(
             ["rev-parse", "--verify", "HEAD"], repo_path, check=False,
@@ -274,7 +283,8 @@ def _try_cherry_pick_path(
             reason = ai_result.error or (
                 "timed out" if ai_result.timed_out else "unknown failure"
             )
-            return False, f"AI resolve failed on {sha[:12]}: {reason}"
+            return False, f"AI resolve failed on {sha[:12]}: {reason}", warnings
+        warnings.extend(ai_result.warnings)
         iters = (
             f" (iterations: {ai_result.iterations})"
             if ai_result.iterations else ""
@@ -283,7 +293,7 @@ def _try_cherry_pick_path(
             f"      [green]✓[/green] AI resolved cherry-pick conflict{iters}"
         )
 
-    return True, None
+    return True, None, warnings
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +310,7 @@ def _try_diff_fallback(
     source_pr: PRInfo,
     head_sha: str,
     ai_active: bool,
-) -> tuple[bool, str | None]:
+) -> tuple[bool, str | None, list[str]]:
     """Replay the PR as a single squashed merge of ``head_sha`` onto target.
 
     Used as a last resort when the per-commit cherry-pick path can't be
@@ -331,7 +341,7 @@ def _try_diff_fallback(
         _hard_reset(repo_path, target_ref)
         return False, (
             "git merge --squash failed without producing conflict markers"
-        )
+        ), []
 
     if conflict_files:
         console.print(
@@ -342,7 +352,9 @@ def _try_diff_fallback(
         if not ai_active:
             _abort_any(repo_path)
             _hard_reset(repo_path, target_ref)
-            return False, "squashed merge conflicted and AI resolver disabled"
+            return False, (
+                "squashed merge conflicted and AI resolver disabled"
+            ), []
 
         head = run_git(
             ["rev-parse", "--verify", "HEAD"], repo_path, check=False,
@@ -369,10 +381,10 @@ def _try_diff_fallback(
                 "timed out" if ai_result.timed_out else "unknown failure"
             )
             _hard_reset(repo_path, target_ref)
-            return False, f"AI resolve failed on squashed merge: {reason}"
+            return False, f"AI resolve failed on squashed merge: {reason}", []
         # AI committed the resolution itself (the prompt instructs it to
         # `git commit` after fixing). Nothing else to do here.
-        return True, None
+        return True, None, list(ai_result.warnings)
 
     # Clean squashed merge — index has the changes staged but no commit
     # was made (we passed --no-commit). Make one now so we have something
@@ -385,8 +397,8 @@ def _try_diff_fallback(
     if commit.returncode != 0:
         err = (commit.stderr or "").strip()
         _hard_reset(repo_path, target_ref)
-        return False, f"failed to commit squashed merge: {err}"
-    return True, None
+        return False, f"failed to commit squashed merge: {err}", []
+    return True, None, []
 
 
 # ---------------------------------------------------------------------------
@@ -540,12 +552,15 @@ def rebase_one_pr(
 
     ai_active = _ai_active(config, resolve_conflicts)
     fallback_used = False
+    # Postcondition complaints a kept resolution carries; flagged on the
+    # new PR below.
+    resolve_warnings: list[str] = []
 
     if commits:
         console.print(
             f"    [dim]{len(commits)} commit(s) to cherry-pick[/dim]"
         )
-        ok, err = _try_cherry_pick_path(
+        ok, err, resolve_warnings = _try_cherry_pick_path(
             config, repo_path, new_branch, target_branch,
             pr_info, commits, ai_active,
         )
@@ -553,7 +568,7 @@ def rebase_one_pr(
             console.print(
                 f"    [yellow]cherry-pick path failed:[/yellow] {err}"
             )
-            ok2, err2 = _try_diff_fallback(
+            ok2, err2, resolve_warnings = _try_diff_fallback(
                 config, repo_path, new_branch, target_branch, target_ref,
                 pr_info, head_sha, ai_active,
             )
@@ -607,6 +622,9 @@ def rebase_one_pr(
     console.print(
         f"    [green]✓[/green] PR opened: [link={new_pr_url}]{new_pr_url}[/link]"
     )
+
+    if resolve_warnings:
+        flag_resolution_warnings_on_pr(config, new_pr_url, resolve_warnings)
 
     closed = close_pull_request(
         config, pr_number,

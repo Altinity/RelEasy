@@ -826,6 +826,12 @@ class AIResolveConfig:
     # hands the exact error back to Claude to trim the offending file in
     # place. 0 disables (revert to the old fail-and-reset behaviour).
     postcondition_retries: int = 2
+    # What to do when those passes are spent and the check still fails.
+    # True (default): keep the resolution, push it, and flag it on the PR
+    # (warning comment + ``verify_label``) — the port is complete apart
+    # from that one registry file, so a human reviews a diff instead of
+    # redoing the whole conflict. False: discard and reset, as before.
+    warn_on_unfixed_postconditions: bool = True
     # Auto-recovery on detected missing prerequisites (off by default).
     # See ``AutoAddPrerequisitePRsConfig``.
     auto_add_prerequisite_prs: AutoAddPrerequisitePRsConfig = field(
@@ -1399,6 +1405,9 @@ def load_config(config_path: Path | None = None) -> Config:
             ai_raw.get("session_exhaustion_extra_patterns", []) or []
         ),
         postcondition_retries=int(ai_raw.get("postcondition_retries", 2)),
+        warn_on_unfixed_postconditions=bool(
+            ai_raw.get("warn_on_unfixed_postconditions", True)
+        ),
         auto_add_prerequisite_prs=auto_add_prerequisite_prs,
     )
 
@@ -1807,6 +1816,13 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         ai_data["session_exhaustion_extra_patterns"] = ai.session_exhaustion_extra_patterns
     if ai.postcondition_retries != ai_defaults.postcondition_retries:
         ai_data["postcondition_retries"] = ai.postcondition_retries
+    if (
+        ai.warn_on_unfixed_postconditions
+        != ai_defaults.warn_on_unfixed_postconditions
+    ):
+        ai_data["warn_on_unfixed_postconditions"] = (
+            ai.warn_on_unfixed_postconditions
+        )
     auto_prereq_defaults = AutoAddPrerequisitePRsConfig()
     if (
         ai.auto_add_prerequisite_prs.enabled != auto_prereq_defaults.enabled

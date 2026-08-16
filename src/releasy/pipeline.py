@@ -5644,6 +5644,21 @@ def _try_ai_resolve_step(
         f"    [green]✓[/green] AI resolved #{pr.number}{iters}{cost}"
     )
 
+    # A resolution kept despite a failing postcondition rides the verifier's
+    # channel: the unit's PR doesn't exist yet, and ``_finalise_unit``
+    # already turns these into the label + PR comment once it does.
+    if result.warnings:
+        from releasy.ai_resolve import flatten_resolve_warnings
+
+        unit.verify_needs_attention = True
+        unit.verify_findings.append(
+            f"**#{pr.number} — resolution kept with a failing "
+            f"post-resolution check**"
+        )
+        for line in flatten_resolve_warnings(result.warnings):
+            unit.verify_findings.append(f"- {line}")
+        unit.verify_findings.append("")
+
     if config.ai_resolve.verify_resolution and result.new_head and start_sha:
         _run_verify_pass(
             config, repo_path, unit, new_branch, base_branch, pr,

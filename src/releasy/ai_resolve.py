@@ -29,7 +29,13 @@ from releasy.git_ops import (
     is_operation_in_progress,
     run_git,
 )
-from releasy.github_ops import PRInfo
+from releasy.github_ops import (
+    PRInfo,
+    add_issue_comment,
+    add_label_to_pr,
+    get_origin_repo_slug,
+    parse_pr_url,
+)
 
 if TYPE_CHECKING:
     from releasy.api_agent import ApiAgentSpec
@@ -119,6 +125,11 @@ class AIResolveResult:
     # must not spend a retry budget (``max_partial_continue_attempts``) on
     # it. A timeout is NOT this: that one burned the whole wall-clock.
     api_aborted: bool = False
+    # Postcondition failures downgraded to warnings instead of sinking an
+    # otherwise-complete resolution (see ``_DOWNGRADABLE_POSTCONDITIONS``).
+    # Paired with ``success=True``: the work is kept and pushed, and
+    # callers that own a PR flag it there for a human.
+    warnings: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -1165,6 +1176,81 @@ def _check_settings_history_whitelist(
 # otherwise-good resolve — never "claude didn't finish" signals.
 _CORRECTABLE_POSTCONDITIONS = {"settings_history"}
 
+# …and of those, the ones that must NOT sink the resolution once the
+# correction budget is spent. The cherry-pick concluded, the tree is clean
+# and HEAD advanced — only a registry file is suspect. Discarding all of
+# that leaves a human to redo the whole port by hand, so RelEasy keeps the
+# resolution, pushes it, and flags the complaint on the PR instead.
+# Gated by ``ai_resolve.warn_on_unfixed_postconditions``.
+_DOWNGRADABLE_POSTCONDITIONS = {"settings_history"}
+
+
+def flatten_resolve_warnings(warnings: list[str]) -> list[str]:
+    """One squashed single-line entry per warning, fit for a markdown bullet."""
+    return [" ".join(w.split()) for w in warnings if w and w.strip()]
+
+
+def resolve_warning_comment_body(warnings: list[str]) -> str:
+    """Render kept-with-warnings notes as a PR comment body."""
+    lines = [
+        "## RelEasy — resolution kept with warnings",
+        "",
+        "The AI resolution was pushed, but a post-resolution check is "
+        "still failing on it. **Nothing was rolled back** — please review "
+        "the point(s) below before merging and either fix them or dismiss "
+        "them as false positives.",
+        "",
+    ]
+    lines += [f"- {line}" for line in flatten_resolve_warnings(warnings)]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def flag_resolution_warnings_on_pr(
+    config: Config, pr_url: str | None, warnings: list[str],
+) -> bool:
+    """Best-effort: comment + label a PR whose resolution was kept with warnings.
+
+    Reuses ``ai_resolve.verify_label`` — same "a human must look at this
+    resolution" meaning as a flagged verifier pass, so existing dashboards
+    and filters keep working. Never raises; True iff the comment landed.
+    """
+    if not warnings or not pr_url:
+        return False
+    parsed = parse_pr_url(pr_url)
+    if parsed is None:
+        console.print(
+            f"    [yellow]![/yellow] could not parse PR URL for the "
+            f"resolution-warning comment: {pr_url!r}"
+        )
+        return False
+    owner, repo, number = parsed
+
+    # ``add_issue_comment`` / ``add_label_to_pr`` address the origin repo by
+    # NUMBER, so a URL from any other repo would land on an unrelated PR.
+    origin_slug = get_origin_repo_slug(config)
+    if origin_slug and f"{owner}/{repo}".lower() != origin_slug.lower():
+        console.print(
+            f"    [yellow]![/yellow] {pr_url} is not on origin "
+            f"({origin_slug}) — not commenting the resolution warning there"
+        )
+        return False
+
+    posted = add_issue_comment(
+        config, number, resolve_warning_comment_body(warnings),
+    )
+    if posted:
+        console.print(
+            f"    [yellow]💬[/yellow] Flagged the kept resolution on "
+            f"[link={pr_url}]PR #{number}[/link]"
+        )
+    else:
+        console.print(
+            f"    [yellow]![/yellow] could not comment the resolution "
+            f"warning on PR #{number} — it is only in this log"
+        )
+    add_label_to_pr(config, number, config.ai_resolve.verify_label)
+    return posted
+
 
 # Focused follow-up prompt for the ``settings_history`` postcondition. The
 # resolution is already committed; Claude only trims the unauthorized rows
@@ -1509,6 +1595,10 @@ def resolve_with_claude(
     # follow-up amends it. Bounded by ``postcondition_retries``.
     fix_passes = max(0, config.ai_resolve.postcondition_retries)
     pass_no = 0
+    # Set when a correction pass died mid-flight (timeout / dropped turn);
+    # the loop stops and the repo is re-read once before deciding.
+    bail_note: str | None = None
+    bail_timed_out = False
     while (
         not ok
         and err_kind in _CORRECTABLE_POSTCONDITIONS
@@ -1537,14 +1627,12 @@ def resolve_with_claude(
         if fcost is not None:
             cost_usd_total = (cost_usd_total or 0.0) + fcost
         if fto:
-            return AIResolveResult(
-                success=False, timed_out=True, iterations=iterations,
-                new_head=new_head, cost_usd=cost_usd_total,
-                error=(
-                    f"claude timed out after {config.ai_resolve.timeout_seconds}s "
-                    f"correcting postcondition '{err_kind}' (pass {pass_no})"
-                ),
+            bail_note = (
+                f"claude timed out after {config.ai_resolve.timeout_seconds}s "
+                f"correcting postcondition '{err_kind}' (pass {pass_no})"
             )
+            bail_timed_out = True
+            break
         # A transient API error means the turn was dropped before Claude
         # could act — re-prompting just burns the rest of the budget, so
         # bail now with a diagnostic that names the real cause (the main
@@ -1554,26 +1642,52 @@ def resolve_with_claude(
         if fc != 0:
             transient = _find_transient_api_error(fout)
             if transient:
-                return AIResolveResult(
-                    success=False, iterations=iterations, new_head=new_head,
-                    cost_usd=cost_usd_total,
-                    error=(
-                        f"transient API error correcting postcondition "
-                        f"'{err_kind}' (pass {pass_no}): {transient}"
-                    ),
+                bail_note = (
+                    f"transient API error correcting postcondition "
+                    f"'{err_kind}' (pass {pass_no}): {transient}"
                 )
+                break
         ok, new_head, err, err_kind = _verify_postconditions(
             config, repo_path, ctx,
         )
 
-    if not ok:
+    if bail_note:
+        # Re-read the repo before judging: a pass that died late may still
+        # have landed its amend, and the downgrade decision below must see
+        # the current state rather than the one that triggered the pass.
+        ok, new_head, err, err_kind = _verify_postconditions(
+            config, repo_path, ctx,
+        )
+        if not ok:
+            err = f"{err}\n({bail_note})"
+    elif not ok and pass_no:
         # Make it clear the corrective loop ran, so the surfaced error isn't
         # mistaken for an un-attempted first-pass failure.
-        if pass_no:
-            err = f"{err}\n(still failing after {pass_no} correction pass(es))"
+        err = f"{err}\n(still failing after {pass_no} correction pass(es))"
+
+    if not ok:
+        keep = (
+            err_kind in _DOWNGRADABLE_POSTCONDITIONS
+            and config.ai_resolve.warn_on_unfixed_postconditions
+        )
+        if not keep:
+            return AIResolveResult(
+                success=False, iterations=iterations, new_head=new_head,
+                error=err, timed_out=bail_timed_out,
+                cost_usd=cost_usd_total,
+            )
+        # Keep the resolution: it is complete apart from this check, and
+        # the caller flags it on the PR instead of dropping the work.
+        console.print(
+            f"    [yellow]⚠ postcondition '{err_kind}' is still failing — "
+            "keeping the resolution anyway; it is flagged for review on "
+            "the PR[/yellow]"
+        )
+        for line in (err or "").strip().splitlines():
+            console.print(f"      [dim]{escape(line)}[/dim]")
         return AIResolveResult(
-            success=False, iterations=iterations, new_head=new_head, error=err,
-            cost_usd=cost_usd_total,
+            success=True, iterations=iterations, new_head=new_head,
+            cost_usd=cost_usd_total, warnings=[err or err_kind],
         )
 
     return AIResolveResult(

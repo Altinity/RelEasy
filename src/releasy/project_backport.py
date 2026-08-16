@@ -14,6 +14,7 @@ from pathlib import Path
 
 from releasy.termlog import console
 
+from releasy.ai_resolve import flag_resolution_warnings_on_pr
 from releasy.config import Config, UpstreamConfig, make_stateless_config
 from releasy.git_ops import (
     abort_in_progress_op,
@@ -348,6 +349,9 @@ def _backport_one(
     version = opts.version
     n = upstream.number
     branch = _backport_branch(version, n)
+    # Postcondition complaints the resolver kept the resolution despite;
+    # flagged on the PR below once it exists.
+    resolve_warnings: list[str] = []
 
     # Fresh branch off the target tip.
     if is_operation_in_progress(repo.repo_path):
@@ -378,7 +382,7 @@ def _backport_one(
                 n, "failed", reason=cp.error_message or "cherry-pick failed",
             )
         if opts.resolve_conflicts:
-            ok, err = _try_ai_resolve(
+            ok, err, resolve_warnings = _try_ai_resolve(
                 config, repo.repo_path, branch, opts.target, upstream,
                 cp.conflict_files, "backport",
             )
@@ -413,6 +417,9 @@ def _backport_one(
             n, "failed",
             reason="branch pushed but PR creation failed (see warnings)",
         )
+
+    if resolve_warnings:
+        flag_resolution_warnings_on_pr(config, pr_url, resolve_warnings)
 
     _register_on_project(config, project_id, field_node, item, pr_url, version)
     return ItemOutcome(n, "created", pr_url=pr_url)
