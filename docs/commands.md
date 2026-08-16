@@ -189,7 +189,7 @@ iterative fix-build-rerun loop. Same
 machinery as the standalone [`analyze-fails`](#releasy-analyze-fails)
 command — see that section for outcome classifications, flaky-elsewhere
 heuristic, and config. Per-PR sub-flags: `--no-flaky-check`,
-`--post-comment` / `--no-post-comment`.
+`--no-baseline-check`, `--post-comment` / `--no-post-comment`.
 
 **`--address-review`** — for each tracked PR, fetch comments and let
 the AI append fix commits. Filters compose: trust gate
@@ -227,7 +227,7 @@ releasy refresh [--pr <URL>]
                 [--resolve-conflicts | --no-resolve-conflicts]
                 [--merge-target | --no-merge-target]
                 [--analyze-fails | --no-analyze-fails]
-                [--no-flaky-check]
+                [--no-flaky-check] [--no-baseline-check]
                 [--post-comment | --no-post-comment]
                 [--address-review | --no-address-review]
                 [--only <url-or-id>]
@@ -243,6 +243,7 @@ releasy refresh [--pr <URL>]
 | `--merge-target` / `--no-merge-target` | Merge `origin/<base>` into PR branches + push. | off |
 | `--analyze-fails` / `--no-analyze-fails` | Run the AI CI-triage pass on each in-scope PR. | off |
 | `--no-flaky-check` | (with `--analyze-fails`) skip flaky-elsewhere cross-check. | off |
+| `--no-baseline-check` | (with `--analyze-fails`) skip the pre-change comparison against the target branch. | off |
 | `--post-comment` / `--no-post-comment` | (with `--analyze-fails`) post per-PR summary comment. | `analyze_fails.post_comment_to_pr` |
 | `--address-review` / `--no-address-review` | Run the AI review-feedback pass. Needs at least one trust source — `review_response.trusted_associations` (defaults to OWNER/MEMBER/COLLABORATOR/CONTRIBUTOR) or `review_response.trusted_reviewers`. Refuses only if both are empty. | off |
 | `--only <url-or-id>` | Single tracked PR (URL — source or rebase) or feature/group id. | — |
@@ -525,11 +526,24 @@ whichever report its `target_url` points at:
   failing scenarios are kept (TestFlows also reports every enclosing
   feature and module), and `Known`/`XFail` entries are excluded.
 
-GitHub-Actions job logs have no machine-readable report and are still
-ignored. So is the workflow-level rolled-up `PR` status — the per-job
-statuses already cover it. Anything skipped is reported with the reason
-rather than dropped silently, including checks whose report has no
-failing test leaf (a build or packaging failure). Narrow the sweep with
+Every failed check ends up in exactly one of three places, so none can
+go missing:
+
+- **A shard of its own.** Checks with no per-test results — a build,
+  packaging, image or scan check, a job killed before its test phase, a
+  `target_url` that is only a job log — become a one-record *job-level*
+  shard carrying the failure reason, the status description and the
+  report URL. Its prompt says to read the log rather than run a suite,
+  and its name never reaches a test runner. Turn this off with
+  [`analyze_fails.job_level_failures: false`](configuration.md#key-options).
+- **Covered by another shard.** The same test failing in several shards
+  is investigated once; a check whose failures all duplicate another's
+  is listed as covered there (console and PR comment) instead of
+  vanishing from the shard count.
+- **A warning with the reason.** Only the workflow-level rolled-up `PR`
+  status lands here — the per-job statuses cover it.
+
+Narrow the sweep with
 [`analyze_fails.categories`](configuration.md#key-options) — e.g. drop
 `regression`, which needs the external
 [`Altinity/clickhouse-regression`](https://github.com/Altinity/clickhouse-regression)
@@ -542,9 +556,45 @@ build → re-run still-failing tests in one batch → repeat (up to
 reproduction recipe and triage prior; categories with no recipe are
 handed over with instructions to find the job definition first.
 
+#### Baseline: what was red before the change
+
+Before triaging, `analyze-fails` reads the **last CI run on the target
+branch that predates the PR's diff** and compares it against the PR's
+failures. That run is found by walking back from the merge base until a
+commit with CI statuses turns up — most release-branch commits are
+GitHub merge commits no workflow ever ran on, while a merged PR's own
+head commit carries a full run. Runs that never exercised the checks
+this PR failed are passed over for an older one that did (a run with no
+Fast test check answers nothing about a Fast test failure); when that
+happens the prompt says so, since "new since baseline" then also admits
+"broken by something merged after the baseline". Up to
+[`baseline_scan_commits`](configuration.md#key-options) commits are
+tried — only the chosen run's reports are fetched, the rest cost one
+status call each. `--no-baseline-check` (or `baseline_check: false`)
+skips the pass.
+
+Every failure is then labelled in the prompt:
+
+| Verdict | Meaning |
+|---------|---------|
+| **pre-existing** | Already red at the baseline commit. The PR's diff isn't in that commit, so it cannot be the cause — `[unrelated]`, no edits, no reproduction runs. |
+| **new since baseline** | Did not fail there, and its category did run. The prime suspects; where the build budget goes. |
+| **baseline says nothing** | The baseline run never ran that check. Falls back to the diff and flaky-elsewhere. |
+
+A shard with nothing new since the baseline is told to verify the
+comparison and report `UNRELATED` without building. Baseline evidence
+outranks the category prior and the flaky-elsewhere annotation — it is a
+direct observation of the same test on the same branch without this PR's
+diff, not a heuristic. On Altinity/ClickHouse#2210 it accounts for 377 of
+385 failures.
+
+One baseline is decoded per merge base and reused across every PR cut
+from it, so a multi-PR refresh pays for it once.
+
 A **flaky-elsewhere map** cross-references failures across other tracked
-PRs (`flaky_elsewhere_threshold` default 2) so master-side flakes get
-classified `UNRELATED` instead of fix attempts.
+PRs (`flaky_elsewhere_threshold` default 2) so master-side flakes that
+postdate the baseline still get classified `UNRELATED` instead of fix
+attempts.
 
 Per-shard outcomes:
 
@@ -555,6 +605,60 @@ Per-shard outcomes:
 | `UNRELATED` | Whole shard is master-side flake. No code changes. |
 | `UNRESOLVED` | Couldn't make progress. |
 
+#### Second opinion: auditing the outcome
+
+One session's judgement decides whether code lands on someone's PR, so
+a **second, independent session audits the outcome** — a fresh context
+with read-only tools, given the commits, the failure list with baseline
+verdicts, and the first session's claims (framed as claims to check,
+not as evidence). It asks four questions:
+
+- Do the commits **fix** anything, or **neuter** the test — weakened or
+  deleted assertions, a reference file rewritten to match whatever the
+  binary now prints, a widened tolerance, a retry around a real bug?
+- Does every edit **trace to a listed failure**, or is something out of
+  scope — including code edited for a failure that predates the PR?
+- Does the verdict **match the evidence**: `UNRELATED` over a
+  new-since-baseline failure needs a concrete stated reason, and `DONE`
+  needs a re-run that actually happened.
+- Is the branch **append-only**?
+
+It runs only on shards **in doubt**, so it doesn't double the bill:
+
+| Shard | Audited? |
+|-------|----------|
+| Committed code | **Yes** — a commit is about to be pushed on one session's say-so |
+| `UNRELATED`/`DONE` while a failure passed at the baseline and fails on no other tracked PR | **Yes** — the verdict contradicts the evidence |
+| No commits, every failure pre-existing at baseline | No — already evidenced |
+| `UNRESOLVED`, nothing committed | No — no conclusion to audit; a human is needed either way |
+
+**A dispute sends the shard back.** The audit's findings go to a fresh
+investigator, which starts from the disputed round's tip — so the
+commits under objection are still there to `git revert` (append-only,
+never a rewrite). It is told to revert what the audit called neutering
+or out-of-scope, re-triage what the audit called unevidenced, and, if
+it still believes the previous conclusion, to say so with the evidence
+that answers the finding. Standing its ground is allowed; ignoring the
+finding is not. Each round is audited in turn, capped by
+`analyze_fails.max_investigation_rounds` (default 2 — one redo). Set it
+to `1` for advisory-only.
+
+The audit never acts on its own: no automatic revert, no blocked push.
+A dispute still standing after the last round labels the PR
+[`ai-needs-verify`](configuration.md#key-options), turns the run's
+verdict into `DISPUTED`, and puts the findings in the comment for a
+human to judge. A dispute a redo settled leaves no label — the rejected
+round stays in the comment as `REDONE`, with its findings, so the trail
+is visible. An audit that times out or returns no parsable verdict
+leaves that round's verdict standing, with a warning.
+
+The one thing it *does* block: if the read-only auditor is caught
+modifying the work-dir (its `Bash(git:*)` grant is broad enough to
+commit), the PR is not pushed at all — what would be pushed is no
+longer what was audited.
+
+Turn it off with `analyze_fails.verify_outcome: false`.
+
 The failed-test list lands at `.releasy/failed-tests.txt` for the AI to
 read. Anthropic spend rolls into `ai_cost_usd` (same field as `run` /
 `refresh`) and surfaces on the board's
@@ -564,7 +668,7 @@ read. Anthropic spend rolls into `ai_cost_usd` (same field as `run` /
 releasy analyze-fails [--pr <URL>] [--work-dir <path>]
                       [--dry-run]
                       [--push | --no-push]
-                      [--no-flaky-check]
+                      [--no-flaky-check] [--no-baseline-check]
                       [--post-comment | --no-post-comment]
                       [--only <url-or-id>]
                       [--stateless ...]
@@ -574,9 +678,10 @@ releasy analyze-fails [--pr <URL>] [--work-dir <path>]
 |--------|-------------|---------|
 | `--pr <URL>` | PR on origin. Omit to iterate every tracked PR with a `rebase_pr_url`. | — |
 | `--work-dir <path>` | Working dir. | config / cwd |
-| `--dry-run` | List failed tests + flake counts, exit. No Claude, no push. | off |
+| `--dry-run` | List failed tests, baseline verdicts + flake counts, exit. No Claude, no push. | off |
 | `--push` / `--no-push` | Push AI commits. Plain push, no force; race aborts. | on |
 | `--no-flaky-check` | Skip flaky-elsewhere assessment. | off |
+| `--no-baseline-check` | Skip the pre-change comparison (see [Baseline](#baseline-what-was-red-before-the-change)). | off |
 | `--post-comment` / `--no-post-comment` | Per-PR summary comment with outcomes + commit list. | `analyze_fails.post_comment_to_pr` |
 | `--only <url-or-id>` | Single tracked PR / feature / group. Mutex with `--pr` and `--stateless`. | — |
 | `--stateless` | Skip session/state/lock; act on `--pr` alone. `config.yaml` still loaded if present. | off |

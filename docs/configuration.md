@@ -160,6 +160,14 @@ Options live in `config.yaml` unless marked **(session)**.
 | `analyze_fails.command` | Claude executable. | `claude` |
 | `analyze_fails.prompt_file` | Prompt template. | `prompts/analyze_fails.md` |
 | `analyze_fails.categories` | Check categories to investigate; empty = every failed check. Known: `fasttest`, `quick_functional`, `stateless`, `integration`, `regression`, `other`. | `[]` |
+| `analyze_fails.job_level_failures` | Investigate failed checks with no per-test results (build / packaging / image / scan checks, jobs killed before their test phase, job-log `target_url`s). They become a shard carrying the failure reason and report URL instead of a test list. Off = report as warnings. | `true` |
+| `analyze_fails.baseline_check` | Compare each PR's failures against the last CI run on the target branch that predates its diff, and tell Claude which were already red. See [Baseline](commands.md#baseline-what-was-red-before-the-change). | `true` |
+| `analyze_fails.baseline_scan_commits` | How far back from the merge base to look for a commit that has a CI run at all (release-branch merge commits mostly have none). | `25` |
+| `analyze_fails.verify_outcome` | After a shard's investigation, have a second independent session audit the outcome — but only when the shard is in doubt. See [Second opinion](commands.md#second-opinion-auditing-the-outcome). | `true` |
+| `analyze_fails.max_investigation_rounds` | Investigator sessions one shard may get. A disputed outcome hands the audit's findings to a fresh investigator that starts from the disputed round's tip and can revert it. `1` = no redo (report and leave it). | `2` |
+| `analyze_fails.verify_prompt_file` | Prompt template for that audit. | `prompts/verify_analysis.md` |
+| `analyze_fails.verify_timeout_seconds` | Timeout for one audit (read-only, no build). | `1800` |
+| `analyze_fails.verify_label` | Label applied when an audit disputes a shard. | `ai-needs-verify` |
 | `analyze_fails.timeout_seconds` | Per-invocation Claude timeout. | `7200` |
 | `analyze_fails.max_iterations` | Build attempts per failed test. | `6` |
 | `analyze_fails.max_prs_per_run` | Cap on tracked PRs when `--pr` omitted (0 = no cap). | `0` |

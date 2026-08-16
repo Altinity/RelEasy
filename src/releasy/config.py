@@ -688,6 +688,13 @@ class AnalyzeFailsConfig:
     # skip expensive suites — e.g. drop "regression", which needs the
     # external Altinity/clickhouse-regression repo to reproduce.
     categories: list[str] = field(default_factory=list)
+    # Investigate failed checks that published no per-test results at
+    # all — a build / packaging / image / scan check, a job killed
+    # before its test phase, a target_url that is just a job log. They
+    # become a one-record shard carrying the failure reason and the
+    # report URL instead of a test list. Off = report them as warnings
+    # and move on.
+    job_level_failures: bool = True
     # Full build + per-test rerun cycles routinely take 30-60 minutes,
     # so 2h gives Claude headroom for one iteration plus a retry.
     timeout_seconds: int = 7200  # 2h
@@ -698,6 +705,16 @@ class AnalyzeFailsConfig:
     # per invocation (0 = no cap). Keeps a stray cron run from
     # cherry-picking everyone's CI bill at once.
     max_prs_per_run: int = 0
+    # Before triaging, read the last CI run on the target branch that
+    # predates the PR's diff (walking back from the merge base) and tell
+    # Claude which failures were already red there. A pre-existing
+    # failure is not this PR's to fix; a test that passed at baseline
+    # and fails here is the prime suspect. Costs one extra report sweep
+    # per PR.
+    baseline_check: bool = True
+    # How far back from the merge base to look for a commit that has a
+    # CI run at all — release-branch merge commits mostly have none.
+    baseline_scan_commits: int = 25
     # The same test failing in this many OTHER recent tracked PRs
     # earns it the "likely unrelated flake" label, which Claude is told
     # about in the prompt. Set to 0 to disable the heuristic entirely
@@ -707,6 +724,28 @@ class AnalyzeFailsConfig:
     # build the flaky-elsewhere map. Cheap reads from S3, but each one
     # is a network round-trip per shard, so we don't want it unbounded.
     flaky_check_prs: int = 12
+    # Second, independent AI session auditing what the first one
+    # concluded — a fresh context with read-only tools, given the
+    # commits, the failure list with baseline verdicts and the first
+    # session's claims. Advisory: it labels and comments, never reverts
+    # or blocks the push.
+    #
+    # Only shards in doubt are audited (see ``_verification_reason``):
+    # one that committed code, or whose verdict contradicts the
+    # baseline. A shard that changed nothing and whose failures all
+    # predate the PR is already evidenced — auditing it would just
+    # double the bill.
+    verify_outcome: bool = True
+    # How many investigator sessions one shard may get. A disputed
+    # outcome hands the audit's findings to a fresh investigator, which
+    # starts from the disputed round's tip and can revert it. 1 = no
+    # redo (the dispute is reported and left for a human); the cap
+    # applies per shard, and the audit runs after every round.
+    max_investigation_rounds: int = 2
+    verify_prompt_file: str = "prompts/verify_analysis.md"
+    verify_timeout_seconds: int = 1800  # read-only, no build
+    verify_label: str = "ai-needs-verify"
+    verify_label_color: str = "FBCA04"
     # When the PR is on origin, post a top-level comment summarising
     # each shard's outcome (test counts, classification, Claude's
     # narration tail, commits added, cost). The comment is the durable
@@ -1473,6 +1512,21 @@ def load_config(config_path: Path | None = None) -> Config:
             "prompt_file", "prompts/analyze_fails.md",
         ),
         categories=[c.strip() for c in af_categories if c.strip()],
+        job_level_failures=bool(af_raw.get("job_level_failures", True)),
+        baseline_check=bool(af_raw.get("baseline_check", True)),
+        baseline_scan_commits=int(af_raw.get("baseline_scan_commits", 25)),
+        verify_outcome=bool(af_raw.get("verify_outcome", True)),
+        max_investigation_rounds=int(
+            af_raw.get("max_investigation_rounds", 2),
+        ),
+        verify_prompt_file=af_raw.get(
+            "verify_prompt_file", "prompts/verify_analysis.md",
+        ),
+        verify_timeout_seconds=int(
+            af_raw.get("verify_timeout_seconds", 1800),
+        ),
+        verify_label=af_raw.get("verify_label", "ai-needs-verify"),
+        verify_label_color=af_raw.get("verify_label_color", "FBCA04"),
         timeout_seconds=int(af_raw.get("timeout_seconds", 7200)),
         max_iterations=int(af_raw.get("max_iterations", 6)),
         max_prs_per_run=int(af_raw.get("max_prs_per_run", 0)),
@@ -2794,6 +2848,10 @@ def build_stateless_analyze_fails_config(
             Path(__file__).parent / "prompts" / "analyze_fails.md"
         ).resolve()
         prompt_file = str(bundled)
+    # No project dir to resolve a relative template against.
+    verify_prompt_file = str(
+        (Path(__file__).parent / "prompts" / "verify_analysis.md").resolve()
+    )
 
     base = make_stateless_config(
         origin_url,
@@ -2808,6 +2866,7 @@ def build_stateless_analyze_fails_config(
     base.analyze_fails = AnalyzeFailsConfig(
         command=claude_command,
         prompt_file=prompt_file,
+        verify_prompt_file=verify_prompt_file,
         timeout_seconds=timeout_seconds,
         max_iterations=max_iterations,
         max_prs_per_run=max_prs_per_run,

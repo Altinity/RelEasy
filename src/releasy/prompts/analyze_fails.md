@@ -31,6 +31,32 @@ The repository at `{cwd}` is already prepared:
 
 ---
 
+## Where this attempt stands
+
+{redo_section}
+
+---
+
+## Baseline: what was ALREADY failing before this PR
+
+{baseline_section}
+
+Each failure block below is annotated with one of:
+
+- **pre-existing** — already red at the baseline commit. The change
+  under investigation is not in that commit, so it cannot be the
+  cause. `[unrelated]`, no code edits, no reproduction runs.
+- **new since baseline** — did not fail at the baseline, whose run did
+  exercise that category. Your prime suspects; spend the budget here.
+- **baseline says nothing** — the baseline run never ran that check.
+  Fall back to the diff and the flaky-elsewhere annotation.
+
+Baseline evidence outranks every other signal here, including the
+category prior below. It is a direct observation of the same test on
+the same branch without this PR's diff.
+
+---
+
 ## Category-specific prior — read before you triage
 
 The base scoping rule above is universal. Apply it through the lens of
@@ -110,6 +136,7 @@ A fix is in scope iff:
 
 Out of scope (NEVER edit code for these):
 
+- already failing at the baseline commit (pre-existing annotation)
 - failing on master before this PR existed
 - failing on multiple unrelated PRs (flaky-elsewhere annotation)
 - infrastructure / environment issue (docker, network, disk)
@@ -131,12 +158,16 @@ test because <X in the diff>", it's out of scope.
 git diff {base_branch}..HEAD --stat
 ```
 
+Read the baseline verdicts first — they settle most of the list before
+you look at a single diff hunk.
+
 Classify each failure as:
 
-- **CAUSED-BY-THIS-PR** — a specific area of the diff plausibly
-  explains it. Carry into Step 2.
-- **NOT-THIS-PR** — unrelated. Flaky-elsewhere is the strongest
-  signal. Goes to the final summary as `[unrelated]`; no code change.
+- **CAUSED-BY-THIS-PR** — not failing at the baseline, and a specific
+  area of the diff plausibly explains it. Carry into Step 2.
+- **NOT-THIS-PR** — unrelated. Pre-existing at the baseline is
+  conclusive; flaky-elsewhere is the next strongest signal. Goes to the
+  final summary as `[unrelated]`; no code change.
 - **CAN'T-TELL** — ambiguous; reproduce once to resolve. Still
   ambiguous → `NOT-THIS-PR` (ties go to "don't edit").
 
@@ -215,7 +246,8 @@ with one label and a one-line reason:
 
 - `[fixed]` — caused by this PR; now passing.
 - `[unrelated]` — NOT caused by this PR; *no code change*. Reason
-  briefly (e.g. "also failing on PR #1689, #1701 — master flake").
+  briefly (e.g. "already failing at baseline abc1234def", "also
+  failing on PR #1689, #1701 — master flake").
 - `[remaining]` — caused by this PR but couldn't fix in budget.
 - `[skipped]` — never investigated (be honest — out-of-budget on a
   CAUSED-BY-THIS-PR failure is `[skipped]`, not `[unrelated]`).

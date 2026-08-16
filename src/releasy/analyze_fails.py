@@ -37,12 +37,14 @@ if TYPE_CHECKING:
     from releasy.pipeline import OnlyFilter
 
 from releasy.ai_resolve import (
+    _VERIFY_ALLOWED_TOOLS,
     _build_api_spec,
     _build_claude_argv,
     _exhaustion_kwargs,
     _extract_assistant_text,
     _extract_cost_usd,
     _find_transient_api_error,
+    _parse_verify_output,
     _resolve_backend,
     _spawn_claude,
     _write_build_script,
@@ -50,9 +52,12 @@ from releasy.ai_resolve import (
 from releasy.ci_failures import (
     CATEGORY_ORDER,
     CATEGORY_OTHER,
+    BaselineRun,
     FailedTest,
     PRFailures,
+    baseline_run_before,
     discover_pr_failures,
+    merge_base_sha,
 )
 from releasy.config import Config, get_github_token, is_stateless
 from releasy.git_ops import (
@@ -64,6 +69,8 @@ from releasy.git_ops import (
     stash_and_clean,
 )
 from releasy.github_ops import (
+    add_label_to_pr,
+    ensure_label,
     fetch_pr_by_url,
     get_origin_repo_slug,
     parse_pr_url,
@@ -94,6 +101,34 @@ class ShardOutcome:
     narration: str = ""
     cost_usd: float | None = None
     commits_added: int = 0
+    # Independent second-session audit. ``verify_reason`` is why this
+    # shard was picked for one (``None`` = it wasn't in doubt, so no
+    # session ran); ``verify_verdict`` is "ok" / "needs_attention" /
+    # "unknown" (unknown = the audit itself failed, advisory only).
+    verify_reason: str | None = None
+    verify_verdict: str | None = None
+    verify_summary: str = ""
+    verify_findings: list[str] = field(default_factory=list)
+    # 1 for the first investigation, 2+ for a redo the audit triggered.
+    # ``superseded`` marks a round a later one replaced — kept for the
+    # record, but it isn't this shard's verdict any more.
+    round_index: int = 1
+    superseded: bool = False
+
+    @property
+    def disputed(self) -> bool:
+        return self.verify_verdict == "needs_attention"
+
+
+@dataclass
+class RedoContext:
+    """What a re-investigation is told about the round it replaces."""
+    round_index: int
+    classification: str
+    commits_added: int
+    commit_range: str
+    audit_summary: str
+    audit_findings: list[str]
 
 
 @dataclass
@@ -109,12 +144,34 @@ class PRRunResult:
     shards_partial: int = 0
     shards_unrelated: int = 0
     shards_unresolved: int = 0
+    shards_audited: int = 0
+    shards_disputed: int = 0
+    # The read-only auditor touched the repo — a contract violation, so
+    # what it observed no longer describes what we'd push.
+    audit_mutated_repo: bool = False
+
+    @property
+    def open_disputes(self) -> int:
+        """Disputes still standing — a redo that fixed one doesn't count."""
+        return sum(
+            1 for o in self.outcomes if o.disputed and not o.superseded
+        )
     commits_added: int = 0
     pushed: bool = False
     cost_usd: float = 0.0
     comment_url: str | None = None
     outcomes: list[ShardOutcome] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Failed checks whose failures the cross-shard dedupe folded into
+    # another check's shard — they get no shard of their own, so this is
+    # the only place they're accounted for.
+    covered_elsewhere: list[str] = field(default_factory=list)
+    # The pre-change CI run the failures were compared against, and how
+    # the comparison came out.
+    baseline_sha: str | None = None
+    baseline_committed_at: str | None = None
+    baseline_note: str | None = None
+    tests_pre_existing: int = 0
     error: str | None = None
 
 
@@ -206,7 +263,10 @@ def _build_flaky_elsewhere_map(
 
     categories = _configured_categories(config)
     for url in pr_urls:
-        failures, err = discover_pr_failures(config, url, categories=categories)
+        failures, err = discover_pr_failures(
+            config, url, categories=categories,
+            job_level=config.analyze_fails.job_level_failures,
+        )
         if err or failures is None:
             warnings.append(f"flaky-elsewhere: {url}: {err}")
             continue
@@ -320,8 +380,27 @@ _CATEGORY_PRIORS: dict[str, str] = {
 }
 
 
-def _category_prior_section(category: str) -> str:
+# Used instead of the category prior when the check failed as a whole
+# and published no per-test results — the category says nothing useful
+# about a job that never reached its test phase.
+_JOB_LEVEL_PRIOR = (
+    "This check failed **as a whole**, without per-test results. "
+    "Typical causes: the job died before its test phase (runner OOM, "
+    "docker / network failure, cancellation), a build or packaging step "
+    "failed, or the check has nothing per-test to report (image build, "
+    "vulnerability scan, install check).\n\n"
+    "Judge relatedness from the job's own log plus the diff. A compile, "
+    "link or packaging error naming files this PR touches is "
+    "**CAUSED-BY-THIS-PR**. A CVE in a base image, a registry timeout, "
+    "a killed runner or an artefact that never uploaded is "
+    "**NOT-THIS-PR** — report it, never edit code to silence it."
+)
+
+
+def _category_prior_section(category: str, *, job_level: bool = False) -> str:
     """Render the category-specific scoping prior, or a no-op fallback."""
+    if job_level:
+        return _JOB_LEVEL_PRIOR
     prior = _CATEGORY_PRIORS.get(category)
     if prior is None:
         return (
@@ -453,6 +532,32 @@ _CATEGORY_RUNNER_HINTS: dict[str, str] = {
 }
 
 
+# Used for a check that published no per-test failures at all. There is
+# no test list to re-run, so the category recipe must NOT be used —
+# interpolating an empty test list into `tests/clickhouse-test` would
+# run the entire suite.
+_JOB_LEVEL_RUNNER_HINT = (
+    "**There is no test list for this check** — it failed as a whole, so "
+    "`{failed_tests_file}` is empty and there is nothing to re-run. Do "
+    "**not** invoke a test runner without arguments; that runs the whole "
+    "suite and tells you nothing.\n\n"
+    "Read the evidence first:\n\n"
+    "- The job's report / log is at {target_url} — fetch it (`WebFetch`, "
+    "or `curl` if the artefact is plain text). The failure reason is "
+    "there.\n"
+    "- Strip the parenthesised parameters from `{shard_context}` and look "
+    "the job name up in `ci/defs/job_configs.py`: its `command=` is "
+    "verbatim what CI ran, and the script it names lives under "
+    "`ci/jobs/`. For a `Regression …` check, look in "
+    "`.github/workflows/regression.yml` instead.\n\n"
+    "Reproduce only the single failing step, and only if it is cheap and "
+    "local (a build, a script under `ci/jobs/`). If it needs CI "
+    "infrastructure you don't have — a docker registry, S3 credentials, "
+    "a vulnerability database — don't attempt it: diagnose from the log "
+    "plus the diff and classify honestly."
+)
+
+
 # Fallback for a failed check with no recipe of its own. Deliberately
 # points at the job definition instead of guessing an invocation: in
 # praktika, ``Job.Config.command`` is verbatim what CI ran.
@@ -512,8 +617,15 @@ _REGRESSION_OVERFLOW_NOTE = (
 def _category_runner_section(
     category: str, test_names: list[str], shard_context: str,
     repo_path: Path, target_url: str = "",
-    *, max_inline: int = 25,
+    *, max_inline: int = 25, job_level: bool = False,
 ) -> str:
+    if job_level:
+        return (
+            _JOB_LEVEL_RUNNER_HINT
+            .replace("{shard_context}", shard_context)
+            .replace("{target_url}", target_url or "(no report URL)")
+            .replace("{failed_tests_file}", ".releasy/failed-tests.txt")
+        )
     template = _CATEGORY_RUNNER_HINTS.get(category, _GENERIC_RUNNER_HINT)
     overflow_note = ""
     if len(test_names) <= max_inline:
@@ -564,12 +676,38 @@ _PER_TEST_EXCERPT_MAX = 1000
 _INLINE_FAILURE_LIMIT = 30
 
 
+def _baseline_line(test: FailedTest, baseline: BaselineRun | None) -> str:
+    """The one-line pre-change verdict shown under a failure block."""
+    if baseline is None:
+        return "baseline: no pre-change run available."
+    verdict = baseline.verdict_for(test.category, test.name)
+    short = baseline.sha[:10]
+    if verdict == "failed":
+        where = baseline.failing.get((test.category, test.name), "")
+        return (
+            f"**pre-existing:** already failing before this PR — "
+            f"baseline commit `{short}` ({baseline.committed_at}), in "
+            f"`{where}`. **This PR did not break it.**"
+        )
+    if verdict == "passed":
+        return (
+            f"**new since baseline:** did NOT fail at `{short}` "
+            f"({baseline.committed_at}), where its category did run — "
+            "this PR is the prime suspect."
+        )
+    return (
+        f"baseline: `{short}` never ran a {test.category} check, so it "
+        "says nothing about this failure."
+    )
+
+
 def _render_failure_block(
     test: FailedTest,
     index: int,
     flaky_map: dict[str, list[str]],
     threshold: int,
     current_pr_url: str,
+    baseline: BaselineRun | None = None,
 ) -> str:
     info = (test.info_excerpt or "").strip()
     if len(info) > _PER_TEST_EXCERPT_MAX:
@@ -590,9 +728,18 @@ def _render_failure_block(
     else:
         flaky = "flaky-elsewhere: none."
 
+    if test.job_level:
+        heading = (
+            f"### {index}. Job-level failure: `{test.name}` "
+            f"({test.status}) — not a test, no per-test results"
+        )
+    else:
+        heading = f"### {index}. `{test.name}`  ({test.status})"
+
     lines = [
-        f"### {index}. `{test.name}`  ({test.status})",
+        heading,
         "",
+        f"- {_baseline_line(test, baseline)}",
         f"- {flaky}",
         "",
     ]
@@ -602,6 +749,134 @@ def _render_failure_block(
         lines.append(f"---END FAILURE EXCERPT #{index}---")
     else:
         lines.append("_(no per-test info captured by the CI report)_")
+    return "\n".join(lines)
+
+
+def _baseline_section(
+    tests: list[FailedTest], baseline: BaselineRun | None,
+    base_branch: str, unavailable_reason: str | None = None,
+) -> str:
+    """Render the shard's pre-change comparison for the prompt."""
+    if baseline is None:
+        return (
+            "RelEasy found **no CI run on "
+            f"`{base_branch}` predating this PR** to compare against"
+            + (f" ({unavailable_reason})" if unavailable_reason else "")
+            + ". Triage from the diff and the flaky-elsewhere "
+            "annotations alone, and be correspondingly careful before "
+            "calling a failure this PR's fault."
+        )
+
+    pre_existing = [
+        t for t in tests
+        if baseline.verdict_for(t.category, t.name) == "failed"
+    ]
+    fresh = [
+        t for t in tests
+        if baseline.verdict_for(t.category, t.name) == "passed"
+    ]
+    unknown = len(tests) - len(pre_existing) - len(fresh)
+
+    lines = [
+        f"The last CI run on `{base_branch}` **without this PR's diff** "
+        f"is commit `{baseline.sha[:10]}` ({baseline.committed_at}), "
+        f"where {baseline.checks_failed} of {baseline.checks_total} "
+        f"checks were already red. Comparing this shard against it:",
+        "",
+    ]
+    if baseline.skipped_newer:
+        lines += [
+            f"_({baseline.skipped_newer} newer run(s) on `{base_branch}` "
+            "were passed over — they never ran these checks. So a "
+            "`new since baseline` verdict here can also mean 'broken by "
+            "something merged into the target branch after the "
+            "baseline'; confirm against the diff before fixing.)_",
+            "",
+        ]
+    lines += [
+        f"- **{len(pre_existing)} of {len(tests)} already failed there** "
+        "— pre-existing breakage, NOT this PR's to fix. Classify as "
+        "`[unrelated]` and do not edit code for them.",
+        f"- **{len(fresh)} did not fail there** while their category "
+        "did run — these are the failures worth your build budget.",
+    ]
+    if unknown:
+        lines.append(
+            f"- {unknown} could not be compared (the baseline run never "
+            "exercised their check)."
+        )
+    lines += [
+        "",
+        "Each failure below carries its own verdict. The baseline is "
+        "**stronger evidence than any reasoning from the diff**: a test "
+        "that was already red on the target branch cannot have been "
+        "broken by a change that isn't in it yet.",
+    ]
+    if fresh and len(fresh) < len(tests):
+        lines += [
+            "",
+            "So start with the new-since-baseline failures. If they turn "
+            "out to be unrelated too, say so and finish — do not spend "
+            "the budget re-litigating the pre-existing ones.",
+        ]
+    elif not fresh:
+        lines += [
+            "",
+            "**Nothing in this shard is new since the baseline.** Verify "
+            "the comparison holds (spot-check one or two failures "
+            "against the baseline report), then report `UNRELATED` "
+            "without building anything.",
+        ]
+    return "\n".join(lines)
+
+
+def _redo_section(redo: RedoContext | None, pr_branch: str) -> str:
+    """Tell a re-investigation what the audit objected to, and to fix it."""
+    if redo is None:
+        return (
+            "_(First look at this shard — no prior round to correct.)_"
+        )
+    lines = [
+        f"**This is attempt {redo.round_index + 1}.** Round "
+        f"{redo.round_index} concluded `{redo.classification}`"
+        + (
+            f" and committed {redo.commits_added} change(s) "
+            f"(`{redo.commit_range}`)"
+            if redo.commits_added else " and committed nothing"
+        )
+        + ". An independent audit rejected that outcome:",
+        "",
+    ]
+    if redo.audit_summary:
+        lines += [f"> {redo.audit_summary}", ""]
+    for f in redo.audit_findings[:10]:
+        lines.append(f"- {f}")
+    if redo.audit_findings:
+        lines.append("")
+    lines += [
+        "Those commits are **still on the branch** — you start from the "
+        "tip that includes them. Act on the findings:",
+        "",
+        f"- If a finding says a commit silences a test rather than "
+        f"fixing it (assertion weakened or deleted, reference output "
+        f"rewritten, tolerance widened, test skipped), `git revert "
+        f"--no-edit <sha>` it first, then either fix the cause properly "
+        f"or classify the failure honestly. A reverted bad fix plus an "
+        f"accurate `[unrelated]` is a **better** outcome than a fix that "
+        f"hides a regression.\n"
+        f"- If a finding says an edit is out of scope, revert that "
+        f"commit.\n"
+        f"- If a finding says a verdict contradicts the evidence, "
+        f"re-triage that failure specifically — do not restate the "
+        f"previous conclusion without new evidence.\n"
+        f"- If you still believe the previous conclusion after checking, "
+        f"say so explicitly and give the evidence that answers the "
+        f"finding. Standing your ground is allowed; ignoring the "
+        f"finding is not.",
+        "",
+        f"Revert, never rewrite: history on `{pr_branch}` stays "
+        "append-only (see the linear-history section below).",
+    ]
     return "\n".join(lines)
 
 
@@ -617,6 +892,9 @@ def _render_shard_prompt(
     category: str,
     tests: list[FailedTest],
     flaky_map: dict[str, list[str]],
+    baseline: BaselineRun | None = None,
+    baseline_note: str | None = None,
+    redo: RedoContext | None = None,
 ) -> str:
     raw = config.analyze_fails.prompt_file
     prompt_path = Path(raw)
@@ -636,7 +914,9 @@ def _render_shard_prompt(
     inline = tests[:_INLINE_FAILURE_LIMIT]
     extra = tests[_INLINE_FAILURE_LIMIT:]
     blocks = "\n\n".join(
-        _render_failure_block(t, i + 1, flaky_map, threshold, pr_url)
+        _render_failure_block(
+            t, i + 1, flaky_map, threshold, pr_url, baseline,
+        )
         for i, t in enumerate(inline)
     )
     if extra:
@@ -647,11 +927,16 @@ def _render_shard_prompt(
             "for the test arguments in the runner command.)_"
         )
 
+    # Job-level records name a job or one of its steps, never a test —
+    # they must not reach the runner command line. A shard left with no
+    # real test name is a job-level shard.
+    runnable = [t.name for t in tests if not t.job_level]
+    job_level = not runnable
     runner_section = _category_runner_section(
-        category, [t.name for t in tests], shard_context, repo_path,
-        target_url,
+        category, runnable, shard_context, repo_path,
+        target_url, job_level=job_level,
     )
-    category_prior = _category_prior_section(category)
+    category_prior = _category_prior_section(category, job_level=job_level)
 
     placeholders = {
         "repo_slug": repo_slug,
@@ -664,6 +949,10 @@ def _render_shard_prompt(
         "target_url": target_url,
         "test_category": category,
         "category_prior": category_prior,
+        "baseline_section": _baseline_section(
+            tests, baseline, base_branch, baseline_note,
+        ),
+        "redo_section": _redo_section(redo, pr_branch),
         "failure_count": str(len(tests)),
         "failure_blocks": blocks,
         "runner_section": runner_section,
@@ -689,12 +978,15 @@ def _write_failed_tests_manifest(
     Claude reads this file when the test list is too long to embed
     cleanly in the runner command line. Unconditional write so the file
     always reflects the *current* shard's failure set, not the previous
-    one.
+    one. Job-level records name a CI job, not a test, so they leave the
+    file empty — feeding one to a runner would select nothing (or, with
+    ``clickhouse-test``, everything).
     """
+    names = [t.name for t in tests if not t.job_level]
     target = repo_path / ".releasy" / "failed-tests.txt"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(
-        "\n".join(t.name for t in tests) + "\n", encoding="utf-8",
+        ("\n".join(names) + "\n") if names else "", encoding="utf-8",
     )
 
 
@@ -757,6 +1049,160 @@ def _resolve_tool_paths(items: list[str], repo_path: Path) -> list[str]:
                 s = s.replace(ph, repo_str)
         out.append(s)
     return out
+
+
+def _verification_reason(
+    classification: str,
+    commits_added: int,
+    tests: list[FailedTest],
+    baseline: BaselineRun | None,
+    flaky_map: dict[str, list[str]],
+    threshold: int,
+    pr_url: str,
+) -> str | None:
+    """Why this shard's outcome needs a second opinion — ``None`` if not.
+
+    Two things count as doubt:
+
+    * **Code landed.** A commit is about to be pushed to someone's PR
+      on the strength of one session's judgement.
+    * **The verdict contradicts the evidence.** "Nothing here is mine"
+      over a failure that passed at the baseline and fails on no other
+      tracked PR is exactly the call that must not go unchallenged.
+
+    Everything else is left alone: a shard that changed nothing and
+    whose failures all predate the PR is already evidenced, and
+    UNRESOLVED without commits has no conclusion to audit — a human is
+    needed either way.
+    """
+    if commits_added > 0:
+        return (
+            f"the session committed {commits_added} change(s) to the PR "
+            "branch"
+        )
+    if classification not in ("UNRELATED", "DONE"):
+        return None
+    if baseline is None:
+        return None
+    unexplained = [
+        t for t in tests
+        if baseline.verdict_for(t.category, t.name) == "passed"
+        and len([
+            u for u in flaky_map.get(_flaky_key(t.category, t.name), [])
+            if u != pr_url
+        ]) < max(threshold, 1)
+    ]
+    if unexplained:
+        names = ", ".join(t.name for t in unexplained[:3])
+        return (
+            f"the session called this shard {classification}, but "
+            f"{len(unexplained)} failure(s) passed at the baseline and "
+            f"fail on no other tracked PR ({names}"
+            + ("…" if len(unexplained) > 3 else "") + ")"
+        )
+    return None
+
+
+def _render_verify_prompt(
+    config: Config,
+    repo_path: Path,
+    pr_url: str,
+    pr_number: int,
+    pr_branch: str,
+    base_branch: str,
+    shard_context: str,
+    target_url: str,
+    category: str,
+    tests: list[FailedTest],
+    baseline: BaselineRun | None,
+    outcome: ShardOutcome,
+    commit_range: str,
+) -> str:
+    raw = config.analyze_fails.verify_prompt_file
+    prompt_path = Path(raw)
+    if not prompt_path.is_absolute():
+        prompt_path = (config.repo_dir / prompt_path).resolve()
+    if not prompt_path.exists():
+        raise FileNotFoundError(
+            f"analyze_fails verify prompt not found: {prompt_path}. Set "
+            "analyze_fails.verify_prompt_file, copy the bundled "
+            "prompts/verify_analysis.md alongside config.yaml, or turn "
+            "the audit off with analyze_fails.verify_outcome: false."
+        )
+    template = prompt_path.read_text(encoding="utf-8")
+
+    verdict_lines = []
+    for t in tests[:_INLINE_FAILURE_LIMIT]:
+        mark = (
+            baseline.verdict_for(t.category, t.name) if baseline
+            else "no baseline"
+        )
+        label = {
+            "failed": "pre-existing at baseline",
+            "passed": "NEW since baseline",
+            "not covered": "baseline did not run this check",
+        }.get(mark, mark)
+        verdict_lines.append(f"- [{label}] `{t.name}`")
+    if len(tests) > _INLINE_FAILURE_LIMIT:
+        verdict_lines.append(
+            f"- …(+{len(tests) - _INLINE_FAILURE_LIMIT} more; full list "
+            "in `.releasy/failed-tests.txt`)"
+        )
+
+    placeholders = {
+        "repo_slug": get_origin_repo_slug(config) or "<unknown>",
+        "cwd": str(repo_path),
+        "pr_url": pr_url,
+        "pr_number": str(pr_number),
+        "pr_branch": pr_branch,
+        "base_branch": base_branch,
+        "shard_context": shard_context,
+        "target_url": target_url,
+        "test_category": category,
+        "failure_count": str(len(tests)),
+        "failure_verdicts": "\n".join(verdict_lines),
+        "baseline_sha": baseline.sha if baseline else "(none)",
+        "baseline_committed_at": (
+            baseline.committed_at if baseline else "(none)"
+        ),
+        "classification": outcome.classification,
+        "doubt_reason": outcome.verify_reason or "(unspecified)",
+        "commit_range": commit_range or "(no commits)",
+        "commit_count": str(outcome.commits_added),
+        "claimed_summary": _trim_narration_for_comment(outcome.narration),
+        "failed_tests_file": ".releasy/failed-tests.txt",
+    }
+
+    def _replace(match: re.Match[str]) -> str:
+        return placeholders.get(match.group(1), match.group(0))
+
+    return re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", _replace, template)
+
+
+def _invoke_verifier(
+    config: Config, repo_path: Path, prompt: str,
+) -> tuple[int, str, bool, float | None]:
+    """Spawn the read-only auditor in a fresh session."""
+
+    class _ResolveShim:
+        command = config.analyze_fails.command
+        allowed_tools = list(_VERIFY_ALLOWED_TOOLS)
+        extra_args = list(config.analyze_fails.extra_args)
+
+    class _ConfigShim:
+        ai_resolve = _ResolveShim
+        ai_model = config.ai_model
+        ai_effort = config.ai_effort
+        ai_backend = config.ai_backend
+        ai_api = config.ai_api
+
+    argv = _build_claude_argv(_ConfigShim)  # type: ignore[arg-type]
+    api = _build_api_spec(_ConfigShim)  # type: ignore[arg-type]
+    exit_code, output, timed_out = _spawn_claude(
+        argv, repo_path, config.analyze_fails.verify_timeout_seconds,
+        prompt=prompt, api=api, **_exhaustion_kwargs(config),
+    )
+    return exit_code, output, timed_out, _extract_cost_usd(output)
 
 
 def _invoke_claude(
@@ -893,6 +1339,281 @@ def _group_failures_by_shard(
     )
 
 
+# Baseline runs are decomposed once per merge base, not once per PR:
+# a batch of rebase PRs cut from the same target-branch commit shares
+# one, and decoding a run means re-fetching every failed shard's report.
+# Keyed by everything that changes the result; process-lifetime only.
+_BASELINE_CACHE: dict[
+    tuple[str, str, tuple[str, ...] | None, bool, frozenset[str]],
+    tuple[BaselineRun | None, str | None],
+] = {}
+
+
+def _tally_outcome(result: PRRunResult, outcome: ShardOutcome) -> None:
+    """Count a shard's *final* outcome and print its marker."""
+    field_name = {
+        "DONE": "shards_done",
+        "PARTIAL": "shards_partial",
+        "UNRELATED": "shards_unrelated",
+        "UNRESOLVED": "shards_unresolved",
+    }.get(outcome.classification, "shards_unresolved")
+    setattr(result, field_name, getattr(result, field_name) + 1)
+
+
+def _run_investigation_round(
+    config: Config,
+    repo_path: Path,
+    prompt: str,
+    start_sha: str,
+    *,
+    category: str,
+    shard_ctx: str,
+    target_url: str,
+    test_count: int,
+) -> tuple[ShardOutcome, str, bool]:
+    """One investigator session plus the checks that make it pushable.
+
+    Returns ``(outcome, head_sha_after, unsafe)``. ``unsafe`` means the
+    branch is no longer append-only, so the caller must stop touching
+    this PR — nothing after that point can be trusted or pushed.
+    """
+    def _failed(summary: str, narration: str, cost: float | None) -> ShardOutcome:
+        return ShardOutcome(
+            category=category, shard_context=shard_ctx,
+            target_url=target_url, test_count=test_count,
+            classification="UNRESOLVED", summary=summary,
+            narration=narration, cost_usd=cost,
+        )
+
+    exit_code, output, timed_out, cost = _invoke_claude(
+        config, repo_path, prompt,
+    )
+    narration = _extract_assistant_text(output)
+
+    if timed_out:
+        console.print(
+            f"    [red]✗[/red] timed out after "
+            f"{config.analyze_fails.timeout_seconds}s"
+        )
+        return _failed("claude timed out", narration, cost), start_sha, False
+
+    if exit_code != 0:
+        transient = _find_transient_api_error(output)
+        console.print(
+            f"    [red]✗[/red] claude exited {exit_code}"
+            + (f" — transient: {transient}" if transient else "")
+        )
+        return _failed(
+            (narration.strip().splitlines() or ["<empty>"])[-1],
+            narration, cost,
+        ), start_sha, False
+
+    clean_err = _verify_post_run_cleanliness(repo_path)
+    if clean_err:
+        console.print(f"    [red]✗[/red] {clean_err}")
+        return _failed(clean_err, narration, cost), start_sha, False
+
+    new_head = run_git(
+        ["rev-parse", "--verify", "HEAD"], repo_path, check=False,
+    )
+    if new_head.returncode != 0:
+        console.print("    [red]✗[/red] could not read HEAD post-run")
+        return _failed(
+            "git rev-parse HEAD failed", narration, cost,
+        ), start_sha, False
+    new_sha = new_head.stdout.strip()
+
+    if new_sha != start_sha and is_ancestor(repo_path, start_sha, new_sha) is not True:
+        msg = (
+            "non-linear history detected (HEAD is not a descendant of "
+            f"{start_sha[:10]} — refusing to push)"
+        )
+        console.print(f"    [red]✗[/red] {msg}")
+        return _failed(msg, narration, cost), new_sha, True
+
+    token, summary = _classify_outcome(narration)
+    commits_added = 0
+    if new_sha != start_sha:
+        rev_count = run_git(
+            ["rev-list", "--count", f"{start_sha}..{new_sha}"],
+            repo_path, check=False,
+        )
+        try:
+            commits_added = int((rev_count.stdout or "0").strip())
+        except ValueError:
+            commits_added = 0
+
+    marker = {
+        "DONE": "[green]✓[/green]",
+        "PARTIAL": "[yellow]◐[/yellow]",
+        "UNRELATED": "[yellow]→[/yellow]",
+        "UNRESOLVED": "[red]✗[/red]",
+    }.get(token, "[red]✗[/red]")
+    console.print(
+        f"    {marker} {token}"
+        + (f" [dim]+{commits_added} commit(s)[/dim]" if commits_added else "")
+        + (f" [dim](cost ${cost:.4f})[/dim]" if cost else "")
+    )
+    return ShardOutcome(
+        category=category, shard_context=shard_ctx,
+        target_url=target_url, test_count=test_count,
+        classification=token, summary=summary, narration=narration,
+        cost_usd=cost, commits_added=commits_added,
+    ), new_sha, False
+
+
+def _audit_shard_outcome(
+    config: Config,
+    repo_path: Path,
+    result: PRRunResult,
+    outcome: ShardOutcome,
+    *,
+    pr_url: str,
+    pr_number: int,
+    pr_branch: str,
+    base_branch: str,
+    category: str,
+    tests: list[FailedTest],
+    baseline: BaselineRun | None,
+    flaky_map: dict[str, list[str]],
+    commit_range: str,
+) -> None:
+    """Second opinion on one shard's outcome, when the shard is in doubt.
+
+    Advisory throughout: findings are recorded on ``outcome`` and drive
+    the PR comment and label. Nothing is reverted, and the push is not
+    blocked — the operator decides what to do with a dispute. A failed
+    audit (timeout, unparsable verdict) is likewise never fatal; it
+    just leaves ``verify_verdict`` at ``"unknown"``.
+    """
+    if not config.analyze_fails.verify_outcome:
+        return
+    reason = _verification_reason(
+        outcome.classification, outcome.commits_added, tests, baseline,
+        flaky_map, config.analyze_fails.flaky_elsewhere_threshold, pr_url,
+    )
+    if reason is None:
+        return
+    outcome.verify_reason = reason
+    head = run_git(["rev-parse", "--verify", "HEAD"], repo_path, check=False)
+    head_before = head.stdout.strip() if head.returncode == 0 else ""
+
+    console.print(
+        f"    [magenta]🔎 second opinion[/magenta] [dim]({reason})[/dim]"
+    )
+    try:
+        prompt = _render_verify_prompt(
+            config, repo_path, pr_url, pr_number, pr_branch, base_branch,
+            outcome.shard_context, outcome.target_url, category, tests,
+            baseline, outcome, commit_range,
+        )
+    except FileNotFoundError as exc:
+        outcome.verify_verdict = "unknown"
+        result.warnings.append(f"audit skipped: {exc}")
+        console.print(f"      [yellow]![/yellow] {exc}")
+        return
+
+    exit_code, output, timed_out, cost = _invoke_verifier(
+        config, repo_path, prompt,
+    )
+    if cost:
+        result.cost_usd += cost
+        outcome.cost_usd = (outcome.cost_usd or 0.0) + cost
+    result.shards_audited += 1
+
+    if timed_out or exit_code != 0:
+        outcome.verify_verdict = "unknown"
+        why = (
+            f"timed out after {config.analyze_fails.verify_timeout_seconds}s"
+            if timed_out else f"exited {exit_code}"
+        )
+        result.warnings.append(
+            f"{outcome.shard_context}: second opinion {why} — the "
+            "first session's verdict stands unaudited."
+        )
+        console.print(f"      [yellow]![/yellow] audit {why}")
+        return
+
+    # The auditor is told it is read-only, and its allowlist has no
+    # editing tools — but `Bash(git:*)` is broad enough to commit, so
+    # confirm rather than assume. A verifier that wrote to the repo has
+    # invalidated what we were about to push.
+    after = run_git(["rev-parse", "--verify", "HEAD"], repo_path, check=False)
+    moved = after.returncode != 0 or after.stdout.strip() != head_before
+    if moved or _verify_post_run_cleanliness(repo_path):
+        result.audit_mutated_repo = True
+        msg = (
+            f"{outcome.shard_context}: the read-only auditor modified the "
+            "repository — nothing will be pushed for this PR. Inspect the "
+            "work-dir by hand."
+        )
+        result.warnings.append(msg)
+        console.print(f"      [red]✗[/red] {msg}")
+
+    verdict, summary, findings = _parse_verify_output(output)
+    outcome.verify_verdict = verdict
+    outcome.verify_summary = summary
+    outcome.verify_findings = findings
+
+    if verdict == "needs_attention":
+        result.shards_disputed += 1
+        console.print(
+            f"      [yellow]⚠ disputed[/yellow] {summary or '(no summary)'}"
+        )
+        for f in findings[:5]:
+            console.print(f"        [dim]- {f}[/dim]")
+    elif verdict == "ok":
+        console.print("      [green]✓[/green] audit agrees")
+    else:
+        result.warnings.append(
+            f"{outcome.shard_context}: second opinion returned no "
+            "parsable verdict — treated as unaudited."
+        )
+        console.print("      [yellow]![/yellow] audit gave no verdict")
+
+
+def _resolve_baseline(
+    config: Config,
+    origin_slug: str,
+    base_ref: str,
+    head_sha: str,
+    needed_categories: frozenset[str],
+) -> tuple[BaselineRun | None, str | None]:
+    """Fetch the pre-change CI run for this PR, or explain why not.
+
+    ``needed_categories`` are the check families the PR actually failed
+    in — a run that never exercised them is skipped in favour of an
+    older one that did.
+
+    Never fatal: a PR whose target branch has no reachable run is
+    triaged the old way, from the diff and the flaky-elsewhere map.
+    """
+    if not config.analyze_fails.baseline_check:
+        return None, "disabled (analyze_fails.baseline_check)"
+    owner, _, repo = origin_slug.partition("/")
+    if not owner or not repo:
+        return None, f"cannot parse origin slug {origin_slug!r}"
+
+    categories = _configured_categories(config)
+    job_level = config.analyze_fails.job_level_failures
+    mb, err = merge_base_sha(owner, repo, base_ref, head_sha)
+    if err or not mb:
+        return None, err or "no merge base"
+
+    key = (
+        origin_slug.lower(), mb, categories, job_level, needed_categories,
+    )
+    if key not in _BASELINE_CACHE:
+        _BASELINE_CACHE[key] = baseline_run_before(
+            owner, repo, mb,
+            max_commits=config.analyze_fails.baseline_scan_commits,
+            categories=categories, job_level=job_level,
+            exclude_sha=head_sha,
+            require_categories=needed_categories or None,
+        )
+    return _BASELINE_CACHE[key]
+
+
 def _process_pr(
     config: Config,
     repo_path: Path,
@@ -949,6 +1670,7 @@ def _process_pr(
         config, pr_url,
         head_sha=head_sha, head_ref=head_ref, base_ref=base_ref,
         categories=_configured_categories(config),
+        job_level=config.analyze_fails.job_level_failures,
     )
     if err or failures is None:
         return PRRunResult(
@@ -961,6 +1683,7 @@ def _process_pr(
         statuses_failed=len(failures.statuses),
         tests_total=len(failures.failed_tests),
         warnings=list(failures.skipped_status_warnings),
+        covered_elsewhere=list(failures.covered_elsewhere),
     )
 
     if not failures.failed_tests:
@@ -976,10 +1699,41 @@ def _process_pr(
     console.print(
         f"\n[bold]{pr_url}[/bold] — "
         f"{len(failures.failed_tests)} failing test(s) across "
-        f"{len(shards)} shard(s)"
+        f"{len(shards)} shard(s) "
+        f"[dim](from {len(failures.statuses)} failed check(s))[/dim]"
     )
+
+    baseline, baseline_note = _resolve_baseline(
+        config, origin_slug, base_ref, head_sha,
+        frozenset(t.category for t in failures.failed_tests),
+    )
+    if baseline is not None:
+        result.baseline_sha = baseline.sha
+        result.baseline_committed_at = baseline.committed_at
+        result.tests_pre_existing = sum(
+            1 for t in failures.failed_tests
+            if baseline.verdict_for(t.category, t.name) == "failed"
+        )
+        console.print(
+            f"  [dim]baseline {baseline.sha[:10]} "
+            f"({baseline.committed_at}) on {base_ref}: "
+            f"{baseline.checks_failed}/{baseline.checks_total} check(s) "
+            f"already red[/dim] — [bold]{result.tests_pre_existing} of "
+            f"{len(failures.failed_tests)} failure(s) predate this "
+            "PR[/bold]"
+        )
+    elif baseline_note:
+        result.baseline_note = baseline_note
+        # An operator who turned the pass off doesn't need warning about
+        # it on every PR.
+        if config.analyze_fails.baseline_check:
+            console.print(f"  [yellow]![/yellow] baseline: {baseline_note}")
+        else:
+            console.print(f"  [dim]baseline: {baseline_note}[/dim]")
     for w in result.warnings:
         console.print(f"  [yellow]![/yellow] {w}")
+    for c in result.covered_elsewhere:
+        console.print(f"  [dim]≡ {c}[/dim]")
 
     if dry_run:
         for category, shard_ctx, _, tests in shards:
@@ -989,9 +1743,21 @@ def _process_pr(
                     _flaky_key(t.category, t.name), [],
                 ) if u != pr_url]
             )
+            fresh = (
+                sum(
+                    1 for t in tests
+                    if baseline.verdict_for(t.category, t.name) != "failed"
+                ) if baseline is not None else None
+            )
             console.print(
                 f"  [cyan]{category}[/cyan] {shard_ctx}: "
                 f"{len(tests)} test(s)"
+                + (
+                    f" [green]({fresh} new since baseline)[/green]"
+                    if fresh else
+                    " [dim](all predate this PR)[/dim]"
+                    if fresh == 0 else ""
+                )
                 + (
                     f" [yellow]({flaky_count} also fail elsewhere)[/yellow]"
                     if flaky_count else ""
@@ -1035,164 +1801,98 @@ def _process_pr(
 
         try:
             _write_failed_tests_manifest(repo_path, tests)
-            prompt = _render_shard_prompt(
-                config, repo_path, pr_url, pr_number,
-                head_ref, base_ref, shard_ctx, target_url, category,
-                tests, flaky_map,
-            )
-        except FileNotFoundError as exc:
-            result.error = str(exc)
-            return result
         except OSError as exc:
             result.error = f"Could not stage shard manifest: {exc}"
             return result
 
-        exit_code, output, timed_out, cost = _invoke_claude(
-            config, repo_path, prompt,
-        )
-        if cost is not None:
-            result.cost_usd += cost
-        narration = _extract_assistant_text(output)
-
-        if timed_out:
-            console.print(
-                f"    [red]✗[/red] timed out after "
-                f"{config.analyze_fails.timeout_seconds}s"
-            )
-            result.outcomes.append(ShardOutcome(
-                category=category, shard_context=shard_ctx,
-                target_url=target_url, test_count=len(tests),
-                classification="UNRESOLVED",
-                summary="claude timed out",
-                narration=narration,
-                cost_usd=cost,
-            ))
-            result.shards_unresolved += 1
-            result.shards_processed += 1
-            continue
-
-        if exit_code != 0:
-            transient = _find_transient_api_error(output)
-            console.print(
-                f"    [red]✗[/red] claude exited {exit_code}"
-                + (f" — transient: {transient}" if transient else "")
-            )
-            result.outcomes.append(ShardOutcome(
-                category=category, shard_context=shard_ctx,
-                target_url=target_url, test_count=len(tests),
-                classification="UNRESOLVED",
-                summary=(narration.strip().splitlines() or ["<empty>"])[-1],
-                narration=narration,
-                cost_usd=cost,
-            ))
-            result.shards_unresolved += 1
-            result.shards_processed += 1
-            continue
-
-        clean_err = _verify_post_run_cleanliness(repo_path)
-        if clean_err:
-            console.print(f"    [red]✗[/red] {clean_err}")
-            result.outcomes.append(ShardOutcome(
-                category=category, shard_context=shard_ctx,
-                target_url=target_url, test_count=len(tests),
-                classification="UNRESOLVED",
-                summary=clean_err,
-                narration=narration,
-                cost_usd=cost,
-            ))
-            result.shards_unresolved += 1
-            result.shards_processed += 1
-            continue
-
-        new_head = run_git(
-            ["rev-parse", "--verify", "HEAD"], repo_path, check=False,
-        )
-        if new_head.returncode != 0:
-            console.print(
-                "    [red]✗[/red] could not read HEAD post-run"
-            )
-            result.outcomes.append(ShardOutcome(
-                category=category, shard_context=shard_ctx,
-                target_url=target_url, test_count=len(tests),
-                classification="UNRESOLVED",
-                summary="git rev-parse HEAD failed",
-                narration=narration,
-                cost_usd=cost,
-            ))
-            result.shards_unresolved += 1
-            result.shards_processed += 1
-            continue
-        new_sha = new_head.stdout.strip()
-
-        if new_sha != start_sha:
-            ancestor = is_ancestor(repo_path, start_sha, new_sha)
-            if ancestor is not True:
-                msg = (
-                    "non-linear history detected (HEAD is not a "
-                    f"descendant of {start_sha[:10]} — refusing to push)"
+        # Investigate, audit, and — when the audit disputes what came
+        # out — hand the findings to a fresh investigator and try once
+        # more. Bounded by max_investigation_rounds; each round starts
+        # from the previous round's tip, so a redo can revert what the
+        # audit objected to.
+        redo: RedoContext | None = None
+        outcome: ShardOutcome | None = None
+        unsafe = False
+        for round_index in range(
+            1, max(1, config.analyze_fails.max_investigation_rounds) + 1,
+        ):
+            if round_index > 1:
+                console.print(
+                    f"    [magenta]↻ round {round_index}[/magenta] "
+                    "[dim](re-investigating with the audit's "
+                    "findings)[/dim]"
                 )
-                console.print(f"    [red]✗[/red] {msg}")
-                result.outcomes.append(ShardOutcome(
-                    category=category, shard_context=shard_ctx,
-                    target_url=target_url, test_count=len(tests),
-                    classification="UNRESOLVED",
-                    summary=msg,
-                    narration=narration,
-                    cost_usd=cost,
-                ))
-                result.shards_unresolved += 1
-                result.shards_processed += 1
-                # Stop — local branch state is unsafe for further shards.
+            try:
+                prompt = _render_shard_prompt(
+                    config, repo_path, pr_url, pr_number,
+                    head_ref, base_ref, shard_ctx, target_url, category,
+                    tests, flaky_map, baseline, baseline_note, redo,
+                )
+            except FileNotFoundError as exc:
+                result.error = str(exc)
+                return result
+
+            outcome, new_sha, unsafe = _run_investigation_round(
+                config, repo_path, prompt, start_sha,
+                category=category, shard_ctx=shard_ctx,
+                target_url=target_url, test_count=len(tests),
+            )
+            outcome.round_index = round_index
+            result.outcomes.append(outcome)
+            if unsafe:
                 break
 
-        token, summary = _classify_outcome(narration)
-        commits_added_this_shard = 0
-        if new_sha != start_sha:
-            rev_count = run_git(
-                ["rev-list", "--count", f"{start_sha}..{new_sha}"],
-                repo_path, check=False,
-            )
-            try:
-                commits_added_this_shard = int(
-                    (rev_count.stdout or "0").strip()
+            if new_sha != start_sha and outcome.classification == "UNRELATED":
+                result.warnings.append(
+                    f"{shard_ctx}: AI declared UNRELATED but moved HEAD "
+                    f"from {start_sha[:10]} to {new_sha[:10]}; commits "
+                    "kept locally."
                 )
-            except ValueError:
-                commits_added_this_shard = 0
-        result.outcomes.append(ShardOutcome(
-            category=category, shard_context=shard_ctx,
-            target_url=target_url, test_count=len(tests),
-            classification=token, summary=summary,
-            narration=narration,
-            cost_usd=cost,
-            commits_added=commits_added_this_shard,
-        ))
-        result.shards_processed += 1
-        marker = {
-            "DONE": ("[green]✓[/green]", "shards_done"),
-            "PARTIAL": ("[yellow]◐[/yellow]", "shards_partial"),
-            "UNRELATED": ("[yellow]→[/yellow]", "shards_unrelated"),
-            "UNRESOLVED": ("[red]✗[/red]", "shards_unresolved"),
-        }.get(token, ("[red]✗[/red]", "shards_unresolved"))
-        setattr(result, marker[1], getattr(result, marker[1]) + 1)
-        cost_note = f" [dim](cost ${cost:.4f})[/dim]" if cost else ""
-        commit_note = (
-            f" [dim]+{commits_added_this_shard} commit(s)[/dim]"
-            if commits_added_this_shard else ""
-        )
-        console.print(
-            f"    {marker[0]} {token}{commit_note}{cost_note}"
-        )
+            # Walk the linear-history baseline forward: later rounds and
+            # later shards baseline against the now-extended tip.
+            round_start_sha, start_sha = start_sha, new_sha
 
-        if new_sha != start_sha and token == "UNRELATED":
-            result.warnings.append(
-                f"{shard_ctx}: AI declared UNRELATED but moved HEAD "
-                f"from {start_sha[:10]} to {new_sha[:10]}; commits "
-                "kept locally."
+            _audit_shard_outcome(
+                config, repo_path, result, outcome,
+                pr_url=pr_url, pr_number=pr_number, pr_branch=head_ref,
+                base_branch=base_ref, category=category, tests=tests,
+                baseline=baseline, flaky_map=flaky_map,
+                commit_range=(
+                    f"{round_start_sha}..{new_sha}"
+                    if new_sha != round_start_sha else ""
+                ),
+            )
+            if not outcome.disputed:
+                break
+            if round_index >= config.analyze_fails.max_investigation_rounds:
+                result.warnings.append(
+                    f"{shard_ctx}: still disputed after {round_index} "
+                    "round(s) — left for a human."
+                )
+                break
+            if result.audit_mutated_repo:
+                # The work-dir is no longer trustworthy; a redo would
+                # build on it.
+                break
+            outcome.superseded = True
+            redo = RedoContext(
+                round_index=round_index,
+                classification=outcome.classification,
+                commits_added=outcome.commits_added,
+                commit_range=(
+                    f"{round_start_sha}..{new_sha}"
+                    if new_sha != round_start_sha else ""
+                ),
+                audit_summary=outcome.verify_summary,
+                audit_findings=list(outcome.verify_findings),
             )
 
-        # Walk the linear-history baseline forward so later shards
-        # baseline against the now-extended branch tip.
-        start_sha = new_sha
+        if outcome is not None:
+            result.shards_processed += 1
+            _tally_outcome(result, outcome)
+        if unsafe:
+            # Stop — local branch state is unsafe for further shards.
+            break
 
     final_head = run_git(
         ["rev-parse", "--verify", "HEAD"], repo_path, check=False,
@@ -1208,7 +1908,14 @@ def _process_pr(
         except ValueError:
             result.commits_added = 0
 
-    if result.commits_added > 0 and push:
+    if result.commits_added > 0 and result.audit_mutated_repo:
+        result.error = (
+            "the read-only auditor modified the work-dir, so the "
+            f"{result.commits_added} new commit(s) on {head_ref} are not "
+            "what was audited — refusing to push. Inspect the work-dir."
+        )
+        console.print(f"  [red]✗[/red] {result.error}")
+    elif result.commits_added > 0 and push:
         push_res = run_git(
             ["push", config.origin.remote_name, head_ref],
             repo_path, check=False,
@@ -1284,6 +1991,9 @@ def _trim_narration_for_comment(narration: str) -> str:
 def _format_pr_comment(run: PRRunResult) -> str:
     """Build the markdown body posted to the PR after a per-PR run."""
     overall = (
+        # A shard whose audit still stands rejected is never a clean
+        # result, whatever the session concluded.
+        "DISPUTED" if run.open_disputes else
         "DONE" if run.shards_unresolved == 0 and run.shards_partial == 0
         and run.shards_done > 0 and run.shards_processed > 0 else
         "PARTIAL" if run.shards_done > 0 or run.shards_partial > 0 else
@@ -1304,13 +2014,41 @@ def _format_pr_comment(run: PRRunResult) -> str:
         f"_run completed at {_utc_now_iso()}_",
         "",
         f"- **Head SHA:** `{run.head_sha[:10]}` (`{run.head_ref}`)",
+        f"- **Failed CI checks:** {run.statuses_failed}",
         f"- **Tests considered:** {run.tests_total} across "
         f"{run.shards_total} CI shard(s)",
+        (
+            f"- **Baseline (`{run.baseline_sha[:10]}`, "
+            f"{run.baseline_committed_at}, before this PR):** "
+            f"{run.tests_pre_existing} of {run.tests_total} failure(s) "
+            "were already red there"
+            if run.baseline_sha else
+            f"- **Baseline:** none available — {run.baseline_note}"
+            if run.baseline_note else
+            "- **Baseline:** none available"
+        ),
         f"- **Outcomes:** "
         f"{run.shards_done} done · "
         f"{run.shards_partial} partial · "
         f"{run.shards_unrelated} unrelated · "
         f"{run.shards_unresolved} unresolved",
+        (
+            f"- **Second opinion:** {run.shards_audited} audit(s) by an "
+            "independent session"
+            + (
+                f"; {run.shards_disputed - run.open_disputes} dispute(s) "
+                "sent back for re-investigation and settled"
+                if run.shards_disputed > run.open_disputes else ""
+            )
+            + (
+                f"; **{run.open_disputes} still disputed** — read the "
+                "findings below before trusting this run."
+                if run.open_disputes else "; nothing left disputed."
+            )
+            if run.shards_audited else
+            "- **Second opinion:** no shard was in doubt (nothing "
+            "committed, and the evidence backs each verdict)."
+        ),
         f"- **Commits added by AI:** {run.commits_added} ({pushed_note})",
         f"- **Anthropic cost:** {cost_note}",
     ]
@@ -1322,6 +2060,17 @@ def _format_pr_comment(run: PRRunResult) -> str:
             lines.append(f"  - {w}")
         if len(run.warnings) > 5:
             lines.append(f"  - …(+{len(run.warnings) - 5} more)")
+    if run.covered_elsewhere:
+        lines.append(
+            "- **Checks covered by another shard** (same failures, "
+            "investigated once):"
+        )
+        for c in run.covered_elsewhere[:10]:
+            lines.append(f"  - {c}")
+        if len(run.covered_elsewhere) > 10:
+            lines.append(
+                f"  - …(+{len(run.covered_elsewhere) - 10} more)"
+            )
     lines.append("")
 
     if not run.outcomes:
@@ -1339,6 +2088,10 @@ def _format_pr_comment(run: PRRunResult) -> str:
                 "UNRELATED": "⏭️ UNRELATED",
                 "UNRESOLVED": "❌ UNRESOLVED",
             }.get(o.classification, f"❓ {o.classification}")
+            if o.disputed:
+                badge = f"⚠️ {o.classification} — DISPUTED"
+            if o.superseded:
+                badge = f"↻ {o.classification} — REDONE"
             commit_note = (
                 f" — **+{o.commits_added} commit(s)**"
                 if o.commits_added else ""
@@ -1347,10 +2100,21 @@ def _format_pr_comment(run: PRRunResult) -> str:
                 f" — cost ${o.cost_usd:.4f}"
                 if o.cost_usd else ""
             )
+            round_note = (
+                f" (round {o.round_index})" if o.round_index > 1
+                or o.superseded else ""
+            )
             lines.append(
-                f"### {badge} — `{o.shard_context}`"
+                f"### {badge} — `{o.shard_context}`{round_note}"
             )
             lines.append("")
+            if o.superseded:
+                lines.append(
+                    "_Superseded: the audit rejected this round, and a "
+                    "fresh investigator was given its findings. The "
+                    "shard's verdict is the round below._"
+                )
+                lines.append("")
             lines.append(
                 f"_{o.test_count} failed test(s) considered{commit_note}{cost_per}_"
             )
@@ -1358,6 +2122,31 @@ def _format_pr_comment(run: PRRunResult) -> str:
                 f"[full report]({o.target_url})"
             )
             lines.append("")
+            if o.verify_reason:
+                verdict_note = {
+                    "needs_attention": "⚠️ **disputes it**",
+                    "ok": "✅ agrees",
+                }.get(
+                    o.verify_verdict or "",
+                    "❓ reached no verdict (advisory only)",
+                )
+                lines.append(
+                    f"**Second opinion** — audited because "
+                    f"{o.verify_reason}; an independent session "
+                    f"{verdict_note}."
+                )
+                lines.append("")
+                if o.verify_summary:
+                    lines.append(f"> {o.verify_summary}")
+                    lines.append("")
+                for f in o.verify_findings[:10]:
+                    lines.append(f"- {f}")
+                if len(o.verify_findings) > 10:
+                    lines.append(
+                        f"- …(+{len(o.verify_findings) - 10} more)"
+                    )
+                if o.verify_findings:
+                    lines.append("")
             lines.append("<details><summary>AI narration</summary>")
             lines.append("")
             lines.append(_trim_narration_for_comment(o.narration))
@@ -1408,6 +2197,23 @@ def _attribute_cost_to_feature(
             fs.ai_cost_usd = (fs.ai_cost_usd or 0.0) + cost_usd
             return fid
     return None
+
+
+def _apply_verify_label(config: Config, pr_url: str) -> None:
+    """Best-effort ``verify_label`` on a PR whose audit found something."""
+    parsed = parse_pr_url(pr_url)
+    if parsed is None:
+        return
+    label = config.analyze_fails.verify_label
+    ensure_label(
+        config, label, config.analyze_fails.verify_label_color,
+        "An independent audit disputed the AI's CI-failure analysis",
+    )
+    if add_label_to_pr(config, parsed[2], label):
+        console.print(
+            f"  [yellow]🔎[/yellow] labelled PR [yellow]{label}[/yellow] "
+            "[dim](second opinion disputed a shard)[/dim]"
+        )
 
 
 def _post_pr_comment(
@@ -1512,6 +2318,8 @@ def run_analyze_fails_pass(
             push=push and not dry_run, dry_run=dry_run,
         )
         runs.append(run)
+        if run.open_disputes and not dry_run:
+            _apply_verify_label(config, run.pr_url)
         # Accumulate cost on the matching FeatureState so the next
         # state-save (whoever's driving us) reflects the spend. No-op
         # for stateless / dry-run / unmatched PRs.

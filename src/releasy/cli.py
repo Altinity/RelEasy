@@ -1410,6 +1410,15 @@ def _maybe_sync_graph_progress(
          "that cross-references failures against other tracked PRs.",
 )
 @click.option(
+    "--no-baseline-check",
+    "no_baseline_check",
+    is_flag=True,
+    default=False,
+    help="(--analyze-fails only) Skip the pre-change comparison "
+         "against the last CI run on the target branch that predates "
+         "the PR. Overrides analyze_fails.baseline_check.",
+)
+@click.option(
     "--post-comment/--no-post-comment",
     "post_comment_flag",
     default=None,
@@ -1445,6 +1454,7 @@ def refresh(
     address_review_flag: bool,
     analyze_fails_flag: bool,
     no_flaky_check: bool,
+    no_baseline_check: bool,
     post_comment_flag: bool | None,
     dry_run: bool,
 ) -> None:
@@ -1623,6 +1633,8 @@ def refresh(
         config.session = None
         config.stateless = True
         config.dry_run = dry_run
+        if no_baseline_check:
+            config.analyze_fails.baseline_check = False
         if not resolve_conflicts_for_pr(
             config, pr_url, wd, resolve_conflicts=ai_resolve_flag,
             force_merge=merge_target,
@@ -1641,6 +1653,8 @@ def refresh(
     if pr_url is None:
         with _locked_config(ctx, session="optional") as config:
             config.dry_run = dry_run
+            if no_baseline_check:
+                config.analyze_fails.baseline_check = False
             ok = refresh_tracked_prs(
                 config, wd, resolve_conflicts=ai_resolve_flag,
                 only=only_filter, force_merge=merge_target,
@@ -1658,6 +1672,8 @@ def refresh(
 
     with _locked_config(ctx, session="optional") as config:
         config.dry_run = dry_run
+        if no_baseline_check:
+            config.analyze_fails.baseline_check = False
         if not resolve_conflicts_for_pr(
             config, pr_url, wd, resolve_conflicts=ai_resolve_flag,
             force_merge=merge_target,
@@ -1703,6 +1719,15 @@ def refresh(
          "other tracked PRs to corroborate flake signals). Faster, "
          "but Claude has to judge unrelated-vs-related from the diff "
          "alone.",
+)
+@click.option(
+    "--no-baseline-check",
+    is_flag=True,
+    default=False,
+    help="Skip the pre-change comparison (don't read the last CI run "
+         "on the target branch that predates the PR). Faster, but "
+         "Claude loses the strongest unrelated-vs-related signal "
+         "there is. Overrides analyze_fails.baseline_check.",
 )
 @click.option(
     "--post-comment/--no-post-comment",
@@ -1806,6 +1831,7 @@ def analyze_fails_cmd(
     dry_run: bool,
     push: bool,
     no_flaky_check: bool,
+    no_baseline_check: bool,
     post_comment: bool | None,
     stateless: bool,
     origin_url: str | None,
@@ -1958,6 +1984,8 @@ def analyze_fails_cmd(
         config.session = None
         config.stateless = True
         config.dry_run = dry_run
+        if no_baseline_check:
+            config.analyze_fails.baseline_check = False
         result = analyze_fails(
             config, pr_url=pr_url, work_dir=wd, dry_run=dry_run,
             push=push, no_flaky_check=no_flaky_check,
@@ -1976,6 +2004,8 @@ def analyze_fails_cmd(
         # Multi-PR mode needs the state file to enumerate tracked PRs.
         with _locked_config(ctx, session="optional") as config:
             config.dry_run = dry_run
+            if no_baseline_check:
+                config.analyze_fails.baseline_check = False
             result = analyze_fails(
                 config, pr_url=None, work_dir=wd, dry_run=dry_run,
                 push=push, no_flaky_check=no_flaky_check,
@@ -1989,6 +2019,8 @@ def analyze_fails_cmd(
 
     with _locked_config(ctx, session="skip") as config:
         config.dry_run = dry_run
+        if no_baseline_check:
+            config.analyze_fails.baseline_check = False
         result = analyze_fails(
             config, pr_url=pr_url, work_dir=wd, dry_run=dry_run,
             push=push, no_flaky_check=no_flaky_check,
