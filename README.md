@@ -29,6 +29,7 @@ All commands need `RELEASY_GITHUB_TOKEN`. The first group works anywhere
 - CI is red — let AI triage failing tests → `releasy analyze-fails` (or `releasy refresh --analyze-fails`)
 - Re-port all rebase PRs onto a different target → `releasy rebase --target <branch>`
 - Discard a broken local-only branch with no PR yet → `releasy clear <id>`
+- A merged port was reverted on target; never port it again → `releasy mark-reverted --branch <id>`
 - See where everything stands → `releasy status`
 - Draft the GitHub release notes → `releasy draft-release --from <tag> --to <branch> --name <name>`
 

@@ -804,6 +804,40 @@ def _unmet_deps(unit: FeatureUnit, state: PipelineState) -> list[str]:
     return unmet
 
 
+# Terminal statuses a ``pr_policy.recreate_*`` flag can opt back in, and
+# what to tell the user when it does. Both re-attempt the port on a
+# renumbered branch (``<canonical>-1`` / ``-2`` / …) because the canonical
+# one already carries a dead PR.
+_RECREATABLE: dict[str, tuple[str, str]] = {
+    "closed": ("Rebase PR closed without merge", "recreate_closed_prs"),
+    "reverted": ("Port was reverted on target", "recreate_reverted_prs"),
+}
+
+
+def terminal_statuses(config: Config) -> set[str]:
+    """Statuses ``releasy run`` will not re-enter, given the opt-ins.
+
+    ``merged`` / ``skipped`` / ``superseded`` are always terminal.
+    ``closed`` and ``reverted`` are terminal until their flag in
+    :class:`~releasy.config.PRPolicyConfig` says otherwise — without it
+    we'd waste a cherry-pick on a port somebody already decided against
+    (closed) or deliberately took back out of the branch (reverted).
+    """
+    terminal = {"merged", "skipped", "superseded"}
+    for status, (_, flag) in _RECREATABLE.items():
+        if not getattr(config.pr_policy, flag):
+            terminal.add(status)
+    return terminal
+
+
+def _recreate_opt_in(config: Config, status: str | None) -> tuple[str, str] | None:
+    """``(why, flag_name)`` when ``status`` is opted back in, else ``None``."""
+    entry = _RECREATABLE.get(status or "")
+    if entry is None or not getattr(config.pr_policy, entry[1]):
+        return None
+    return entry
+
+
 def _refresh_all_merge_status_from_github(
     config: Config, state: PipelineState,
 ) -> int:
@@ -1393,16 +1427,11 @@ def run_pipeline(
         # or after the merged-status sweep promoted a unit would re-cherry-
         # pick source PRs whose port is already merged.
         #
-        # ``closed`` is also terminal — the rebase PR was closed without
-        # merging — but ``pr_policy.recreate_closed_prs`` opts back in: the
-        # renumbered-branch path in ``_process_feature_unit`` re-attempts
-        # the port on ``<canonical>-1`` / ``-2`` / … . Without that flag,
-        # closed entries stay terminal so we don't waste a cherry-pick on
-        # a PR the user (or someone else) already decided against.
+        # ``closed`` and ``reverted`` are terminal too unless their
+        # ``pr_policy.recreate_*`` flag opts back in — see
+        # :func:`terminal_statuses`.
         prev_fs = state.features.get(unit.feature_id)
-        terminal = {"merged", "skipped", "superseded"}
-        if not config.pr_policy.recreate_closed_prs:
-            terminal.add("closed")
+        terminal = terminal_statuses(config)
         if prev_fs is not None and prev_fs.status in terminal:
             primary = unit.primary_pr()
             origin_slug = get_origin_repo_slug(config)
@@ -1423,7 +1452,9 @@ def run_pipeline(
                         f"{prev_fs.rebase_pr_url}[/link][/dim]"
                     )
                 if (
-                    prev_fs.status in ("skipped", "closed", "superseded")
+                    prev_fs.status in (
+                        "skipped", "closed", "superseded", "reverted",
+                    )
                     and prev_fs.skip_reason
                 ):
                     console.print(
@@ -1705,9 +1736,7 @@ def run_sequential(
         primary = unit.primary_pr()
         ref = pr_ref_label(primary.repo_slug, primary.number, origin_slug)
 
-        seq_terminal = {"merged", "skipped", "superseded"}
-        if not config.pr_policy.recreate_closed_prs:
-            seq_terminal.add("closed")
+        seq_terminal = terminal_statuses(config)
         if fs is not None and fs.status in seq_terminal:
             console.print(
                 f"  [dim]{unit.feature_id} ({ref}) — {fs.status}, skipping[/dim]"
@@ -2981,6 +3010,8 @@ def _process_feature_unit(
     ``pr_policy.recreate_closed_prs`` allocates ``feature/.../<id>-1``,
     ``-2``, … when the stored ``rebase_pr_url`` PR was closed without merging,
     then runs the normal cherry-pick + push + open-PR path for that name.
+    ``pr_policy.recreate_reverted_prs`` does the same for a port that
+    merged and was then reverted on target.
     """
     origin_slug = get_origin_repo_slug(config)
     canonical_branch = config.feature_branch_name(unit.feature_id, onto)
@@ -3159,23 +3190,26 @@ def _process_feature_unit(
     # The merge-status sweep at the top of every run / refresh / continue
     # has already promoted closed-on-GitHub PRs to ``status="closed"``,
     # so the local status IS the source of truth here — no GitHub call.
-    prev_was_closed = (
-        prev_state is not None and prev_state.status == "closed"
+    # Terminal-but-opted-back-in (``closed`` / ``reverted``): the canonical
+    # port branch already carries a dead PR, so the retry needs a fresh
+    # name — and must not take the "rebase PR already open" exit below.
+    # The run gate only lets these through when the flag is on; the check
+    # here is belt-and-braces for other callers.
+    recreate = _recreate_opt_in(
+        config, prev_state.status if prev_state is not None else None,
     )
+    prev_was_dead = recreate is not None
 
     new_branch = canonical_branch
-    if (
-        config.pr_policy.recreate_closed_prs
-        and not force_retry
-        and prev_was_closed
-    ):
+    if recreate is not None and not force_retry:
+        why, flag = recreate
         new_branch = _next_free_renumbered_port_branch(
             repo_path, remote, canonical_branch,
         )
         console.print(
-            f"\n    [yellow]↻[/yellow] Rebase PR closed without merge — "
+            f"\n    [yellow]↻[/yellow] {why} — "
             f"opening a new port branch [cyan]{new_branch}[/cyan] "
-            "([cyan]pr_policy.recreate_closed_prs[/cyan])"
+            f"([cyan]pr_policy.{flag}[/cyan])"
         )
 
     on_remote = remote_branch_exists(repo_path, new_branch, remote)
@@ -3195,7 +3229,7 @@ def _process_feature_unit(
         and prev_state is not None
         and prev_state.rebase_pr_url
         and unit.if_exists != "append"
-        and not prev_was_closed
+        and not prev_was_dead
     ):
         console.print(
             f"\n    [dim]{new_branch} ({label}) — rebase PR already "
@@ -6091,6 +6125,11 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
             console.print(f"{header} — [dim]superseded: {reason}[/dim]")
             continue
 
+        if fs.status == "reverted":
+            reason = fs.skip_reason or "port reverted on target"
+            console.print(f"{header} — [dim]reverted: {reason}[/dim]")
+            continue
+
         # AI-gave-up flavour of conflict (partial group / dropped
         # singleton) — these have an explicit human-action checkpoint
         # (the draft PR or the source PR), so we never auto-flip them
@@ -6319,6 +6358,51 @@ def skip_branch(config: Config, branch_name: str) -> bool:
     clear_conflict_markers(state.features[feat.id])
     _persist_state(config, state)
     console.print(f"[yellow]⏭[/yellow] Feature [cyan]{feat.id}[/cyan] skipped")
+    return True
+
+
+def mark_reverted(
+    config: Config, branch_name: str, reason: str | None = None,
+) -> bool:
+    """Record that a merged port was reverted on the target branch.
+
+    State-only: git and the port PR are untouched — the revert itself is
+    the user's, already on target. The entry becomes unconditionally
+    terminal, so no later `run` / `refresh` re-ports it and no sweep
+    flips it back (they only look at in-flight statuses).
+    """
+    state = load_state(config)
+    feat = _resolve_branch_target(config, state, branch_name)
+
+    if feat is None:
+        console.print(f"[red]Unknown branch or feature: {branch_name}[/red]")
+        return False
+
+    fs = state.features.get(feat.id)
+    if fs is None:
+        console.print(f"[red]No state found for feature {feat.id}[/red]")
+        return False
+
+    if fs.status == "reverted":
+        console.print(
+            f"[dim]Feature [cyan]{feat.id}[/cyan] is already reverted: "
+            f"{fs.skip_reason or 'no reason recorded'}[/dim]"
+        )
+        return True
+
+    was = fs.status
+    fs.status = "reverted"
+    fs.skip_reason = reason or "port reverted on target — do not re-port"
+    clear_conflict_markers(fs)
+    _persist_state(config, state)
+    console.print(
+        f"[red]↩[/red] Feature [cyan]{feat.id}[/cyan] marked reverted "
+        f"(was {was}) — releasy will not port it again"
+    )
+    console.print(f"  [dim]{fs.skip_reason}[/dim]")
+    console.print(
+        "  [dim]Run `releasy graph sync` to state it on the graph issue.[/dim]"
+    )
     return True
 
 
@@ -6556,7 +6640,7 @@ def print_status(config: Config) -> None:
         "needs_review": "blue", "branch_created": "yellow",
         "conflict": "red", "skipped": "yellow",
         "blocked": "yellow", "closed": "bright_black",
-        "superseded": "bright_black",
+        "superseded": "bright_black", "reverted": "red",
     }
 
     origin_slug = get_origin_repo_slug(config)

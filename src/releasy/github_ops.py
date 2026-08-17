@@ -2812,6 +2812,7 @@ STATUS_OPTIONS = [
     "Merged",
     "Closed",
     "Superseded",
+    "Reverted",
 ]
 
 STATUS_COLORS = {
@@ -2823,6 +2824,7 @@ STATUS_COLORS = {
     "Merged": "GREEN",
     "Closed": "GRAY",
     "Superseded": "GRAY",
+    "Reverted": "RED",
 }
 
 
@@ -3135,6 +3137,7 @@ STATUS_MAP = {
     "merged": "Merged",
     "closed": "Closed",
     "superseded": "Superseded",
+    "reverted": "Reverted",
 }
 
 REST_API_URL = "https://api.github.com"

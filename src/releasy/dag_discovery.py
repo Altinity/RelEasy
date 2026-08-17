@@ -2669,12 +2669,13 @@ _PROGRESS_MARKER: dict[str, str] = {
     "blocked": "⏸ blocked",
     "closed": "⛔ PR closed unmerged",
     "superseded": "♻ superseded",
+    "reverted": "↩ reverted (do not re-port)",
 }
 
 # Order the progress summary lists status counts in.
 _PROGRESS_SUMMARY_ORDER: tuple[str, ...] = (
     "merged", "needs_review", "branch_created", "build_failed",
-    "conflict", "blocked", "closed", "superseded", "skipped",
+    "conflict", "blocked", "closed", "superseded", "reverted", "skipped",
 )
 
 _NOT_STARTED_MARKER = "⬜ not started"
@@ -2688,6 +2689,12 @@ _FOLDED_STATUSES: frozenset[str] = frozenset({"merged"})
 # empty cherry-pick) dropped it, or another PR already carried the change.
 # Units are listed in this order inside the section.
 _DISCARDED_STATUSES: tuple[str, ...] = ("closed", "skipped", "superseded")
+
+# ``reverted`` also leaves the working lists, but into a section of its
+# own, unfolded: it is the one terminal status that reverses a port that
+# had already landed, and the next person reading the graph has to see
+# that before they think about porting it again.
+_REVERTED_STATUS = "reverted"
 
 
 def build_progress_map(
@@ -2727,11 +2734,13 @@ def _unit_ported(fs: FeatureState | None) -> bool:
     Includes the draft PR of a partially-applied group. Neither ``closed``
     (the PR was rejected) nor ``superseded`` (someone else's PR carried the
     change) counts — the tally measures what *releasy* ported, and both are
-    listed under Discarded with their own markers.
+    listed under Discarded with their own markers. ``reverted`` doesn't
+    count either: the port landed and was then taken back out, so the
+    change is not in the target branch.
     """
     if fs is None:
         return False
-    if fs.status == "superseded":
+    if fs.status in ("superseded", _REVERTED_STATUS):
         return False
     return bool(fs.rebase_pr_url) and fs.status != "closed"
 
@@ -2787,6 +2796,8 @@ def _progress_note(fs: FeatureState | None, total: int, *, html: bool = False) -
             reason[len("superseded"):] if reason.startswith("superseded")
             else f": {reason}"
         )
+    elif fs.status == _REVERTED_STATUS and fs.skip_reason:
+        marker += f" · {fs.skip_reason}"
     elif fs.status == "conflict" and total > 1:
         marker += f" · {_picks_landed(fs, total)}/{total} picked"
     note = f" — {marker}"
@@ -2866,11 +2877,18 @@ def render_graph_issue_body(
          and progress[n.unit_id].status in _rank),
         key=lambda n: _rank[progress[n.unit_id].status],
     )
-    discarded_ids = {n.unit_id for n in discarded}
-    groups = [n for n in all_groups if n.unit_id not in discarded_ids]
+    # Reverted units leave the working lists too, but into their own
+    # unfolded section — see _REVERTED_STATUS.
+    reverted = [
+        n for n in report.nodes
+        if progress.get(n.unit_id) is not None
+        and progress[n.unit_id].status == _REVERTED_STATUS
+    ]
+    parked_ids = {n.unit_id for n in discarded} | {n.unit_id for n in reverted}
+    groups = [n for n in all_groups if n.unit_id not in parked_ids]
     singles = [
         n for n in report.nodes
-        if len(n.pr_urls) == 1 and n.unit_id not in discarded_ids
+        if len(n.pr_urls) == 1 and n.unit_id not in parked_ids
     ]
     headline = (
         f"**{report.candidate_unit_count} unit(s) across "
@@ -2883,6 +2901,11 @@ def render_graph_issue_body(
         headline += (
             f" {len(discarded)} terminal unit(s) sit under **Discarded** at "
             "the bottom."
+        )
+    if reverted:
+        headline += (
+            f" {len(reverted)} unit(s) were ported and then **reverted** on "
+            "target — see the Reverted section; do not port them again."
         )
     lines.append(headline)
     lines.append("")
@@ -2901,6 +2924,28 @@ def render_graph_issue_body(
 
     def _box(done: bool) -> str:
         return "[x]" if done else "[ ]"
+
+    def _parked_entry(n: DAGNode) -> list[str]:
+        """One bullet for a unit that left the working lists (no checkbox).
+
+        A group becomes a headed bullet with its member PRs beneath it;
+        a singleton is the one line. Used by Reverted and Discarded.
+        """
+        fs = progress.get(n.unit_id)
+        total = len(n.pr_urls)
+        if total == 1:
+            url = n.pr_urls[0]
+            return [
+                f"- [{_pr_short(url)}]({url}) "
+                f"{_title_of(n, 0)}".rstrip() + _progress_note(fs, 1)
+            ]
+        out = [f"- **`{n.unit_id}`** · {total} PRs" + _progress_note(fs, total)]
+        out += [
+            f"  {i + 1}. [{_pr_short(url)}]({url}) "
+            f"{_title_of(n, i)}".rstrip()
+            for i, url in enumerate(n.pr_urls)
+        ]
+        return out
 
     # --- Groups (port together, in order) ---
     if groups:
@@ -2943,6 +2988,25 @@ def render_graph_issue_body(
             )
         lines.append("")
 
+    # --- Reverted (merged, then taken back out of the target branch) ---
+    # Not folded, and not inside Discarded: those units releasy dropped on
+    # its own, while a revert is a decision a human made *after* the port
+    # landed. Anyone about to re-port one has to read that first.
+    if reverted:
+        lines.append("### ↩ Reverted — do NOT re-port")
+        lines.append("")
+        lines.append(
+            "Ported and merged, then the port was **reverted on "
+            f"`{report.base_branch}` deliberately**. These are terminal for "
+            "releasy: it will not port them again, and it will not reopen "
+            "the port PR. Re-add one only if whoever reverted it asks for "
+            "it — the revert had a reason."
+        )
+        lines.append("")
+        for n in reverted:
+            lines += _parked_entry(n)
+        lines.append("")
+
     # --- Discarded (closed / skipped / superseded + already-in-target) ---
     # No checkboxes here: nothing in this section is on the working list.
     # The section is its own foldable, shut by default. Each entry's marker
@@ -2956,24 +3020,7 @@ def render_graph_issue_body(
         lines.append(f"<summary>🗑 <b>Discarded</b> · {tally}</summary>")
         lines.append("")
         for n in discarded:
-            fs = progress.get(n.unit_id)
-            total = len(n.pr_urls)
-            if total > 1:
-                lines.append(
-                    f"- **`{n.unit_id}`** · {total} PRs"
-                    + _progress_note(fs, total)
-                )
-                for i, url in enumerate(n.pr_urls):
-                    lines.append(
-                        f"  {i + 1}. [{_pr_short(url)}]({url}) "
-                        f"{_title_of(n, i)}".rstrip()
-                    )
-            else:
-                url = n.pr_urls[0]
-                lines.append(
-                    f"- [{_pr_short(url)}]({url}) "
-                    f"{_title_of(n, 0)}".rstrip() + _progress_note(fs, 1)
-                )
+            lines += _parked_entry(n)
         lines.append("")
         # Dropped by discovery before they reached the graph — the report
         # keeps only their unit IDs (no PR URLs, no titles), so this is a

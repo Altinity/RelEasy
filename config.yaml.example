@@ -237,6 +237,13 @@ target_branch: antalya-26.3
 #     # (not merged), allocate `<canonical>-1`, `-2`, … for the port branch
 #     # name and cherry-pick + open a fresh PR. Off by default: a closed
 #     # rebase PR just leaves the branch skipped on subsequent runs.
+#   recreate_reverted_prs: false
+#     # Same renumbered-branch re-port, for an entry marked `reverted` by
+#     # `releasy mark-reverted` (the port merged, then was reverted on the
+#     # target branch). Its own knob, and off by default, because a revert
+#     # is a stronger signal than a closed PR: somebody read the landed
+#     # code and took it back out. Turn it on only where reverts are
+#     # routine churn rather than a verdict.
 #   detect_superseded: true
 #     # When true (default), the refresh / run sweeps scan the target
 #     # branch's recent git history AND open PRs targeting the same base

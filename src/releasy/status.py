@@ -20,6 +20,7 @@ STATUS_ICONS: dict[str, str] = {
     "blocked": "\u23f8 blocked",
     "closed": "\u26d4 closed",
     "superseded": "\u267b superseded",
+    "reverted": "\u21a9 reverted",
 }
 
 STATUS_HEADINGS: dict[str, str] = {
@@ -32,4 +33,5 @@ STATUS_HEADINGS: dict[str, str] = {
     "blocked": "Blocked \u2014 waiting on depends_on units",
     "closed": "Closed \u2014 rebase PR closed without merging",
     "superseded": "Superseded \u2014 another PR already cherry-picks the source",
+    "reverted": "Reverted \u2014 port merged, then reverted on target (never re-ported)",
 }

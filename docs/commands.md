@@ -19,6 +19,7 @@ config they read, see [configuration.md](configuration.md).
   [`continue`](#releasy-continue) ·
   [Sequential mode](#sequential-mode) ·
   [`skip`](#releasy-skip) ·
+  [`mark-reverted`](#releasy-mark-reverted) ·
   [`abort`](#releasy-abort) ·
   [`clear`](#releasy-clear)
 - One-off porting:
@@ -94,7 +95,8 @@ refines that graph from issue comments (no git);
 [`graph sync`](#releasy-graph-sync) pushes port progress back to the issue
 as checkboxes (`run` / `refresh` do it for you).
 
-The rest ([`skip`](#releasy-skip), [`abort`](#releasy-abort),
+The rest ([`skip`](#releasy-skip),
+[`mark-reverted`](#releasy-mark-reverted), [`abort`](#releasy-abort),
 [`status`](#releasy-status), board-sync, release, feature) never touch git
 history.
 
@@ -465,6 +467,7 @@ PR unticks the box again; `superseded` counts as done. Markers:
 | `🔴 conflict` | Unresolved (`· n/m picked` for a partial group) |
 | `⏸ blocked` | Waiting on `depends_on` units (named inline) |
 | `⛔ PR closed unmerged` · `♻ superseded` · `⏭ skipped` | Terminal |
+| `↩ reverted (do not re-port)` | Merged, then reverted on target — terminal |
 | `⬜ not started` | No state entry yet |
 
 **Each group is a foldable `<details>` block** headed by its unit ID, PR count
@@ -472,7 +475,16 @@ and status marker. Merged (and `superseded`) groups are folded shut — the work
 is done, there's nothing to read; everything else stays expanded. Standalone
 PRs are one line each and stay plain checkboxes.
 
-Two more foldables sit at the bottom, **both shut by default**:
+**↩ Reverted** is its own section, and the only one at the bottom that is
+**not** folded: these units were ported, merged, and then reverted on the
+target branch deliberately ([`releasy mark-reverted`](#releasy-mark-reverted)).
+A revert is a decision someone made *after* the port landed, so it does not
+belong in Discarded — where everything was dropped by releasy itself — and
+anyone about to re-port the change has to read it first. Entries carry the
+recorded reason and a link to the port PR, and don't count as ported: the
+change is not in the target branch.
+
+Two foldables sit below it, **both shut by default**:
 
 **🗑 Discarded** collects every unit releasy will do no more work on, moved
 out of the lists above and listed with the marker that says why — `⛔ PR
@@ -774,6 +786,38 @@ Marks `skipped` so subsequent passes ignore it. Doesn't touch git.
 ```bash
 releasy skip --branch <branch-or-feature-id>
 ```
+
+### `releasy mark-reverted`
+
+*Record that a merged port was reverted on the target branch.*
+
+For the port that landed and was then reverted on purpose. Marks the entry
+`reverted`: `run` and `refresh` leave it alone, `pr_policy.recreate_closed_prs`
+does not reach it, and no sweep flips it back (they only look at in-flight
+entries). Only
+[`pr_policy.recreate_reverted_prs`](configuration.md#reference) — its own knob,
+off by default — re-ports it, on a renumbered branch. `graph sync` then states
+the revert in the graph issue's own **↩ Reverted** section, so the next person
+reading the graph sees it before they think about re-porting.
+
+State-only — git and the port PR are untouched; the revert is already yours.
+
+```bash
+releasy mark-reverted --branch <branch-or-feature-id> [--reason <text>]
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--branch <id>` | Branch name or feature ID whose port was reverted. | required |
+| `--reason <text>` | Why. Shown by `status` and on the graph issue — cite the revert PR here. | `port reverted on target — do not re-port` |
+
+```bash
+releasy mark-reverted --branch pr-1806 \
+  --reason "port PR #2148 merged, then reverted by #2217"
+```
+
+To undo it — the revert was itself a mistake — edit the entry's `status:` in
+the state file (`releasy where` prints the path) back to `merged`.
 
 ### `releasy abort`
 

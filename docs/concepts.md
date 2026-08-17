@@ -100,6 +100,7 @@ After conflicts:
 | Mark a manually-resolved port branch as done | [`releasy continue`](commands.md#releasy-continue) |
 | Resolve target-drift conflicts on an open rebase PR | [`releasy refresh`](commands.md#releasy-refresh) |
 | Drop a port from this run | [`releasy skip`](commands.md#releasy-skip) |
+| Record that a merged port was reverted on target | [`releasy mark-reverted`](commands.md#releasy-mark-reverted) |
 | Resync the GitHub Project board | [`releasy project push`](commands.md#releasy-project-push) |
 
 **Status semantics:** clean or AI-resolved port with rebase PR open →
@@ -108,7 +109,11 @@ After conflicts:
 → `closed` (terminal — `pr_policy.recreate_closed_prs` lets a fresh
 `<canonical>-1` / `-2` / … attempt opt back in). Another PR on the same
 base already cherry-picks the source(s) → `superseded` (terminal — gated
-by `pr_policy.detect_superseded`). AI involvement is signalled by
+by `pr_policy.detect_superseded`). Merged and then reverted on target →
+`reverted` (terminal, set only by
+[`releasy mark-reverted`](commands.md#releasy-mark-reverted); re-porting
+would undo a human decision, so it takes its own opt-in,
+`pr_policy.recreate_reverted_prs`). AI involvement is signalled by
 `ai_resolved` + the `ai-resolved` PR label.
 
 For per-PR hints to the resolver, see

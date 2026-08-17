@@ -37,6 +37,7 @@ target_branch: antalya-26.3         # when set, --onto becomes optional
 #   auto_pr: true
 #   retry_failed: true
 #   recreate_closed_prs: false
+#   recreate_reverted_prs: false
 #   detect_superseded: true
 ```
 
@@ -187,6 +188,7 @@ Options live in `config.yaml` unless marked **(session)**.
 | `pr_policy.if_exists` | What to do with an existing port branch: `skip` (leave it) / `recreate` (rebuild from base — only if no rebase PR open yet) / `append` (cherry-pick declared PRs not yet on the branch). | `skip` |
 | `pr_policy.retry_failed` | Revisit `conflict` entries per their `if_exists`. Override per-run with `--retry-failed`/`--no-retry-failed`. | `true` |
 | `pr_policy.recreate_closed_prs` | If a rebase PR is closed (not merged), allocate `<canonical>-1`, `-2`, … and open a fresh one. The closed entry stays terminal until this flag opts it back in. | `false` |
+| `pr_policy.recreate_reverted_prs` | Same renumbered-branch re-port for an entry marked [`reverted`](commands.md#releasy-mark-reverted) — the port merged, then was reverted on target. Separate from `recreate_closed_prs` and off by default: a closed PR was never in the branch, while a revert means someone took the landed code back out. | `false` |
 | `pr_policy.detect_superseded` | Each refresh / run sweeps the target branch's recent git log AND open PRs targeting the same base for `(cherry picked from commit <sha>)` footers citing any tracked entry's source PR. Matches mark the entry `superseded` — terminal, no more retries. | `true` |
 | `pr_policy.max_partial_continue_attempts` | How many times `run` auto-resumes a **partially-applied group** (a prior run landed some of the group's PRs, then a conflict — often an AI token/budget exhaustion — left a draft PR labelled `ai-needs-attention`). Each run appends the not-yet-applied PRs and re-resolves (no need to set `if_exists: append` by hand); after the cap it leaves the draft PR for manual help. Wins over `if_exists: recreate` — only terminal cases (closed PR, first-pick conflict) redo from base. `0` disables, restoring plain `if_exists` handling. | `2` |
 | `pr_policy.honor_stall_reasons` | Skip a unit whose recorded [stall](concepts.md#stall-reasons) can't clear on its own — waiting for another unit's PR to merge, or on a prereq nobody ports. Re-resolving those reaches the same verdict at full token price; the stall is dropped (and the unit retried) as soon as what it waits on changes. Override per run with `run --ignore-stalls`. | `true` |

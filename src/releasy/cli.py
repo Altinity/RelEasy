@@ -776,6 +776,39 @@ def skip(ctx: click.Context, branch: str) -> None:
             raise SystemExit(1)
 
 
+@cli.command(
+    name="mark-reverted",
+    short_help="Record that a merged port was reverted on target (state-only).",
+)
+@click.option(
+    "--branch", required=True,
+    help="Branch name or feature ID whose port was reverted",
+)
+@click.option(
+    "--reason", default=None,
+    help="Why it was reverted (shown in `status` and on the graph issue). "
+         "Cite the revert PR here.",
+)
+@click.pass_context
+def mark_reverted_cmd(
+    ctx: click.Context, branch: str, reason: str | None,
+) -> None:
+    """Mark a port as reverted on the target branch (state-only).
+
+    For a port that merged and was then reverted on purpose. The entry
+    becomes terminal: `run` and `refresh` leave it alone, and `graph sync`
+    states the revert in its own section of the graph issue. Only
+    `pr_policy.recreate_reverted_prs` (off by default) re-ports it — the
+    `closed` opt-in does not reach it. Nothing in git or on the PR is
+    touched — the revert is already yours.
+    """
+    from releasy.pipeline import mark_reverted
+
+    with _locked_config(ctx, session="skip") as config:
+        if not mark_reverted(config, branch, reason):
+            raise SystemExit(1)
+
+
 @cli.command(short_help="Persist state and exit (nothing rolled back).")
 @click.pass_context
 def abort(ctx: click.Context) -> None:

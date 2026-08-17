@@ -54,6 +54,14 @@ BranchStatus = Literal[
     # <sha>)`` footers citing our source SHAs. Like ``closed``, this is
     # gated by ``pr_policy.detect_superseded``.
     "superseded",
+    # Terminal: the port PR merged and was then reverted on the target
+    # branch on purpose. No sweep flips an entry into or out of it — it is
+    # set only by ``releasy mark-reverted`` — and ``recreate_closed_prs``
+    # does NOT reach it: a revert is a human decision that a re-port would
+    # undo, so it has its own opt-in, ``pr_policy.recreate_reverted_prs``
+    # (off by default), which re-ports on a renumbered branch exactly like
+    # a closed PR. The why lives in ``skip_reason``.
+    "reverted",
 ]
 PipelinePhase = Literal["init", "ports_done"]
 
@@ -253,6 +261,7 @@ STATUS_DISPLAY_ORDER: tuple[str, ...] = (
     "skipped",
     "closed",
     "superseded",
+    "reverted",
     "merged",
 )
 
@@ -403,10 +412,11 @@ class FeatureState:
     # every subsequent ``releasy run``. Stays ``False`` when
     # ``merged_label`` is unset in config.
     merged_label_applied: bool = False
-    # Free-form one-line explanation of why ``status == "skipped"``.
-    # Written by the pipeline (e.g. "already in target — empty cherry-pick")
-    # and surfaced by ``releasy status``. ``None`` for skips that predate
-    # the field or were applied without a reason.
+    # Free-form one-line explanation of why ``status`` is terminal —
+    # ``skipped``, ``closed``, ``superseded`` or ``reverted``. Written by
+    # the pipeline (e.g. "already in target — empty cherry-pick") and
+    # surfaced by ``releasy status``. ``None`` for skips that predate the
+    # field or were applied without a reason.
     skip_reason: str | None = None
     # Why this unit stopped short of a mergeable PR (see :class:`StallReason`).
     # Set on every non-clean exit path, cleared once the unit lands. Read by

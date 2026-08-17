@@ -313,8 +313,15 @@ def refresh_tracked_prs(
     candidates: list[tuple[str, FeatureState]] = []
     closed_count = 0
     superseded_count = 0
+    reverted_count = 0
     for fid, fs in state.features.items():
         if fs.status in ("skipped", "merged"):
+            continue
+        if fs.status == "reverted":
+            # Out of scope: the port merged and was reverted on target on
+            # purpose. Nothing to refresh — the PR is closed and staying
+            # that way. See state.BranchStatus docstring.
+            reverted_count += 1
             continue
         if fs.status == "closed":
             # Out of scope: rebase PR was closed without merging. The
@@ -341,6 +348,11 @@ def refresh_tracked_prs(
         console.print(
             f"  [dim]Skipping {superseded_count} entry/ies superseded by "
             "another PR targeting the same base.[/dim]"
+        )
+    if reverted_count:
+        console.print(
+            f"  [dim]Skipping {reverted_count} entry/ies whose port was "
+            "reverted on the target branch.[/dim]"
         )
 
     if only is not None:

@@ -226,6 +226,15 @@ class PRPolicyConfig:
     auto_pr: bool = True
     retry_failed: bool = True
     recreate_closed_prs: bool = False
+    # Re-port an entry marked ``reverted`` (port merged, then reverted on
+    # the target branch) on a renumbered port branch, same as
+    # ``recreate_closed_prs`` does for a closed PR. Separate knob, and off
+    # by default, because the two say different things: a closed PR was
+    # never in the branch, while a revert means somebody looked at the
+    # landed code and took it back out. Turn this on only for a base
+    # branch where reverts are routine churn — otherwise leave it off and
+    # re-port deliberately by clearing the entry's status by hand.
+    recreate_reverted_prs: bool = False
     # Detect tracked entries whose source PRs were already cherry-picked
     # by some OTHER PR (open or merged) targeting the same base branch,
     # and mark them ``status="superseded"`` so refresh / run stop wasting
@@ -1242,6 +1251,9 @@ def load_config(config_path: Path | None = None) -> Config:
         auto_pr=bool(pp_raw.get("auto_pr", True)),
         retry_failed=bool(pp_raw.get("retry_failed", True)),
         recreate_closed_prs=bool(pp_raw.get("recreate_closed_prs", False)),
+        recreate_reverted_prs=bool(
+            pp_raw.get("recreate_reverted_prs", False)
+        ),
         detect_superseded=bool(pp_raw.get("detect_superseded", True)),
         max_partial_continue_attempts=int(
             pp_raw.get("max_partial_continue_attempts", 2) or 0
@@ -1740,6 +1752,8 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         pp_data["retry_failed"] = pp.retry_failed
     if pp.recreate_closed_prs != pp_defaults.recreate_closed_prs:
         pp_data["recreate_closed_prs"] = pp.recreate_closed_prs
+    if pp.recreate_reverted_prs != pp_defaults.recreate_reverted_prs:
+        pp_data["recreate_reverted_prs"] = pp.recreate_reverted_prs
     if pp.detect_superseded != pp_defaults.detect_superseded:
         pp_data["detect_superseded"] = pp.detect_superseded
     if (
