@@ -2265,15 +2265,11 @@ def release(
 )
 @click.option(
     "--work-dir", default=None,
-    help="Working directory for the local clone used to resolve "
-         "--from / --to refs and dates.",
-)
-@click.option(
-    "--compared-to-url", default=None,
-    help="Override the URL used in the 'as compared to' header link. "
-         "When omitted, RelEasy links to the upstream release page if "
-         "--from looks like a tag and an upstream remote is configured, "
-         "otherwise to the origin commit page.",
+    help="Existing clone used to resolve --from / --to refs and dates. "
+         "When given, no config.yaml is needed: origin (and upstream, if "
+         "the clone has one) are read from its git remotes. Without it, "
+         "config.yaml supplies the origin remote and the work dir. An "
+         "explicit --config always wins.",
 )
 @click.option(
     "--docker-image-url", default=None,
@@ -2294,7 +2290,6 @@ def draft_release_cmd(
     release_title: str | None,
     output_file: Path | None,
     work_dir: str | None,
-    compared_to_url: str | None,
     docker_image_url: str | None,
 ) -> None:
     """Build a categorised release changelog from merged PRs.
@@ -2312,11 +2307,23 @@ def draft_release_cmd(
     on stdout. When ``--name`` is omitted and ``--to`` is not an actual
     tag, the draft's tag field is left blank instead of being defaulted
     to the commit / branch in ``--to``.
+
+    Needs no project: with ``--work-dir`` the origin (and upstream)
+    remote comes from that clone and no ``config.yaml`` is read. Without
+    it, ``config.yaml`` supplies both. An explicit ``--config`` wins over
+    ``--work-dir``.
     """
     from releasy.changelog import emit_changelog
+    from releasy.config import make_stateless_config_for_repo
 
-    config = _load_and_verify(ctx, session="skip")
     wd = Path(work_dir) if work_dir else None
+    if wd is not None and ctx.obj.get("config_path") is None:
+        try:
+            config = make_stateless_config_for_repo(wd)
+        except ValueError as exc:
+            raise click.ClickException(str(exc))
+    else:
+        config = _load_and_verify(ctx, session="skip")
 
     explicit_prs: list[str] = list(prs)
     if prs_file is not None:
@@ -2333,7 +2340,6 @@ def draft_release_cmd(
         display_title=release_title,
         output_file=output_file,
         work_dir=wd,
-        compared_to_url=compared_to_url,
         docker_image_url=docker_image_url,
         base_branch=base_branch,
         explicit_prs=explicit_prs or None,

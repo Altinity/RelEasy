@@ -28,7 +28,7 @@ from releasy.git_ops import (
     first_parent_pr_numbers,
     is_ancestor,
     is_tag_ref,
-    resolve_ref,
+    resolve_ref_prefer_remote,
     run_git,
 )
 from releasy.github_ops import (
@@ -815,22 +815,15 @@ def _looks_like_tag(ref: str) -> bool:
 
 def _resolve_compared_to(
     config: Config,
-    repo_path: Path,
     from_ref: str,
-    explicit_url: str | None,
-) -> tuple[str, str | None, str | None]:
-    """Return (label, sha_or_none, url_or_none) for the comparison anchor.
+    sha: str,
+) -> tuple[str, str | None]:
+    """Return (label, url_or_none) for the comparison anchor.
 
-    If ``explicit_url`` was supplied, it wins. Otherwise, when the
-    upstream remote is configured and ``from_ref`` resolves to a tag on
-    upstream, link to the upstream release page; failing that, link to
-    the origin commit page.
+    When the upstream remote is configured and ``from_ref`` resolves to
+    a tag on upstream, link to the upstream release page; failing that,
+    link to the origin commit page.
     """
-    sha = resolve_ref(repo_path, from_ref)
-
-    if explicit_url:
-        return from_ref, sha, explicit_url
-
     # Try upstream tag link.
     if config.upstream and _looks_like_tag(from_ref):
         upstream_remote = config.upstream.remote
@@ -842,16 +835,16 @@ def _resolve_compared_to(
         if m:
             slug = f"{m.group(1)}/{m.group(2)}"
             return (
-                from_ref, sha,
+                from_ref,
                 f"https://github.com/{slug}/releases/tag/{from_ref}",
             )
 
     # Origin commit link.
     origin_slug = get_origin_repo_slug(config)
-    if origin_slug and sha:
-        return from_ref, sha, f"https://github.com/{origin_slug}/commit/{sha}"
+    if origin_slug:
+        return from_ref, f"https://github.com/{origin_slug}/commit/{sha}"
 
-    return from_ref, sha, None
+    return from_ref, None
 
 
 # ---------------------------------------------------------------------------
@@ -867,7 +860,6 @@ def build_changelog(
     release_name: str,
     display_title: str | None = None,
     work_dir: Path | None = None,
-    compared_to_url: str | None = None,
     docker_image_url: str | None = None,
     base_branch: str | None = None,
     explicit_prs: list[str] | None = None,
@@ -990,22 +982,29 @@ def build_changelog(
                 repo_path, check=False,
             )
 
-    to_sha = resolve_ref(repo_path, to_ref)
-    if to_sha is None:
-        console.print(
-            f"[red]Could not resolve --to {to_ref!r} in the repo.[/red] "
-            "Pass a tag/branch/SHA that exists on origin or upstream "
-            "(or configure ``upstream:`` in config.yaml)."
-        )
-        return None
-
-    if resolve_ref(repo_path, from_ref) is None:
-        console.print(
-            f"[red]Could not resolve --from {from_ref!r} in the repo.[/red] "
-            "Pass a tag/branch/SHA that exists on origin or upstream "
-            "(or configure ``upstream:`` in config.yaml)."
-        )
-        return None
+    # Resolve both bounds the remote's way (see resolve_ref_prefer_remote):
+    # a release is cut from what's on origin, so a stale local branch of the
+    # same name must never win. Everything below works off these SHAs.
+    remote_name = config.origin.remote_name
+    resolved: dict[str, str] = {}
+    for flag, ref in (("--from", from_ref), ("--to", to_ref)):
+        hit = resolve_ref_prefer_remote(repo_path, ref, remote_name)
+        if hit is None:
+            console.print(
+                f"[red]Could not resolve {flag} {ref!r} in the repo.[/red] "
+                "Pass a tag/branch/SHA that exists on origin or upstream "
+                "(or configure ``upstream:`` in config.yaml)."
+            )
+            return None
+        sha, kind = hit
+        if kind == "local-branch":
+            console.print(
+                f"[yellow]{flag} {ref!r} is a local branch not on "
+                f"{remote_name}[/yellow] — using it as-is ({sha[:11]})."
+            )
+        resolved[flag] = sha
+    from_sha = resolved["--from"]
+    to_sha = resolved["--to"]
 
     title = display_title or format_display_title(release_name)
     packages_block = render_packages_block(release_name, docker_image_url)
@@ -1039,12 +1038,12 @@ def build_changelog(
                 )
                 continue
             prs.append(pr)
-    elif ancestry := is_ancestor(repo_path, from_ref, to_ref):
+    elif ancestry := is_ancestor(repo_path, from_sha, to_sha):
         # Same-line release: the commit range from_ref..to_ref is the exact
         # set of changes. Walk its first-parent PRs (--base is not consulted).
         if base_branch:
             console.print("  [dim]--base ignored — walking the commit range[/dim]")
-        numbers = first_parent_pr_numbers(repo_path, from_ref, to_ref)
+        numbers = first_parent_pr_numbers(repo_path, from_sha, to_sha)
         console.print(
             f"Walking [cyan]{from_ref}..{to_ref}[/cyan] — "
             f"[cyan]{len(numbers)}[/cyan] PR(s) merged onto the branch..."
@@ -1083,8 +1082,8 @@ def build_changelog(
         # base is the target branch.
         anc_unknown = ancestry is None
         base = base_branch or config.target_branch or to_ref
-        from_date = commit_date(repo_path, from_ref)
-        to_date = commit_date(repo_path, to_ref)
+        from_date = commit_date(repo_path, from_sha)
+        to_date = commit_date(repo_path, to_sha)
         if from_date is None or to_date is None:
             # Both bounds required — an unbounded window scans whole history.
             missing = from_ref if from_date is None else to_ref
@@ -1135,9 +1134,7 @@ def build_changelog(
     for pr in prs:
         entries.extend(_entries_for_pr(config, pr, origin_slug, upstream_cache))
 
-    from_label, from_sha, from_url = _resolve_compared_to(
-        config, repo_path, from_ref, compared_to_url,
-    )
+    from_label, from_url = _resolve_compared_to(config, from_ref, from_sha)
     full_changelog_url = None
     if from_sha and origin_slug:
         full_changelog_url = (
@@ -1165,7 +1162,6 @@ def emit_changelog(
     output_file: Path | None,
     display_title: str | None = None,
     work_dir: Path | None = None,
-    compared_to_url: str | None = None,
     docker_image_url: str | None = None,
     base_branch: str | None = None,
     explicit_prs: list[str] | None = None,
@@ -1189,7 +1185,6 @@ def emit_changelog(
         release_name=effective_name,
         display_title=title,
         work_dir=work_dir,
-        compared_to_url=compared_to_url,
         docker_image_url=docker_image_url,
         base_branch=base_branch,
         explicit_prs=explicit_prs,

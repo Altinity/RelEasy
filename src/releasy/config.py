@@ -2896,6 +2896,47 @@ def build_stateless_analyze_fails_config(
     return base
 
 
+def make_stateless_config_for_repo(work_dir: Path) -> Config:
+    """Build an in-memory ``Config`` from an existing clone's git remotes.
+
+    For commands that need only a repo plus ``RELEASY_GITHUB_TOKEN`` and
+    no project: ``origin`` (required) and ``upstream`` (optional) are read
+    from the clone at ``work_dir``, so no ``config.yaml`` is involved.
+
+    Raises ``ValueError`` when ``work_dir`` isn't a git repo or has no
+    ``origin`` remote.
+    """
+    # Local import: git_ops imports Config from this module.
+    from releasy.git_ops import run_git
+
+    repo = work_dir.expanduser().resolve()
+    if not (repo / ".git").exists():
+        raise ValueError(
+            f"--work-dir {repo} is not a git clone. Without a config.yaml "
+            "the origin remote is read from the clone, so point --work-dir "
+            "at an existing checkout of the repo you're releasing."
+        )
+
+    def _remote_url(name: str) -> str | None:
+        result = run_git(["remote", "get-url", name], repo, check=False)
+        if result.returncode != 0:
+            return None
+        return (result.stdout or "").strip() or None
+
+    origin_url = _remote_url("origin")
+    if not origin_url:
+        raise ValueError(
+            f"The clone at {repo} has no 'origin' remote — cannot tell "
+            "which GitHub repo to query."
+        )
+
+    config = make_stateless_config(origin_url, work_dir=repo, push=False)
+    upstream_url = _remote_url("upstream")
+    if upstream_url:
+        config.upstream = UpstreamConfig(remote=upstream_url)
+    return config
+
+
 def is_stateless(config: Config) -> bool:
     """True when ``config`` was built for a stateless flow.
 

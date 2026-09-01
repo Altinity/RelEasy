@@ -17,6 +17,7 @@ All commands need `RELEASY_GITHUB_TOKEN`. The first group works anywhere
 - Cherry-pick / backport one PR or commit into a branch → `releasy cherry-pick --origin <url> --target <branch> --commit <github-url> [--with-pr]`
 - Batch-backport upstream PRs queued in a GitHub Project (Stable releases) → `releasy project-backport --project <url> --version <ver> --target <branch>`
 - Address review comments on one PR in any repo → `releasy refresh --pr <url> --address-review --stateless`
+- Draft GitHub release notes for any repo → `releasy draft-release --from <tag> --to <branch> --name <name> --work-dir <clone>`
 
 **In a set-up project:**
 

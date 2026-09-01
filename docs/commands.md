@@ -1160,30 +1160,40 @@ nothing; without it, creates a **draft** GitHub release on origin (tag =
 
 The walk reads PR numbers from GitHub's merge-commit / squash-merge subjects,
 so rebase-merged PRs (which leave no PR reference) aren't detected — origin
-uses squash / merge-commit. `--from` / `--to` are resolved against a local
-clone.
+uses squash / merge-commit.
+
+`--from` / `--to` are resolved against a local clone, remote-first: a bare
+name hits `refs/remotes/<origin>/<name>` before `refs/tags/<name>` and before
+any local branch, so a stale local checkout can't decide what the release
+contains. A local branch that isn't on origin is still usable — it's reported
+when used.
+
+Needs no project. With `--work-dir` the origin (and upstream) remote is read
+from that clone's git remotes and no `config.yaml` is loaded — so the command
+runs anywhere, on any repo, with just `RELEASY_GITHUB_TOKEN`. Without
+`--work-dir`, `config.yaml` supplies both the origin remote and the work dir.
+An explicit `--config` wins over `--work-dir`.
 
 ```bash
 releasy draft-release --from <ref> --to <ref> [--base <branch>]
                       [--prs <url> ...] [--prs-file <path>]
                       [--name <tag>] [--title <text>] [-o <file>]
-                      [--compared-to-url <url>] [--docker-image-url <url>]
+                      [--docker-image-url <url>]
                       [--work-dir <path>]
 ```
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--from <ref>` (required) | Range lower bound, **exclusive** (usually the previous release / upstream fork tag). | — |
-| `--to <ref>` (required) | Range upper bound (inclusive) and draft commitish (release-branch tip or the tag being cut). | — |
+| `--from <ref>` (required) | Range lower bound, **exclusive** (usually the previous release / upstream fork tag). Resolved remote-first. | — |
+| `--to <ref>` (required) | Range upper bound (inclusive) and draft commitish (release-branch tip or the tag being cut). Resolved remote-first. | — |
 | `--base <branch>` | Branch whose merged PRs are collected — **only used in the date-window fallback** (when `--from` isn't an ancestor of `--to`). | target branch → `--to` |
 | `--prs <url>` | Explicit PR URL to include (repeatable); bypasses discovery. | — |
 | `--prs-file <path>` | File of PR URLs (one per line, `#` comments ok); merged with `--prs`. | — |
 | `--name <tag>` | Release tag. Defaults to `--to` when it's a tag; left blank if `--to` is a commit / branch. | — |
 | `--title <text>` | Changelog heading / draft display name. | prettified `--name` |
 | `-o` / `--output <file>` | Write markdown to file instead of creating a draft release. | — |
-| `--compared-to-url <url>` | Override the "as compared to" header link. | auto |
 | `--docker-image-url <url>` | Docker image URL; placeholder `sha256-TBD` if omitted. | — |
-| `--work-dir <path>` | Local clone for resolving `--from` / `--to`. | config / cwd |
+| `--work-dir <path>` | Existing clone for resolving `--from` / `--to`. Given, it also supplies the origin/upstream remotes and no `config.yaml` is read. | config / cwd |
 
 ## Feature management
 

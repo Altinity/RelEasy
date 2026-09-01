@@ -615,6 +615,44 @@ def resolve_ref(repo_path: Path, ref: str) -> str | None:
     return None
 
 
+def resolve_ref_prefer_remote(
+    repo_path: Path, ref: str, remote_name: str = "origin",
+) -> tuple[str, str] | None:
+    """Resolve ``ref`` the remote's way first. Returns ``(sha, kind)``.
+
+    Order: ``refs/remotes/<remote>/<ref>``, ``refs/tags/<ref>``, then ``ref``
+    itself — so a bare branch name can't silently resolve to a stale local
+    branch when the remote-tracking ref is what the caller meant.
+
+    ``kind`` is ``"remote"``, ``"tag"``, ``"local-branch"`` (resolved via
+    ``refs/heads``) or ``"other"`` (SHA, qualified ref, …).
+    """
+    for candidate, kind in (
+        (f"refs/remotes/{remote_name}/{ref}", "remote"),
+        (f"refs/tags/{ref}", "tag"),
+        (ref, "other"),
+    ):
+        result = run_git(
+            ["rev-parse", "--verify", "--quiet", candidate],
+            repo_path, check=False,
+        )
+        sha = (result.stdout or "").strip()
+        if result.returncode != 0 or not sha:
+            continue
+        if kind == "other":
+            full = run_git(
+                ["rev-parse", "--symbolic-full-name", ref],
+                repo_path, check=False,
+            )
+            name = (full.stdout or "").strip()
+            if name.startswith("refs/remotes/"):
+                kind = "remote"
+            elif name.startswith("refs/heads/"):
+                kind = "local-branch"
+        return sha, kind
+    return None
+
+
 def is_tag_ref(repo_path: Path, ref: str) -> bool:
     """True if ``ref`` resolves to an actual git tag in the repo."""
     result = run_git(
