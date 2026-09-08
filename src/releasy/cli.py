@@ -980,7 +980,8 @@ def graph_discover_cmd(
     each onto the target tip in a scratch worktree. A real (non-cosmetic)
     conflict groups the PR with its prerequisite; connected PRs collapse into
     one combined unit, cherry-picked in apply order. Always emits a diagnostic
-    YAML report.
+    YAML report, checkpointed as each unit finishes so an interrupted run
+    resumes from where it stopped instead of re-picking + re-resolving.
 
     By default also writes a deps overlay (multi-PR ``auto_discovered`` groups)
     to ``pr_sources.deps_file`` so the next ``releasy run`` honors it. Pass

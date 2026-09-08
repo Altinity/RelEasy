@@ -302,9 +302,13 @@ def run_discover_deps(
     # toward ``--redo``.
     report_path = output_path or _default_report_path(config, base_branch)
     warnings_acc: list[str] = []
+    # Read whenever a report exists: its nodes drive reuse (opted out of by
+    # --redo / --no-write), and its issue link is carried into every
+    # checkpoint either way — checkpointing overwrites the file long before
+    # the end-of-run carry-over would otherwise read it back.
     prior_report: DiscoveryReport | None = None
     target_moved = False
-    if cache_enabled and not redo and report_path.exists():
+    if report_path.exists():
         try:
             prior_report = load_report(report_path)
         except Exception:
@@ -312,14 +316,15 @@ def run_discover_deps(
             # hand-edited prior report must degrade to a full re-scan, never
             # crash discovery (YAML errors, KeyError, TypeError, …).
             prior_report = None
+    reuse_prior = prior_report if (cache_enabled and not redo) else None
     reuse_index: dict[str, DAGNode] = {}
     prior_groups: list[DAGNode] = []
-    if prior_report is not None:
-        target_moved = prior_report.target_sha != target_sha
+    if reuse_prior is not None:
+        target_moved = reuse_prior.target_sha != target_sha
         if target_moved:
             warnings_acc.append(
                 f"base {base_branch} moved since last discover "
-                f"({prior_report.target_sha[:8]} → {target_sha[:8]}); reused "
+                f"({reuse_prior.target_sha[:8]} → {target_sha[:8]}); reused "
                 "picks may be stale — run `graph discover --redo` to rebuild."
             )
             console.print(
@@ -331,11 +336,14 @@ def run_discover_deps(
                 "  [dim]incremental: reusing units from the previous run "
                 "(only new PRs are trial-picked)[/dim]"
             )
-        for n in prior_report.nodes:
+        for n in reuse_prior.nodes:
             if n.discovery_method == "grouped":
                 prior_groups.append(n)
-            else:
-                reuse_index[n.unit_id] = n
+            # Every node is also indexed under its own id: once a group's
+            # overlay entry is merged back into ``pr_sources.groups`` it
+            # returns as ONE candidate unit carrying that id, so the
+            # member-level path below never sees it.
+            reuse_index[n.unit_id] = n
 
     # Capture the auto-discovered unit IDs from the existing overlay (if
     # any) so we can show a refresh diff after the new overlay is built.
@@ -380,6 +388,7 @@ def run_discover_deps(
     active_for_traversal = [
         cu for cu in candidates if cu.unit_id not in fully_merged_units
     ]
+    active_unit_ids = {cu.unit_id for cu in active_for_traversal}
     console.print(
         f"  [dim]{len(fully_merged_units)} already in target · "
         f"{len(active_for_traversal)} to trial-pick[/dim]"
@@ -466,7 +475,47 @@ def run_discover_deps(
             "(oldest first)…[/dim]"
         )
 
+        def _checkpoint() -> None:
+            """Persist the units discovered so far, so a killed run resumes.
+
+            Written before each unit is picked (and once the queue drains):
+            an interrupted run leaves the same report a completed one would
+            have for the units it got through, and the next run reuses them
+            instead of re-picking + re-resolving. Prior-run nodes for units
+            not yet reached are carried over — the next run re-verifies each
+            before reusing it — as is the issue link, so an interruption
+            never loses ground. Components / singletons need the whole
+            traversal, so a checkpoint has none; the final write adds them.
+            """
+            carried = [
+                n for n in (reuse_prior.nodes if reuse_prior else [])
+                if n.unit_id not in nodes
+            ]
+            snapshot = DiscoveryReport(
+                base_branch=base_branch,
+                target_sha=target_sha,
+                generated_at=datetime.now(timezone.utc).isoformat(
+                    timespec="seconds",
+                ),
+                candidate_unit_count=len(candidates),
+                candidate_pr_count=sum(len(cu.prs) for cu in candidates),
+                skipped_already_in_target=sorted(fully_merged_units),
+                nodes=sorted(
+                    list(nodes.values()) + carried, key=_node_sort_key,
+                ),
+                components=[],
+                singletons=[],
+                warnings=warnings_acc,
+            )
+            if prior_report is not None:
+                snapshot.issue_number = prior_report.issue_number
+                snapshot.issue_url = prior_report.issue_url
+                snapshot.last_ingested_at = prior_report.last_ingested_at
+                snapshot.excluded = list(prior_report.excluded)
+            _write_report(snapshot, report_path)
+
         while queue:
+            _checkpoint()
             unit_id, depth = queue.pop(0)
             if unit_id in nodes:
                 continue
@@ -507,32 +556,56 @@ def run_discover_deps(
                 console.print(f"  [dim]· {unit_id}: reused (group member)[/dim]")
                 continue
 
-            # Incremental reuse: a prior standalone clean/cached unit whose
-            # PRs (and merge SHAs) are unchanged is reused as-is — skip the
-            # (re-)trial-pick (and any AI). With the base unchanged and the
-            # cache branch still anchored to the target tip, reuse it
-            # ``cached`` (the anchor check guards against a branch left on a
-            # stale/diverged base — interrupted run, force-push). With the
-            # base moved, we still skip the expensive re-pick but emit
+            # Incremental reuse: a prior unit — a single PR or a whole group
+            # carried as one candidate — whose PRs (and merge SHAs) are
+            # unchanged is reused as-is: skip the (re-)trial-pick and any AI.
+            #
+            # A clean/resolved unit is reused ``cached`` while its branch is
+            # still anchored to the target tip (the anchor check guards
+            # against a branch left on a stale/diverged base — interrupted
+            # run, force-push). A unit that CONFLICTED has no branch to
+            # verify: its result is the traced prereq list, so it is reused
+            # whatever the ref namespace looks like, and its edges are
+            # re-recorded below so the same group re-forms. With the base
+            # moved, we still skip the expensive re-pick but emit
             # ``cached=False`` and drop any stale branch so ``run`` re-picks
             # onto the new tip.
             cache_br = _cache_branch_name(base_branch, unit_id)
             prior_n = reuse_index.get(unit_id)
-            if prior_n is not None and _is_reusable_unit(prior_n, cu):
+            if (
+                prior_n is not None
+                and _is_reusable_unit(prior_n, cu, active_unit_ids)
+            ):
                 branch_live = (
                     local_branch_exists(repo_path, cache_br)
                     and _branch_anchored_to(repo_path, cache_br, target_ref)
                 )
-                if branch_live or target_moved:
+                if branch_live or target_moved or not prior_n.cached:
                     if not branch_live and local_branch_exists(repo_path, cache_br):
                         run_git(["branch", "-D", cache_br], repo_path, check=False)
                     nodes[unit_id] = _make_node(
-                        cu, deps=[], method=prior_n.discovery_method,
+                        cu, deps=list(prior_n.deps),
+                        method=prior_n.discovery_method,
                         conflict_files=list(prior_n.conflict_files_at_discovery),
                         cached=branch_live,
                     )
+                    if prior_n.discovery_method == "grouped":
+                        # Carrying the method keeps this node in the group
+                        # cache-branch builder's scope; tell it the combined
+                        # branch is unchanged so it doesn't re-pick it.
+                        prior_group_pr_urls[unit_id] = list(prior_n.pr_urls)
+                    for dep in prior_n.deps:
+                        edges.add((unit_id, dep))
                     reused.append(unit_id)
-                    suffix = "" if branch_live else " (base moved — run re-picks)"
+                    if branch_live:
+                        suffix = ""
+                    elif target_moved:
+                        suffix = " (base moved — run re-picks)"
+                    else:
+                        suffix = (
+                            f" (conflicts with {', '.join(prior_n.deps)} — "
+                            "run resolves)"
+                        )
                     console.print(f"  [dim]· {unit_id}: reused{suffix}[/dim]")
                     continue
 
@@ -733,6 +806,9 @@ def run_discover_deps(
             # in-set prereq is already processed; no recursion needed here.
             for d in deps:
                 edges.add((unit_id, d))
+
+        # The last unit's result isn't covered by the top-of-loop write.
+        _checkpoint()
 
         if reused:
             console.print(
@@ -2116,25 +2192,32 @@ def _node_sort_key(node: DAGNode) -> tuple[str, str]:
     return (node.earliest_merged_at or "9999", node.unit_id)
 
 
-def _is_reusable_unit(prior_node: DAGNode, cu: _CandidateUnit) -> bool:
+def _is_reusable_unit(
+    prior_node: DAGNode, cu: _CandidateUnit, active_unit_ids: set[str],
+) -> bool:
     """Can a prior run's node be reused as-is (skip re-trial-picking)?
 
-    Only standalone, dependency-free, cached single-PR units qualify — their
-    cached ``feature/<base>/<id>`` branch already carries a working result,
-    and (with the target tip unchanged) re-picking the same PR is
-    deterministic. The PR's merge SHA must also be unchanged, so a PR that
-    was re-merged (same URL, new SHA) is re-picked rather than reused stale.
-    Grouped / conflicted units are always re-discovered. The caller
-    additionally verifies the cached branch is anchored to the target tip.
+    Reusable when this run would re-derive the same outcome: same unit id,
+    same PR list in the same apply order, same merge SHAs (a re-merged PR
+    means a stale result). Applies to a group carried as one candidate unit
+    as much as to a single PR.
+
+    The recorded outcome must also still hold. For a clean / AI-resolved
+    unit that's the cached ``feature/<base>/<id>`` branch — the caller
+    additionally verifies it's anchored to the target tip. For a unit that
+    conflicted it's the traced prerequisites, which need nothing on disk but
+    must still name active candidates, since the reused edges have to
+    re-form the same group. A conflict that traced NO prerequisite is not a
+    result — it's a trace that came up empty, worth retrying — so it is
+    never reused.
     """
-    if not (
-        len(prior_node.pr_urls) == 1
-        and not prior_node.deps
-        and prior_node.cached
-        and prior_node.pr_urls == [p.url for p in cu.prs]
-    ):
+    if prior_node.pr_urls != [p.url for p in cu.prs]:
         return False
-    # Merge SHA must match too (re-merged PR → stale branch → re-pick).
+    if not (prior_node.cached or prior_node.deps):
+        return False
+    if not set(prior_node.deps) <= active_unit_ids:
+        return False
+    # Merge SHAs must match too (re-merged PR → stale branch → re-pick).
     # A prior report without merge_shas (older format) can't be verified —
     # don't reuse, to be safe.
     return bool(prior_node.merge_shas) and (
@@ -2241,11 +2324,13 @@ def _collapse_components_to_groups(
             continue
         pr_urls: list[str] = []
         pr_titles: list[str] = []
+        merge_shas: list[str] = []
         merged_ats: list[str] = []
         for uid in auto_ids:  # comp.unit_ids is topo order: prereq first
             n = nodes[uid]
             pr_urls.extend(n.pr_urls)
             pr_titles.extend(n.pr_titles)
+            merge_shas.extend(n.merge_shas)
             if n.earliest_merged_at:
                 merged_ats.append(n.earliest_merged_at)
         # Key the group id on the lead (prereq-most) unit id, which is
@@ -2263,6 +2348,7 @@ def _collapse_components_to_groups(
             deps=[],
             discovery_method="grouped",
             cached=False,
+            merge_shas=merge_shas,
         )
     return folded, kept_components
 
@@ -2489,8 +2575,12 @@ def _write_report(report: DiscoveryReport, path: Path) -> None:
         for n in report.nodes
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    # Atomic: the report is checkpointed after every unit, so a kill
+    # mid-write must not leave a truncated file to resume from.
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as f:
         yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+    tmp.replace(path)
 
 
 def _write_session_overlay(

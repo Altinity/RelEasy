@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import yaml
 
@@ -634,7 +635,7 @@ class DeclaredEdges(unittest.TestCase):
 
 
 class IsReusableUnit(unittest.TestCase):
-    """Incremental discovery reuses only standalone, cached, unchanged units."""
+    """Incremental discovery reuses cached, dependency-free, unchanged units."""
 
     def _cu(self, num):
         from releasy.pipeline import FeatureUnit
@@ -646,33 +647,75 @@ class IsReusableUnit(unittest.TestCase):
             f"pr-{num}", False, False, [pr], pr.merged_at,
             FeatureUnit(feature_id=f"pr-{num}", prs=[pr], if_exists="skip"))
 
+    def _grp(self, nums):
+        from releasy.pipeline import FeatureUnit
+        from releasy.github_ops import PRInfo
+        prs = [PRInfo(number=n, title=f"t{n}", body="", state="merged",
+                      merge_commit_sha=f"s{n}", head_sha="h", url=URL(n),
+                      repo_slug="o/r", merged_at="2026-01-01T00:00:00+00:00")
+               for n in nums]
+        gid = f"auto-grp-pr-{nums[0]}"
+        return d._CandidateUnit(
+            gid, True, False, prs, prs[0].merged_at,
+            FeatureUnit(feature_id=gid, prs=prs, if_exists="skip",
+                        is_group=True, group_id=gid, auto_discovered=True))
+
     def _node(self, urls, *, deps=None, cached=True, shas=None):
         return d.DAGNode("pr-x", False, urls, ["t"] * len(urls),
                          "2026-01-01T00:00:00+00:00", deps or [], "trial-clean",
                          cached=cached, merge_shas=shas if shas is not None else ["s1"])
 
+    def _reusable(self, node, cu, active=None):
+        # Default: every prereq the node traced is still an active candidate,
+        # so each test exercises the rule it names.
+        return d._is_reusable_unit(
+            node, cu, set(node.deps) if active is None else set(active),
+        )
+
     def test_reusable_clean_standalone(self):
-        self.assertTrue(d._is_reusable_unit(self._node([URL(1)], shas=["s1"]), self._cu(1)))
+        self.assertTrue(self._reusable(self._node([URL(1)], shas=["s1"]), self._cu(1)))
 
-    def test_not_reusable_multi_pr(self):
-        self.assertFalse(d._is_reusable_unit(self._node([URL(1), URL(2)]), self._cu(1)))
+    def test_reusable_group_carried_as_one_unit(self):
+        # A group round-trips through the deps overlay as ONE candidate unit;
+        # unchanged, it must be reused instead of re-picked + re-AI-resolved.
+        self.assertTrue(self._reusable(
+            self._node([URL(1), URL(2)], shas=["s1", "s2"]), self._grp([1, 2]),
+        ))
 
-    def test_not_reusable_with_deps(self):
-        self.assertFalse(d._is_reusable_unit(self._node([URL(1)], deps=["pr-9"]), self._cu(1)))
+    def test_reusable_conflicted_unit_has_no_branch_to_check(self):
+        # Conflicted + prereqs traced: the result is the prereq list, not a
+        # branch, so an uncached node is still reusable.
+        self.assertTrue(self._reusable(
+            self._node([URL(1)], deps=["pr-9"], cached=False), self._cu(1),
+        ))
 
-    def test_not_reusable_uncached(self):
-        self.assertFalse(d._is_reusable_unit(self._node([URL(1)], cached=False), self._cu(1)))
+    def test_not_reusable_when_a_traced_dep_is_gone(self):
+        self.assertFalse(self._reusable(
+            self._node([URL(1)], deps=["pr-9"]), self._cu(1), active=[],
+        ))
+
+    def test_not_reusable_group_member_added(self):
+        self.assertFalse(self._reusable(
+            self._node([URL(1)], shas=["s1"]), self._grp([1, 2]),
+        ))
+
+    def test_not_reusable_multi_pr_against_single(self):
+        self.assertFalse(self._reusable(self._node([URL(1), URL(2)]), self._cu(1)))
+
+    def test_not_reusable_uncached_without_deps(self):
+        # Conflicted but nothing traced — a failed trace, not a result.
+        self.assertFalse(self._reusable(self._node([URL(1)], cached=False), self._cu(1)))
 
     def test_not_reusable_url_changed(self):
-        self.assertFalse(d._is_reusable_unit(self._node([URL(2)]), self._cu(1)))
+        self.assertFalse(self._reusable(self._node([URL(2)]), self._cu(1)))
 
     def test_not_reusable_sha_changed(self):
         # same URL, but the PR was re-merged (new merge SHA) → must NOT reuse.
-        self.assertFalse(d._is_reusable_unit(self._node([URL(1)], shas=["OLD"]), self._cu(1)))
+        self.assertFalse(self._reusable(self._node([URL(1)], shas=["OLD"]), self._cu(1)))
 
     def test_not_reusable_missing_shas(self):
         # prior report has no merge_shas (older format) → can't verify → no reuse.
-        self.assertFalse(d._is_reusable_unit(self._node([URL(1)], shas=[]), self._cu(1)))
+        self.assertFalse(self._reusable(self._node([URL(1)], shas=[]), self._cu(1)))
 
 
 class ReusablePriorGroups(unittest.TestCase):
@@ -1410,6 +1453,157 @@ class SyncGraphProgress(unittest.TestCase):
         self.assertEqual(d.sync_graph_progress(self._cfg()), 0)
         self.assertEqual(
             d.load_report(self.tmp / "graph.b.yaml").issue_number, 99,
+        )
+
+
+class CheckpointResume(unittest.TestCase):
+    """A killed discover leaves a resumable report; the next run reuses it."""
+
+    _STUBS = (
+        "ensure_work_repo", "is_operation_in_progress", "fetch_remote",
+        "run_git", "_resolve_sha", "get_origin_repo_slug",
+        "discover_feature_units", "load_state", "_state_already_in_target",
+        "_trailer_scan", "_git_cherry_already", "_open_scratch_worktree",
+        "_close_scratch_worktree", "_trial_pick_unit", "_release_cache_branch",
+        "local_branch_exists", "_branch_anchored_to",
+        "_build_merge_containment_map", "_candidate_deps_for_conflict",
+    )
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.report_path = self.tmp / "graph.b.yaml"
+        self.units = [self._unit(n) for n in (1, 2, 3, 4)]
+        self.picked = []       # unit ids this run actually trial-picked
+        self.branches = set()  # cache branches kept on disk
+        self.kill_at = None    # unit id whose pick dies, as a kill would
+        self.conflicts = set()  # unit ids whose pick conflicts
+        self.traced = []       # prereq unit ids the conflict trace yields
+        self._saved = {n: getattr(d, n) for n in self._STUBS}
+
+        d.ensure_work_repo = lambda cfg, wd: (wd, None)
+        d.is_operation_in_progress = lambda p: False
+        d.fetch_remote = lambda *a, **k: None
+        d.run_git = lambda *a, **k: SimpleNamespace(
+            returncode=0, stdout="", stderr="",
+        )
+        d._resolve_sha = lambda repo, ref: "a" * 40
+        d.get_origin_repo_slug = lambda cfg: "o/r"
+        d.discover_feature_units = lambda cfg: list(self.units)
+        d.load_state = lambda cfg: PipelineState()
+        d._state_already_in_target = lambda cands, st: set()
+        d._trailer_scan = lambda *a: set()
+        d._git_cherry_already = lambda *a: set()
+        d._open_scratch_worktree = lambda repo, parent, ref: self.tmp / "scratch"
+        d._close_scratch_worktree = lambda repo, scratch: None
+        d._trial_pick_unit = self._pick
+        d._release_cache_branch = (
+            lambda scratch, ref, br, keep=False: (
+                self.branches.add(br) if keep else self.branches.discard(br)
+            )
+        )
+        d.local_branch_exists = lambda repo, br: br in self.branches
+        d._branch_anchored_to = lambda repo, br, ref: True
+        d._build_merge_containment_map = lambda *a, **k: {}
+        d._candidate_deps_for_conflict = lambda *a, **k: list(self.traced)
+
+    def tearDown(self):
+        for name, fn in self._saved.items():
+            setattr(d, name, fn)
+
+    def _unit(self, num):
+        from releasy.pipeline import FeatureUnit
+        from releasy.github_ops import PRInfo
+        pr = PRInfo(number=num, title=f"t{num}", body="", state="merged",
+                    merge_commit_sha=f"s{num}", head_sha="h", url=URL(num),
+                    repo_slug="o/r", merged_at=f"2026-01-0{num}T00:00:00+00:00")
+        return FeatureUnit(feature_id=f"pr-{num}", prs=[pr], if_exists="skip")
+
+    def _pick(self, scratch, cu, target_ref, *, cache_branch, is_group,
+              origin_slug):
+        if cu.unit_id == self.kill_at:
+            raise KeyboardInterrupt  # stands in for the kill
+        self.picked.append(cu.unit_id)
+        if cu.unit_id in self.conflicts:
+            return d._PickOutcome(clean=False, conflict_files=["f.cpp"],
+                                  conflicting_pr_idx=0,
+                                  cache_branch=cache_branch)
+        return d._PickOutcome(clean=True, conflict_files=[],
+                              cache_branch=cache_branch)
+
+    def _run(self):
+        cfg = Config(
+            name="n", origin=OriginConfig(remote="git@github.com:o/r.git"),
+            project="p", target_branch="b",
+            config_path=self.tmp / "config.yaml",
+        )
+        return d.run_discover_deps(
+            cfg, onto=None, work_dir=self.tmp,
+            output_path=self.report_path,
+            deps_overlay_path=self.tmp / "b.deps.yaml",
+            use_ai=False, max_depth=2, pr_limit=None,
+            include_already_merged=False,
+        )
+
+    def test_interrupted_run_leaves_the_finished_units(self):
+        self.kill_at = "pr-3"
+        with self.assertRaises(KeyboardInterrupt):
+            self._run()
+        got = d.load_report(self.report_path)
+        self.assertEqual([n.unit_id for n in got.nodes], ["pr-1", "pr-2"])
+        self.assertTrue(all(n.cached for n in got.nodes))
+
+    def test_resume_reuses_them_instead_of_re_picking(self):
+        self.kill_at = "pr-3"
+        with self.assertRaises(KeyboardInterrupt):
+            self._run()
+        self.kill_at, self.picked = None, []
+        rep = self._run()
+        self.assertEqual(self.picked, ["pr-3", "pr-4"])  # 1 + 2 reused
+        self.assertEqual(len(rep.nodes), 4)
+
+    def test_interrupted_rerun_keeps_units_it_never_reached(self):
+        self._run()
+        self.units.insert(0, self._unit(0))  # oldest → picked first
+        self.kill_at, self.picked = "pr-0", []
+        with self.assertRaises(KeyboardInterrupt):
+            self._run()
+        got = d.load_report(self.report_path)
+        self.assertEqual(
+            [n.unit_id for n in got.nodes], ["pr-1", "pr-2", "pr-3", "pr-4"],
+        )
+
+    def test_resume_reuses_a_conflicted_unit_and_regroups_it(self):
+        # pr-2 conflicts and traces pr-1 as its prereq: no cache branch, so
+        # the reusable result is the prereq list. A resume must reuse it and
+        # re-record the edge, or the group silently falls apart.
+        self.conflicts, self.traced = {"pr-2"}, ["pr-1"]
+        self.kill_at = "pr-4"
+        with self.assertRaises(KeyboardInterrupt):
+            self._run()
+        stopped = {n.unit_id: n for n in d.load_report(self.report_path).nodes}
+        self.assertEqual(stopped["pr-2"].deps, ["pr-1"])
+        self.assertFalse(stopped["pr-2"].cached)
+
+        self.kill_at, self.picked = None, []
+        rep = self._run()
+        # pr-1..pr-3 reused; only the new unit and the combined group branch
+        # are picked.
+        self.assertEqual(self.picked, ["pr-4", "auto-grp-pr-1"])
+        grp = [n for n in rep.nodes if n.unit_id == "auto-grp-pr-1"]
+        self.assertEqual([n.pr_urls for n in grp], [[URL(1), URL(2)]])
+
+    def test_write_report_is_atomic(self):
+        d._write_report(report([node("pr-1", 1)]), self.report_path)
+        boom = lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+        saved, yaml.dump = yaml.dump, boom
+        try:
+            with self.assertRaises(OSError):
+                d._write_report(report([node("pr-9", 9)]), self.report_path)
+        finally:
+            yaml.dump = saved
+        # The half-written report never replaces the resumable one.
+        self.assertEqual(
+            [n.unit_id for n in d.load_report(self.report_path).nodes], ["pr-1"],
         )
 
 
