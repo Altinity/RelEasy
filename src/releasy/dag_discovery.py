@@ -3740,7 +3740,8 @@ def run_graph_update(
     if report.issue_number is None:
         console.print(
             "[red]The saved graph has no issue.[/red] Run "
-            "`releasy graph discover --open-issue` to open one first."
+            "`releasy graph sync --open-issue` to open one from this graph, "
+            "then let members comment on it."
         )
         return 1
 
@@ -3896,6 +3897,7 @@ def run_graph_update(
 
 def sync_graph_progress(
     config: Config, *, onto: str | None = None, quiet: bool = False,
+    open_issue: bool = False,
 ) -> int:
     """Re-render the graph issue with progress from the pipeline state.
 
@@ -3903,6 +3905,9 @@ def sync_graph_progress(
     ``state.yaml`` and edits the issue body in place. ``quiet`` silences
     the "no graph / no issue" cases (the automatic post-``run`` /
     post-``refresh`` hook, where they just mean "not using the issue").
+    ``open_issue`` opens one from the saved graph when it has none, so a
+    ``discover`` run that forgot ``--open-issue`` doesn't have to be redone;
+    it stays opt-in so the automatic hook never opens an issue by itself.
     Returns an exit code.
     """
     try:
@@ -3930,17 +3935,19 @@ def sync_graph_progress(
         console.print(f"[red]graph sync: unreadable graph report: {e}[/red]")
         return 1
 
-    if report.issue_number is None:
+    if report.issue_number is None and not open_issue:
         if quiet:
             return 0
         console.print(
-            "[red]The saved graph has no issue.[/red] Run "
-            "`releasy graph discover --open-issue` to open one first."
+            "[red]The saved graph has no issue.[/red] Re-run as "
+            "`releasy graph sync --open-issue` to open one from this graph "
+            "— no re-discovery needed."
         )
         return 1
 
     progress = build_progress_map(report, load_state(config))
     prior_number = report.issue_number
+    opening = prior_number is None
     if config.dry_run and not quiet:
         console.print(
             render_graph_issue_body(report, progress),
@@ -3951,19 +3958,31 @@ def sync_graph_progress(
         progress=progress,
     )
     if res is None:
-        console.print(
-            f"  [yellow]warning:[/yellow] failed to update graph issue "
-            f"#{prior_number}"
+        if opening and config.dry_run:
+            # ``create_issue`` reports a dry run by returning None; nothing
+            # failed, there's just no issue to point at.
+            console.print(
+                f"  [dim]would open a graph issue for {base_branch}[/dim]"
+            )
+            return 0
+        target = (
+            "open the graph issue" if opening
+            else f"update graph issue #{prior_number}"
         )
+        console.print(f"  [yellow]warning:[/yellow] failed to {target}")
         return 1
-    # The issue was 404 and got recreated — persist the new number.
+    # Freshly opened, or 404'd and recreated — persist the number.
     if report.issue_number != prior_number and not config.dry_run:
         _write_report(report, report_path)
 
     ported = sum(
         1 for n in report.nodes if _unit_ported(progress.get(n.unit_id))
     )
-    verb = "would refresh" if config.dry_run else "refreshed"
+    verb = (
+        "opened" if opening
+        else "would refresh" if config.dry_run
+        else "refreshed"
+    )
     console.print(
         f"  [green]✓[/green] {verb} graph issue #{report.issue_number} — "
         f"{ported}/{len(report.nodes)} unit(s) ported"

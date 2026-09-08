@@ -1446,6 +1446,28 @@ class SyncGraphProgress(unittest.TestCase):
         d.update_issue = lambda *a, **k: False
         self.assertEqual(d.sync_graph_progress(self._cfg()), 1)
 
+    def test_open_issue_opens_one_from_the_saved_graph(self):
+        # `discover` ran without --open-issue: the issue must come from the
+        # report on disk, never from re-running discovery.
+        self._write_graph()
+        created = {}
+        d.create_issue = lambda cfg, title, body, labels=None: (
+            created.update(title=title, body=body) or (77, "u77")
+        )
+        self.assertEqual(d.sync_graph_progress(self._cfg(), open_issue=True), 0)
+        self.assertEqual(created["title"], "Port graph for b")
+        saved = d.load_report(self.tmp / "graph.b.yaml")
+        self.assertEqual((saved.issue_number, saved.issue_url), (77, "u77"))
+        self.assertEqual([n.unit_id for n in saved.nodes], ["pr-1"])
+
+    def test_open_issue_on_dry_run_reports_instead_of_failing(self):
+        self._write_graph()
+        d.create_issue = self._create  # the real one: returns None on dry-run
+        cfg = self._cfg()
+        cfg.dry_run = True
+        self.assertEqual(d.sync_graph_progress(cfg, open_issue=True), 0)
+        self.assertIsNone(d.load_report(self.tmp / "graph.b.yaml").issue_number)
+
     def test_recreated_issue_number_persisted(self):
         self._write_graph(issue_number=42, issue_url="u")
         d.update_issue = lambda *a, **k: None  # 404

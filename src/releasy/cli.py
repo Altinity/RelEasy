@@ -1245,9 +1245,15 @@ def graph_update_cmd(
     "--dry-run", is_flag=True, default=False,
     help="Show what would be posted; don't touch the issue.",
 )
+@click.option(
+    "--open-issue", is_flag=True, default=False,
+    help="Open the issue from the saved graph when it has none — for a "
+         "`graph discover` run that forgot --open-issue. Reads the report "
+         "on disk; no trial-picks, no AI, no re-discovery.",
+)
 @click.pass_context
 def graph_sync_cmd(
-    ctx: click.Context, onto: str | None, dry_run: bool,
+    ctx: click.Context, onto: str | None, dry_run: bool, open_issue: bool,
 ) -> None:
     """Refresh the graph issue's progress checkboxes from pipeline state.
 
@@ -1257,6 +1263,10 @@ def graph_sync_cmd(
     with the unit's status and a link to the PR. No git, no AI, no
     comment ingest — cheap enough to run any time.
 
+    Pass ``--open-issue`` to open the issue from the saved graph when the
+    ``discover`` run that produced it didn't; re-running discovery just to
+    get an issue is never necessary.
+
     ``releasy run`` and ``releasy refresh`` do this automatically unless
     ``graph.sync_progress: false``.
     """
@@ -1265,7 +1275,7 @@ def graph_sync_cmd(
     with _locked_config(ctx, session="optional") as config:
         if dry_run:
             config.dry_run = True
-        code = sync_graph_progress(config, onto=onto)
+        code = sync_graph_progress(config, onto=onto, open_issue=open_issue)
     if code != 0:
         raise SystemExit(code)
 
