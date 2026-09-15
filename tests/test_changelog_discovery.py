@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import releasy.changelog as cl
 from releasy.git_ops import first_parent_pr_numbers, pr_number_from_subject
@@ -486,6 +487,120 @@ class SplitInlineEntries(unittest.TestCase):
         )
         self.assertEqual(chunks[1][0], "Fix B.")
         self.assertEqual(chunks[1][1], [("ClickHouse/ClickHouse", 3, "c")])
+
+
+_LISTING = """<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+<Name>altinity-build-artifacts</Name>
+<Prefix>REFs/v26.6.4.20001.altinityantalya/abc123/</Prefix>
+<CommonPrefixes><Prefix>REFs/v26.6.4.20001.altinityantalya/abc123/34481990917/</Prefix></CommonPrefixes>
+<CommonPrefixes><Prefix>REFs/v26.6.4.20001.altinityantalya/abc123/build_amd_release/</Prefix></CommonPrefixes>
+</ListBucketResult>"""
+
+_EMPTY_LISTING = """<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+<Name>altinity-build-artifacts</Name>
+<Prefix>REFs/v26.6.4.20001.altinityantalya/abc123/</Prefix>
+</ListBucketResult>"""
+
+
+class _FakeResponse:
+    def __init__(self, body, status_code=200):
+        self.content = body.encode()
+        self.status_code = status_code
+
+
+class BuildReportBlock(unittest.TestCase):
+    """Regression: draft releases shipped with no Build report section."""
+
+    TAG = "v26.6.4.20001.altinityantalya"
+
+    def _render(self, listing, **kwargs):
+        with mock.patch.object(
+            cl.requests, "get", return_value=_FakeResponse(listing),
+        ):
+            return cl.render_build_report_block(self.TAG, "abc123", **kwargs)
+
+    def test_run_id_resolved_from_bucket(self):
+        self.assertEqual(
+            self._render(_LISTING),
+            "## [Build report](https://s3.amazonaws.com/altinity-build-artifacts"
+            f"/REFs/{self.TAG}/abc123/34481990917/ci_run_report.html)",
+        )
+
+    def test_placeholder_when_ci_has_not_published(self):
+        self.assertIn("RUN-ID-TBD", self._render(_EMPTY_LISTING))
+
+    def test_placeholder_when_lookup_fails(self):
+        with mock.patch.object(
+            cl.requests, "get", side_effect=RuntimeError("boom"),
+        ):
+            block = cl.render_build_report_block(self.TAG, "abc123")
+        self.assertIn("RUN-ID-TBD", block)
+
+    def test_explicit_url_skips_lookup(self):
+        with mock.patch.object(cl.requests, "get") as get:
+            block = cl.render_build_report_block(
+                self.TAG, "abc123", "https://example.com/ci_run_report.html",
+            )
+        get.assert_not_called()
+        self.assertEqual(
+            block, "## [Build report](https://example.com/ci_run_report.html)",
+        )
+
+    def test_non_altinity_ref_renders_nothing(self):
+        self.assertIsNone(cl.render_build_report_block("antalya-26.3", "abc123"))
+
+    def test_rendered_above_packages(self):
+        md = cl.render_markdown(
+            display_title="26.6.4.20001 Altinity Antalya",
+            to_sha="abc123",
+            from_ref_label="v26.6.2.20001.altinityantalya",
+            from_sha=None,
+            from_url=None,
+            entries=[],
+            build_report_block="## [Build report](https://x/ci_run_report.html)",
+            release_notes_block="## [Release notes](https://x/26.6/)",
+            packages_block=cl.render_packages_block(self.TAG),
+        )
+        self.assertLess(md.index("## [Build report]"), md.index("## [Release notes]"))
+        self.assertLess(md.index("## [Release notes]"), md.index("## Packages"))
+
+
+class ReleaseNotesBlock(unittest.TestCase):
+    """Regression: draft releases shipped with no Release notes section."""
+
+    def test_antalya_tag(self):
+        self.assertEqual(
+            cl.render_release_notes_block("v26.6.4.20001.altinityantalya"),
+            "## [Release notes](https://docs.altinity.com/releasenotes/"
+            "altinity-antalya-release-notes/26.6/)",
+        )
+
+    def test_stable_tag(self):
+        self.assertEqual(
+            cl.render_release_notes_block("v26.3.16.10001.altinitystable"),
+            "## [Release notes](https://docs.altinity.com/releasenotes/"
+            "altinity-stable-release-notes/26.3/)",
+        )
+
+    def test_unpartitioned_project_renders_nothing(self):
+        # fips docs are one flat page under a differently-shaped slug — a
+        # derived <major>.<minor> URL would 404.
+        self.assertIsNone(
+            cl.render_release_notes_block("v25.3.8.30001.altinityfips"),
+        )
+
+    def test_non_altinity_ref_renders_nothing(self):
+        self.assertIsNone(cl.render_release_notes_block("antalya-26.3"))
+
+    def test_explicit_url_wins(self):
+        self.assertEqual(
+            cl.render_release_notes_block(
+                "v25.3.8.30001.altinityfips", "https://docs.example/fips/",
+            ),
+            "## [Release notes](https://docs.example/fips/)",
+        )
 
 
 if __name__ == "__main__":

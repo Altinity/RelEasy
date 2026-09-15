@@ -1231,6 +1231,16 @@ PR set instead, bypassing discovery. With `-o` writes to disk and publishes
 nothing; without it, creates a **draft** GitHub release on origin (tag =
 `--name`, commitish = `--to`) and prints its URL.
 
+For an Altinity-shaped tag the body also carries a **Build report** link. Its
+workflow-run id is looked up under `REFs/<tag>/<sha>/` in the build-artifacts
+bucket; if CI hasn't published for that ref yet the link keeps a `RUN-ID-TBD`
+placeholder. `--build-report-url` supplies the link outright.
+
+A **Release notes** link follows it, derived from the tag as
+`docs.altinity.com/releasenotes/altinity-<project>-release-notes/<major>.<minor>/`.
+Only `antalya` and `stable` are split by version that way; other projects
+(`fips`) get no link unless `--release-notes-url` supplies one.
+
 The walk reads PR numbers from GitHub's merge-commit / squash-merge subjects,
 so rebase-merged PRs (which leave no PR reference) aren't detected — origin
 uses squash / merge-commit.
@@ -1251,8 +1261,8 @@ An explicit `--config` wins over `--work-dir`.
 releasy draft-release --from <ref> --to <ref> [--base <branch>]
                       [--prs <url> ...] [--prs-file <path>]
                       [--name <tag>] [--title <text>] [-o <file>]
-                      [--docker-image-url <url>]
-                      [--work-dir <path>]
+                      [--docker-image-url <url>] [--build-report-url <url>]
+                      [--release-notes-url <url>] [--work-dir <path>]
 ```
 
 | Option | Description | Default |
@@ -1266,6 +1276,8 @@ releasy draft-release --from <ref> --to <ref> [--base <branch>]
 | `--title <text>` | Changelog heading / draft display name. | prettified `--name` |
 | `-o` / `--output <file>` | Write markdown to file instead of creating a draft release. | — |
 | `--docker-image-url <url>` | Docker image URL; placeholder `sha256-TBD` if omitted. | — |
+| `--build-report-url <url>` | CI build report (`ci_run_report.html`) URL. Omitted, the workflow-run id is resolved from the build-artifacts bucket, falling back to a `RUN-ID-TBD` placeholder. | — |
+| `--release-notes-url <url>` | docs.altinity.com release-notes URL. Omitted, it's derived from the tag for `antalya` / `stable`; other projects get no link. | — |
 | `--work-dir <path>` | Existing clone for resolving `--from` / `--to`. Given, it also supplies the origin/upstream remotes and no `config.yaml` is read. | config / cwd |
 
 ## Feature management

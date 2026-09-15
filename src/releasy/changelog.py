@@ -19,6 +19,9 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from xml.etree import ElementTree
+
+import requests
 
 from releasy.config import Config, get_github_token
 from releasy.git_ops import (
@@ -740,6 +743,121 @@ def render_packages_block(tag: str, docker_image_url: str | None = None) -> str 
     )
 
 
+# Altinity CI publishes every run's artefacts under
+# ``REFs/<ref>/<sha>/<workflow-run-id>/`` in this bucket; the rendered
+# summary is ``ci_run_report.html``.
+_BUILD_ARTIFACTS_BASE = "https://s3.amazonaws.com/altinity-build-artifacts"
+_S3_NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
+_RUN_ID_PLACEHOLDER = "RUN-ID-TBD"
+
+
+def _lookup_ci_run_id(ref: str, sha: str, *, timeout: int = 30) -> str | None:
+    """Find the CI workflow-run id published under ``REFs/<ref>/<sha>/``.
+
+    Lists that prefix in the build-artifacts bucket (anonymous read) and
+    returns the highest numeric sub-prefix — one per workflow run.
+    Returns ``None`` when there is none: CI hasn't published for this ref
+    yet, or it ran under a different one (e.g. the branch, not the tag).
+
+    The listing is not paginated: S3 returns prefixes in lexicographic
+    order, so all-digit run ids precede the per-task name prefixes and
+    are always on the first page.
+    """
+    try:
+        resp = requests.get(
+            f"{_BUILD_ARTIFACTS_BASE}/",
+            params={
+                "list-type": "2",
+                "prefix": f"REFs/{ref}/{sha}/",
+                "delimiter": "/",
+            },
+            timeout=timeout,
+        )
+    except Exception as exc:
+        log.debug("build-report lookup failed: %s", exc)
+        return None
+    if resp.status_code != 200:
+        log.debug("build-report lookup -> HTTP %s", resp.status_code)
+        return None
+    try:
+        root = ElementTree.fromstring(resp.content)
+    except ElementTree.ParseError as exc:
+        log.debug("build-report listing is not valid XML: %s", exc)
+        return None
+
+    run_ids: list[str] = []
+    for node in root.iter(f"{_S3_NS}CommonPrefixes"):
+        prefix = (node.findtext(f"{_S3_NS}Prefix") or "").rstrip("/")
+        leaf = prefix.rsplit("/", 1)[-1]
+        if leaf.isdigit():
+            run_ids.append(leaf)
+    if not run_ids:
+        return None
+    return max(run_ids, key=int)
+
+
+def render_build_report_block(
+    ref: str, sha: str, build_report_url: str | None = None,
+) -> str | None:
+    """Render the Build report section for an Altinity tag.
+
+    Returns ``None`` for refs that don't fit the ``...altinity<project>``
+    convention, unless ``build_report_url`` is given explicitly.
+
+    Without an explicit URL the workflow-run id is resolved from the
+    build-artifacts bucket; when nothing is published for ``ref`` yet the
+    link keeps a ``RUN-ID-TBD`` placeholder to fill in by hand.
+    """
+    if build_report_url is None:
+        if not _DISPLAY_TITLE_RE.match((ref or "").strip()):
+            return None
+        run_id = _lookup_ci_run_id(ref, sha)
+        if run_id is None:
+            run_id = _RUN_ID_PLACEHOLDER
+            console.print(
+                f"[yellow]No CI run published under REFs/{ref}/{sha[:11]}"
+                f"[/yellow] — build report link left as {_RUN_ID_PLACEHOLDER}."
+            )
+        build_report_url = (
+            f"{_BUILD_ARTIFACTS_BASE}/REFs/{ref}/{sha}/"
+            f"{run_id}/ci_run_report.html"
+        )
+    return f"## [Build report]({build_report_url})"
+
+
+# docs.altinity.com partitions these projects' release notes by
+# <major>.<minor>. Other Altinity projects (fips) live on a single flat
+# page under a differently-shaped slug, so no link is derived for them.
+_RELEASE_NOTES_BASE = "https://docs.altinity.com/releasenotes"
+_RELEASE_NOTES_PROJECTS = {"antalya", "stable"}
+
+
+def render_release_notes_block(
+    tag: str, release_notes_url: str | None = None,
+) -> str | None:
+    """Render the Release notes section for an Altinity tag.
+
+    Returns ``None`` for tags outside the ``...altinity<project>``
+    convention and for projects whose docs aren't split by version,
+    unless ``release_notes_url`` is given explicitly.
+    """
+    if release_notes_url is None:
+        m = _DISPLAY_TITLE_RE.match((tag or "").strip())
+        if not m:
+            return None
+        proj = m.group("proj").lower()
+        if proj not in _RELEASE_NOTES_PROJECTS:
+            return None
+        parts = m.group("ver").split(".")
+        if len(parts) < 2:
+            return None
+        release_notes_url = (
+            f"{_RELEASE_NOTES_BASE}/altinity-{proj}-release-notes/"
+            f"{parts[0]}.{parts[1]}/"
+        )
+    return f"## [Release notes]({release_notes_url})"
+
+
 def render_markdown(
     *,
     display_title: str,
@@ -749,6 +867,8 @@ def render_markdown(
     from_url: str | None,
     entries: list[ChangelogEntry],
     full_changelog_url: str | None = None,
+    build_report_block: str | None = None,
+    release_notes_block: str | None = None,
     packages_block: str | None = None,
 ) -> str:
     """Build the changelog markdown body.
@@ -791,6 +911,14 @@ def render_markdown(
 
     if not rendered_any:
         lines.append("_No user-visible changes since the previous release._")
+        lines.append("")
+
+    if build_report_block:
+        lines.append(build_report_block.rstrip())
+        lines.append("")
+
+    if release_notes_block:
+        lines.append(release_notes_block.rstrip())
         lines.append("")
 
     if packages_block:
@@ -861,6 +989,8 @@ def build_changelog(
     display_title: str | None = None,
     work_dir: Path | None = None,
     docker_image_url: str | None = None,
+    build_report_url: str | None = None,
+    release_notes_url: str | None = None,
     base_branch: str | None = None,
     explicit_prs: list[str] | None = None,
 ) -> tuple[str, str, bool] | None:
@@ -1008,6 +1138,12 @@ def build_changelog(
 
     title = display_title or format_display_title(release_name)
     packages_block = render_packages_block(release_name, docker_image_url)
+    build_report_block = render_build_report_block(
+        release_name, to_sha, build_report_url,
+    )
+    release_notes_block = render_release_notes_block(
+        release_name, release_notes_url,
+    )
     to_is_tag = is_tag_ref(repo_path, to_ref)
 
     # Collect the PR set. Three paths, in priority order:
@@ -1148,6 +1284,8 @@ def build_changelog(
         from_url=from_url,
         entries=entries,
         full_changelog_url=full_changelog_url,
+        build_report_block=build_report_block,
+        release_notes_block=release_notes_block,
         packages_block=packages_block,
     )
     return md, to_sha, to_is_tag
@@ -1163,6 +1301,8 @@ def emit_changelog(
     display_title: str | None = None,
     work_dir: Path | None = None,
     docker_image_url: str | None = None,
+    build_report_url: str | None = None,
+    release_notes_url: str | None = None,
     base_branch: str | None = None,
     explicit_prs: list[str] | None = None,
 ) -> bool:
@@ -1186,6 +1326,8 @@ def emit_changelog(
         display_title=title,
         work_dir=work_dir,
         docker_image_url=docker_image_url,
+        build_report_url=build_report_url,
+        release_notes_url=release_notes_url,
         base_branch=base_branch,
         explicit_prs=explicit_prs,
     )

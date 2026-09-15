@@ -2333,6 +2333,19 @@ def release(
          "a placeholder ending in `sha256-TBD` so the digest can be "
          "filled in mechanically after the image is pushed.",
 )
+@click.option(
+    "--build-report-url", default=None,
+    help="Full URL to the CI build report (ci_run_report.html). When "
+         "omitted, RelEasy resolves the workflow-run id from the "
+         "build-artifacts bucket, falling back to a `RUN-ID-TBD` "
+         "placeholder if CI has not published for the ref yet.",
+)
+@click.option(
+    "--release-notes-url", default=None,
+    help="Full URL to the docs.altinity.com release notes. When omitted, "
+         "it is derived from the tag for projects whose docs are split by "
+         "version (antalya, stable); other projects get no link.",
+)
 @click.pass_context
 def draft_release_cmd(
     ctx: click.Context,
@@ -2346,6 +2359,8 @@ def draft_release_cmd(
     output_file: Path | None,
     work_dir: str | None,
     docker_image_url: str | None,
+    build_report_url: str | None,
+    release_notes_url: str | None,
 ) -> None:
     """Build a categorised release changelog from merged PRs.
 
@@ -2396,6 +2411,8 @@ def draft_release_cmd(
         output_file=output_file,
         work_dir=wd,
         docker_image_url=docker_image_url,
+        build_report_url=build_report_url,
+        release_notes_url=release_notes_url,
         base_branch=base_branch,
         explicit_prs=explicit_prs or None,
     ):
