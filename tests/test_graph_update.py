@@ -1629,5 +1629,62 @@ class CheckpointResume(unittest.TestCase):
         )
 
 
+class CarriedSessionFields(unittest.TestCase):
+    """Regression: a re-discover orphaned the graph issue.
+
+    The carry-over of the issue link, ingest watermark and vetoes used to
+    sit inside the ``if open_issue:`` branch of ``run_discover_deps``, so a
+    run that completed WITHOUT ``--open-issue`` wrote a report with no
+    ``graph_issue``. ``graph update`` then refused, and the sync it points
+    at opens a duplicate issue rather than finding the existing one.
+    """
+
+    def _prior(self):
+        return report(
+            [node("pr-1", 1)],
+            issue_number=2322,
+            issue_url="https://github.com/o/r/issues/2322",
+            last_ingested_at="2026-09-14T15:53:10+00:00",
+            excluded=[{"url": URL(2154), "reason": "vetoed"}],
+        )
+
+    def test_all_four_fields_carried(self):
+        self.assertEqual(
+            d._carried_session_fields(self._prior()),
+            {
+                "issue_number": 2322,
+                "issue_url": "https://github.com/o/r/issues/2322",
+                "last_ingested_at": "2026-09-14T15:53:10+00:00",
+                "excluded": [{"url": URL(2154), "reason": "vetoed"}],
+            },
+        )
+
+    def test_no_prior_report(self):
+        self.assertEqual(d._carried_session_fields(None), {})
+
+    def test_excluded_not_aliased(self):
+        # Two reports built from one prior must not share the list.
+        prior = self._prior()
+        a = d._carried_session_fields(prior)["excluded"]
+        b = d._carried_session_fields(prior)["excluded"]
+        a.append({"url": URL(9), "reason": "x"})
+        self.assertEqual(len(b), 1)
+        self.assertEqual(len(prior.excluded), 1)
+
+    def test_report_born_with_them_round_trips(self):
+        # The written YAML must carry graph_issue — its absence is what
+        # made `graph update` refuse.
+        fresh = report([node("pr-2", 2)], **d._carried_session_fields(self._prior()))
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "graph.b.yaml"
+            d._write_report(fresh, path)
+            raw = yaml.safe_load(path.read_text())
+            self.assertEqual(raw["graph_issue"]["number"], 2322)
+            back = d.load_report(path)
+        self.assertEqual(back.issue_number, 2322)
+        self.assertEqual(back.last_ingested_at, "2026-09-14T15:53:10+00:00")
+        self.assertEqual(len(back.excluded), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

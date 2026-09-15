@@ -216,6 +216,26 @@ def _resolve_base_branch(config: Config, onto: str | None) -> str:
     )
 
 
+def _carried_session_fields(prior: DiscoveryReport | None) -> dict:
+    """Session facts a re-discover inherits rather than recomputes.
+
+    The graph issue the report was posted to, how far its comments have
+    been ingested, and the member vetoes. Every :class:`DiscoveryReport`
+    a run builds — each checkpoint and the final one — is constructed
+    with these, so no path can write a report that drops the issue link
+    and orphans the graph issue. Returns a fresh ``excluded`` list per
+    call, so two reports never share one.
+    """
+    if prior is None:
+        return {}
+    return {
+        "issue_number": prior.issue_number,
+        "issue_url": prior.issue_url,
+        "last_ingested_at": prior.last_ingested_at,
+        "excluded": list(prior.excluded),
+    }
+
+
 def run_discover_deps(
     config: Config,
     onto: str | None,
@@ -304,9 +324,8 @@ def run_discover_deps(
     report_path = output_path or _default_report_path(config, base_branch)
     warnings_acc: list[str] = []
     # Read whenever a report exists: its nodes drive reuse (opted out of by
-    # --redo / --no-write), and its issue link is carried into every
-    # checkpoint either way — checkpointing overwrites the file long before
-    # the end-of-run carry-over would otherwise read it back.
+    # --redo / --no-write), and it is the source of the session fields every
+    # report this run builds inherits (see ``_carried_session_fields``).
     prior_report: DiscoveryReport | None = None
     target_moved = False
     if report_path.exists():
@@ -507,12 +526,8 @@ def run_discover_deps(
                 components=[],
                 singletons=[],
                 warnings=warnings_acc,
+                **_carried_session_fields(prior_report),
             )
-            if prior_report is not None:
-                snapshot.issue_number = prior_report.issue_number
-                snapshot.issue_url = prior_report.issue_url
-                snapshot.last_ingested_at = prior_report.last_ingested_at
-                snapshot.excluded = list(prior_report.excluded)
             _write_report(snapshot, report_path)
 
         while queue:
@@ -901,6 +916,7 @@ def run_discover_deps(
         warnings=warnings_acc,
         refresh_removed=refresh_removed,
         refresh_added=refresh_added,
+        **_carried_session_fields(prior_report),
     )
 
     # --- Write outputs ---
@@ -936,19 +952,9 @@ def run_discover_deps(
 
     output_path = report_path
 
-    # Open/refresh the issue before the final write so issue_number persists
-    # in the same report; carry a prior issue over to avoid duplicates.
+    # Open/refresh the issue before the final write so issue_number
+    # persists in the same report.
     if open_issue:
-        if output_path.exists():
-            try:
-                prior = load_report(output_path)
-                report.issue_number = prior.issue_number
-                report.issue_url = prior.issue_url
-                # Preserve ingest watermark + vetoes across a re-discover.
-                report.last_ingested_at = prior.last_ingested_at
-                report.excluded = list(prior.excluded)
-            except (OSError, ValueError):
-                pass
         title = issue_title or f"Port graph for {base_branch}"
         if open_or_update_graph_issue(config, report, title=title) is None:
             warnings_acc.append("failed to open/update the graph issue")
