@@ -809,6 +809,50 @@ def mark_reverted_cmd(
             raise SystemExit(1)
 
 
+@cli.command(short_help="Park a PR without vetoing it (session-level).")
+@click.argument("url")
+@click.option(
+    "--reason", default=None,
+    help="What it is waiting on. Shown on the graph issue and by "
+         "`releasy pr list`.",
+)
+@click.pass_context
+def hold(ctx: click.Context, url: str, reason: str | None) -> None:
+    """Put a PR on hold — appends it to ``pr_sources.on_hold``.
+
+    A hold is not a veto. The PR keeps its place (and its dependency
+    edges) in the graph and whatever port branch / PR it already has;
+    `run` just walks past the unit carrying it, and anything declaring
+    that unit in ``depends_on`` reports as blocked. The graph issue lists
+    it under **On hold** from the next write onward.
+
+    Holding any PR of a group holds the whole group — its members
+    cherry-pick as one atomic unit. Use `releasy unhold` to put it back in
+    work. Refused for a PR already vetoed in ``exclude_prs``.
+    """
+    from releasy.pr_membership import hold_pr
+
+    with _locked_config(ctx, session="required") as config:
+        if not hold_pr(config, url, reason or ""):
+            raise SystemExit(1)
+
+
+@cli.command(short_help="Take a PR off hold (session-level).")
+@click.argument("url")
+@click.pass_context
+def unhold(ctx: click.Context, url: str) -> None:
+    """Take a PR off hold — drops it from ``pr_sources.on_hold``.
+
+    The unit ports on the next `releasy run`. A no-op (exit 0) when the
+    PR was not on hold.
+    """
+    from releasy.pr_membership import unhold_pr
+
+    with _locked_config(ctx, session="required") as config:
+        if not unhold_pr(config, url):
+            raise SystemExit(1)
+
+
 @cli.command(short_help="Persist state and exit (nothing rolled back).")
 @click.pass_context
 def abort(ctx: click.Context) -> None:

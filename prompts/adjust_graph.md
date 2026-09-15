@@ -10,6 +10,11 @@ ignore non-actionable comments (questions, 👍). Allowed actions:
 
 - **Add** a PR ("also port #2000").
 - **Veto** a PR ("drop #1010") — list under `exclude`, omit from every unit.
+- **Hold** a PR ("park #2234 until the follow-up lands", "wait on #2249") —
+  list under `on_hold` and KEEP its unit. A hold is not a veto: the PR stays
+  in the graph, it just isn't ported yet.
+- **Release** a held PR ("#2234 can go ahead now") — leave it out of
+  `on_hold`.
 - **Regroup** — merge PRs into one atomic unit, or split a unit.
 - **Reorder** — add/remove `depends_on` edges.
 
@@ -46,6 +51,9 @@ units:
 exclude:                      # omit if nothing vetoed
   - url: <pr-url>
     reason: <short reason>
+on_hold:                      # OMIT ENTIRELY if no comment touches holds
+  - url: <pr-url>             # (omitting it keeps the current holds as-is)
+    reason: <what it waits on>
 addressed: [C1, C3]           # comment handles you applied; omit the rest
 ```
 
@@ -54,5 +62,13 @@ requested); each PR is in exactly one unit *or* `exclude`, never both;
 `depends_on` ids must exist in this block; no cycles. List under `addressed`
 only the comment handles you actually applied — leave out questions, 👍, and
 requests you ignored or disagreed with, so they stay visible for a human.
+
+`on_hold` is the **complete** new hold list and *replaces* the current one,
+so re-list every PR that should stay on hold (they are shown above under
+"Currently on hold"), not just newly held ones — anything you leave out goes
+back in work. A held PR keeps its unit under `units`; `on_hold` annotates it,
+it does not remove it. When no comment asks to hold or release anything, omit
+the `on_hold` key altogether and the current holds are left untouched — an
+empty list means "release everything".
 
 ## Respond now.

@@ -52,7 +52,7 @@ features:
 # Set arithmetic:
 #   union(by_labels) − exclude_labels − exclude_authors
 #   ∩ (include_authors when set)
-#   + include_prs − exclude_prs
+#   + include_prs − exclude_prs − on_hold
 # include_prs bypasses label & author filters.
 pr_sources:
   by_labels:
@@ -71,6 +71,14 @@ pr_sources:
 
   exclude_prs:
     - https://github.com/Altinity/ClickHouse/pull/789
+
+  # Parked, not vetoed: `run` skips these, `graph discover` still keeps
+  # them (and their edges) in the graph, and the graph issue lists them
+  # under "On hold". Drop the entry to put one back in work.
+  on_hold:
+    - https://github.com/Altinity/ClickHouse/pull/2234
+    - url: https://github.com/Altinity/ClickHouse/pull/2249
+      reason: waiting for the upstream follow-up
 
   # Cherry-pick multiple PRs onto ONE branch, open ONE combined PR.
   # sort: listed (default, walks `prs:`) | merged_at
@@ -98,6 +106,23 @@ pr_sources:
 If a PR URL appears in two of `include_prs` / `exclude_prs` / a group's
 `prs`, you get a one-line stderr warning. The pipeline still resolves
 deterministically (group wins over `include_prs`; `exclude_prs` is final).
+A URL in both `on_hold` and `exclude_prs` warns too — the veto already
+keeps it out.
+
+### On hold vs. excluded
+
+`exclude_prs` is a veto: the PR leaves the graph and stops being a
+candidate. `on_hold` is a pause — the PR keeps its unit, its dependency
+edges and any port PR it already has, `releasy run` just walks past it,
+and anything that declares its unit in `depends_on` reports as blocked
+(a held unit never reaches `merged`). Holding any PR of a group holds the
+whole group: its members cherry-pick as one atomic unit.
+
+Three ways in and out, all reflected on the graph issue at the next write:
+[`releasy hold`](commands.md#releasy-hold) /
+[`releasy unhold`](commands.md#releasy-unhold), a comment on the graph issue
+followed by [`releasy graph update`](commands.md#releasy-graph-update), or
+editing `pr_sources.on_hold` by hand.
 
 ## Key options
 
@@ -204,6 +229,7 @@ Options live in `config.yaml` unless marked **(session)**.
 | `pr_sources.exclude_authors` **(session)** | Denylist of GitHub logins. Bypassed by `include_prs`. | `[]` |
 | `pr_sources.include_prs` **(session)** | Always include. Bare URL or `{url, ai_context}`. | `[]` |
 | `pr_sources.exclude_prs` **(session)** | Always exclude. | `[]` |
+| `pr_sources.on_hold` **(session)** | Park without vetoing: `run` skips the unit, the graph keeps it. Bare URL or `{url, reason}`. | `[]` |
 | `pr_sources.groups[].id` **(session)** | Group id → branch name. | — |
 | `pr_sources.groups[].prs` **(session)** | Ordered PR list. Bare URL or `{url, ai_context}`. | — |
 | `pr_sources.groups[].description` **(session)** | Combined PR title. | id |

@@ -235,6 +235,11 @@ def remove_pr(
     removed_from_top = _remove_url_from_list(url, ps.include_prs)
     _drop_context(url, ps.include_pr_contexts)
 
+    # A veto outranks a hold — leaving the entry would only trip the
+    # load-time "has no effect" warning.
+    removed_from_hold = _remove_url_from_list(url, ps.on_hold)
+    _drop_context(url, ps.on_hold_reasons)
+
     removed_from_groups: list[str] = []
     overlay_groups: list[str] = []
     for g in ps.groups:
@@ -260,6 +265,7 @@ def remove_pr(
 
     nothing_to_do = (
         not removed_from_top
+        and not removed_from_hold
         and not removed_from_groups
         and not overlay_groups
         and not state_purged
@@ -278,6 +284,8 @@ def remove_pr(
     console.print(f"[green]✓[/green] Removed [cyan]{url}[/cyan]")
     if removed_from_top:
         console.print("[dim]  - dropped from include_prs[/dim]")
+    if removed_from_hold:
+        console.print("[dim]  - dropped from on_hold[/dim]")
     for gid in removed_from_groups:
         console.print(f"[dim]  - dropped from group '{gid}'[/dim]")
     for gid in overlay_groups:
@@ -294,6 +302,70 @@ def remove_pr(
         console.print(
             "[dim]  - kept out of exclude_prs (--keep-discovery)[/dim]"
         )
+    return True
+
+
+def hold_pr(config: Config, url: str, reason: str = "") -> bool:
+    """Park a PR in ``pr_sources.on_hold`` — waiting, not vetoed.
+
+    Re-holding an already-held PR just refreshes its reason. A held PR
+    stays in the dependency graph and keeps whatever port branch / PR it
+    already has; ``releasy run`` skips the unit carrying it until the entry
+    is dropped by :func:`unhold_pr`, by a graph-issue comment, or by hand.
+    """
+    session = _require_session(config)
+
+    if parse_pr_url(url) is None:
+        console.print(f"[red]Malformed PR URL: {url}[/red]")
+        return False
+
+    ps = session.pr_sources
+    if _url_in_list(url, ps.exclude_prs):
+        console.print(
+            f"[red]PR {url} is vetoed in exclude_prs.[/red] A hold is for "
+            "PRs still on the list — re-add it with `releasy pr add` first."
+        )
+        return False
+
+    already = _url_in_list(url, ps.on_hold)
+    if already and _lookup_context(url, ps.on_hold_reasons) == reason:
+        console.print("[yellow]PR already on hold[/yellow] — no change.")
+        return True
+
+    if not already:
+        ps.on_hold.append(url)
+    _drop_context(url, ps.on_hold_reasons)
+    if reason:
+        ps.on_hold_reasons[url] = reason
+
+    save_session(session)
+    verb = "Updated the hold on" if already else "Put"
+    tail = " on hold" if not already else ""
+    console.print(
+        f"[green]✓[/green] {verb} [cyan]{url}[/cyan]{tail}"
+        + (f" — {reason}" if reason else "")
+    )
+    return True
+
+
+def unhold_pr(config: Config, url: str) -> bool:
+    """Drop a PR from ``pr_sources.on_hold`` — back in work next run."""
+    session = _require_session(config)
+
+    if parse_pr_url(url) is None:
+        console.print(f"[red]Malformed PR URL: {url}[/red]")
+        return False
+
+    ps = session.pr_sources
+    if not _remove_url_from_list(url, ps.on_hold):
+        console.print(f"[yellow]PR {url} was not on hold — nothing to do.[/yellow]")
+        return True
+    _drop_context(url, ps.on_hold_reasons)
+    save_session(session)
+    console.print(
+        f"[green]✓[/green] Took [cyan]{url}[/cyan] off hold — it ports on "
+        "the next `releasy run`"
+    )
     return True
 
 
@@ -320,6 +392,15 @@ def list_prs(config: Config) -> None:
         table.add_column("ai_context", style="dim")
         for url in g.prs:
             table.add_row(url, _lookup_context(url, g.pr_ai_contexts))
+        console.print(table)
+        any_printed = True
+
+    if ps.on_hold:
+        table = Table(title="on_hold (parked, not vetoed)")
+        table.add_column("URL", style="cyan")
+        table.add_column("reason", style="dim")
+        for url in ps.on_hold:
+            table.add_row(url, _lookup_context(url, ps.on_hold_reasons))
         console.print(table)
         any_printed = True
 

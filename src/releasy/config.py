@@ -273,6 +273,15 @@ class PRSourcesConfig:
         ∩ (include_authors when set)
         + include_prs
         − exclude_prs
+        − on_hold
+
+    ``on_hold`` parks PRs without vetoing them: they stay in the dependency
+    graph (and in the graph issue, under their own section) but ``releasy
+    run`` skips the units carrying them, so anything that declares such a
+    unit in ``depends_on`` reports as blocked. A hold on any PR of a group
+    holds the whole group — its members cherry-pick as one atomic unit.
+    Entries are a bare URL or ``{url, reason}``; drop the entry to put the
+    PR back in work. ``exclude_prs`` wins over a hold.
 
     ``groups`` are evaluated independently: every PR listed in any group is
     ported as part of that group (one combined PR per group), regardless of
@@ -293,6 +302,7 @@ class PRSourcesConfig:
     exclude_labels: list[str] = field(default_factory=list)
     include_prs: list[str] = field(default_factory=list)
     exclude_prs: list[str] = field(default_factory=list)
+    on_hold: list[str] = field(default_factory=list)
     include_authors: list[str] = field(default_factory=list)
     exclude_authors: list[str] = field(default_factory=list)
     groups: list[PRGroupConfig] = field(default_factory=list)
@@ -304,6 +314,9 @@ class PRSourcesConfig:
     # ``--no-write`` / ``--deps-file <override>`` says otherwise). Relative paths
     # resolve against the session file's directory.
     deps_file: str | None = None
+    # Why each ``on_hold`` URL is parked, keyed by URL exactly as listed.
+    # Entries listed as a bare URL have none; shown on the graph issue.
+    on_hold_reasons: dict[str, str] = field(default_factory=dict)
     # Per-PR-URL ai_context for individual entries inside ``include_prs``
     # that used the dict form (``{url: ..., ai_context: ...}``). Keyed by
     # URL exactly as listed in the session file. Surfaced to the AI
@@ -2055,54 +2068,54 @@ def lookup_pr_ai_context(
 
 
 def _parse_pr_url_entries(
-    raw: list, *, where: str,
+    raw: list, *, where: str, value_key: str = "ai_context",
 ) -> tuple[list[str], dict[str, str]]:
     """Parse a YAML list whose entries are either bare URL strings or
-    ``{url: ..., ai_context: ...}`` dicts.
+    ``{url: ..., <value_key>: ...}`` dicts.
 
-    Returns ``(urls, contexts)`` where ``urls`` preserves input order and
-    ``contexts`` maps URL → ai_context for entries that supplied one (dict
-    entries with no ``ai_context`` and bare-string entries do not appear in
-    the contexts map).
+    Returns ``(urls, values)`` where ``urls`` preserves input order and
+    ``values`` maps URL → the ``value_key`` field for entries that supplied
+    one (dict entries without it and bare-string entries do not appear).
 
     Both forms can be mixed freely in a single list. ``where`` is the
     user-facing path used in error messages (e.g.
-    ``"pr_sources.include_prs"``).
+    ``"pr_sources.include_prs"``); ``value_key`` is ``ai_context`` for the
+    PR lists and ``reason`` for ``pr_sources.on_hold``.
     """
     if not isinstance(raw, list):
         raise ValueError(f"{where} must be a list, got {type(raw).__name__}")
     urls: list[str] = []
-    contexts: dict[str, str] = {}
+    values: dict[str, str] = {}
     seen: set[str] = set()
     for idx, entry in enumerate(raw):
         if isinstance(entry, str):
             url = entry.strip()
-            ai_context = ""
+            value = ""
         elif isinstance(entry, dict):
             url = (entry.get("url") or "").strip()
             if not url:
                 raise ValueError(
                     f"{where}[{idx}]: dict entry must specify 'url'"
                 )
-            ai_context = (entry.get("ai_context") or "").strip()
-            extra = set(entry.keys()) - {"url", "ai_context"}
+            value = (entry.get(value_key) or "").strip()
+            extra = set(entry.keys()) - {"url", value_key}
             if extra:
                 raise ValueError(
                     f"{where}[{idx}]: unknown keys {sorted(extra)} "
-                    "(allowed: 'url', 'ai_context')"
+                    f"(allowed: 'url', {value_key!r})"
                 )
         else:
             raise ValueError(
                 f"{where}[{idx}]: must be a URL string or "
-                f"{{url, ai_context}} mapping, got {type(entry).__name__}"
+                f"{{url, {value_key}}} mapping, got {type(entry).__name__}"
             )
         if url in seen:
             raise ValueError(f"{where}: duplicate URL {url!r}")
         seen.add(url)
         urls.append(url)
-        if ai_context:
-            contexts[url] = ai_context
-    return urls, contexts
+        if value:
+            values[url] = value
+    return urls, values
 
 
 def resolve_deps_file_path(
@@ -2370,6 +2383,12 @@ def load_session(
         where="pr_sources.include_prs",
     )
 
+    on_hold_list, on_hold_reasons = _parse_pr_url_entries(
+        ps_raw.get("on_hold", []) or [],
+        where="pr_sources.on_hold",
+        value_key="reason",
+    )
+
     fp_labels_raw = ps_raw.get("forward_port_labels", []) or []
     if isinstance(fp_labels_raw, str):
         fp_labels_raw = [fp_labels_raw]
@@ -2386,6 +2405,8 @@ def load_session(
         exclude_labels=ps_raw.get("exclude_labels", []) or [],
         include_prs=include_prs_list,
         exclude_prs=ps_raw.get("exclude_prs", []) or [],
+        on_hold=on_hold_list,
+        on_hold_reasons=on_hold_reasons,
         include_authors=_str_list("include_authors"),
         exclude_authors=_str_list("exclude_authors"),
         groups=groups,
@@ -2406,6 +2427,7 @@ def load_session(
         groups, include_prs_list,
         ps_raw.get("exclude_prs", []) or [],
         overlay_warnings,
+        on_hold_list,
     )
 
     raw_pr_labels = raw.get("pr_labels", []) or []
@@ -2467,6 +2489,7 @@ def _warn_on_redundant_pr_listings(
     include_prs: list[str],
     exclude_prs: list[str],
     overlay_warnings: list[str],
+    on_hold: list[str] | None = None,
 ) -> None:
     """Surface configurations where the same PR URL appears in two places
     that resolve to a single, deterministic outcome at runtime.
@@ -2485,6 +2508,8 @@ def _warn_on_redundant_pr_listings(
       entry is contradictory.
     * URL in some ``groups[].prs`` AND in ``exclude_prs`` — the PR is
       dropped from the group, possibly emptying it.
+    * URL in ``on_hold`` AND in ``exclude_prs`` — the veto already keeps
+      it out, so the hold entry never comes into play.
     """
     group_pr_to_id: dict[str, str] = {}
     for g in groups:
@@ -2493,6 +2518,13 @@ def _warn_on_redundant_pr_listings(
 
     include_set = set(include_prs)
     exclude_set = set(exclude_prs)
+
+    for url in set(on_hold or []) & exclude_set:
+        overlay_warnings.append(
+            f"PR {url} appears in both pr_sources.on_hold and "
+            "pr_sources.exclude_prs; the veto already keeps it out, so the "
+            "hold entry has no effect"
+        )
 
     for url in include_set & set(group_pr_to_id):
         overlay_warnings.append(
@@ -2614,16 +2646,16 @@ def save_session(session: SessionConfig, path: Path | None = None) -> None:
     data: dict = {}
 
     def _dump_pr_url_list(
-        urls: list[str], contexts: dict[str, str],
+        urls: list[str], values: dict[str, str], key: str = "ai_context",
     ) -> list:
-        """Render a PR URL list: bare strings when no ai_context is
-        attached, dict form (``{url, ai_context}``) when one is.
+        """Render a PR URL list: bare strings when no ``key`` value is
+        attached, dict form (``{url, <key>}``) when one is.
         """
         out: list = []
         for url in urls:
-            ctx = contexts.get(url, "")
-            if ctx:
-                out.append({"url": url, "ai_context": ctx})
+            val = values.get(url, "")
+            if val:
+                out.append({"url": url, key: val})
             else:
                 out.append(url)
         return out
@@ -2670,6 +2702,10 @@ def save_session(session: SessionConfig, path: Path | None = None) -> None:
         )
     if ps.exclude_prs:
         ps_data["exclude_prs"] = ps.exclude_prs
+    if ps.on_hold:
+        ps_data["on_hold"] = _dump_pr_url_list(
+            ps.on_hold, ps.on_hold_reasons, "reason",
+        )
     if ps.include_authors:
         ps_data["include_authors"] = ps.include_authors
     if ps.exclude_authors:

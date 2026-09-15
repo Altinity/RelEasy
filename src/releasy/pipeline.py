@@ -186,6 +186,11 @@ class FeatureUnit:
     # URL. Combined with ``ai_context`` above when a step's source PR
     # has a matching entry.
     per_pr_ai_context: dict[str, str] = field(default_factory=dict)
+    # Why this unit is parked by ``pr_sources.on_hold`` — the recorded
+    # reason, or ``""`` when the hold carries none. ``None`` means the unit
+    # is not held. ``releasy run`` skips a held unit; discovery still
+    # analyses it so it keeps its place (and its edges) in the graph.
+    hold_reason: str | None = None
     # Mutable per-run bookkeeping (set by _process_feature_unit):
     ai_resolved_count: int = 0
     ai_iterations_total: int = 0
@@ -381,6 +386,41 @@ def _singleton_feature_id(pr: PRInfo, origin_slug: str | None) -> str:
         return f"pr-{pr.number}"
     owner, repo = pr.repo_slug.split("/", 1)
     return f"{owner}-{repo}-pr-{pr.number}"
+
+
+def hold_map(config: Config) -> dict[PRRef, str]:
+    """``pr_sources.on_hold`` as canonical PR ref → recorded reason.
+
+    Keyed by ``(owner, repo, number)`` so a URL written with a ``.git``
+    suffix or a trailing path still matches. Unparseable entries are
+    dropped. A held PR with no recorded reason maps to ``""``.
+    """
+    out: dict[PRRef, str] = {}
+    reasons = config.pr_sources.on_hold_reasons
+    for url in config.pr_sources.on_hold:
+        parsed = parse_pr_url(url)
+        if parsed is not None:
+            out[parsed] = reasons.get(url, "")
+    return out
+
+
+def _unit_hold_reason(
+    unit: "FeatureUnit", holds: dict[PRRef, str],
+) -> str | None:
+    """The hold parking ``unit``, or ``None``. Holding any PR of a group
+    holds the whole group: its members cherry-pick as one atomic unit, so
+    porting the rest without the held one would ship a broken subset.
+
+    Several held PRs in one group → the reasons are joined, so the graph
+    issue names every hold the unit is waiting on.
+    """
+    reasons = [
+        holds[ref] for pr in unit.prs
+        if (ref := pr.ref()) in holds
+    ]
+    if not reasons:
+        return None
+    return "; ".join(dict.fromkeys(r for r in reasons if r))
 
 
 def _author_filter_reason(
@@ -732,7 +772,43 @@ def discover_feature_units(config: Config) -> list["FeatureUnit"]:
     units: list[FeatureUnit] = (
         _build_singleton_units(config, collected) + group_units
     )
+    _mark_held_units(config, units, origin_slug)
     return _topo_sort_units(units)
+
+
+def _mark_held_units(
+    config: Config, units: list[FeatureUnit], origin_slug: str | None,
+) -> None:
+    """Stamp ``hold_reason`` on every unit parked by ``pr_sources.on_hold``.
+
+    Marks rather than filters: ``graph discover`` runs off the same unit
+    list and a held unit has to keep its node (and its edges) in the graph,
+    which is where the issue lists it. The ``run`` loops are what skip it.
+    """
+    holds = hold_map(config)
+    if not holds:
+        return
+    held = 0
+    for unit in units:
+        reason = _unit_hold_reason(unit, holds)
+        if reason is None:
+            continue
+        unit.hold_reason = reason
+        held += 1
+    if held:
+        console.print(
+            f"\n  [dim]{held} unit(s) on hold (pr_sources.on_hold) — "
+            "kept in the graph, skipped by `run`[/dim]"
+        )
+    unknown = sorted(
+        ref for ref in holds
+        if not any(pr.ref() == ref for u in units for pr in u.prs)
+    )
+    for owner, repo, num in unknown:
+        console.print(
+            f"  [dim]  on_hold: {pr_ref_label(f'{owner}/{repo}', num, origin_slug)} "
+            "matches no discovered unit[/dim]"
+        )
 
 
 def _topo_sort_units(units: list[FeatureUnit]) -> list[FeatureUnit]:
@@ -1462,6 +1538,9 @@ def run_pipeline(
                     )
                 _dry_record(state, f"skip-{prev_fs.status}")
             continue
+        if unit.hold_reason is not None:
+            _report_hold(config, state, unit)
+            continue
         # _process_feature_unit always returns "continue" — unresolved
         # conflicts are now handled in-place (drop the branch or open a
         # draft PR), and the pipeline keeps moving so a single bad PR
@@ -1498,6 +1577,7 @@ def run_pipeline(
                 ("skip-partial-continue-exhausted",
                                                 "skip — partial group, auto-continue cap reached"),
                 ("blocked-by-deps",             "blocked by unmet deps (no action)"),
+                ("skip-on-hold",                "skip — on hold (pr_sources.on_hold)"),
                 ("skip-stalled",                "skip — stalled on something outside the unit"),
                 ("skip-conflict-retry-off",     "skip — prior conflict, retry-off"),
                 ("skip-merged",                 "skip — already merged"),
@@ -1741,6 +1821,10 @@ def run_sequential(
             console.print(
                 f"  [dim]{unit.feature_id} ({ref}) — {fs.status}, skipping[/dim]"
             )
+            continue
+
+        if unit.hold_reason is not None:
+            _report_hold(config, state, unit)
             continue
 
         if fs is not None and fs.status == "conflict":
@@ -2979,6 +3063,35 @@ def _skip_for_stall(
     _persist_state(config, state)
     _dry_record(state, "skip-stalled")
     return True
+
+
+def _report_hold(
+    config: Config, state: PipelineState, unit: FeatureUnit,
+) -> None:
+    """Announce that ``unit`` is parked by ``pr_sources.on_hold`` and leave
+    it alone — no branch, no PR, no state write.
+
+    Nothing is recorded because the hold lives in the session, not in
+    state: a unit already ported before the hold keeps the status (and the
+    PR) it had, and dropping the entry from ``on_hold`` puts it straight
+    back in the queue on the next run. Anything declaring the unit in
+    ``depends_on`` reports as blocked meanwhile — a held unit never reaches
+    ``merged``.
+    """
+    from rich.markup import escape
+
+    primary = unit.primary_pr()
+    ref = pr_ref_label(
+        primary.repo_slug, primary.number, get_origin_repo_slug(config),
+    )
+    why = f": {unit.hold_reason}" if unit.hold_reason else ""
+    console.print(
+        f"\n    [yellow]⏸[/yellow] [cyan]{unit.feature_id}[/cyan] ({ref}) "
+        f"— on hold{escape(why)}\n"
+        "      [dim]drop it from pr_sources.on_hold (or comment on the "
+        "graph issue) to put it back in work[/dim]"
+    )
+    _dry_record(state, "skip-on-hold")
 
 
 def _process_feature_unit(

@@ -106,6 +106,15 @@ features:
 #   a PR listed here is never processed. Matched by full owner/repo/number,
 #   so excluding e.g. ClickHouse/ClickHouse#42 won't drop Altinity/ClickHouse#42.
 #
+# on_hold — park a PR without vetoing it: `releasy run` skips the unit
+#   carrying it, but `graph discover` keeps that unit (and its dependency
+#   edges) in the graph, and the graph issue lists it under "On hold".
+#   Units that depend on a held one report as blocked. Holding any PR of a
+#   group holds the whole group — its members port as one atomic unit.
+#   Entries are a bare URL or {url, reason}; drop the entry to put the PR
+#   back in work on the next run. A trusted comment on the graph issue can
+#   do the same via `releasy graph update`.
+#
 # include_authors (when non-empty) — restrict discovered PRs to those
 #   authored by one of the listed GitHub logins. Case-insensitive.
 #   Bypassed for PRs explicitly listed in include_prs.
@@ -137,6 +146,11 @@ features:
 #   exclude_prs:
 #     - https://github.com/Altinity/ClickHouse/pull/789
 #
+#   on_hold:
+#     - https://github.com/Altinity/ClickHouse/pull/2234
+#     - url: https://github.com/Altinity/ClickHouse/pull/2249
+#       reason: waiting for the upstream follow-up
+#
 #   # Sequential PR groups: cherry-pick multiple PRs onto a SINGLE port
 #   # branch and open ONE combined PR for the whole group. Use this when
 #   # PR #B depends on PR #A and they should land together. The group
@@ -154,6 +168,7 @@ features:
 #   #
 #   # `exclude_prs` and `exclude_labels` still drop individual PRs from
 #   # a group; if a group ends up empty it is skipped with a warning.
+#   # `on_hold` is different: it parks the WHOLE group, members intact.
 #   #
 #   # AI conflict resolution works per cherry-pick step inside a group:
 #   # if any PR in the group conflicts, Claude resolves+builds+commits

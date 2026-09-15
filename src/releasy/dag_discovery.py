@@ -76,6 +76,7 @@ from releasy.pipeline import (
     FeatureUnit,
     _SOURCE_PR_URL_RE,
     discover_feature_units,
+    hold_map,
 )
 from releasy.state import FeatureState, PipelineState, load_state
 from releasy.termlog import get_console
@@ -2770,6 +2771,12 @@ _PROGRESS_SUMMARY_ORDER: tuple[str, ...] = (
 
 _NOT_STARTED_MARKER = "⬜ not started"
 
+# Shown for a unit parked by ``pr_sources.on_hold``. Not a BranchStatus:
+# a hold is a session-level decision that leaves whatever state the unit
+# already had untouched, so it prefixes the progress note rather than
+# replacing it.
+_HOLD_MARKER = "⏸ on hold"
+
 # Statuses whose group is folded shut in the issue: the port landed, there
 # is nothing left to look at. Everything else stays expanded.
 _FOLDED_STATUSES: frozenset[str] = frozenset({"merged"})
@@ -2863,15 +2870,20 @@ def _stall_note(fs: FeatureState) -> str:
     return f" · ⏳ {why}"
 
 
-def _progress_note(fs: FeatureState | None, total: int, *, html: bool = False) -> str:
-    """`` — <marker> [#N](url) · <why>`` suffix for a unit's issue entry.
+def _progress_note(
+    fs: FeatureState | None, total: int, *, html: bool = False,
+    lead: str = " — ",
+) -> str:
+    """``<lead><marker> [#N](url) · <why>`` suffix for a unit's issue entry.
 
     ``html`` renders the PR link as an ``<a>`` tag for use inside a
     ``<summary>``: that content sits in a raw HTML block, where GitHub does
-    not run the markdown parser.
+    not run the markdown parser. ``lead`` is the separator the note opens
+    with — the On-hold section passes ``" · "`` so its entries read as one
+    clause after the hold reason instead of a second dash.
     """
     if fs is None:
-        return f" — {_NOT_STARTED_MARKER}"
+        return f"{lead}{_NOT_STARTED_MARKER}"
     marker = _PROGRESS_MARKER.get(fs.status, fs.status)
     if fs.status == "blocked" and fs.blocked_by:
         marker += f" by {', '.join(_code(b, html) for b in fs.blocked_by)}"
@@ -2890,7 +2902,7 @@ def _progress_note(fs: FeatureState | None, total: int, *, html: bool = False) -
         marker += f" · {fs.skip_reason}"
     elif fs.status == "conflict" and total > 1:
         marker += f" · {_picks_landed(fs, total)}/{total} picked"
-    note = f" — {marker}"
+    note = f"{lead}{marker}"
     if fs.rebase_pr_url:
         short = _pr_short(fs.rebase_pr_url)
         note += (
@@ -2915,16 +2927,58 @@ def _to_html_inline(text: str) -> str:
     return re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
 
 
+def _node_hold_reason(
+    node: DAGNode, held: dict[tuple, str] | None,
+) -> str | None:
+    """The hold parking ``node``, or ``None``.
+
+    ``held`` maps canonical PR refs → reason (``pipeline.hold_map``).
+    Matches ``pipeline._unit_hold_reason``: any held PR holds the whole
+    node, and several holds on one node join their reasons.
+    """
+    if not held:
+        return None
+    reasons = [
+        held[key] for url in node.pr_urls
+        if (key := parse_pr_url(url)) is not None and key in held
+    ]
+    if not reasons:
+        return None
+    return "; ".join(dict.fromkeys(r for r in reasons if r))
+
+
+def _hold_note(reason: str, fs: FeatureState | None, total: int) -> str:
+    """`` — ⏸ on hold: <why> · <progress>`` suffix for an On-hold entry.
+
+    The progress half is appended only when the unit has state at all —
+    a hold usually lands before anything was ported, and "⬜ not started"
+    after "on hold" says nothing.
+    """
+    note = f" — {_HOLD_MARKER}" + (f": {reason}" if reason else "")
+    if fs is not None:
+        note += _progress_note(fs, total, lead=" · ")
+    return note
+
+
 def _progress_summary(
     report: DiscoveryReport, progress: dict[str, FeatureState],
+    held_ids: set[str] | None = None,
 ) -> str:
-    """One-line tally: ported / total, then a per-status breakdown."""
+    """One-line tally: ported / total, then a per-status breakdown.
+
+    A held unit is counted once, under on-hold: its status (usually "not
+    started") is not what is stopping it, and listing it in both buckets
+    would make the breakdown add up to more than the unit count.
+    """
+    held_ids = held_ids or set()
     counts: dict[str, int] = {}
     ported = 0
     for n in report.nodes:
         fs = progress.get(n.unit_id)
         if _unit_ported(fs):
             ported += 1
+        if n.unit_id in held_ids:
+            continue
         counts[fs.status if fs else ""] = counts.get(fs.status if fs else "", 0) + 1
     bits = [
         f"{_PROGRESS_MARKER.get(s, s)}: {counts[s]}"
@@ -2932,6 +2986,8 @@ def _progress_summary(
     ]
     if counts.get(""):
         bits.append(f"{_NOT_STARTED_MARKER}: {counts['']}")
+    if held_ids:
+        bits.append(f"{_HOLD_MARKER}: {len(held_ids)}")
     total = len(report.nodes)
     line = f"**Progress: {ported}/{total} unit(s) ported**"
     return line + (" — " + " · ".join(bits) if bits else "")
@@ -2940,12 +2996,16 @@ def _progress_summary(
 def render_graph_issue_body(
     report: DiscoveryReport,
     progress: dict[str, FeatureState] | None = None,
+    held: dict[tuple, str] | None = None,
 ) -> str:
     """Render a DiscoveryReport as a GitHub issue body (markdown).
 
     ``progress`` (from :func:`build_progress_map`) ticks the checkbox of
     every unit releasy has already opened a port PR for and annotates it
     with its status and PR link. Omitted / empty → every box unticked.
+
+    ``held`` (from :func:`pipeline.hold_map`) maps canonical PR refs → hold
+    reason; the units carrying them move to their own **On hold** section.
     """
     progress = progress or {}
     lines: list[str] = [_issue_marker(report.base_branch)]
@@ -2975,6 +3035,22 @@ def render_graph_issue_body(
         and progress[n.unit_id].status == _REVERTED_STATUS
     ]
     parked_ids = {n.unit_id for n in discarded} | {n.unit_id for n in reverted}
+    # On hold: parked by ``pr_sources.on_hold``, so `run` skips them — but
+    # still live graph units, unlike anything above. A held unit whose port
+    # already merged stays where it is: the work is done, the hold no
+    # longer decides anything about it.
+    hold_reasons = {
+        n.unit_id: reason
+        for n in report.nodes
+        if n.unit_id not in parked_ids
+        and (reason := _node_hold_reason(n, held)) is not None
+        and (
+            progress.get(n.unit_id) is None
+            or progress[n.unit_id].status != "merged"
+        )
+    }
+    on_hold = [n for n in report.nodes if n.unit_id in hold_reasons]
+    parked_ids |= set(hold_reasons)
     groups = [n for n in all_groups if n.unit_id not in parked_ids]
     singles = [
         n for n in report.nodes
@@ -2997,9 +3073,14 @@ def render_graph_issue_body(
             f" {len(reverted)} unit(s) were ported and then **reverted** on "
             "target — see the Reverted section; do not port them again."
         )
+    if on_hold:
+        headline += (
+            f" {len(on_hold)} unit(s) are **on hold** and are not being "
+            "ported right now."
+        )
     lines.append(headline)
     lines.append("")
-    lines.append(_progress_summary(report, progress))
+    lines.append(_progress_summary(report, progress, set(hold_reasons)))
     lines.append("")
     lines.append(
         "_A box is ticked once releasy has opened the port PR (a "
@@ -3015,11 +3096,12 @@ def render_graph_issue_body(
     def _box(done: bool) -> str:
         return "[x]" if done else "[ ]"
 
-    def _parked_entry(n: DAGNode) -> list[str]:
+    def _parked_entry(n: DAGNode, note: str | None = None) -> list[str]:
         """One bullet for a unit that left the working lists (no checkbox).
 
         A group becomes a headed bullet with its member PRs beneath it;
-        a singleton is the one line. Used by Reverted and Discarded.
+        a singleton is the one line. Used by On hold, Reverted and
+        Discarded; ``note`` overrides the trailing progress annotation.
         """
         fs = progress.get(n.unit_id)
         total = len(n.pr_urls)
@@ -3027,9 +3109,13 @@ def render_graph_issue_body(
             url = n.pr_urls[0]
             return [
                 f"- [{_pr_short(url)}]({url}) "
-                f"{_title_of(n, 0)}".rstrip() + _progress_note(fs, 1)
+                f"{_title_of(n, 0)}".rstrip()
+                + (note if note is not None else _progress_note(fs, 1))
             ]
-        out = [f"- **`{n.unit_id}`** · {total} PRs" + _progress_note(fs, total)]
+        out = [
+            f"- **`{n.unit_id}`** · {total} PRs"
+            + (note if note is not None else _progress_note(fs, total))
+        ]
         out += [
             f"  {i + 1}. [{_pr_short(url)}]({url}) "
             f"{_title_of(n, i)}".rstrip()
@@ -3075,6 +3161,32 @@ def render_graph_issue_body(
             lines.append(
                 f"- {_box(_unit_ported(fs))} [{_pr_short(url)}]({url}) "
                 f"{_title_of(n, 0)}".rstrip() + _progress_note(fs, 1)
+            )
+        lines.append("")
+
+    # --- On hold (waiting on something; not vetoed) ---
+    # Above Reverted and unfolded: these are live units somebody expects to
+    # come back, and the reader has to see them before assuming the working
+    # lists above are the whole remaining scope.
+    if on_hold:
+        lines.append("### ⏸ On hold — not being ported right now")
+        lines.append("")
+        lines.append(
+            "Parked in `pr_sources.on_hold`: **not vetoed**, just waiting on "
+            "something (a follow-up PR, a decision). `releasy run` skips "
+            "them, and anything that depends on one reports as blocked. "
+            "Comment here to put one back in work (or take it off "
+            "`on_hold` in the session file) and it ports on the next run."
+        )
+        lines.append("")
+        for n in on_hold:
+            lines += _parked_entry(
+                n,
+                _hold_note(
+                    hold_reasons[n.unit_id],
+                    progress.get(n.unit_id),
+                    len(n.pr_urls),
+                ),
             )
         lines.append("")
 
@@ -3144,8 +3256,9 @@ def render_graph_issue_body(
     lines.append("---")
     lines.append(
         "Org members can **comment on this issue** to change the graph — "
-        "add or veto PRs, regroup, or set ordering — then run "
-        "`releasy graph update` to apply your feedback."
+        "add or veto PRs, put one on hold (or back in work), regroup, or "
+        "set ordering — then run `releasy graph update` to apply your "
+        "feedback."
     )
     lines.append("")
     lines.append(
@@ -3170,11 +3283,13 @@ def open_or_update_graph_issue(
 
     Sets report.issue_number/issue_url on create. Returns (number, url) or
     None on failure/dry-run. ``progress`` defaults to the current pipeline
-    state, so every writer of the issue body keeps the checkboxes intact.
+    state, so every writer of the issue body keeps the checkboxes intact;
+    the On-hold section is read straight from the session, so a hand-edit
+    to ``pr_sources.on_hold`` shows up on the next write of the issue.
     """
     if progress is None:
         progress = build_progress_map(report, load_state(config))
-    body = render_graph_issue_body(report, progress)
+    body = render_graph_issue_body(report, progress, hold_map(config))
     if report.issue_number is not None:
         res = update_issue(config, report.issue_number, body=body)
         if res is True:
@@ -3304,7 +3419,9 @@ def _normalize_addressed(value: object) -> set[str]:
     return out
 
 
-def _render_current_graph_block(report: DiscoveryReport) -> str:
+def _render_current_graph_block(
+    report: DiscoveryReport, held: dict[tuple, str] | None = None,
+) -> str:
     out: list[str] = []
     for n in report.nodes:
         deps = ", ".join(n.deps) if n.deps else "(none)"
@@ -3321,6 +3438,14 @@ def _render_current_graph_block(report: DiscoveryReport) -> str:
         out.append("Currently excluded:")
         for e in report.excluded:
             out.append(f"- {e.get('url','')} — {e.get('reason','')}")
+    if held:
+        out.append("")
+        out.append("Currently on hold:")
+        for (owner, repo, num), reason in held.items():
+            out.append(
+                f"- https://github.com/{owner}/{repo}/pull/{num} — "
+                f"{reason or '(no reason recorded)'}"
+            )
     return "\n".join(out) or "_(empty graph)_"
 
 
@@ -3348,7 +3473,9 @@ def _ask_claude_for_new_graph(
     ) or "_(none)_"
     placeholders = {
         "base_branch": report.base_branch,
-        "current_graph_block": _render_current_graph_block(report),
+        "current_graph_block": _render_current_graph_block(
+            report, hold_map(config),
+        ),
         "candidate_pr_list": candidate_pr_list,
         "comments_block": _render_comments_block(handled),
     }
@@ -3628,6 +3755,92 @@ def _build_report_from_spec(
     return new
 
 
+def _parse_spec_holds(
+    spec: dict, warnings_acc: list[str],
+) -> dict[str, str] | None:
+    """Read the spec's ``on_hold`` block as URL → reason, or ``None``.
+
+    ``None`` means the key was absent — the model didn't touch holds, so
+    the session's current list stands. An explicit empty list is the way
+    to release everything, and is returned as an empty mapping.
+    """
+    if "on_hold" not in spec:
+        return None
+    raw = spec.get("on_hold") or []
+    if not isinstance(raw, list):
+        warnings_acc.append(
+            f"graph update: `on_hold` is not a list "
+            f"({type(raw).__name__}); ignoring it (current holds preserved)"
+        )
+        return None
+    out: dict[str, str] = {}
+    for e in raw:
+        if isinstance(e, str):
+            url, reason = e.strip(), ""
+        elif isinstance(e, dict):
+            url = str(e.get("url", "")).strip()
+            reason = str(e.get("reason", "")).strip()
+        else:
+            warnings_acc.append(
+                f"graph update: on_hold entry is not a URL or mapping "
+                f"({e!r}); skipping"
+            )
+            continue
+        if not url or parse_pr_url(url) is None:
+            warnings_acc.append(
+                f"graph update: on_hold entry has bad URL {e!r}; skipping"
+            )
+            continue
+        out[url] = reason
+    return out
+
+
+def _apply_spec_holds(
+    config: Config, holds: dict[str, str],
+) -> tuple[list[str], list[str], list[str]]:
+    """Make ``pr_sources.on_hold`` match ``holds``. Returns
+    ``(newly_held, released, failures)``.
+
+    The spec's list replaces the session's outright — that is what lets a
+    comment put a PR back in work by leaving it out. A hold on a URL no
+    unit carries is applied anyway and survives until the PR turns up;
+    ``discover_feature_units`` is what points out the mismatch.
+    """
+    from releasy import pr_membership
+
+    ps = config.pr_sources
+    current = {
+        key: url for url in ps.on_hold
+        if (key := parse_pr_url(url)) is not None
+    }
+    wanted = {
+        key: url for url in holds
+        if (key := parse_pr_url(url)) is not None
+    }
+    reasons = ps.on_hold_reasons
+    newly_held: list[str] = []
+    released: list[str] = []
+    failures: list[str] = []
+    for key, url in wanted.items():
+        reason = holds[url]
+        was_held = key in current
+        if was_held and reasons.get(current[key], "") == reason:
+            continue  # already parked for the same reason
+        if not pr_membership.hold_pr(config, url, reason):
+            failures.append(f"hold {_pr_short(url)}")
+            continue
+        if not was_held:
+            newly_held.append(url)
+    for key, url in current.items():
+        if key in wanted:
+            continue
+        if not pr_membership.unhold_pr(config, url):
+            failures.append(f"release {_pr_short(url)}")
+            continue
+        released.append(url)
+    return newly_held, released, failures
+
+
 def _has_cycle(nodes: list[DAGNode]) -> bool:
     """DFS cycle check over the directed dep graph (edge unit -> dep)."""
     succ = {n.unit_id: list(n.deps) for n in nodes}
@@ -3803,8 +4016,20 @@ def run_graph_update(
     excluded_urls = [e["url"] for e in new_report.excluded]
     # Only enforce vetoes new this run (prior ones already in exclude_prs).
     newly_excluded = [u for u in excluded_urls if u not in prior_excluded_urls]
+    # A missing `on_hold` key means the reply didn't touch holds; an empty
+    # list means "release everything". Warnings get their own list: the
+    # build_warnings print loop above has already run, and a skipped URL
+    # has to reach the terminal, not just the report file.
+    hold_warnings: list[str] = []
+    spec_holds = _parse_spec_holds(spec, hold_warnings)
+    for w in hold_warnings:
+        console.print(f"  [yellow]warning:[/yellow] {w}")
+    new_report.warnings += hold_warnings
 
-    _print_graph_update_summary(new_report, added, excluded_urls)
+    _print_graph_update_summary(
+        new_report, added, excluded_urls,
+        sorted(spec_holds) if spec_holds is not None else None,
+    )
 
     if dry_run:
         console.print("[dim](--dry-run: no report / overlay / session / issue writes)[/dim]")
@@ -3834,6 +4059,14 @@ def run_graph_update(
             "[dim]  (graph.apply_exclusions=false — vetoes recorded in the "
             "graph only, not added to exclude_prs)[/dim]"
         )
+
+    newly_held: list[str] = []
+    released: list[str] = []
+    if spec_holds is not None:
+        newly_held, released, hold_failures = _apply_spec_holds(
+            config, spec_holds,
+        )
+        failures += hold_failures
 
     # --- Persist the new graph (report + overlay) ---
     _write_report(new_report, report_path)
@@ -3876,6 +4109,7 @@ def run_graph_update(
     if post_comment:
         summary = _render_update_comment(
             new_report, added, newly_excluded, len(ingest), failures,
+            newly_held, released,
         )
         add_issue_comment(config, new_report.issue_number, summary)
 
@@ -3950,7 +4184,7 @@ def sync_graph_progress(
     opening = prior_number is None
     if config.dry_run and not quiet:
         console.print(
-            render_graph_issue_body(report, progress),
+            render_graph_issue_body(report, progress, hold_map(config)),
             markup=False, highlight=False,
         )
     res = open_or_update_graph_issue(
@@ -3992,6 +4226,7 @@ def sync_graph_progress(
 
 def _print_graph_update_summary(
     report: DiscoveryReport, added: list[str], excluded: list[str],
+    on_hold: list[str] | None = None,
 ) -> None:
     console.print("")
     console.print(f"graph update · base={report.base_branch}")
@@ -4003,6 +4238,11 @@ def _print_graph_update_summary(
         console.print(f"  added PRs: {', '.join(_pr_short(u) for u in added)}")
     if excluded:
         console.print(f"  vetoed PRs: {', '.join(_pr_short(u) for u in excluded)}")
+    if on_hold is not None:
+        console.print(
+            "  on hold: "
+            + (", ".join(_pr_short(u) for u in on_hold) or "(none)")
+        )
 
 
 def _render_update_comment(
@@ -4011,6 +4251,8 @@ def _render_update_comment(
     newly_excluded: list[str],
     n_comments: int,
     failures: list[str] | None = None,
+    newly_held: list[str] | None = None,
+    released: list[str] | None = None,
 ) -> str:
     failures = failures or []
     lines = [
@@ -4027,6 +4269,16 @@ def _render_update_comment(
         lines.append(
             f"- vetoed (added to `exclude_prs`): "
             f"{', '.join(_pr_short(u) for u in newly_excluded)}"
+        )
+    if newly_held:
+        lines.append(
+            f"- ⏸ put on hold (added to `on_hold`; still in the graph, not "
+            f"ported): {', '.join(_pr_short(u) for u in newly_held)}"
+        )
+    if released:
+        lines.append(
+            f"- ▶ back in work (removed from `on_hold`): "
+            f"{', '.join(_pr_short(u) for u in released)}"
         )
     if failures:
         lines.append(

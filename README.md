@@ -29,6 +29,7 @@ All commands need `RELEASY_GITHUB_TOKEN`. The first group works anywhere
 - Address reviewer comments across all in-scope PRs → `releasy refresh --address-review`
 - CI is red — let AI triage failing tests → `releasy analyze-fails` (or `releasy refresh --analyze-fails`)
 - Re-port all rebase PRs onto a different target → `releasy rebase --target <branch>`
+- Park a PR until a follow-up lands (not a veto) → `releasy hold <pr-url> --reason <why>` (back in work: `releasy unhold <pr-url>`)
 - Discard a broken local-only branch with no PR yet → `releasy clear <id>`
 - A merged port was reverted on target; never port it again → `releasy mark-reverted --branch <id>`
 - See where everything stands → `releasy status`

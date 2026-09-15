@@ -19,6 +19,8 @@ config they read, see [configuration.md](configuration.md).
   [`continue`](#releasy-continue) ·
   [Sequential mode](#sequential-mode) ·
   [`skip`](#releasy-skip) ·
+  [`hold`](#releasy-hold) ·
+  [`unhold`](#releasy-unhold) ·
   [`mark-reverted`](#releasy-mark-reverted) ·
   [`abort`](#releasy-abort) ·
   [`clear`](#releasy-clear)
@@ -95,7 +97,8 @@ refines that graph from issue comments (no git);
 [`graph sync`](#releasy-graph-sync) pushes port progress back to the issue
 as checkboxes (`run` / `refresh` do it for you).
 
-The rest ([`skip`](#releasy-skip),
+The rest ([`skip`](#releasy-skip), [`hold`](#releasy-hold) /
+[`unhold`](#releasy-unhold),
 [`mark-reverted`](#releasy-mark-reverted), [`abort`](#releasy-abort),
 [`status`](#releasy-status), board-sync, release, feature) never touch git
 history.
@@ -397,6 +400,12 @@ A member can ask for any change in prose; Claude decides:
 - **veto** a PR ("don't port #1010") → recorded, and (unless
   `graph.apply_exclusions: false`) added to `exclude_prs` so
   [`run`](#releasy-run) skips it;
+- **hold** a PR ("park #2234 until the follow-up lands") → added to
+  `pr_sources.on_hold`. Not a veto: the unit stays in the graph with its
+  edges, [`run`](#releasy-run) skips it, and the issue lists it under
+  **On hold**;
+- **release** a held PR ("#2234 can go ahead now") → dropped from
+  `on_hold`, ported on the next [`run`](#releasy-run);
 - **regroup** into an atomic unit, or **reorder** via `depends_on`.
 
 A PR added here was never trial-picked, so its dependencies are whatever the
@@ -427,8 +436,16 @@ are skipped.
 `graph.minimize_addressed_comments: false`); comments Claude ignored or
 couldn't action (questions, 👍) stay visible so a human sees what's pending.
 
+**Holds are replace-not-merge.** The reply's `on_hold` list becomes the new
+`pr_sources.on_hold` in full — that is what lets a comment put a PR back in
+work by leaving it out. A reply that omits the key entirely changes no
+holds; an explicitly empty list releases every one. You can also edit
+`pr_sources.on_hold` by hand — the next write of the issue (any `run`,
+`graph sync` or `graph update`) moves the unit into or out of the **On
+hold** section to match.
+
 Rewrites the report, deps overlay, and session (`include_prs` /
-`exclude_prs`), and refreshes the issue. Deps here are AI/human-asserted, not
+`exclude_prs` / `on_hold`), and refreshes the issue. Deps here are AI/human-asserted, not
 trial-pick-verified — re-run `graph discover` for verified deps.
 
 Exit: `0` on success or clean no-op; `1` on fetch error, malformed reply,
@@ -786,6 +803,62 @@ Marks `skipped` so subsequent passes ignore it. Doesn't touch git.
 ```bash
 releasy skip --branch <branch-or-feature-id>
 ```
+
+### `releasy hold`
+
+*Park a PR until it is ready — without vetoing it.*
+
+Appends the URL to
+[`pr_sources.on_hold`](configuration.md#on-hold-vs-excluded). A hold is
+**not** a veto: the PR keeps its unit, its dependency edges and any port
+branch / PR it already has. [`run`](#releasy-run) walks past the unit,
+anything declaring that unit in `depends_on` reports as `blocked` (a held
+unit never reaches `merged`), and the graph issue lists it under **⏸ On
+hold** from the next write of the issue onward.
+
+Session-only — nothing in git, state, or the PR is touched.
+
+```bash
+releasy hold <pr-url> [--reason <text>]
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `<pr-url>` | The PR to park. Matched by full owner/repo/number. | required |
+| `--reason <text>` | What it is waiting on. Shown on the graph issue and by `releasy pr list`. | none |
+
+```bash
+releasy hold https://github.com/Altinity/ClickHouse/pull/2294 \
+  --reason "waiting for the export follow-up"
+```
+
+**Holding one PR of a group holds the whole group** — its members
+cherry-pick as one atomic unit, so porting the rest without the held one
+would ship a broken subset. To park just one member, split it out of the
+group first (a comment on the graph issue +
+[`graph update`](#releasy-graph-update) does that).
+
+Re-holding refreshes the reason. Refused (exit `1`) for a PR already vetoed
+in `exclude_prs` — re-add it with [`pr add`](#pr-membership) first.
+[`pr remove`](#pr-membership) clears any hold on the URL it vetoes.
+
+Exit: `0` on success or a no-change re-hold; `1` on a malformed URL or a
+vetoed PR.
+
+### `releasy unhold`
+
+*Put a held PR back in work.*
+
+Drops the URL from `pr_sources.on_hold`. The unit ports on the next
+[`run`](#releasy-run), and the next write of the graph issue moves it out of
+the **On hold** section back into the working lists.
+
+```bash
+releasy unhold <pr-url>
+```
+
+A PR that was not on hold is a no-op, reported and exit `0`. Exit `1` only
+on a malformed URL.
 
 ### `releasy mark-reverted`
 
@@ -1233,8 +1306,8 @@ releasy pr list
 | Subcommand | Description |
 |------------|-------------|
 | `add` | Append URL to `pr_sources.include_prs` (or `groups[<id>].prs` with `--group`). Validates the URL via the GitHub API, idempotent on re-add, and clears the URL from `exclude_prs` if it was previously excluded. Optional `--context` sets the per-PR `ai_context` note. |
-| `remove` | Drop the URL from every session list (`include_prs`, every group's `prs`, both `ai_context` dicts) and purge the matching `FeatureState`. By default also appends the URL to `exclude_prs` so label-driven discovery doesn't re-add it on the next refresh; pass `--keep-discovery` to skip that step. Refuses if the URL is part of a multi-PR group still in state (groups are atomic — use `releasy clear <identifier>` to wipe the whole group). |
-| `list` | Print every URL the session references — top-level `include_prs`, each group's `prs`, and `exclude_prs` — with their `ai_context` notes. |
+| `remove` | Drop the URL from every session list (`include_prs`, every group's `prs`, `on_hold`, both `ai_context` dicts) and purge the matching `FeatureState`. By default also appends the URL to `exclude_prs` so label-driven discovery doesn't re-add it on the next refresh; pass `--keep-discovery` to skip that step. Refuses if the URL is part of a multi-PR group still in state (groups are atomic — use `releasy clear <identifier>` to wipe the whole group). |
+| `list` | Print every URL the session references — top-level `include_prs`, each group's `prs`, `on_hold` (with its reasons) and `exclude_prs` — with their `ai_context` notes. |
 
 Exit: `1` on a malformed URL, an unreachable PR, a group id that doesn't
 exist, or any cross-list collision (URL already in `include_prs` when

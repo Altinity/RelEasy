@@ -116,6 +116,14 @@ would undo a human decision, so it takes its own opt-in,
 `pr_policy.recreate_reverted_prs`). AI involvement is signalled by
 `ai_resolved` + the `ai-resolved` PR label.
 
+A unit listed in `pr_sources.on_hold` has no status of its own: the hold
+lives in the session, not in state, so `run` walks past the unit without
+touching whatever it already had. It keeps its node and its edges in the
+graph (units that depend on it report `blocked`, since a held unit never
+reaches `merged`), the graph issue lists it under **On hold**, and dropping
+the entry puts it straight back in the queue. See
+[on hold vs. excluded](configuration.md#on-hold-vs-excluded).
+
 For per-PR hints to the resolver, see
 [`ai_context`](configuration.md#per-pr--per-group-ai_context).
 
