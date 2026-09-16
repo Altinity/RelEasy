@@ -1140,6 +1140,43 @@ class ProgressCheckboxes(unittest.TestCase):
         self.assertIn("- [x] [#1]", body)
         self.assertIn("🟡 in review [#51]", body)
 
+    def test_build_failed_links_pushed_branch(self):
+        # Regression: a parked build_failed unit has no PR, so the issue
+        # used to name it with nothing to click through to.
+        fs = FeatureState(
+            status="build_failed",
+            branch_url="https://github.com/o/r/tree/feature/b/pr-1",
+        )
+        body = self._body([node("pr-1", 1)], self._state(**{"pr-1": fs}))
+        self.assertIn(
+            "🚧 build failed "
+            "[branch](https://github.com/o/r/tree/feature/b/pr-1)",
+            body,
+        )
+
+    def test_build_failed_group_links_branch_in_summary(self):
+        grp = d.DAGNode("grp", False, [URL(1), URL(2)], ["t1", "t2"],
+                        "2026-01-01T00:00:00+00:00", [], "grouped")
+        fs = FeatureState(
+            status="build_failed",
+            branch_url="https://github.com/o/r/tree/feature/b/grp",
+        )
+        body = self._body([grp], self._state(grp=fs))
+        self.assertIn(
+            '🚧 build failed <a href="https://github.com/o/r/tree/'
+            'feature/b/grp">branch</a>',
+            body,
+        )
+
+    def test_port_pr_wins_over_branch_link(self):
+        fs = FeatureState(
+            status="needs_review", rebase_pr_url=URL(51),
+            branch_url="https://github.com/o/r/tree/feature/b/pr-1",
+        )
+        body = self._body([node("pr-1", 1)], self._state(**{"pr-1": fs}))
+        self.assertIn(f"🟡 in review [#51]({URL(51)})", body)
+        self.assertNotIn("[branch]", body)
+
     def test_conflict_without_pr_unticked(self):
         fs = FeatureState(status="conflict")
         body = self._body([node("pr-1", 1)], self._state(**{"pr-1": fs}))

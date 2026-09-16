@@ -151,7 +151,7 @@ Options live in `config.yaml` unless marked **(session)**.
 | `ai_resolve.max_verify_resume_attempts` | How many times a `build_failed` branch is resumed on later runs before it's left for a human. `0` disables resume. | `2` |
 | `ai_resolve.max_resume_base_drift` | Re-port from base instead of resuming when a parked branch is this many commits behind base. `0` disables the check. | `50` |
 | `ai_resolve.max_verify_iterations` | Overall cap on build↔test iterations within one verify pass. | `12` |
-| `ai_resolve.build_log_tail_lines` | Lines of `.releasy/build.log` fed to the fix-build prompt (plus grepped errors). | `500` |
+| `ai_resolve.build_log_tail_lines` | Lines of the branch's `.releasy/build-<branch>.log` fed to the fix-build prompt (plus grepped errors). | `500` |
 | `ai_resolve.build_timeout_seconds` | RelEasy's wall-clock cap for one build subprocess. | `7200` |
 | `ai_resolve.run_pr_tests` | After a green build, run the source PR's own tests (Claude-driven). | `true` |
 | `ai_resolve.test_file_globs` | Globs marking a changed file as a runnable test. | ClickHouse defaults |

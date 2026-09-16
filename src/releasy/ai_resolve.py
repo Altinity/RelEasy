@@ -141,19 +141,30 @@ class AIResolveResult:
 # multi-step (`cd build` + `cmake …` + `ninja`) and its output is too
 # large to fit in a single Bash tool result. We solve both problems at
 # once by writing the build commands to a wrapper script inside the repo
-# (`.releasy/build.sh`) that internally tees full output to
-# `.releasy/build.log`. Claude then only needs to run the single
+# (`.releasy/build.sh`) that internally tees full output to a per-branch
+# log under `.releasy/`. Claude then only needs to run the single
 # command  `bash .releasy/build.sh`, and can `Read` the log on failure.
 
 _BUILD_DIR = ".releasy"
 _BUILD_SCRIPT = f"{_BUILD_DIR}/build.sh"
-_BUILD_LOG = f"{_BUILD_DIR}/build.log"
 
 
-def _write_build_script(repo_path: Path, build_command: str) -> None:
+def build_log_path(branch: str) -> str:
+    """Build-log path for ``branch``, relative to the repo root.
+
+    One log per branch: a later unit's build must not overwrite the log of
+    a branch that failed, which is the only record of why it failed.
+    """
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", branch).strip("-")
+    return f"{_BUILD_DIR}/build-{slug}.log" if slug else f"{_BUILD_DIR}/build.log"
+
+
+def _write_build_script(
+    repo_path: Path, build_command: str, log_path: str,
+) -> None:
     """Materialise the build wrapper inside the repo.
 
-    Overwrites any previous copy so config changes take effect.
+    Overwrites any previous copy so config / log-path changes take effect.
     """
     target = repo_path / _BUILD_SCRIPT
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -170,7 +181,7 @@ def _write_build_script(repo_path: Path, build_command: str) -> None:
         "set -euo pipefail\n"
         "cd \"$(git rev-parse --show-toplevel)\"\n"
         f"mkdir -p {_BUILD_DIR}\n"
-        f"exec > >(tee {_BUILD_LOG}) 2>&1\n"
+        f"exec > >(tee {log_path}) 2>&1\n"
         "echo \"[releasy] build started at $(date -u +%FT%TZ)\"\n"
         "echo \"[releasy] git submodule update --init --recursive\"\n"
         "git submodule update --init --recursive --jobs 8\n"
@@ -328,7 +339,7 @@ def _render_prompt(config: Config, repo_path: Path, ctx: AIResolveContext) -> st
         "conflict_files": conflict_files_md,
         "build_command": config.ai_resolve.build_command,
         "build_script": _BUILD_SCRIPT,
-        "build_log": _BUILD_LOG,
+        "build_log": build_log_path(ctx.port_branch),
         "max_iterations": str(config.ai_resolve.max_iterations),
         "label": config.ai_resolve.label,
         # Merge-only — rendered as a literal placeholder for cherry-pick
@@ -1501,7 +1512,10 @@ def resolve_with_claude(
     # In resolve-only mode build_verify owns the build wrapper.
     if not ctx.skip_build:
         try:
-            _write_build_script(repo_path, config.ai_resolve.build_command)
+            _write_build_script(
+                repo_path, config.ai_resolve.build_command,
+                build_log_path(ctx.port_branch),
+            )
         except OSError as exc:
             return AIResolveResult(
                 success=False, error=f"could not write build wrapper: {exc}",

@@ -2882,6 +2882,9 @@ def _progress_note(
 ) -> str:
     """``<lead><marker> [#N](url) · <why>`` suffix for a unit's issue entry.
 
+    A unit with no port PR falls back to its pushed branch, so a parked
+    ``build_failed`` entry still links the code it failed to build.
+
     ``html`` renders the PR link as an ``<a>`` tag for use inside a
     ``<summary>``: that content sits in a raw HTML block, where GitHub does
     not run the markdown parser. ``lead`` is the separator the note opens
@@ -2914,6 +2917,11 @@ def _progress_note(
         note += (
             f' <a href="{fs.rebase_pr_url}">{short}</a>' if html
             else f" [{short}]({fs.rebase_pr_url})"
+        )
+    elif fs.branch_url:
+        note += (
+            f' <a href="{fs.branch_url}">branch</a>' if html
+            else f" [branch]({fs.branch_url})"
         )
     stall = _stall_note(fs)
     return note + (_to_html_inline(stall) if html else stall)

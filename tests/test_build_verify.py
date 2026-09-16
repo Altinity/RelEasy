@@ -106,6 +106,7 @@ class StateRoundTrip(unittest.TestCase):
             status="build_failed", branch_name="feature/b/1",
             base_commit="deadbeef", build_attempts=5,
             verify_resume_attempts=1, last_verify_error="boom",
+            branch_url="https://github.com/o/r/tree/feature/b/1",
         )
         save_state(st, cfg)
         loaded = load_state(cfg)
@@ -114,6 +115,9 @@ class StateRoundTrip(unittest.TestCase):
         self.assertEqual(fs.build_attempts, 5)
         self.assertEqual(fs.verify_resume_attempts, 1)
         self.assertEqual(fs.last_verify_error, "boom")
+        self.assertEqual(
+            fs.branch_url, "https://github.com/o/r/tree/feature/b/1",
+        )
 
     def test_zero_counters_not_written(self):
         # Lazy-write: zero/empty verify fields must not bloat the YAML.
@@ -128,6 +132,7 @@ class StateRoundTrip(unittest.TestCase):
         self.assertNotIn("build_attempts", text)
         self.assertNotIn("verify_resume_attempts", text)
         self.assertNotIn("last_verify_error", text)
+        self.assertNotIn("branch_url", text)
 
 
 class AIResolveBuildKnobs(unittest.TestCase):
@@ -239,11 +244,12 @@ class BuildLogExcerpt(unittest.TestCase):
 
     def _excerpt(self, lines: list[str]) -> str:
         d = tempfile.mkdtemp()
+        rel = bv.build_log_path("feature/b/1")
         try:
-            p = Path(d) / bv._BUILD_LOG
+            p = Path(d) / rel
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text("\n".join(lines), encoding="utf-8")
-            return bv._build_log_excerpt(Path(d), 500)
+            return bv._build_log_excerpt(Path(d), rel, 500)
         finally:
             import shutil
             shutil.rmtree(d)
@@ -272,7 +278,9 @@ class BuildLogExcerpt(unittest.TestCase):
 
     def test_missing_log(self):
         self.assertEqual(
-            bv._build_log_excerpt(Path(tempfile.mkdtemp()), 500),
+            bv._build_log_excerpt(
+                Path(tempfile.mkdtemp()), bv.build_log_path("feature/b/1"), 500,
+            ),
             "(build log unavailable)",
         )
 
@@ -323,34 +331,35 @@ class BuildReachedCompiler(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self._tmp.name)
         (self.repo / ".releasy").mkdir()
+        self.LOG = bv.build_log_path("feature/b/1")
 
     def tearDown(self):
         self._tmp.cleanup()
 
     def _log(self, text: str) -> None:
-        (self.repo / bv._BUILD_LOG).write_text(text, encoding="utf-8")
+        (self.repo / self.LOG).write_text(text, encoding="utf-8")
 
     def test_compiler_error(self):
         self._log("[1/2] Building X.cpp\nX.cpp:9:1: error: no member named 'y'\n")
-        self.assertTrue(bv.build_reached_compiler(self.repo))
+        self.assertTrue(bv.build_reached_compiler(self.repo, self.LOG))
 
     def test_ninja_failed_line(self):
         self._log("FAILED: src/x.o \nlink step blew up\n")
-        self.assertTrue(bv.build_reached_compiler(self.repo))
+        self.assertTrue(bv.build_reached_compiler(self.repo, self.LOG))
 
     def test_ninja_stopped_line(self):
         self._log("ninja: build stopped: subcommand failed.\n")
-        self.assertTrue(bv.build_reached_compiler(self.repo))
+        self.assertTrue(bv.build_reached_compiler(self.repo, self.LOG))
 
     def test_missing_build_dir(self):
         self._log(
             "[releasy] build started at 2026-08-05T14:56:10Z\n"
             ".releasy/build.sh: line 12: cd: build: No such file or directory\n"
         )
-        self.assertFalse(bv.build_reached_compiler(self.repo))
+        self.assertFalse(bv.build_reached_compiler(self.repo, self.LOG))
 
     def test_absent_log(self):
-        self.assertFalse(bv.build_reached_compiler(self.repo))
+        self.assertFalse(bv.build_reached_compiler(self.repo, self.LOG))
 
 
 class EnvironmentFaultShortCircuit(unittest.TestCase):
@@ -360,7 +369,7 @@ class EnvironmentFaultShortCircuit(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self._tmp.name)
         (self.repo / ".releasy").mkdir()
-        (self.repo / bv._BUILD_LOG).write_text(
+        (self.repo / bv.build_log_path("feature/b/1")).write_text(
             ".releasy/build.sh: line 12: cd: build: No such file or directory\n",
             encoding="utf-8",
         )
@@ -520,6 +529,138 @@ class ResumeDryRun(unittest.TestCase):
         cfg.dry_run = True
         out, _ = self._resume(cfg)
         self.assertEqual(out, "continue")
+
+
+class PerBranchBuildLog(unittest.TestCase):
+    """Regression: one unit's build must not overwrite another unit's log.
+
+    Every build used to tee into a single ``.releasy/build.log``, so the log
+    of a branch parked as ``build_failed`` was gone as soon as the next unit
+    built — the failure left no evidence behind.
+    """
+
+    def test_distinct_path_per_branch(self):
+        self.assertNotEqual(
+            bv.build_log_path("feature/antalya-26.8/auto-grp-pr-2141"),
+            bv.build_log_path("feature/antalya-26.8/pr-2040"),
+        )
+
+    def test_path_is_flat_and_sanitised(self):
+        p = bv.build_log_path("feature/antalya-26.8/auto-grp-pr-2141")
+        self.assertEqual(
+            p, ".releasy/build-feature-antalya-26.8-auto-grp-pr-2141.log",
+        )
+        self.assertNotIn("/", p.split("/", 1)[1])  # one flat file in .releasy
+
+    def test_empty_branch_falls_back(self):
+        self.assertEqual(bv.build_log_path(""), ".releasy/build.log")
+
+    def test_build_script_tees_to_the_given_log(self):
+        from releasy.ai_resolve import _BUILD_SCRIPT, _write_build_script
+        d = Path(tempfile.mkdtemp())
+        rel = bv.build_log_path("feature/b/1")
+        _write_build_script(d, "ninja", rel)
+        self.assertIn(f"tee {rel}", (d / _BUILD_SCRIPT).read_text())
+
+    def test_readers_see_the_branch_they_ask_for(self):
+        d = Path(tempfile.mkdtemp())
+        for branch, text in (
+            ("feature/b/1", "X.cpp:1:1: error: first"),
+            ("feature/b/2", "Y.cpp:1:1: error: second"),
+        ):
+            log = d / bv.build_log_path(branch)
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text(text, encoding="utf-8")
+        self.assertIn(
+            "first", bv._build_log_excerpt(d, bv.build_log_path("feature/b/1"), 50),
+        )
+        self.assertIn(
+            "second", bv._build_log_excerpt(d, bv.build_log_path("feature/b/2"), 50),
+        )
+
+
+class ParkBuildFailedPush(unittest.TestCase):
+    """Regression: parking as ``build_failed`` pushes the branch.
+
+    A parked unit gets no PR, so without the push there is nothing to link
+    and no way to see the code that failed to build.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self._tmp.name)
+        self._prev = os.environ.get("RELEASY_STATE_DIR")
+        os.environ["RELEASY_STATE_DIR"] = self._tmp.name
+
+    def tearDown(self):
+        if self._prev is None:
+            os.environ.pop("RELEASY_STATE_DIR", None)
+        else:
+            os.environ["RELEASY_STATE_DIR"] = self._prev
+        self._tmp.cleanup()
+
+    def _config(self, *, push: bool):
+        path = self.repo / "config.yaml"
+        path.write_text(
+            "name: test-proj\nproject: testp\n"
+            f"push: {str(push).lower()}\n"
+            "origin:\n  remote: https://github.com/o/r.git\n",
+            encoding="utf-8",
+        )
+        return load_config(path)
+
+    def _park(self, cfg, push_fn=None):
+        """Park a unit; return (pushed branches, resulting FeatureState)."""
+        import releasy.pipeline as pl
+        from releasy.build_verify import VerifyResult
+        from releasy.github_ops import PRInfo
+
+        unit = pl.FeatureUnit(
+            feature_id="f1",
+            prs=[PRInfo(
+                number=1, title="t", body="", state="merged",
+                merge_commit_sha=None, head_sha="abc", url="https://x/1",
+                repo_slug="o/r",
+            )],
+            if_exists="recreate",
+        )
+        state = PipelineState(base_branch="b")
+        pushed: list[str] = []
+        orig = pl._push
+        pl._push = push_fn or (lambda c, r, branch: pushed.append(branch))
+        try:
+            pl._park_build_failed(
+                cfg, self.repo, state, unit, "feature/b/1", "deadbeef",
+                VerifyResult(
+                    success=False, outcome="build_failed", build_attempts=5,
+                    error="build still failing after 5 fix attempt(s)",
+                ),
+                resume_attempts=0,
+            )
+        finally:
+            pl._push = orig
+        return pushed, state.features["f1"]
+
+    def test_pushes_and_records_branch_url(self):
+        pushed, fs = self._park(self._config(push=True))
+        self.assertEqual(pushed, ["feature/b/1"])
+        self.assertEqual(fs.status, "build_failed")
+        self.assertEqual(
+            fs.branch_url, "https://github.com/o/r/tree/feature/b/1",
+        )
+
+    def test_push_disabled_leaves_branch_local(self):
+        pushed, fs = self._park(self._config(push=False))
+        self.assertEqual(pushed, [])
+        self.assertIsNone(fs.branch_url)
+
+    def test_failed_push_still_parks(self):
+        def _boom(*a, **kw):
+            raise subprocess.CalledProcessError(1, ["git", "push"])
+
+        _, fs = self._park(self._config(push=True), push_fn=_boom)
+        self.assertEqual(fs.status, "build_failed")
+        self.assertIsNone(fs.branch_url)
 
 
 if __name__ == "__main__":

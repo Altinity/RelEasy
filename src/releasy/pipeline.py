@@ -12,6 +12,7 @@ records the entry as ``Conflict`` in the GitHub Project.
 from __future__ import annotations
 
 import re
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -3564,7 +3565,7 @@ def _process_feature_unit(
             # wording, and a successful retry will hit this same path.
             _maybe_synthesize_changelog(config, unit, base_branch)
             # Deterministic build + tests before opening the PR; on failure
-            # park as build_failed (local branch, no PR) and resume next run.
+            # park as build_failed (branch pushed, no PR) and resume next run.
             if _should_verify_build(config, unit):
                 vres = _run_verify_phase(
                     config, repo_path, unit, new_branch, base_branch, onto,
@@ -4118,9 +4119,11 @@ def _park_build_failed(
     config: Config, repo_path: Path, state: PipelineState, unit: "FeatureUnit",
     branch: str, onto: str, result: "VerifyResult", *, resume_attempts: int,
 ) -> None:
-    """Park a unit whose build/tests didn't pass as ``build_failed`` — stays
-    on the local branch (no PR), resumes next run. ``resume_attempts`` is the
-    cross-run counter (0 on the first park)."""
+    """Park a unit whose build/tests didn't pass as ``build_failed`` — the
+    branch is pushed (no PR is opened), and it resumes next run.
+    ``resume_attempts`` is the cross-run counter (0 on the first park)."""
+    from releasy.ai_resolve import build_log_path
+
     fs = FeatureState(
         status="build_failed", branch_name=branch, base_commit=onto,
         **_unit_pr_meta(unit),
@@ -4137,12 +4140,31 @@ def _park_build_failed(
     )
     if unit.ai_cost_usd_total is not None:
         fs.ai_cost_usd = unit.ai_cost_usd_total
+
+    # A parked unit gets no PR, so the pushed branch is the only thing a
+    # reviewer can open — and the only way to see the failing code at all.
+    if config.push:
+        try:
+            _push(config, repo_path, branch)
+        except subprocess.CalledProcessError as exc:
+            console.print(
+                f"    [yellow]![/yellow] could not push [cyan]{branch}[/cyan] "
+                f"[dim]({exc})[/dim]"
+            )
+        else:
+            slug = get_origin_repo_slug(config)
+            if slug and not config.dry_run:
+                fs.branch_url = f"https://github.com/{slug}/tree/{branch}"
+            console.print(f"    [green]✓[/green] Pushed [cyan]{branch}[/cyan]")
+    else:
+        console.print("    [dim]Skipping push[/dim]")
+
     state.features[unit.feature_id] = fs
     _persist_state(config, state)
     console.print(
         f"    [yellow]⏸ parked[/yellow] [cyan]{branch}[/cyan] as "
-        f"[yellow]build_failed[/yellow] [dim]({result.error}; local branch "
-        "kept, resumes next run)[/dim]"
+        f"[yellow]build_failed[/yellow] [dim]({result.error}; resumes next "
+        f"run; build log: {repo_path / build_log_path(branch)})[/dim]"
     )
 
 
@@ -4175,7 +4197,7 @@ def _resume_build_failed_unit(
         console.print(
             f"\n    [yellow]⏭[/yellow]  [cyan]{branch}[/cyan] ({label}) — "
             f"build_failed resume cap reached ({attempts}/{cap}); leaving the "
-            "local branch for manual help. [dim](bump "
+            "branch for manual help. [dim](bump "
             "ai_resolve.max_verify_resume_attempts, or fix it by hand)[/dim]"
         )
         prev_state.stall = make_stall(

@@ -48,6 +48,7 @@ from releasy.ai_resolve import (
     _resolve_backend,
     _spawn_claude,
     _write_build_script,
+    build_log_path,
 )
 from releasy.ci_failures import (
     CATEGORY_ORDER,
@@ -960,7 +961,7 @@ def _render_shard_prompt(
         "runner_section": runner_section,
         "max_iterations": str(config.analyze_fails.max_iterations),
         "build_script": ".releasy/build.sh",
-        "build_log": ".releasy/build.log",
+        "build_log": build_log_path(pr_branch),
         "build_command": config.ai_resolve.build_command,
         "failed_tests_file": ".releasy/failed-tests.txt",
     }
@@ -1774,7 +1775,10 @@ def _process_pr(
         return result
 
     try:
-        _write_build_script(repo_path, config.ai_resolve.build_command)
+        _write_build_script(
+            repo_path, config.ai_resolve.build_command,
+            build_log_path(head_ref),
+        )
     except OSError as exc:
         result.error = f"Could not write build wrapper: {exc}"
         return result

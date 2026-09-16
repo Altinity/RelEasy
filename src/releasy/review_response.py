@@ -54,6 +54,7 @@ from releasy.ai_resolve import (
     _resolve_backend,
     _spawn_claude,
     _write_build_script,
+    build_log_path,
 )
 from releasy.config import Config, get_github_token
 from releasy.state import PipelineState, load_state, save_state
@@ -511,7 +512,7 @@ def _render_prompt(
         "comment_blocks": comment_blocks,
         "max_iterations": str(config.review_response.max_iterations),
         "build_script": ".releasy/build.sh",
-        "build_log": ".releasy/build.log",
+        "build_log": build_log_path(pr_branch),
         "build_command": config.ai_resolve.build_command,
         "reply_section": reply_section,
         "summary_section": summary_section,
@@ -835,7 +836,10 @@ def address_review(
     # the prompt tells it `bash .releasy/build.sh` is available, so we
     # must materialise the file. Reuses ai_resolve's writer verbatim.
     try:
-        _write_build_script(repo_path, config.ai_resolve.build_command)
+        _write_build_script(
+            repo_path, config.ai_resolve.build_command,
+            build_log_path(head_ref),
+        )
     except OSError as exc:
         return AddressReviewResult(
             success=False,

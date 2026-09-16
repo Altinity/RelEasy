@@ -31,7 +31,7 @@ from the bottom for the earliest failure.
 ```
 
 If the excerpt above is not enough, you may `Grep "error:"` / `"^FAILED:"`
-and `tail` **`.releasy/build.log`** for more context. Never `Read` the
+and `tail` **`{build_log}`** for more context. Never `Read` the
 whole log (it is huge and will be rejected).
 
 ## What to do
@@ -90,4 +90,4 @@ CANNOT FIX: <one-line reason>
   `{pre_resolve_sha}`.
 - No compound Bash (`&&`, `||`, `;`, `(...)`, `bash -c`) except the two
   git lines shown for the amend. One command per call otherwise.
-- Read `.releasy/build.log` only; never write logs.
+- Read `{build_log}` only; never write logs.

@@ -3,8 +3,8 @@
 RelEasy builds (exit code is truth); on failure a fresh Claude invocation
 fixes the build from the log tail (up to ``max_build_attempts``); on a green
 build Claude runs the PR's own tests. A test fix re-enters the build loop;
-the two-level loop is bounded by ``max_verify_iterations``. Failures stay on
-the local branch as ``build_failed`` and resume next ``releasy run``.
+the two-level loop is bounded by ``max_verify_iterations``. Failures park as
+``build_failed`` (branch pushed, no PR) and resume next ``releasy run``.
 """
 from __future__ import annotations
 
@@ -24,11 +24,11 @@ from releasy.github_ops import PRInfo
 from releasy.git_ops import run_git
 # Reuse the resolve module's build wrapper + Claude-invocation primitives.
 from releasy.ai_resolve import (
-    _BUILD_LOG,
     _BUILD_SCRIPT,
     _extract_assistant_text,
     _invoke_claude_with_retries,
     _write_build_script,
+    build_log_path,
 )
 from releasy.analyze_fails import _CATEGORY_RUNNER_HINTS
 
@@ -121,7 +121,7 @@ def _tail_bytes(text: str, budget: int) -> tuple[str, bool]:
 _COMPILE_ERROR_RE = re.compile(r"\berror:|^FAILED:|^ninja: build stopped")
 
 
-def build_reached_compiler(repo_path: Path) -> bool:
+def build_reached_compiler(repo_path: Path, log_path: str) -> bool:
     """True when the build log holds a real compile/link failure.
 
     A non-zero build with no such line means the harness died before the
@@ -130,7 +130,7 @@ def build_reached_compiler(repo_path: Path) -> bool:
     not spend an attempt on it.
     """
     try:
-        text = (repo_path / _BUILD_LOG).read_text(
+        text = (repo_path / log_path).read_text(
             encoding="utf-8", errors="replace",
         )
     except OSError:
@@ -138,16 +138,19 @@ def build_reached_compiler(repo_path: Path) -> bool:
     return any(_COMPILE_ERROR_RE.search(ln) for ln in text.splitlines())
 
 
-def _build_log_excerpt(repo_path: Path, tail_lines: int) -> str:
+def _build_log_excerpt(
+    repo_path: Path, log_path: str, tail_lines: int,
+) -> str:
     """Grepped error/FAILED lines + the tail of the build log, byte-bounded.
 
     ninja compiles past the first error, so the real cause can sit above a
     plain tail — surface the grepped lines too. Bounded to stay under the OS
     arg limit (see ``_MAX_EXCERPT_BYTES``).
     """
-    log_path = repo_path / _BUILD_LOG
     try:
-        text = log_path.read_text(encoding="utf-8", errors="replace")
+        text = (repo_path / log_path).read_text(
+            encoding="utf-8", errors="replace",
+        )
     except OSError:
         return "(build log unavailable)"
     raw_lines = text.splitlines()
@@ -169,7 +172,7 @@ def _build_log_excerpt(repo_path: Path, tail_lines: int) -> str:
     budget = _MAX_EXCERPT_BYTES - len(err_block.encode("utf-8"))
     tail = [_cap_line(ln) for ln in raw_lines[-tail_lines:]]
     tail_text, cut = _tail_bytes("\n".join(tail), budget)
-    header = f"# Tail of {_BUILD_LOG}" + (" (truncated)" if cut else "")
+    header = f"# Tail of {log_path}" + (" (truncated)" if cut else "")
 
     parts = [p for p in (err_block, f"{header}\n{tail_text}") if p.strip()]
     return "\n\n".join(parts)
@@ -316,6 +319,7 @@ def verify_build_and_tests(
     """
     max_build = max_build_attempts or config.ai_resolve.max_build_attempts
     max_iters = max(1, config.ai_resolve.max_verify_iterations)
+    log_path = build_log_path(port_branch)
 
     pre_resolve_sha = ""
     res = run_git(["rev-parse", "--verify", "HEAD~1"], repo_path, check=False)
@@ -324,7 +328,9 @@ def verify_build_and_tests(
 
     # Write the build wrapper once from current config (idempotent).
     try:
-        _write_build_script(repo_path, config.ai_resolve.build_command)
+        _write_build_script(
+            repo_path, config.ai_resolve.build_command, log_path,
+        )
     except OSError as exc:
         return VerifyResult(
             success=False, outcome="error",
@@ -357,14 +363,14 @@ def verify_build_and_tests(
             )
 
         if rc != 0:
-            if not build_reached_compiler(repo_path):
+            if not build_reached_compiler(repo_path, log_path):
                 # The build died before compiling anything — nothing in the
                 # port can fix it. Report it as an environment fault so the
                 # caller neither burns a fix attempt nor spends a cross-run
                 # resume on it.
                 console.print(
                     f"    [red]✗ build never reached the compiler[/red] "
-                    f"[dim](no error:/FAILED: line in {_BUILD_LOG} — "
+                    f"[dim](no error:/FAILED: line in {log_path} — "
                     "environment fault, not a code fix)[/dim]"
                 )
                 return VerifyResult(
@@ -373,7 +379,7 @@ def verify_build_and_tests(
                     iterations=iterations,
                     error=(
                         "build never reached the compiler (no compile error "
-                        f"in {_BUILD_LOG}) — check the build environment "
+                        f"in {log_path}) — check the build environment "
                         "(ai_resolve.build_command, build dir, toolchain)"
                     ),
                     cost_usd=cost_total, new_head=_head_sha(repo_path),
@@ -396,8 +402,9 @@ def verify_build_and_tests(
                 pre_resolve_sha,
             )
             mapping["build_log_excerpt"] = _build_log_excerpt(
-                repo_path, config.ai_resolve.build_log_tail_lines,
+                repo_path, log_path, config.ai_resolve.build_log_tail_lines,
             )
+            mapping["build_log"] = log_path
             mapping["attempt"] = str(consecutive_build_failures)
             mapping["max_build_attempts"] = str(max_build)
             try:

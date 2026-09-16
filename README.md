@@ -104,8 +104,8 @@ releasy run        # resume with the remaining PRs
 (Set `ai_resolve.enabled: true` in `config.yaml` to let Claude attempt
 conflicts for you. Claude resolves; RelEasy then builds the result itself
 and runs the PR's tests, retrying build fixes in fresh context. A
-resolution that won't build yet is parked on a local branch as
-`build_failed` and retried on the next `releasy run`.)
+resolution that won't build yet is parked as `build_failed` — the branch
+is pushed but no PR is opened — and retried on the next `releasy run`.)
 
 By default the AI work runs through the `claude` CLI. To use an API token
 instead — no CLI install, no subscription — set `ai_backend: api` and

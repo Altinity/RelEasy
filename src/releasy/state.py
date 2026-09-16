@@ -351,6 +351,10 @@ class FeatureState:
     build_attempts: int = 0  # build-fix attempts spent in the last verify pass
     verify_resume_attempts: int = 0  # cross-run resumes (cap: max_verify_resume_attempts)
     last_verify_error: str | None = None
+    # Origin URL of the parked branch, set once ``build_failed`` pushes it.
+    # A parked unit has no PR, so this is the only thing the graph issue
+    # can link to.
+    branch_url: str | None = None
     # ----- Missing-prerequisite detection / auto-recovery state -----
     # Populated by the AI resolver when Claude judges the conflict to be
     # caused by an unported upstream PR. Even in detection-only mode (no
@@ -484,6 +488,7 @@ def _parse_features(raw_features: dict) -> dict[str, FeatureState]:
                 fraw.get("verify_resume_attempts", 0) or 0
             ),
             last_verify_error=fraw.get("last_verify_error"),
+            branch_url=fraw.get("branch_url"),
             missing_prereq_prs=fraw.get("missing_prereq_prs", []) or [],
             missing_prereq_note=fraw.get("missing_prereq_note"),
             dynamic_prereq_urls=fraw.get("dynamic_prereq_urls", []) or [],
@@ -610,6 +615,8 @@ def save_state(state: PipelineState, config: Config) -> None:
             entry["verify_resume_attempts"] = fs.verify_resume_attempts
         if fs.last_verify_error:
             entry["last_verify_error"] = fs.last_verify_error
+        if fs.branch_url:
+            entry["branch_url"] = fs.branch_url
         if fs.missing_prereq_prs:
             entry["missing_prereq_prs"] = fs.missing_prereq_prs
         if fs.missing_prereq_note:
