@@ -1515,8 +1515,8 @@ class SyncGraphProgress(unittest.TestCase):
         )
 
 
-class CheckpointResume(unittest.TestCase):
-    """A killed discover leaves a resumable report; the next run reuses it."""
+class _StubbedDiscover(unittest.TestCase):
+    """Drives `run_discover_deps` with git / GitHub / state stubbed out."""
 
     _STUBS = (
         "ensure_work_repo", "is_operation_in_progress", "fetch_remote",
@@ -1577,6 +1577,13 @@ class CheckpointResume(unittest.TestCase):
                     repo_slug="o/r", merged_at=f"2026-01-0{num}T00:00:00+00:00")
         return FeatureUnit(feature_id=f"pr-{num}", prs=[pr], if_exists="skip")
 
+    def _user_group_unit(self, uid, *nums):
+        """A hand-curated `pr_sources.groups[]` entry — never collapsed."""
+        from releasy.pipeline import FeatureUnit
+        prs = [self._unit(n).prs[0] for n in nums]
+        return FeatureUnit(feature_id=uid, prs=prs, if_exists="skip",
+                           is_group=True, group_id=uid)
+
     def _pick(self, scratch, cu, target_ref, *, cache_branch, is_group,
               origin_slug):
         if cu.unit_id == self.kill_at:
@@ -1602,6 +1609,10 @@ class CheckpointResume(unittest.TestCase):
             use_ai=False, max_depth=2, pr_limit=None,
             include_already_merged=False,
         )
+
+
+class CheckpointResume(_StubbedDiscover):
+    """A killed discover leaves a resumable report; the next run reuses it."""
 
     def test_interrupted_run_leaves_the_finished_units(self):
         self.kill_at = "pr-3"
@@ -1664,6 +1675,66 @@ class CheckpointResume(unittest.TestCase):
         self.assertEqual(
             [n.unit_id for n in d.load_report(self.report_path).nodes], ["pr-1"],
         )
+
+
+class MergedUnitsKeepTheirEntry(_StubbedDiscover):
+    """Regression: a re-discover erased the units that had landed in target.
+
+    Once a group's port merged, every member PR read as already-in-target,
+    so the next `graph discover` dropped the group from the report — and
+    with it the merged entry the graph issue had been showing ticked. A
+    re-run may only add to the graph, never take a finished unit out.
+    """
+
+    def _merged(self, *urls):
+        d._state_already_in_target = lambda cands, st: set(urls)
+
+    def test_merged_group_keeps_its_node(self):
+        self.conflicts, self.traced = {"pr-2"}, ["pr-1"]
+        self._run()
+        self._merged(URL(1), URL(2))
+        nodes = {n.unit_id: n for n in self._run().nodes}
+        self.assertIn("auto-grp-pr-1", nodes)
+        self.assertEqual(nodes["auto-grp-pr-1"].pr_urls, [URL(1), URL(2)])
+
+    def test_merged_group_survives_repeated_re_discovers(self):
+        self.conflicts, self.traced = {"pr-2"}, ["pr-1"]
+        self._run()
+        self._merged(URL(1), URL(2))
+        self._run()
+        self.assertIn(
+            "auto-grp-pr-1", [n.unit_id for n in self._run().nodes],
+        )
+
+    def test_merged_standalone_keeps_its_node(self):
+        self._run()
+        self._merged(URL(3))
+        nodes = {n.unit_id: n for n in self._run().nodes}
+        self.assertEqual(nodes["pr-3"].pr_urls, [URL(3)])
+
+    def test_carried_unit_drops_its_deps(self):
+        # pr-2 conflicts into pr-1 but the two stay separate nodes (the
+        # user group in between blocks the collapse), so the carried node
+        # has a dep to lose.
+        self.units[1] = self._user_group_unit("ug", 2)
+        self.conflicts, self.traced = {"ug"}, ["pr-1"]
+        before = {n.unit_id: n for n in self._run().nodes}
+        self.assertEqual(before["ug"].deps, ["pr-1"])
+        self._merged(URL(2))
+        nodes = {n.unit_id: n for n in self._run().nodes}
+        self.assertEqual(nodes["ug"].deps, [])
+
+    def test_carried_unit_is_not_also_listed_as_never_ported(self):
+        self.conflicts, self.traced = {"pr-2"}, ["pr-1"]
+        self._run()
+        self._merged(URL(1), URL(2))
+        self.assertEqual(self._run().skipped_already_in_target, [])
+
+    def test_unit_that_never_reached_the_graph_stays_a_skipped_id(self):
+        self._merged(URL(3))
+        rep = self._run()
+        self.assertEqual(rep.skipped_already_in_target, ["pr-3"])
+        self.assertNotIn("pr-3", [n.unit_id for n in rep.nodes])
 
 
 class CarriedSessionFields(unittest.TestCase):

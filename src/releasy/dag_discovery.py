@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import atexit
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -879,7 +879,27 @@ def run_discover_deps(
         _close_scratch_worktree(repo_path, scratch)
 
     # --- Build report ---
-    skipped = sorted(fully_merged_units)
+    # A unit whose PRs have all landed in target since the last run keeps
+    # the node it had. It is done, and dropping it would erase its entry —
+    # a group's membership and apply order included — from the graph issue
+    # that tracks it as merged.
+    carried_merged_urls: set[str] = set()
+    for pn in (prior_report.nodes if prior_report is not None else []):
+        if pn.unit_id in nodes or not pn.pr_urls:
+            continue
+        if all(url in pr_in_target for url in pn.pr_urls):
+            # Deps go: the unit is done, so nothing gates it any more, and
+            # a prereq that dropped out of this run would dangle.
+            nodes[pn.unit_id] = replace(pn, deps=[])
+            carried_merged_urls.update(pn.pr_urls)
+
+    # Units carried above are full graph nodes now, so they don't also
+    # belong in the bare already-in-target id list.
+    skipped = sorted(
+        uid for uid in fully_merged_units
+        if uid not in nodes
+        and not all(p.url in carried_merged_urls for p in by_unit_id[uid].prs)
+    )
     if include_already_merged:
         for uid in skipped:
             if uid not in nodes:
