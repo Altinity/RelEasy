@@ -278,9 +278,11 @@ def cli(
     is_flag=True,
     default=False,
     help="Re-attempt units parked on a stall that cannot clear by itself "
-         "(waiting for another unit's PR to merge, or on a prereq nobody "
-         "ports). Those are skipped by default because re-resolving them "
-         "reaches the same verdict at full token price — see "
+         "(waiting for another unit's PR to merge, on a prereq nobody "
+         "ports, or a resolution dead end whose "
+         "ai_resolve.max_dead_end_attempts are spent). Those are skipped "
+         "by default because re-resolving "
+         "them reaches the same verdict at full token price — see "
          "pr_policy.honor_stall_reasons.",
 )
 @click.pass_context

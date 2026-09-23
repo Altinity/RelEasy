@@ -152,8 +152,8 @@ stall:
 | `waiting_for_merge` | A prerequisite is queued in another unit — listed there, or carried inside a combined port that unit brings — or a `depends_on` gate is unmet. Nothing to try until that PR merges. | yes |
 | `missing_prereq` | A prerequisite PR was identified but nobody ports it: add it to the session, or merge it upstream. | yes |
 | `retries_exhausted` | An attempt cap was spent (`max_partial_continue_attempts`, `max_verify_resume_attempts`). | the cap does |
-| `unresolvable` | The resolver judged the conflict and could not fix it. | no |
-| `prereq_search_exhausted` | The auto-prereq dive hit its depth cap, a cycle, or a fetch failure. | no |
+| `unresolvable` | The resolver judged the conflict and could not fix it. | once `ai_resolve.max_dead_end_attempts` are spent |
+| `prereq_search_exhausted` | The auto-prereq dive hit its depth cap, a cycle, or a fetch failure. | once `ai_resolve.max_dead_end_attempts` are spent |
 | `resolver_unavailable` | AI resolution is off, or the backend died before reaching a verdict. | no |
 | `build_unfixed` | The resolution landed but the build/tests never went green. | no |
 
@@ -162,9 +162,24 @@ instead of paying for a resolution that can only reach the same verdict. The
 skip is not permanent — it lasts exactly as long as the thing being waited on:
 a `waiting_for_merge` clears when one of its units reaches `merged` /
 `superseded` (or leaves the session), a `missing_prereq` clears once the
-prereq is queued somewhere releasy knows about. `retries_exhausted` isn't
+prereq's own port merges. Queueing the prereq is not enough on its own: a
+unit that ports it but hasn't merged leaves the conflict exactly where it
+was, so the unit stays parked and the stall is re-stated as
+`waiting_for_merge` on that unit. `retries_exhausted` isn't
 gated here because the caps are re-read from config every run, so raising one
 takes effect immediately.
+
+`unresolvable` and `prereq_search_exhausted` are gated by a cap of their own
+rather than by what they wait on: base moves between runs, so a resolution
+that reached a dead end is worth another try or two — but not at full token
+price on every run forever. The stall's `runs` counter is that attempt count
+(it only grows on a run that actually re-resolved), and once it reaches
+`ai_resolve.max_dead_end_attempts` (default 2; `0` never parks) the unit is
+skipped until the cap is raised, the conflict is fixed by hand, or
+`--ignore-stalls` forces a try. The count restarts when the dive reports a
+different set of prereqs — that is new information, worth a run. A partially
+applied group is left to `pr_policy.max_partial_continue_attempts`, which
+bounds the same work.
 
 Set [`pr_policy.honor_stall_reasons:
 false`](configuration.md#configyaml-stable-infrastructure) to always

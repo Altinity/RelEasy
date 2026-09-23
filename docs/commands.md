@@ -138,7 +138,10 @@ spends no fix attempt and no resume.
 A unit parked on a **[stall](concepts.md#stall-reasons)** that cannot clear on
 its own — waiting for another unit's PR to merge, or on a prereq nobody ports
 — is skipped rather than re-resolved: the verdict would be the same at full
-token price. The skip lifts by itself once what it waits on moves. Use
+token price. A resolution that reached a dead end — the resolver gave up,
+or the prereq dive ran out of road — is retried
+`ai_resolve.max_dead_end_attempts` times and then parked the same way.
+The skip lifts by itself once what it waits on moves. Use
 `--ignore-stalls` (or `pr_policy.honor_stall_reasons: false`) to force the
 retry anyway.
 
@@ -166,7 +169,7 @@ releasy run [--onto <ver>] [--work-dir <path>]
 | `--merge-target` / `--no-merge-target` | Push a merge commit on PRs even without conflicts. Never force-pushes. | off |
 | `--only <url-or-id>` | Single PR URL **or** group/singleton id. Drops everything else. **Non-zero** if nothing matches. Mutex with `--pr`. | — |
 | `--pr <URL>` | Single PR by URL. Exits **cleanly (0)** when the PR isn't in session scope. Use from webhook/cron callers. Mutex with `--only`. | — |
-| `--ignore-stalls` | Re-attempt units parked on a [stall](concepts.md#stall-reasons) that can't clear by itself (waiting for another unit's PR to merge, or on a prereq nobody ports). | off |
+| `--ignore-stalls` | Re-attempt units parked on a [stall](concepts.md#stall-reasons) that can't clear by itself (waiting for another unit's PR to merge, on a prereq nobody ports, or a conflict whose re-resolution attempts are spent). | off |
 | `--dry-run` | No writes anywhere (state / git / GitHub). Read-only fetches still happen; cannot predict cherry-pick conflicts. | off |
 
 Exit: `1` on any `conflict` (in scope), else `0`.

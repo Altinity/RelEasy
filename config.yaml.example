@@ -357,6 +357,10 @@ notifications:
 #   # Legacy single-session cap on build attempts Claude makes per
 #   # conflict (only used when `deterministic_build: false`).
 #   max_iterations: 5
+#   # Consecutive runs that may re-resolve a unit whose last resolution
+#   # reached a dead end (resolver gave up, or the prereq dive ran out of
+#   # road); the unit is parked once they are spent. 0: no cap.
+#   max_dead_end_attempts: 2
 #   timeout_seconds: 7200
 #   build_command: cd build && ninja
 #   # --- Deterministic build/test split (default) ---

@@ -148,6 +148,7 @@ Options live in `config.yaml` unless marked **(session)**.
 | `ai_resolve.build_command` | Shell command for the build. RelEasy runs it (deterministic flow), or Claude runs it (legacy). | `cd build && ninja` |
 | `ai_resolve.deterministic_build` | Claude resolves only; RelEasy builds + runs the PR's tests, looping fresh-context build fixes. `false` = legacy single-session resolve+build. | `true` |
 | `ai_resolve.max_build_attempts` | Consecutive build-fix attempts per run before parking as `build_failed`. Resets each run. | `5` |
+| `ai_resolve.max_dead_end_attempts` | How many consecutive runs may re-resolve a unit whose last resolution reached a dead end — `unresolvable` or `prereq_search_exhausted`; the unit is then parked (see [stall reasons](concepts.md#stall-reasons)). `0` re-resolves on every run. | `2` |
 | `ai_resolve.max_verify_resume_attempts` | How many times a `build_failed` branch is resumed on later runs before it's left for a human. `0` disables resume. | `2` |
 | `ai_resolve.max_resume_base_drift` | Re-port from base instead of resuming when a parked branch is this many commits behind base. `0` disables the check. | `50` |
 | `ai_resolve.max_verify_iterations` | Overall cap on build↔test iterations within one verify pass. | `12` |

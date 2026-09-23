@@ -106,6 +106,15 @@ BLOCKING_STALL_KINDS: frozenset[str] = frozenset(
     {"waiting_for_merge", "missing_prereq"}
 )
 
+# Stalls where the resolver spent a full run and reached a dead end: it gave
+# up on the conflict, or the prereq dive ran out of road. Base moves between
+# runs, so these are worth another try or two —
+# ``ai_resolve.max_dead_end_attempts`` says how many, counted in the stall's
+# ``runs``. See :func:`releasy.pipeline._dead_end_budget_spent`.
+CAPPED_STALL_KINDS: frozenset[str] = frozenset(
+    {"unresolvable", "prereq_search_exhausted"}
+)
+
 # Generic one-liner per kind. ``{targets}`` is filled from waiting_on_*.
 _STALL_LABEL: dict[str, str] = {
     "waiting_for_merge": "waiting for {targets} to merge",
@@ -389,10 +398,12 @@ class FeatureState:
     # ``queued_prereq_units`` — cross-references to other units (or
     # config entries) where the discovered prereq is already going to be
     # ported. Each entry is ``{prereq_url: str, queued_in: str,
-    # queued_in_pr_url: str | None, carried: bool}`` where ``queued_in``
-    # is a human-readable identifier (feature_id, "config:include_prs",
-    # "config:groups[<id>]") and ``carried`` marks a unit that brings the
-    # prereq inside a combined port rather than listing it. Drives the
+    # queued_in_pr_url: str | None, carried: bool,
+    # queued_status: str | None}`` where ``queued_in`` is a human-readable
+    # identifier (feature_id, "config:include_prs", "config:groups[<id>]"),
+    # ``carried`` marks a unit that brings the prereq inside a combined
+    # port rather than listing it, and ``queued_status`` is that unit's
+    # status (None when only the config lists the prereq). Drives the
     # "merge unit X first" message; cleared once the unit lands cleanly.
     queued_prereq_units: list[dict] = field(default_factory=list)
     # ----- ``refresh --address-review`` tracking -----

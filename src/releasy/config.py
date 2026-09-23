@@ -812,6 +812,11 @@ class AIResolveConfig:
     split_conflict_commit: bool = True
     allowed_tools: list[str] = field(default_factory=_default_allowed_tools)
     max_iterations: int = 5
+    # Consecutive runs that may re-resolve a unit whose last resolution
+    # reached a dead end (the resolver gave up, or the prereq dive ran out
+    # of road); once spent, the unit is parked instead of buying the same
+    # verdict again. 0 = no cap (re-resolve every run).
+    max_dead_end_attempts: int = 2
     timeout_seconds: int = 7200  # 2h
     build_command: str = "cd build && ninja"
     # --- Deterministic build/test split (the `run` cherry-pick flow) ---
@@ -1401,6 +1406,9 @@ def load_config(config_path: Path | None = None) -> Config:
         split_conflict_commit=bool(ai_raw.get("split_conflict_commit", True)),
         allowed_tools=ai_raw.get("allowed_tools") or _default_allowed_tools(),
         max_iterations=int(ai_raw.get("max_iterations", 5)),
+        max_dead_end_attempts=int(
+            ai_raw.get("max_dead_end_attempts", 2) or 0
+        ),
         timeout_seconds=int(ai_raw.get("timeout_seconds", 7200)),
         build_command=ai_raw.get("build_command", "cd build && ninja"),
         deterministic_build=bool(ai_raw.get("deterministic_build", True)),
@@ -1825,6 +1833,8 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         ai_data["allowed_tools"] = ai.allowed_tools
     if ai.max_iterations != ai_defaults.max_iterations:
         ai_data["max_iterations"] = ai.max_iterations
+    if ai.max_dead_end_attempts != ai_defaults.max_dead_end_attempts:
+        ai_data["max_dead_end_attempts"] = ai.max_dead_end_attempts
     if ai.timeout_seconds != ai_defaults.timeout_seconds:
         ai_data["timeout_seconds"] = ai.timeout_seconds
     if ai.build_command != ai_defaults.build_command:

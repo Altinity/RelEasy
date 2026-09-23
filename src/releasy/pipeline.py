@@ -69,6 +69,7 @@ from releasy.github_ops import (
 )
 from releasy.state import (
     BLOCKING_STALL_KINDS,
+    CAPPED_STALL_KINDS,
     FeatureState,
     PipelineState,
     StallReason,
@@ -2996,7 +2997,11 @@ _LANDED_STATUSES = frozenset({"merged", "superseded"})
 
 
 def _stall_still_blocks(
-    config: Config, state: PipelineState, stall: StallReason,
+    config: Config,
+    state: PipelineState,
+    stall: StallReason,
+    *,
+    exclude_feature_id: str | None = None,
 ) -> bool:
     """True when nothing has changed that could get ``stall`` unstuck.
 
@@ -3006,8 +3011,9 @@ def _stall_still_blocks(
 
     * ``waiting_for_merge`` — one of the units it waits on merged (or left
       the session, so we can no longer tell).
-    * ``missing_prereq`` — the prereq is now queued somewhere releasy knows
-      about, so the dive has somewhere to go.
+    * ``missing_prereq`` — the prereq's own port landed, so base carries it
+      now. Somebody merely queueing the prereq releases nothing: until that
+      port merges, a retry meets the very same conflict.
     """
     if stall.kind == "waiting_for_merge":
         if not stall.waiting_on_units:
@@ -3020,16 +3026,82 @@ def _stall_still_blocks(
     if stall.kind == "missing_prereq":
         if not stall.waiting_on_prs:
             return False
-        return not _find_already_queued_prereqs(
+        queued = _find_already_queued_prereqs(
             config, state, list(stall.waiting_on_prs),
+            exclude_feature_id=exclude_feature_id,
+        )
+        return not any(
+            q["queued_status"] in _LANDED_STATUSES for q in queued
         )
     return False
+
+
+def _prereq_now_queued_stall(
+    config: Config,
+    state: PipelineState,
+    prev_state: FeatureState,
+    feature_id: str,
+) -> StallReason | None:
+    """A ``waiting_for_merge`` for a ``missing_prereq`` somebody now ports.
+
+    The unit stays parked either way — the port has not merged — but the
+    stall can name the unit to merge instead of reporting a prereq nobody
+    ports. ``None`` when nothing changed: only units tracked in state
+    qualify, since a prereq sitting in the config alone gives the gate no
+    merge to watch for.
+    """
+    stall = prev_state.stall
+    if stall is None or stall.kind != "missing_prereq":
+        return None
+    queued = [
+        q for q in _find_already_queued_prereqs(
+            config, state, list(stall.waiting_on_prs),
+            exclude_feature_id=feature_id,
+        )
+        if q["queued_status"] is not None
+    ]
+    return _queued_stall(queued, prior=prev_state) if queued else None
+
+
+def _dead_end_budget_spent(
+    config: Config,
+    state: PipelineState,
+    prev_state: FeatureState,
+    canonical_branch: str,
+    label: str,
+) -> bool:
+    """True when a :data:`CAPPED_STALL_KINDS` stall has used up its budget.
+
+    Base moves between runs, so a resolution that reached a dead end is
+    worth another try or two — but not on every run forever, at full token
+    price for the same verdict. ``stall.runs`` is that attempt count (it
+    only grows on a run that actually re-resolved), so raising the cap takes
+    effect on the next run. A partial group is left to
+    ``pr_policy.max_partial_continue_attempts``, which bounds the very same
+    work with the knob the user configured for it.
+    """
+    from rich.markup import escape
+
+    cap = config.ai_resolve.max_dead_end_attempts
+    stall = prev_state.stall
+    if cap <= 0 or stall.runs < cap or _is_partial_group(prev_state):
+        return False
+    console.print(
+        f"\n    [yellow]⏭[/yellow]  [cyan]{canonical_branch}[/cyan] "
+        f"({label}) — {escape(stall.summary())}; {stall.runs}/{cap} "
+        "attempts spent, not re-resolving [dim](bump "
+        "ai_resolve.max_dead_end_attempts, fix it by hand, or "
+        "--ignore-stalls)[/dim]"
+    )
+    _dry_record(state, "skip-dead-end-exhausted")
+    return True
 
 
 def _skip_for_stall(
     config: Config,
     state: PipelineState,
     prev_state: FeatureState | None,
+    feature_id: str,
     canonical_branch: str,
     label: str,
 ) -> bool:
@@ -3037,7 +3109,9 @@ def _skip_for_stall(
 
     Returns True when the caller should leave the unit untouched this run.
     Re-resolving a unit that waits on somebody else's merge costs a full
-    resolution and reaches the same verdict, so the default is to wait.
+    resolution and reaches the same verdict, so the default is to wait; a
+    resolution that reached a dead end gets a bounded number of tries
+    before the same applies.
     """
     from rich.markup import escape
 
@@ -3046,20 +3120,32 @@ def _skip_for_stall(
         stall is None
         or config.ignore_stalls
         or not config.pr_policy.honor_stall_reasons
-        or stall.kind not in BLOCKING_STALL_KINDS
     ):
         return False
-    if not _stall_still_blocks(config, state, stall):
+
+    if stall.kind in CAPPED_STALL_KINDS:
+        return _dead_end_budget_spent(
+            config, state, prev_state, canonical_branch, label,
+        )
+    if stall.kind not in BLOCKING_STALL_KINDS:
+        return False
+    if not _stall_still_blocks(
+        config, state, stall, exclude_feature_id=feature_id,
+    ):
         # What it waited on moved — let the unit back into the normal flow.
         prev_state.stall = None
         return False
 
-    runs = stall.runs + 1
-    stall.runs = runs
+    upgraded = _prereq_now_queued_stall(config, state, prev_state, feature_id)
+    if upgraded is not None:
+        stall = prev_state.stall = upgraded  # a new wait, counted from here
+    else:
+        stall.runs += 1
     console.print(
         f"\n    [yellow]⏳[/yellow] [cyan]{canonical_branch}[/cyan] "
         f"({label}) — {escape(stall.summary())}; not re-resolving "
-        f"[dim](run {runs} in this state; --ignore-stalls to force)[/dim]"
+        f"[dim](run {stall.runs} in this state; --ignore-stalls to force)"
+        "[/dim]"
     )
     _persist_state(config, state)
     _dry_record(state, "skip-stalled")
@@ -3211,7 +3297,9 @@ def _process_feature_unit(
     # --- Stall gate: don't pay for a retry that cannot get anywhere yet ---
     # A unit parked waiting on somebody else's merge (or on a prereq nobody
     # ports) reaches the same verdict for the same money until that changes.
-    if _skip_for_stall(config, state, prev_state, canonical_branch, label):
+    if _skip_for_stall(
+        config, state, prev_state, unit.feature_id, canonical_branch, label,
+    ):
         return "continue"
 
     # --- Resume a build_failed branch ---
@@ -4853,6 +4941,8 @@ def _find_already_queued_prereqs(
             "queued_in": "<feature_id | 'config:include_prs' | 'config:groups[<id>]'>",
             "queued_in_pr_url": "<rebase PR URL or None>",
             "carried": <True when matched via combined-port provenance>,
+            "queued_status": "<porting unit's status, None when only the
+                              config lists the prereq>",
         }
 
     Empty list when no candidate is already queued — the caller falls
@@ -4877,21 +4967,15 @@ def _find_already_queued_prereqs(
     def _normalize(url: str) -> tuple[str, str, int] | None:
         return parse_pr_url(url)
 
-    # Build the lookup table from config and state.
-    # value = (queued_in_label, queued_in_pr_url_or_None)
-    index: dict[tuple[str, str, int], tuple[str, str | None]] = {}
+    # Build the lookup table from state and config.
+    # value = (queued_in_label, queued_in_pr_url_or_None, status_or_None)
+    index: dict[
+        tuple[str, str, int], tuple[str, str | None, str | None]
+    ] = {}
 
-    for url in config.pr_sources.include_prs:
-        ref = _normalize(url)
-        if ref and ref not in index:
-            index[ref] = ("config:include_prs", None)
-
-    for group in config.pr_sources.groups:
-        for url in group.prs:
-            ref = _normalize(url)
-            if ref and ref not in index:
-                index[ref] = (f"config:groups[{group.id}]", None)
-
+    # State before config: a unit that already ports the prereq names the
+    # merge to wait for and the status to watch; the config line that
+    # queued it names neither.
     for fid, fs in state.features.items():
         if fid == exclude_feature_id:
             continue
@@ -4901,11 +4985,11 @@ def _find_already_queued_prereqs(
                 continue
             ref = _normalize(url)
             if ref and ref not in index:
-                index[ref] = (fid, fs.rebase_pr_url)
+                index[ref] = (fid, fs.rebase_pr_url, fs.status)
         for url in fs.dynamic_prereq_urls:
             ref = _normalize(url)
             if ref and ref not in index:
-                index[ref] = (fid, fs.rebase_pr_url)
+                index[ref] = (fid, fs.rebase_pr_url, fs.status)
         # Also key on releasy's OWN port PR for this feature. A missing-
         # prereq report can name the in-flight port PR (the branch where
         # the prereq's code currently lives on the target) instead of the
@@ -4914,12 +4998,25 @@ def _find_already_queued_prereqs(
         if fs.rebase_pr_url:
             ref = _normalize(fs.rebase_pr_url)
             if ref and ref not in index:
-                index[ref] = (fid, fs.rebase_pr_url)
+                index[ref] = (fid, fs.rebase_pr_url, fs.status)
+
+    for url in config.pr_sources.include_prs:
+        ref = _normalize(url)
+        if ref and ref not in index:
+            index[ref] = ("config:include_prs", None, None)
+
+    for group in config.pr_sources.groups:
+        for url in group.prs:
+            ref = _normalize(url)
+            if ref and ref not in index:
+                index[ref] = (f"config:groups[{group.id}]", None, None)
 
     # Second tier, built after every direct claim is in: PRs a unit's own
     # PRs say they cherry-picked. Kept separate so a unit that lists the
     # prereq outright always wins over one that merely carries it.
-    carried: dict[tuple[str, str, int], tuple[str, str | None]] = {}
+    carried: dict[
+        tuple[str, str, int], tuple[str, str | None, str | None]
+    ] = {}
     for fid, fs in state.features.items():
         if fid == exclude_feature_id:
             continue
@@ -4941,7 +5038,7 @@ def _find_already_queued_prereqs(
         for url in contained:
             ref = _normalize(url)
             if ref and ref not in index and ref not in carried:
-                carried[ref] = (fid, fs.rebase_pr_url)
+                carried[ref] = (fid, fs.rebase_pr_url, fs.status)
 
     out: list[dict] = []
     seen: set[tuple[str, str, int]] = set()
@@ -4951,12 +5048,15 @@ def _find_already_queued_prereqs(
             continue
         hit = index.get(ref)
         if hit is not None or ref in carried:
-            queued_in, queued_pr_url = hit if hit is not None else carried[ref]
+            queued_in, queued_pr_url, queued_status = (
+                hit if hit is not None else carried[ref]
+            )
             out.append({
                 "prereq_url": url,
                 "queued_in": queued_in,
                 "queued_in_pr_url": queued_pr_url,
                 "carried": hit is None,
+                "queued_status": queued_status,
             })
             seen.add(ref)
     return out
