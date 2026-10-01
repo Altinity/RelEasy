@@ -4359,12 +4359,12 @@ def _resume_build_failed_unit(
         return "continue"
 
     if vres.outcome == "error":
-        # The build never reached the compiler, so the resolution was never
-        # judged — don't spend a resume on a broken environment (same rule
-        # as the auto-continue counter above).
+        # The build never reached the compiler, or the tests never ran, so
+        # the resolution was never judged — don't spend a resume on a broken
+        # environment (same rule as the auto-continue counter above).
         console.print(
-            "    [dim]build never ran (environment fault) — resume attempt "
-            "not counted[/dim]"
+            "    [dim]build/tests never ran (environment fault) — resume "
+            "attempt not counted[/dim]"
         )
     _park_build_failed(
         config, repo_path, state, unit, branch, onto, vres,

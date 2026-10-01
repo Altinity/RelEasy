@@ -469,11 +469,15 @@ def _default_analyze_fails_allowed_tools() -> list[str]:
         "Bash(tests/integration/runner:*)",
         "Bash(./tests/clickhouse-test:*)",
         "Bash(./tests/integration/runner:*)",
+        "Bash(build/src/unit_tests_dbms:*)",
+        "Bash(./build/src/unit_tests_dbms:*)",
+        "Bash(./build/programs/clickhouse:*)",
         "Bash(pytest:*)",
         "Bash(python:*)", "Bash(python3:*)",
         # Project-binary paths that {work_dir} resolves to at runtime;
         # see analyze_fails._resolve_tool_paths.
         "Bash({work_dir}/build/programs/clickhouse:*)",
+        "Bash({work_dir}/build/src/unit_tests_dbms:*)",
         "Bash({work_dir}/tests/clickhouse-test:*)",
         "Bash({work_dir}/tests/integration/runner:*)",
     ]

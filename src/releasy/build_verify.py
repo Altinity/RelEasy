@@ -520,8 +520,14 @@ def verify_build_and_tests(
                 success=True, outcome="passed", iterations=iterations,
                 cost_usd=cost_total, new_head=head_after,
             )
+        # Tests never executed — the code was not judged.
+        could_not_run = bool(marker) and marker.startswith(
+            "TESTS FAILED: could not run tests",
+        )
         return VerifyResult(
-            success=False, outcome="tests_failed", iterations=iterations,
+            success=False,
+            outcome="error" if could_not_run else "tests_failed",
+            iterations=iterations,
             error=f"PR tests did not pass: {marker or 'no verdict'}",
             cost_usd=cost_total, new_head=head_after,
         )

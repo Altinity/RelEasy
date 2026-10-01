@@ -435,10 +435,11 @@ class RunTestsAllowlistPaths(unittest.TestCase):
             )
         }
         self.calls: list[dict] = []
+        self.verdict = "TESTS PASSED"
 
         def _claude(*a, **kw):
             self.calls.append(kw)
-            return (0, "TESTS PASSED", False, 0.0)
+            return (0, self.verdict, False, 0.0)
 
         bv.run_build = lambda *a, **kw: (0, False)
         bv._write_build_script = lambda *a, **kw: None
@@ -454,7 +455,7 @@ class RunTestsAllowlistPaths(unittest.TestCase):
             setattr(bv, n, f)
         self._tmp.cleanup()
 
-    def test_work_dir_placeholder_resolved(self):
+    def _verify(self):
         path = self.repo / "config.yaml"
         path.write_text(
             "name: test-proj\nproject: testp\n"
@@ -462,7 +463,7 @@ class RunTestsAllowlistPaths(unittest.TestCase):
             encoding="utf-8",
         )
         from releasy.github_ops import PRInfo
-        res = bv.verify_build_and_tests(
+        return bv.verify_build_and_tests(
             load_config(path), self.repo,
             PRInfo(
                 number=1, title="t", body="", state="merged",
@@ -471,11 +472,37 @@ class RunTestsAllowlistPaths(unittest.TestCase):
             ),
             port_branch="feature/b/1", base_branch="b", base_sha="deadbeef",
         )
+
+    def test_work_dir_placeholder_resolved(self):
+        res = self._verify()
         self.assertTrue(res.success)
         self.assertEqual(len(self.calls), 1)
         tools = self.calls[0]["allowed_tools"]
         self.assertIn(f"Bash({self.repo}/tests/integration/runner:*)", tools)
         self.assertFalse([t for t in tools if "{work_dir}" in t])
+
+    def test_gtest_and_clickhouse_binaries_allowed(self):
+        self._verify()
+        tools = self.calls[0]["allowed_tools"]
+        for t in (
+            f"Bash({self.repo}/build/src/unit_tests_dbms:*)",
+            "Bash(build/src/unit_tests_dbms:*)",
+            "Bash(./build/src/unit_tests_dbms:*)",
+            "Bash(./build/programs/clickhouse:*)",
+        ):
+            self.assertIn(t, tools)
+
+    def test_could_not_run_tests_is_environment_fault(self):
+        self.verdict = "TESTS FAILED: could not run tests: runner denied"
+        res = self._verify()
+        self.assertFalse(res.success)
+        self.assertEqual(res.outcome, "error")
+
+    def test_failing_tests_stay_tests_failed(self):
+        self.verdict = "TESTS FAILED: 2 of 5 tests failed"
+        res = self._verify()
+        self.assertFalse(res.success)
+        self.assertEqual(res.outcome, "tests_failed")
 
 
 class ResumeDryRun(unittest.TestCase):
