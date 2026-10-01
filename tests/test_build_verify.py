@@ -421,6 +421,63 @@ class EnvironmentFaultShortCircuit(unittest.TestCase):
         self.assertIn("never reached the compiler", res.error)
 
 
+class RunTestsAllowlistPaths(unittest.TestCase):
+    """Run-tests gets the analyze-fails allowlist with ``{work_dir}`` resolved."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self._tmp.name)
+        self._saved = {
+            n: getattr(bv, n) for n in (
+                "run_build", "_write_build_script", "_changed_files",
+                "_render", "_common_placeholders",
+                "_invoke_claude_with_retries",
+            )
+        }
+        self.calls: list[dict] = []
+
+        def _claude(*a, **kw):
+            self.calls.append(kw)
+            return (0, "TESTS PASSED", False, 0.0)
+
+        bv.run_build = lambda *a, **kw: (0, False)
+        bv._write_build_script = lambda *a, **kw: None
+        bv._changed_files = lambda *a, **kw: [
+            "tests/integration/test_x/test.py",
+        ]
+        bv._render = lambda *a, **kw: "prompt"
+        bv._common_placeholders = lambda *a, **kw: {}
+        bv._invoke_claude_with_retries = _claude
+
+    def tearDown(self):
+        for n, f in self._saved.items():
+            setattr(bv, n, f)
+        self._tmp.cleanup()
+
+    def test_work_dir_placeholder_resolved(self):
+        path = self.repo / "config.yaml"
+        path.write_text(
+            "name: test-proj\nproject: testp\n"
+            "origin:\n  remote: https://github.com/o/r.git\n",
+            encoding="utf-8",
+        )
+        from releasy.github_ops import PRInfo
+        res = bv.verify_build_and_tests(
+            load_config(path), self.repo,
+            PRInfo(
+                number=1, title="t", body="", state="merged",
+                merge_commit_sha=None, head_sha="abc", url="https://x/1",
+                repo_slug="o/r",
+            ),
+            port_branch="feature/b/1", base_branch="b", base_sha="deadbeef",
+        )
+        self.assertTrue(res.success)
+        self.assertEqual(len(self.calls), 1)
+        tools = self.calls[0]["allowed_tools"]
+        self.assertIn(f"Bash({self.repo}/tests/integration/runner:*)", tools)
+        self.assertFalse([t for t in tools if "{work_dir}" in t])
+
+
 class ResumeDryRun(unittest.TestCase):
     """``--dry-run`` must not check out a parked branch or start a build."""
 

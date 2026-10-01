@@ -58,6 +58,11 @@ Run from the repo root. Use the existing built binary under `build/`; do
   exactly `TESTS PASSED`.
 - A genuine, port-caused failure you cannot fix within scope → final line
   `TESTS FAILED: <one-line reason>`.
+- The tests could not be run (command denied, runner or binary missing,
+  infra error before any test executed) → final line
+  `TESTS FAILED: could not run tests: <one-line reason>`. Never print
+  `TESTS PASSED` for tests you did not run, even if the port looks like a
+  no-op.
 
 ## Hard rules (non-negotiable)
 

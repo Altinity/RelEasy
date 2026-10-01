@@ -30,7 +30,7 @@ from releasy.ai_resolve import (
     _write_build_script,
     build_log_path,
 )
-from releasy.analyze_fails import _CATEGORY_RUNNER_HINTS
+from releasy.analyze_fails import _CATEGORY_RUNNER_HINTS, _resolve_tool_paths
 
 
 VerifyOutcome = Literal[
@@ -492,7 +492,9 @@ def verify_build_and_tests(
         ec, out, to, cost = _invoke_claude_with_retries(
             config, repo_path, prompt,
             timeout=config.ai_resolve.test_timeout_seconds,
-            allowed_tools=config.analyze_fails.allowed_tools,
+            allowed_tools=_resolve_tool_paths(
+                list(config.analyze_fails.allowed_tools), repo_path,
+            ),
         )
         _add_cost(cost)
         if to:
