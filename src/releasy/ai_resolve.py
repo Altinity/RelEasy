@@ -24,7 +24,7 @@ from rich.markup import escape
 
 from releasy.termlog import console
 
-from releasy.config import AIApiConfig, Config, PortMode
+from releasy.config import AIApiConfig, AICodexConfig, Config, PortMode
 from releasy.git_ops import (
     is_operation_in_progress,
     run_git,
@@ -409,14 +409,19 @@ def _build_claude_argv(
     config: Config, allowed_tools: list[str] | None = None,
 ) -> list[str]:
     """Base print-mode argv WITHOUT the prompt — the prompt is supplied at
-    spawn time (inline for small prompts, via stdin for large ones)."""
+    spawn time (inline for small prompts, via stdin for large ones).
+
+    Returns the ``codex exec`` argv instead under ``ai_backend: codex``.
+    """
+    tools = allowed_tools if allowed_tools is not None else config.ai_resolve.allowed_tools
+    if _codex_backend_selected(config):
+        return _build_codex_argv(config, tools)
     cmd = [
         config.ai_resolve.command,
         "-p",
         "--output-format", "stream-json",
         "--verbose",
     ]
-    tools = allowed_tools if allowed_tools is not None else config.ai_resolve.allowed_tools
     if tools:
         cmd += ["--allowedTools", ",".join(tools)]
     cmd += _model_effort_args(config)
@@ -425,8 +430,34 @@ def _build_claude_argv(
 
 
 def _argv_with_inline_prompt(base_argv: list[str], prompt: str) -> list[str]:
-    """Insert ``prompt`` right after the ``-p`` flag (small-prompt path)."""
+    """Insert ``prompt`` right after ``-p`` / ``exec`` (small-prompt path)."""
     return base_argv[:2] + [prompt] + base_argv[2:]
+
+
+# Tools that let the agent change files. A codex call granted none of them
+# runs in codex's read-only sandbox; otherwise it gets full access (codex's
+# workspace-write sandbox blocks network and ``.git`` writes).
+_CODEX_WRITE_TOOLS = frozenset({"Edit", "Write", "NotebookEdit"})
+
+
+def _codex_backend_selected(config: Config) -> bool:
+    return str(getattr(config, "ai_backend", "cli") or "cli").lower() == "codex"
+
+
+def _build_codex_argv(config: Config, allowed_tools: list[str]) -> list[str]:
+    """``codex exec`` argv WITHOUT the prompt (see :func:`_build_claude_argv`)."""
+    codex = getattr(config, "ai_codex", None) or AICodexConfig()
+    cmd = [codex.command, "exec", "--json", "--skip-git-repo-check"]
+    if _CODEX_WRITE_TOOLS & set(allowed_tools):
+        cmd.append("--dangerously-bypass-approvals-and-sandbox")
+    else:
+        cmd += ["--sandbox", "read-only"]
+    if codex.model:
+        cmd += ["--model", codex.model]
+    if codex.reasoning_effort:
+        cmd += ["-c", f'model_reasoning_effort="{codex.reasoning_effort}"']
+    cmd += list(codex.extra_args)
+    return cmd
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +519,8 @@ def _resolve_backend(
     if spec is not None:
         from releasy.api_agent import check_available
         return spec, check_available(spec)
+    if _codex_backend_selected(config):
+        command = (getattr(config, "ai_codex", None) or AICodexConfig()).command
     if shutil.which(command) is None:
         return None, f"'{command}' not found on PATH"
     return None, None
@@ -495,6 +528,9 @@ def _resolve_backend(
 
 def _backend_label(config: Config, command: str) -> str:
     """How to name the backend in progress output."""
+    if _codex_backend_selected(config):
+        codex = getattr(config, "ai_codex", None) or AICodexConfig()
+        return f"{codex.command} ({codex.model})" if codex.model else codex.command
     spec = _build_api_spec(config, allowed_tools=[])
     if spec is None:
         return command
@@ -608,6 +644,96 @@ def _render_event(line: str, start: float) -> str | None:
         return f"[dim]│ [{elapsed}] {' '.join(bits)}[/dim]"
 
     return None
+
+
+def _codex_tool_use(name: str, inp: dict) -> dict:
+    return {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": name, "input": inp},
+    ]}}
+
+
+def _codex_tool_result(text: str, is_error: bool) -> dict:
+    return {"type": "user", "message": {"content": [
+        {"type": "tool_result", "content": text, "is_error": is_error},
+    ]}}
+
+
+# Informational stderr lines ``codex exec`` prints; kept out of the
+# transcript so they don't leak into the assistant text.
+_CODEX_STDIN_NOTICES = frozenset({
+    "Reading prompt from stdin...",
+    "Reading additional input from stdin...",
+})
+
+
+def _translate_codex_line(line: str) -> list[str]:
+    """Rewrite one ``codex exec --json`` event as Claude stream-json lines.
+
+    Keeps rendering, marker parsing and limit detection backend-agnostic.
+    Lines that aren't codex events (claude's own stream-json, plain text)
+    come back unchanged; codex events with nothing to show come back as
+    ``[]``. Errors become plain ``[codex] …`` text lines.
+    """
+    if line.strip() in _CODEX_STDIN_NOTICES:
+        return []
+    try:
+        ev = json.loads(line)
+    except json.JSONDecodeError:
+        return [line]
+    if not isinstance(ev, dict):
+        return [line]
+    etype = ev.get("type")
+    item = ev.get("item") if isinstance(ev.get("item"), dict) else {}
+    itype = item.get("type")
+    out: list[dict | str] = []
+
+    if etype == "thread.started":
+        out.append({"type": "system", "subtype": "init", "model": "codex"})
+    elif etype == "turn.completed":
+        out.append({"type": "result", "subtype": "success",
+                    "usage": ev.get("usage")})
+    elif etype == "turn.failed":
+        msg = (ev.get("error") or {}).get("message", "")
+        out.append(f"[codex] turn failed: {msg}")
+        out.append({"type": "result", "subtype": "error"})
+    elif etype == "error":
+        out.append(f"[codex] error: {ev.get('message', '')}")
+    elif etype == "item.started":
+        if itype == "command_execution":
+            out.append(_codex_tool_use("Bash", {"command": item.get("command", "")}))
+    elif etype == "item.completed":
+        if itype == "agent_message":
+            out.append({"type": "assistant", "message": {"content": [
+                {"type": "text", "text": item.get("text", "")},
+            ]}})
+        elif itype == "reasoning":
+            out.append({"type": "assistant", "message": {"content": [
+                {"type": "thinking", "thinking": item.get("text", "")},
+            ]}})
+        elif itype == "command_execution":
+            out.append(_codex_tool_result(
+                item.get("aggregated_output", ""), item.get("exit_code") != 0,
+            ))
+        elif itype == "file_change":
+            paths = ", ".join(
+                c.get("path", "") for c in item.get("changes") or []
+            )
+            out.append(_codex_tool_use("Edit", {"file_path": paths}))
+            status = item.get("status", "")
+            out.append(_codex_tool_result(f"patch {status}", status != "completed"))
+        elif itype == "error":
+            out.append(f"[codex] {item.get('message', '')}")
+        elif itype in ("mcp_tool_call", "web_search", "collab_tool_call"):
+            out.append(_codex_tool_use(
+                str(itype),
+                {k: v for k, v in item.items() if k not in ("id", "type", "status")},
+            ))
+    elif etype not in ("turn.started", "item.updated"):
+        return [line]
+
+    return [
+        (json.dumps(o) if isinstance(o, dict) else o) + "\n" for o in out
+    ]
 
 
 def _kill_proc_tree(proc: subprocess.Popen) -> None:
@@ -861,10 +987,12 @@ def _spawn_claude_once(
                 if proc.poll() is not None:
                     break
                 continue
-            collected.append(line)
             last_output = time.monotonic()
-            rendered = _render_event(line, start)
-            if rendered:
+            for out_line in _translate_codex_line(line):
+                collected.append(out_line)
+                rendered = _render_event(out_line, start)
+                if not rendered:
+                    continue
                 try:
                     console.print(f"    {rendered}")
                 except Exception:
@@ -1774,14 +1902,17 @@ def synthesize_text(
     if backend_error:
         return AITextResult(success=False, error=backend_error)
 
-    argv = [
-        command,
-        "-p",
-        "--output-format", "stream-json",
-        "--verbose",
-        "--allowedTools", "",
-    ]
-    argv += _model_effort_args(config)
+    if _codex_backend_selected(config):
+        argv = _build_codex_argv(config, [])
+    else:
+        argv = [
+            command,
+            "-p",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--allowedTools", "",
+        ]
+        argv += _model_effort_args(config)
 
     console.print(
         f"    [magenta]\U0001f916 synthesizing text via "
@@ -2108,15 +2239,7 @@ def verify_ai_resolution(
     except FileNotFoundError as exc:
         return VerifyResult(success=False, error=str(exc))
 
-    argv = [
-        config.ai_resolve.command,
-        "-p",
-        "--output-format", "stream-json",
-        "--verbose",
-        "--allowedTools", ",".join(_VERIFY_ALLOWED_TOOLS),
-    ]
-    argv += _model_effort_args(config)
-    argv += list(config.ai_resolve.extra_args)
+    argv = _build_claude_argv(config, list(_VERIFY_ALLOWED_TOOLS))
 
     console.print(
         "    [magenta]\U0001f50e verifying AI resolution "

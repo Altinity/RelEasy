@@ -140,9 +140,10 @@ Options live in `config.yaml` unless marked **(session)**.
 | `sequential` | One PR per invocation, gated on the previous rebase PR merging. See [Sequential mode](commands.md#sequential-mode). Incompatible with `pr_sources.groups`. | `false` |
 | `update_existing_prs` | Reuse existing PR and overwrite its title/body. | `false` |
 | `upstream.remote` | Optional fetch-only upstream remote (URL). Used **only** for `git log -S` prereq detection during AI resolve — never pushed to, never read for code. Sub-keys `upstream.remote_name` (`upstream`), `upstream.branch` (`master`). | unset |
-| `ai_model` | Model for **every** AI call (resolve, changelog, review, analyze-fails, graph). Alias or full id (`opus`, `sonnet`, `claude-opus-4-8`). | claude CLI default |
-| `ai_effort` | Reasoning effort for every AI call. One of `low`/`medium`/`high`/`xhigh`/`max`. | claude CLI default |
-| `ai_backend` | How every AI call reaches the model: `cli` spawns the agent binary (`<section>.command`), `api` talks to the Anthropic API with a token. See [AI backends](#ai-backends). | `cli` |
+| `ai_model` | Model for **every** AI call (resolve, changelog, review, analyze-fails, graph). Alias or full id (`opus`, `sonnet`, `claude-opus-4-8`). Not used by `ai_backend: codex`. | claude CLI default |
+| `ai_effort` | Reasoning effort for every AI call. One of `low`/`medium`/`high`/`xhigh`/`max`. Not used by `ai_backend: codex`. | claude CLI default |
+| `ai_backend` | How every AI call reaches the model: `cli` spawns `claude` (`<section>.command`), `codex` spawns `codex exec`, `api` talks to the Anthropic API with a token. See [AI backends](#ai-backends). | `cli` |
+| `ai_codex.*` | Settings for `ai_backend: codex`. See [AI backends](#ai-backends). | — |
 | `ai_api.*` | Settings for `ai_backend: api`. See [AI backends](#ai-backends). | — |
 | `ai_resolve.enabled` | Master switch for the AI conflict resolver. When off, conflicts always stop the pipeline. | `false` |
 | `ai_resolve.build_command` | Shell command for the build. RelEasy runs it (deterministic flow), or Claude runs it (legacy). | `cd build && ninja` |
@@ -251,13 +252,44 @@ Options live in `config.yaml` unless marked **(session)**.
 
 Every AI call — conflict resolve, build fixes, run-tests, verify, review
 response, analyze-fails, changelog synthesis, graph discovery — goes through
-one of two backends, selected by `ai_backend`.
+one of three backends, selected by `ai_backend`.
 
 **`cli` (default)** spawns the agent binary named by the section's `command`
 (`ai_resolve.command`, `analyze_fails.command`, …) as `claude -p
 --output-format stream-json`. It uses whatever credentials that CLI is
 logged in with (subscription or `ANTHROPIC_API_KEY`), and `extra_args` is
 passed through to it.
+
+**`codex`** spawns the OpenAI Codex CLI as `codex exec --json` and uses
+whatever it is logged in with (ChatGPT subscription via `codex login`, or an
+API key). Its events are translated into the same transcript format, so
+prompts, result markers, `api_retries` and the session-exhaustion wait work
+unchanged. Cost isn't reported (codex gives token counts only).
+
+```yaml
+ai_backend: codex
+
+ai_codex:
+  model: gpt-5.5            # unset = codex's own config default
+  reasoning_effort: high
+```
+
+The per-section `command` / `extra_args`, `ai_model` and `ai_effort` are
+claude settings and are ignored. Codex has no per-tool allowlist, so
+`allowed_tools` only picks the sandbox: a call granted no `Edit` / `Write`
+tool (changelog / graph text, both verifiers) runs with
+`--sandbox read-only` — no file writes, no network, so the verifier's
+`gh pr diff` cross-check fails there. Every other call runs with
+`--dangerously-bypass-approvals-and-sandbox` (full access, like the
+claude `Bash(git:*)` / `Bash(gh:*)` defaults but without any command
+filter).
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `ai_codex.command` | Codex executable. | `codex` |
+| `ai_codex.model` | Passed as `--model`. | codex config default |
+| `ai_codex.reasoning_effort` | Passed as `-c model_reasoning_effort="…"` (e.g. `low`/`medium`/`high`/`xhigh`). | codex config default |
+| `ai_codex.extra_args` | Extra `codex exec` flags (e.g. `["--ephemeral"]`). | `[]` |
 
 **`api`** drops the subprocess: RelEasy talks to the Anthropic Messages API
 with a token and runs the tool calls itself. The `anthropic` SDK ships as a
@@ -301,9 +333,10 @@ section's `allowed_tools` grants them (`analyze_fails` does by default).
 | `ai_api.tool_output_max_chars` | Tool results are middle-truncated past this. | `30000` |
 | `ai_api.system_prompt_extra` | Appended to the built-in system prompt. | `""` |
 
-`--ai-backend cli|api` overrides `ai_backend` on `refresh`, `analyze-fails`,
-`cherry-pick`, and `project-backport` (the last two have no config file, so
-API mode there uses these defaults plus `$ANTHROPIC_API_KEY`).
+`--ai-backend cli|codex|api` overrides `ai_backend` on `refresh`,
+`analyze-fails`, `cherry-pick`, and `project-backport` (the last two have no
+config file, so codex / API mode there uses the defaults above, plus
+`$ANTHROPIC_API_KEY` for API mode).
 
 ## Environment variables
 

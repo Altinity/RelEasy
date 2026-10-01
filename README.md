@@ -107,8 +107,10 @@ and runs the PR's tests, retrying build fixes in fresh context. A
 resolution that won't build yet is parked as `build_failed` — the branch
 is pushed but no PR is opened — and retried on the next `releasy run`.)
 
-By default the AI work runs through the `claude` CLI. To use an API token
-instead — no CLI install, no subscription — set `ai_backend: api` and
+By default the AI work runs through the `claude` CLI, on whatever it is
+logged in with (e.g. your subscription). Set `ai_backend: codex` to use the
+`codex` CLI (e.g. your ChatGPT subscription) instead. To use an API token —
+no CLI install, no subscription — set `ai_backend: api` and
 `export ANTHROPIC_API_KEY=...`; see
 [AI backends](docs/configuration.md#ai-backends).
 

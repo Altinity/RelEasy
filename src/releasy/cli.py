@@ -1412,11 +1412,11 @@ def _maybe_sync_graph_progress(
 @click.option(
     "--ai-backend",
     "ai_backend_cli",
-    type=click.Choice(["cli", "api"]),
+    type=click.Choice(["cli", "codex", "api"]),
     default=None,
-    help="How to reach the model: 'cli' spawns the agent binary, 'api' "
-         "talks to the Anthropic API directly using $ANTHROPIC_API_KEY. "
-         "Overrides ai_backend in config.",
+    help="How to reach the model: 'cli' spawns the claude binary, 'codex' "
+         "spawns 'codex exec', 'api' talks to the Anthropic API directly "
+         "using $ANTHROPIC_API_KEY. Overrides ai_backend in config.",
 )
 @click.option(
     "--prompt-file",
@@ -1867,11 +1867,11 @@ def refresh(
 @click.option(
     "--ai-backend",
     "ai_backend_cli",
-    type=click.Choice(["cli", "api"]),
+    type=click.Choice(["cli", "codex", "api"]),
     default=None,
-    help="How to reach the model: 'cli' spawns the agent binary, 'api' "
-         "talks to the Anthropic API directly using $ANTHROPIC_API_KEY. "
-         "Overrides ai_backend in config.",
+    help="How to reach the model: 'cli' spawns the claude binary, 'codex' "
+         "spawns 'codex exec', 'api' talks to the Anthropic API directly "
+         "using $ANTHROPIC_API_KEY. Overrides ai_backend in config.",
 )
 @click.option(
     "--prompt-file",

@@ -1198,6 +1198,7 @@ def _invoke_verifier(
         ai_effort = config.ai_effort
         ai_backend = config.ai_backend
         ai_api = config.ai_api
+        ai_codex = config.ai_codex
 
     argv = _build_claude_argv(_ConfigShim)  # type: ignore[arg-type]
     api = _build_api_spec(_ConfigShim)  # type: ignore[arg-type]
@@ -1229,6 +1230,7 @@ def _invoke_claude(
         ai_effort = config.ai_effort
         ai_backend = config.ai_backend
         ai_api = config.ai_api
+        ai_codex = config.ai_codex
 
     argv = _build_claude_argv(_ConfigShim)  # type: ignore[arg-type]
     api = _build_api_spec(_ConfigShim)  # type: ignore[arg-type]

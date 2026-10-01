@@ -138,7 +138,7 @@ _VALID_GROUP_SORT = ("listed", "merged_at")
 # Config accepts all three; post-detection only the last two survive.
 _VALID_PORT_MODES = ("auto", "backport", "forward_port")
 _VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
-_VALID_AI_BACKENDS = ("cli", "api")
+_VALID_AI_BACKENDS = ("cli", "codex", "api")
 
 from typing import Literal, get_args  # noqa: E402
 PortMode = Literal["backport", "forward_port"]
@@ -551,6 +551,23 @@ class AIApiConfig:
     tool_output_max_chars: int = 30000
     # Appended verbatim to the built-in system prompt.
     system_prompt_extra: str = ""
+
+
+@dataclass
+class AICodexConfig:
+    """Settings for ``ai_backend: codex`` — spawn ``codex exec`` instead of
+    ``claude``.
+
+    Replaces the per-section ``command`` / ``extra_args`` (those are claude
+    flags). ``allowed_tools`` only picks the sandbox: no Edit/Write tool →
+    ``--sandbox read-only``, otherwise full access.
+    """
+    command: str = "codex"
+    # Unset → codex's own config default. ``ai_model`` / ``ai_effort`` are
+    # claude values and are not used here.
+    model: str | None = None
+    reasoning_effort: str | None = None
+    extra_args: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1023,9 +1040,11 @@ class Config:
 
     # How every AI invocation reaches the model:
     #   "cli" (default) — spawn ``<section>.command`` (``claude -p …``)
+    #   "codex"         — spawn ``ai_codex.command`` (``codex exec …``)
     #   "api"           — drive the Anthropic API with a token, in-process
     ai_backend: str = "cli"
     ai_api: AIApiConfig = field(default_factory=AIApiConfig)
+    ai_codex: AICodexConfig = field(default_factory=AICodexConfig)
 
     @property
     def repo_dir(self) -> Path:
@@ -1140,6 +1159,26 @@ def _parse_label_color(value: object, *, key: str, default: str) -> str:
     if not re.fullmatch(r"[0-9A-Fa-f]{6}", stripped):
         raise ValueError(f"{key} must be 6 hex digits (got {value!r})")
     return stripped.upper()
+
+
+def _parse_ai_codex(raw: object) -> AICodexConfig:
+    """Parse the ``ai_codex:`` block (used when ``ai_backend: codex``)."""
+    if not isinstance(raw, dict):
+        raise ValueError("ai_codex must be a mapping")
+    unknown = set(raw) - {f.name for f in fields(AICodexConfig)}
+    if unknown:
+        raise ValueError(f"unknown ai_codex keys: {sorted(unknown)}")
+    extra_args = raw.get("extra_args") or []
+    if not isinstance(extra_args, list):
+        raise ValueError("ai_codex.extra_args must be a list")
+    return AICodexConfig(
+        command=str(raw.get("command") or AICodexConfig.command),
+        model=(str(raw["model"]) if raw.get("model") else None),
+        reasoning_effort=(
+            str(raw["reasoning_effort"]) if raw.get("reasoning_effort") else None
+        ),
+        extra_args=[str(a) for a in extra_args],
+    )
 
 
 def _parse_ai_api(raw: object) -> AIApiConfig:
@@ -1673,6 +1712,7 @@ def load_config(config_path: Path | None = None) -> Config:
             f"got {ai_backend!r}"
         )
     ai_api = _parse_ai_api(raw.get("ai_api") or {})
+    ai_codex = _parse_ai_codex(raw.get("ai_codex") or {})
 
     from releasy.termlog import configure as _configure_term_log
 
@@ -1708,6 +1748,7 @@ def load_config(config_path: Path | None = None) -> Config:
         ai_effort=ai_effort,
         ai_backend=ai_backend,
         ai_api=ai_api,
+        ai_codex=ai_codex,
     )
     _configure_term_log(log_file)
     return cfg
@@ -1813,6 +1854,14 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     }
     if api_data:
         data["ai_api"] = api_data
+    codex_defaults = AICodexConfig()
+    codex_data = {
+        f.name: getattr(config.ai_codex, f.name)
+        for f in fields(AICodexConfig)
+        if getattr(config.ai_codex, f.name) != getattr(codex_defaults, f.name)
+    }
+    if codex_data:
+        data["ai_codex"] = codex_data
 
     ai = config.ai_resolve
     ai_defaults = AIResolveConfig()

@@ -309,6 +309,9 @@ notifications:
 # How every AI invocation reaches the model:
 #   cli (default) — spawn the agent binary (`<section>.command`, i.e.
 #                   `claude -p …`) and use whatever it is logged in with.
+#   codex         — spawn `codex exec` and use whatever it is logged in
+#                   with (e.g. ChatGPT subscription). Ignores ai_model /
+#                   ai_effort and each section's command / extra_args.
 #   api           — talk to the Anthropic API directly with a token; no
 #                   subprocess, RelEasy runs the tool calls itself.
 #                   Needs: export ANTHROPIC_API_KEY=sk-ant-...
@@ -328,6 +331,13 @@ notifications:
 #   bash_timeout_seconds: 3600       # per Bash tool call
 #   tool_output_max_chars: 30000     # tool results truncated past this
 #   # system_prompt_extra: "Project-specific guidance for the agent."
+#
+# ai_backend: codex
+# ai_codex:
+#   command: codex
+#   model: gpt-5.5                   # unset = codex's config default
+#   reasoning_effort: high           # -c model_reasoning_effort=...
+#   extra_args: []                   # extra `codex exec` flags
 
 # ── AI conflict resolver (Claude) ───────────────────────────────────
 # Optional. When enabled, releasy invokes `claude` to resolve cherry-
