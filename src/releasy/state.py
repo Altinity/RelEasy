@@ -739,17 +739,56 @@ def find_feature_by_pr_url(
     The import of ``parse_pr_url`` is deferred — ``github_ops`` already
     imports this module, so a top-level import here would loop.
     """
+    matches = find_features_by_pr_url(state, pr_url)
+    return matches[0] if matches else None
+
+
+def find_features_by_pr_url(
+    state: PipelineState, pr_url: str,
+) -> list[tuple[str, FeatureState]]:
+    """Every tracked feature whose source or rebase URL matches ``pr_url``.
+
+    A PR can sit in several entries at once, e.g. a merged group and a
+    later singleton port of one of its members.
+    """
     from releasy.github_ops import parse_pr_url
 
     target = parse_pr_url(pr_url)
     if target is None:
-        return None
-    if not state.features:
+        return []
+    return [
+        (fid, fs)
+        for fid, fs in state.features.items()
+        if any(
+            url and parse_pr_url(url) == target
+            for url in (fs.rebase_pr_url, fs.pr_url, *fs.pr_urls)
+        )
+    ]
+
+
+def find_merged_feature_for_prs(
+    state: PipelineState,
+    pr_urls: list[str],
+    *,
+    exclude_feature_id: str | None = None,
+) -> tuple[str, FeatureState] | None:
+    """Locate a ``merged`` feature whose source PRs include every URL in ``pr_urls``.
+
+    Catches a PR already ported under another unit ID — e.g. a member of a
+    merged group that came back as a singleton. ``exclude_feature_id``
+    skips the caller's own entry.
+    """
+    from releasy.github_ops import parse_pr_url
+
+    wanted = {parse_pr_url(u) for u in pr_urls}
+    if not wanted or None in wanted:
         return None
     for fid, fs in state.features.items():
-        for url in (fs.rebase_pr_url, fs.pr_url, *fs.pr_urls):
-            if not url:
-                continue
-            if parse_pr_url(url) == target:
-                return (fid, fs)
+        if fid == exclude_feature_id or fs.status != "merged":
+            continue
+        sources = {
+            parse_pr_url(u) for u in (fs.pr_urls or [fs.pr_url]) if u
+        }
+        if wanted <= sources:
+            return (fid, fs)
     return None

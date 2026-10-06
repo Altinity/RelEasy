@@ -148,6 +148,30 @@ class AddressedComments(unittest.TestCase):
         self.assertIn("[C1] Comment by @u1", block)
         self.assertIn("[C2] Comment by @u2", block)
 
+    def test_pr_search_link_expanded_into_block(self):
+        import types
+        from unittest import mock
+        search = (
+            "https://github.com/Altinity/ClickHouse/pulls?q=is%3Apr+"
+            "state%3Amerged+base%3Aantalya-26.6+label%3Aport-antalya"
+        )
+        c = types.SimpleNamespace(
+            author="u1", author_association="MEMBER",
+            created_at="2026-01-01T00:00:00+00:00",
+            body=f"Review these for inclusion: {search}",
+        )
+        handled = d._handle_comments([c])
+        found = ["https://github.com/Altinity/ClickHouse/pull/2039"]
+        with mock.patch.object(d, "search_pr_urls", return_value=found) as s:
+            searches = d._expand_pr_searches(handled, [])
+        s.assert_called_once_with(
+            "repo:Altinity/ClickHouse is:pr is:merged base:antalya-26.6 "
+            "label:port-antalya"
+        )
+        block = d._render_comments_block(handled, searches)
+        self.assertIn(f"PR search {search} currently lists 1 PR(s):", block)
+        self.assertIn(f"- {found[0]}", block)
+
 
 class HasCycle(unittest.TestCase):
     def test_cycle(self):
@@ -634,6 +658,89 @@ class DeclaredEdges(unittest.TestCase):
         self.assertEqual(d._declared_edges(cands, self._nodes("dep"), []), set())
 
 
+class FollowUpRefParsing(unittest.TestCase):
+    """Only refs directly after a follow-up phrase count."""
+
+    def _refs(self, body, slug="o/r"):
+        from releasy.github_ops import parse_follow_up_refs
+        return parse_follow_up_refs(body, slug)
+
+    def test_phrasings(self):
+        for body in ("Follow-up for #5.", "follow up to #5", "Followup of #5",
+                     "follow-up on #5", "Follow-up: #5", "follow-up #5"):
+            with self.subTest(body=body):
+                self.assertEqual(self._refs(body), [("o", "r", 5)])
+
+    def test_ref_list_and_forms(self):
+        body = ("Follow-up for #1, u/s#2 and "
+                "https://github.com/ClickHouse/ClickHouse/pull/3 & #1")
+        self.assertEqual(self._refs(body), [
+            ("o", "r", 1), ("u", "s", 2), ("ClickHouse", "ClickHouse", 3),
+        ])
+
+    def test_prose_after_the_refs_ignored(self):
+        self.assertEqual(
+            self._refs("Follow-up for #1, also fixes #2"), [("o", "r", 1)],
+        )
+
+    def test_no_ref_right_after_phrase(self):
+        self.assertEqual(self._refs("A follow-up PR will handle #8"), [])
+        self.assertEqual(self._refs("This is a follow-up. See #7"), [])
+        self.assertEqual(self._refs(None), [])
+
+    def test_bare_ref_needs_a_default_slug(self):
+        self.assertEqual(self._refs("Follow-up for #1, u/s#2", None),
+                         [("u", "s", 2)])
+
+
+class FollowUpEdges(unittest.TestCase):
+    """A follow-up PR depends on the PR it follows, so they group."""
+
+    def _nodes(self, *uids):
+        return {u: node(u, 1) for u in uids}
+
+    def test_follow_up_depends_on_original(self):
+        cands = [_cu("pr-1", 1), _cu("pr-2", 2, body="Follow-up for #1")]
+        edges = d._follow_up_edges(
+            cands, self._nodes("pr-1", "pr-2"),
+            {URL(1): "pr-1", URL(2): "pr-2"}, {}, [],
+        )
+        self.assertEqual(edges, {("pr-2", "pr-1")})
+
+    def test_original_carried_in_combined_port(self):
+        """Following the upstream PR means following the port carrying it."""
+        cands = [_cu("pr-2", 2, body="Follow-up for #1388")]
+        edges = d._follow_up_edges(
+            cands, self._nodes("grp-1718", "pr-2"),
+            {URL(2): "pr-2"}, {URL(1388): "grp-1718"}, [],
+        )
+        self.assertEqual(edges, {("pr-2", "grp-1718")})
+
+    def test_original_already_in_target_is_silent(self):
+        cands = [_cu("pr-2", 2, body="Follow-up for #1")]
+        w = []
+        edges = d._follow_up_edges(
+            cands, self._nodes("pr-2"), {URL(1): "pr-1", URL(2): "pr-2"}, {}, w,
+        )
+        self.assertEqual((edges, w), (set(), []))
+
+    def test_original_not_a_candidate_warns(self):
+        cands = [_cu("pr-2", 2, body="Follow-up for #1")]
+        w = []
+        edges = d._follow_up_edges(
+            cands, self._nodes("pr-2"), {URL(2): "pr-2"}, {}, w,
+        )
+        self.assertEqual(edges, set())
+        self.assertTrue(any(URL(1) in x for x in w))
+
+    def test_follow_up_within_one_unit_no_self_edge(self):
+        cands = [_cu("grp", 2, 1, body="Follow-up for #1")]
+        edges = d._follow_up_edges(
+            cands, self._nodes("grp"), {URL(1): "grp", URL(2): "grp"}, {}, [],
+        )
+        self.assertEqual(edges, set())
+
+
 class IsReusableUnit(unittest.TestCase):
     """Incremental discovery reuses cached, dependency-free, unchanged units."""
 
@@ -823,7 +930,7 @@ class BuildGroupCacheBranches(unittest.TestCase):
     def test_clean_group_cached(self):
         nodes, by_id, grp, picked = self._setup(clean=True)
         d._build_group_cache_branches(Path("/x"), "b", "ref", nodes, by_id, "o/r", [],
-                                      repo_path=Path("/x"))
+                                      config=None, repo_path=Path("/x"))
         self.assertTrue(grp.cached)
         self.assertEqual(picked["prs"], [URL(1), URL(2)])   # apply order preserved
         self.assertTrue(picked["is_group"])
@@ -833,7 +940,7 @@ class BuildGroupCacheBranches(unittest.TestCase):
         nodes, by_id, grp, picked = self._setup(clean=False)
         w = []
         d._build_group_cache_branches(Path("/x"), "b", "ref", nodes, by_id, "o/r", w,
-                                      repo_path=Path("/x"))
+                                      config=None, repo_path=Path("/x"))
         self.assertFalse(grp.cached)
         self.assertIn(("feature/b/auto-grp-pr-1", False), self._released)  # dropped
         self.assertTrue(any("conflicts" in x and "1 file" in x for x in w))
@@ -848,7 +955,7 @@ class BuildGroupCacheBranches(unittest.TestCase):
         try:
             d._build_group_cache_branches(
                 Path("/x"), "b", "ref", nodes, by_id, "o/r", [],
-                repo_path=Path("/x"),
+                config=None, repo_path=Path("/x"),
                 reusable_group_urls={"auto-grp-pr-1": [URL(1), URL(2)]},
             )
         finally:
@@ -866,12 +973,23 @@ class BuildGroupCacheBranches(unittest.TestCase):
         try:
             d._build_group_cache_branches(
                 Path("/x"), "b", "ref", nodes, by_id, "o/r", [],
-                repo_path=Path("/x"),
+                config=None, repo_path=Path("/x"),
                 reusable_group_urls={"auto-grp-pr-1": [URL(1)]},  # prior had 1 member
             )
         finally:
             d.local_branch_exists, d._branch_anchored_to = save
         self.assertEqual(picked["prs"], [URL(1), URL(2)])  # rebuilt with both
+
+    def test_run_owned_group_branch_untouched(self):
+        # `run` already ports the group on this branch: never re-pick it.
+        nodes, by_id, grp, picked = self._setup(clean=True)
+        d._build_group_cache_branches(
+            Path("/x"), "b", "ref", nodes, by_id, "o/r", [],
+            config=None, repo_path=Path("/x"),
+            run_branches={"feature/b/auto-grp-pr-1"},
+        )
+        self.assertEqual(picked, {})
+        self.assertEqual(self._released, [])
 
 
 class ResolveBaseBranch(unittest.TestCase):
@@ -1515,6 +1633,7 @@ class SyncGraphProgress(unittest.TestCase):
         )
 
 
+
 class _StubbedDiscover(unittest.TestCase):
     """Drives `run_discover_deps` with git / GitHub / state stubbed out."""
 
@@ -1584,7 +1703,7 @@ class _StubbedDiscover(unittest.TestCase):
         return FeatureUnit(feature_id=uid, prs=prs, if_exists="skip",
                            is_group=True, group_id=uid)
 
-    def _pick(self, scratch, cu, target_ref, *, cache_branch, is_group,
+    def _pick(self, scratch, cu, target_ref, *, config, cache_branch, is_group,
               origin_slug):
         if cu.unit_id == self.kill_at:
             raise KeyboardInterrupt  # stands in for the kill
@@ -1609,6 +1728,30 @@ class _StubbedDiscover(unittest.TestCase):
             use_ai=False, max_depth=2, pr_limit=None,
             include_already_merged=False,
         )
+
+
+class RunOwnedBranchUntouched(_StubbedDiscover):
+    """A port branch `run` tracks in state is never reset by a trial-pick.
+
+    Regression: discover's `checkout -B feature/<base>/<id>` wiped a parked
+    build_failed resolution, and every later resume tested an empty branch.
+    """
+
+    def test_tracked_unit_trial_picked_detached(self):
+        cache_args = {}
+        pick = self._pick
+
+        def recording_pick(scratch, cu, target_ref, **k):
+            cache_args[cu.unit_id] = k["cache_branch"]
+            return pick(scratch, cu, target_ref, **k)
+
+        d._trial_pick_unit = recording_pick
+        d.load_state = lambda cfg: PipelineState(features={
+            "pr-1": FeatureState(status="build_failed", branch_name="feature/b/pr-1"),
+        })
+        self._run()
+        self.assertIsNone(cache_args["pr-1"])
+        self.assertEqual(cache_args["pr-2"], "feature/b/pr-2")
 
 
 class CheckpointResume(_StubbedDiscover):

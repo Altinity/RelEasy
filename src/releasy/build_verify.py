@@ -497,6 +497,19 @@ def verify_build_and_tests(
             ),
         )
         _add_cost(cost)
+        tests_log = log_path.removesuffix(".log") + ".tests.log"
+        try:
+            (repo_path / tests_log).parent.mkdir(parents=True, exist_ok=True)
+            (repo_path / tests_log).write_text(out, encoding="utf-8")
+        except OSError as exc:
+            console.print(
+                f"    [yellow]![/yellow] could not write {tests_log} "
+                f"[dim]({exc})[/dim]"
+            )
+        else:
+            console.print(
+                f"    [dim]run-tests output (exit {ec}): {tests_log}[/dim]"
+            )
         if to:
             return VerifyResult(
                 success=False, outcome="timed_out", iterations=iterations,
@@ -520,8 +533,9 @@ def verify_build_and_tests(
                 success=True, outcome="passed", iterations=iterations,
                 cost_usd=cost_total, new_head=head_after,
             )
-        # Tests never executed — the code was not judged.
-        could_not_run = bool(marker) and marker.startswith(
+        # Tests never executed, or no verdict was given — the code was not
+        # judged.
+        could_not_run = not marker or marker.startswith(
             "TESTS FAILED: could not run tests",
         )
         return VerifyResult(

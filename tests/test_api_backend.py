@@ -776,5 +776,33 @@ class ApiConfigParsing(unittest.TestCase):
         self.assertEqual(again.ai_api.max_turns, 7)
 
 
+
+class ClaudeCliEnv(unittest.TestCase):
+    """The `claude -p` subprocess runs with background tasks disabled.
+
+    Regression: run-tests backgrounded the test run and ended its turn; the
+    task died with the session and the unit was parked with no verdict.
+    """
+
+    def test_background_tasks_disabled(self):
+        seen = {}
+
+        class _Stop(Exception):
+            pass
+
+        def fake_popen(argv, **kw):
+            seen.update(kw["env"])
+            raise _Stop
+
+        saved = a.subprocess.Popen
+        a.subprocess.Popen = fake_popen
+        try:
+            with self.assertRaises(_Stop):
+                a._spawn_claude_once(["claude"], Path("."), 10, "hi")
+        finally:
+            a.subprocess.Popen = saved
+        self.assertEqual(seen.get("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"), "1")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -34,6 +34,7 @@ import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import yaml
 
@@ -48,7 +49,6 @@ from releasy.config import Config
 from releasy.git_ops import (
     abort_in_progress_op,
     append_commit_trailer,
-    cherry_pick_merge_commit,
     ensure_remote,
     ensure_work_repo,
     fetch_commit,
@@ -68,17 +68,25 @@ from releasy.github_ops import (
     get_origin_repo_slug,
     minimize_comment,
     parse_cherry_picked_refs,
+    parse_follow_up_refs,
     parse_pr_url,
+    search_pr_urls,
     slug_to_https_url,
     update_issue,
 )
 from releasy.pipeline import (
     FeatureUnit,
     _SOURCE_PR_URL_RE,
+    _cherry_pick_pr,
     discover_feature_units,
     hold_map,
 )
-from releasy.state import FeatureState, PipelineState, load_state
+from releasy.state import (
+    FeatureState,
+    PipelineState,
+    find_merged_feature_for_prs,
+    load_state,
+)
 from releasy.termlog import get_console
 
 console = get_console()
@@ -95,8 +103,7 @@ class _PickOutcome:
     conflict_files: list[str]
     error_message: str | None = None
     # Index into ``unit.feature_unit.prs`` of the PR whose cherry-pick
-    # failed. ``None`` for clean outcomes or for failures that didn't
-    # reach a real cherry-pick (e.g. a PR with no merge_commit_sha).
+    # failed. ``None`` for clean outcomes.
     conflicting_pr_idx: int | None = None
     # Name of the local branch the cache was attempted on. Always set;
     # the caller decides whether to keep or delete it based on outcome
@@ -390,6 +397,10 @@ def run_discover_deps(
     # --- Detect already-merged units ---
     state = load_state(config)
     state_already = _state_already_in_target(candidates, state)
+    # Port branches `run` tracks: discovery never resets or deletes them.
+    run_branches = {
+        fs.branch_name for fs in state.features.values() if fs.branch_name
+    }
     trailer_already = _trailer_scan(repo_path, target_ref, candidate_pr_urls)
     cherry_already = _git_cherry_already(
         repo_path, target_ref, candidates, warnings_acc,
@@ -597,7 +608,11 @@ def run_discover_deps(
                     and _branch_anchored_to(repo_path, cache_br, target_ref)
                 )
                 if branch_live or target_moved or not prior_n.cached:
-                    if not branch_live and local_branch_exists(repo_path, cache_br):
+                    if (
+                        not branch_live
+                        and cache_br not in run_branches
+                        and local_branch_exists(repo_path, cache_br)
+                    ):
                         run_git(["branch", "-D", cache_br], repo_path, check=False)
                     nodes[unit_id] = _make_node(
                         cu, deps=list(prior_n.deps),
@@ -630,12 +645,14 @@ def run_discover_deps(
             # so a successful pick is preserved for ``releasy run`` to
             # reuse. When caching is disabled (``--no-write``), the
             # trial runs detached and always resets — pure dry-run.
+            # A branch `run` owns is trial-picked detached instead.
             cache_branch = (
-                _cache_branch_name(base_branch, unit_id)
-                if cache_enabled else None
+                cache_br
+                if cache_enabled and cache_br not in run_branches else None
             )
             outcome = _trial_pick_unit(
                 scratch, cu, target_ref,
+                config=config,
                 cache_branch=cache_branch,
                 is_group=cu.is_group,
                 origin_slug=origin_slug,
@@ -707,13 +724,17 @@ def run_discover_deps(
                         cand_dep_unit_ids = confirmed
                         method = "git-graph+claude"
                     ai_path_invoked = True
-                elif cache_branch and outcome.conflicting_pr_idx is not None:
+                elif (
+                    cache_branch
+                    and outcome.conflicting_pr_idx is not None
+                    and outcome.conflict_files
+                ):
                     # Fallback path: deterministic empty AND we have the
                     # conflict state preserved in the cache branch. Hand
                     # it directly to the AI resolver — no need to
                     # recreate the conflict.
                     fb = _ai_resolve_fallback(
-                        config, scratch, base_branch, cu,
+                        config, scratch, base_branch, cache_branch, cu,
                         outcome.conflicting_pr_idx,
                         pr_url_to_unit, carried_pr_url_to_unit,
                         fully_merged_units,
@@ -837,6 +858,10 @@ def run_discover_deps(
         edges |= preseeded_edges
 
         edges |= _declared_edges(candidates, nodes, warnings_acc)
+        edges |= _follow_up_edges(
+            candidates, nodes, pr_url_to_unit, carried_pr_url_to_unit,
+            warnings_acc,
+        )
 
         # --- Collapse components into groups, then build + cache each
         # combined group branch while the scratch worktree is still open
@@ -854,14 +879,14 @@ def run_discover_deps(
             # kept as-is (no re-pick); a moved base forces a rebuild.
             _build_group_cache_branches(
                 scratch, base_branch, target_ref, nodes, by_unit_id,
-                origin_slug, warnings_acc, repo_path=repo_path,
+                origin_slug, warnings_acc, config=config, repo_path=repo_path,
                 reusable_group_urls=({} if target_moved else prior_group_pr_urls),
+                run_branches=run_branches,
             )
             for uid in folded:
-                run_git(
-                    ["branch", "-D", _cache_branch_name(base_branch, uid)],
-                    repo_path, check=False,
-                )
+                folded_br = _cache_branch_name(base_branch, uid)
+                if folded_br not in run_branches:
+                    run_git(["branch", "-D", folded_br], repo_path, check=False)
         if folded:
             console.print(
                 f"  [dim]grouped {len(folded)} unit(s) into combined port(s)[/dim]"
@@ -1074,6 +1099,42 @@ def _declared_edges(
                     "which is not a unit in this run (merged, excluded, or a "
                     "typo); edge not applied"
                 )
+    return out
+
+
+def _follow_up_edges(
+    candidates: list[_CandidateUnit],
+    nodes: dict[str, DAGNode],
+    pr_url_to_unit: dict[str, str],
+    carried_pr_url_to_unit: dict[str, str],
+    warnings_acc: list[str],
+) -> set[tuple[str, str]]:
+    """Edges from a PR body saying it is a follow-up for another PR.
+
+    The follow-up depends on the PR it follows. A referenced PR that is a
+    candidate already in target needs no edge; one that is no candidate at
+    all is warned about.
+    """
+    out: set[tuple[str, str]] = set()
+    for cu in candidates:
+        if cu.unit_id not in nodes:
+            continue
+        for p in cu.prs:
+            for owner, repo, number in parse_follow_up_refs(
+                p.body, p.repo_slug,
+            ):
+                url = f"https://github.com/{owner}/{repo}/pull/{number}"
+                dep = pr_url_to_unit.get(url) or carried_pr_url_to_unit.get(url)
+                if dep == cu.unit_id:
+                    continue
+                if dep in nodes:
+                    out.add((cu.unit_id, dep))
+                elif dep is None:
+                    warnings_acc.append(
+                        f"{p.url} is a follow-up for {url}, which is not a "
+                        "candidate in this run (already in target, excluded, "
+                        "or not selected); edge not applied"
+                    )
     return out
 
 
@@ -1316,11 +1377,16 @@ def _cache_branch_name(base_branch: str, unit_id: str) -> str:
 def _trial_pick_unit(
     scratch: Path, unit: _CandidateUnit, target_ref: str,
     *,
+    config: Config,
     cache_branch: str | None,
     is_group: bool,
     origin_slug: str | None,
 ) -> _PickOutcome:
     """Sequentially cherry-pick every PR in the unit onto a named branch.
+
+    Each PR is picked the way ``releasy run`` picks it
+    (:func:`releasy.pipeline._cherry_pick_pr`): merged PRs by merge commit,
+    open PRs by their ``refs/pull/<n>/merge`` ref.
 
     On clean: returns ``clean=True``; the worktree is left on
     ``cache_branch`` at ``target_ref + unit_PRs`` (caller decides whether
@@ -1346,16 +1412,7 @@ def _trial_pick_unit(
         # Pure dry-run mode: detached HEAD, always reset.
         try:
             for idx, p in enumerate(prs):
-                sha = p.merge_commit_sha
-                if not sha:
-                    return _PickOutcome(
-                        clean=False, conflict_files=[],
-                        error_message=f"PR {p.url} has no merge_commit_sha",
-                        conflicting_pr_idx=idx,
-                    )
-                res = cherry_pick_merge_commit(
-                    scratch, sha, abort_on_conflict=False,
-                )
+                res = _cherry_pick_pr(scratch, config, p)
                 if not res.success:
                     return _PickOutcome(
                         clean=False,
@@ -1374,19 +1431,7 @@ def _trial_pick_unit(
     run_git(["checkout", "-B", cache_branch, target_ref], scratch, check=False)
 
     for idx, p in enumerate(prs):
-        sha = p.merge_commit_sha
-        if not sha:
-            # No merge SHA — caller will reset/delete the branch. Don't
-            # leave junk state behind.
-            return _PickOutcome(
-                clean=False, conflict_files=[],
-                error_message=f"PR {p.url} has no merge_commit_sha",
-                conflicting_pr_idx=idx,
-                cache_branch=cache_branch,
-            )
-        res = cherry_pick_merge_commit(
-            scratch, sha, abort_on_conflict=False,
-        )
+        res = _cherry_pick_pr(scratch, config, p)
         if not res.success:
             # Leave the worktree in conflict state on cache_branch — the
             # caller's AI fallback path can operate on it directly.
@@ -1747,6 +1792,7 @@ def _ai_resolve_fallback(
     config: Config,
     scratch: Path,
     base_branch: str,
+    cache_branch: str,
     unit: _CandidateUnit,
     conflicting_pr_idx: int,
     pr_url_to_unit: dict[str, str],
@@ -1790,7 +1836,7 @@ def _ai_resolve_fallback(
         conflicting_pr = prs[conflicting_pr_idx]
 
         ctx = AIResolveContext(
-            port_branch=f"discover-deps-trial-{unit.unit_id}",
+            port_branch=cache_branch,
             base_branch=base_branch,
             source_pr=conflicting_pr,
             conflict_files=list(conflict_files),
@@ -2413,8 +2459,10 @@ def _build_group_cache_branches(
     origin_slug: str | None,
     warnings_acc: list[str],
     *,
+    config: Config,
     repo_path: Path,
     reusable_group_urls: dict[str, list[str]] | None = None,
+    run_branches: set[str] | frozenset[str] = frozenset(),
 ) -> None:
     """Build + cache each collapsed group's combined branch.
 
@@ -2435,6 +2483,9 @@ def _build_group_cache_branches(
     }
     for node in [n for n in nodes.values() if n.discovery_method == "grouped"]:
         cache_branch = _cache_branch_name(base_branch, node.unit_id)
+        if cache_branch in run_branches:
+            # `run` owns this branch (its port lives there); leave it alone.
+            continue
         # Unchanged reused group with a still-anchored branch: keep as-is.
         if (
             reusable_group_urls.get(node.unit_id) == node.pr_urls
@@ -2476,7 +2527,7 @@ def _build_group_cache_branches(
             ),
         )
         outcome = _trial_pick_unit(
-            scratch, group_cu, target_ref,
+            scratch, group_cu, target_ref, config=config,
             cache_branch=cache_branch, is_group=True, origin_slug=origin_slug,
         )
         if outcome.clean:
@@ -3427,14 +3478,65 @@ def _handle_comments(comments: list) -> list[tuple[str, object]]:  # noqa: ANN00
     return [(f"C{i}", c) for i, c in enumerate(comments, start=1)]
 
 
-def _render_comments_block(handled: list[tuple[str, object]]) -> str:
+# A GitHub web PR-list link, e.g. ``https://github.com/o/r/pulls?q=label:x``.
+_PR_SEARCH_URL_RE = re.compile(
+    r"https://github\.com/([\w.-]+)/([\w.-]+)/(?:pulls|issues)\?[^\s)>\]]+"
+)
+
+
+def _pr_search_query(url: str) -> str | None:
+    """Search-API query for a GitHub web PR-list ``url``, or None."""
+    m = _PR_SEARCH_URL_RE.fullmatch(url)
+    if m is None:
+        return None
+    q = " ".join(parse_qs(urlparse(url).query).get("q", [])).strip()
+    if not q:
+        return None
+    # The web UI accepts ``state:merged``; the Search API only ``is:merged``.
+    q = re.sub(r"\bstate:merged\b", "is:merged", q)
+    if not re.search(r"\brepo:", q):
+        q = f"repo:{m.group(1)}/{m.group(2)} {q}"
+    if not re.search(r"\bis:pr\b", q):
+        q += " is:pr"
+    return q
+
+
+def _expand_pr_searches(
+    handled: list[tuple[str, object]], warnings_acc: list[str],
+) -> dict[str, list[tuple[str, list[str]]]]:
+    """Run every PR-search link in the comments: handle → [(link, PR URLs)]."""
+    out: dict[str, list[tuple[str, list[str]]]] = {}
+    for handle, c in handled:
+        for m in _PR_SEARCH_URL_RE.finditer(c.body or ""):
+            url = m.group(0)
+            query = _pr_search_query(url)
+            if query is None:
+                continue
+            urls = search_pr_urls(query)
+            if urls is None:
+                warnings_acc.append(
+                    f"graph update: could not expand PR search in [{handle}]: {url}"
+                )
+                continue
+            out.setdefault(handle, []).append((url, urls))
+    return out
+
+
+def _render_comments_block(
+    handled: list[tuple[str, object]],
+    searches: dict[str, list[tuple[str, list[str]]]] | None = None,
+) -> str:
     out: list[str] = []
     for handle, c in handled:
         assoc = c.author_association or "?"
-        out.append(
+        text = (
             f"### [{handle}] Comment by @{c.author or 'unknown'} ({assoc}) "
             f"at {c.created_at}\n{c.body.strip()}"
         )
+        for url, urls in (searches or {}).get(handle, []):
+            text += f"\n\nPR search {url} currently lists {len(urls)} PR(s):"
+            text += "".join(f"\n- {u}" for u in urls) or "\n_(none)_"
+        out.append(text)
     return "\n\n".join(out) or "_(none)_"
 
 
@@ -3511,7 +3613,9 @@ def _ask_claude_for_new_graph(
             report, hold_map(config),
         ),
         "candidate_pr_list": candidate_pr_list,
-        "comments_block": _render_comments_block(handled),
+        "comments_block": _render_comments_block(
+            handled, _expand_pr_searches(handled, warnings_acc),
+        ),
     }
 
     def _replace(match: re.Match[str]) -> str:
@@ -3610,6 +3714,7 @@ def _build_report_from_spec(
     spec: dict,
     warnings_acc: list[str],
     config: Config | None = None,
+    state: PipelineState | None = None,
 ) -> DiscoveryReport | None:
     """Build a new DiscoveryReport from Claude's spec + the prior graph.
 
@@ -3617,6 +3722,7 @@ def _build_report_from_spec(
     components. No git, no trial-picks. With ``config``, PRs the prior
     graph never saw are fetched for their title / merge date / merge SHA;
     without it those fields stay blank (the pure-logic path used by tests).
+    With ``state``, a new PR that a merged unit already ported is dropped.
     """
     title_map: dict[str, str] = {}
     merged_map: dict[str, str | None] = {}
@@ -3668,6 +3774,18 @@ def _build_report_from_spec(
                 )
                 continue
             if url not in prior_urls:
+                ported = (
+                    find_merged_feature_for_prs(state, [url])
+                    if state is not None else None
+                )
+                if ported is not None:
+                    fid, fs = ported
+                    via = f" ({fs.rebase_pr_url})" if fs.rebase_pr_url else ""
+                    warnings_acc.append(
+                        f"graph update: PR {url} was already ported by merged "
+                        f"{fid}{via}; not adding it again"
+                    )
+                    continue
                 has_new_pr = True
                 warnings_acc.append(
                     f"graph update: PR {url} is new (not in the prior graph) "
@@ -4028,7 +4146,7 @@ def run_graph_update(
 
     build_warnings: list[str] = []
     new_report = _build_report_from_spec(
-        report, spec, build_warnings, config=config,
+        report, spec, build_warnings, config=config, state=load_state(config),
     )
     for w in build_warnings:
         console.print(f"  [yellow]warning:[/yellow] {w}")

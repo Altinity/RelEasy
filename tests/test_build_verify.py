@@ -498,6 +498,19 @@ class RunTestsAllowlistPaths(unittest.TestCase):
         self.assertFalse(res.success)
         self.assertEqual(res.outcome, "error")
 
+    def test_no_verdict_is_environment_fault(self):
+        self.verdict = "ran out of turns"
+        res = self._verify()
+        self.assertFalse(res.success)
+        self.assertEqual(res.outcome, "error")
+        self.assertIn("no verdict", res.error)
+
+    def test_run_tests_output_logged(self):
+        self.verdict = "transcript\nTESTS FAILED: 1 of 2 tests failed"
+        self._verify()
+        log = self.repo / ".releasy" / "build-feature-b-1.tests.log"
+        self.assertEqual(log.read_text(encoding="utf-8"), self.verdict)
+
     def test_failing_tests_stay_tests_failed(self):
         self.verdict = "TESTS FAILED: 2 of 5 tests failed"
         res = self._verify()

@@ -8,14 +8,18 @@ Trusted members left comments asking for changes. Read their intent, apply it,
 and output the **new graph**. Preserve anything the comments don't touch;
 ignore non-actionable comments (questions, 👍). Allowed actions:
 
-- **Add** a PR ("also port #2000").
+- **Add** a PR ("also port #2000"). A comment that lists PRs — inline, or as a
+  PR search link whose results are shown under the comment — asks to add every
+  listed PR that is not already in the graph or under `exclude`.
 - **Veto** a PR ("drop #1010") — list under `exclude`, omit from every unit.
 - **Hold** a PR ("park #2234 until the follow-up lands", "wait on #2249") —
   list under `on_hold` and KEEP its unit. A hold is not a veto: the PR stays
   in the graph, it just isn't ported yet.
 - **Release** a held PR ("#2234 can go ahead now") — leave it out of
   `on_hold`.
-- **Regroup** — merge PRs into one atomic unit, or split a unit.
+- **Regroup** — merge PRs into one atomic unit, or split a unit. A PR that
+  is a follow-up for another ("#2250 is a follow-up for #2234") goes in
+  that PR's unit, after it — this includes a PR a comment adds.
 - **Reorder** — add/remove `depends_on` edges.
 
 ## Current graph
@@ -57,11 +61,12 @@ on_hold:                      # OMIT ENTIRELY if no comment touches holds
 addressed: [C1, C3]           # comment handles you applied; omit the rest
 ```
 
-Rules: every `prs` URL is a real GitHub PR URL (from above, or explicitly
-requested); each PR is in exactly one unit *or* `exclude`, never both;
-`depends_on` ids must exist in this block; no cycles. List under `addressed`
-only the comment handles you actually applied — leave out questions, 👍, and
-requests you ignored or disagreed with, so they stay visible for a human.
+Rules: every `prs` URL is a real GitHub PR URL (from above, or listed in a
+comment — including a PR search shown under it); each PR is in exactly one
+unit *or* `exclude`, never both; `depends_on` ids must exist in this block; no
+cycles. List under `addressed` only the comment handles you actually applied —
+leave out questions, 👍, and requests you ignored or disagreed with, so they
+stay visible for a human.
 
 `on_hold` is the **complete** new hold list and *replaces* the current one,
 so re-list every PR that should stay on hold (they are shown above under

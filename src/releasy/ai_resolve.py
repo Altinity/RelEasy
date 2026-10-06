@@ -923,6 +923,8 @@ def _spawn_claude_once(
     console.print("    [dim](press Ctrl-C to abort claude)[/dim]")
 
     env = os.environ.copy()
+    # A backgrounded command dies with the `-p` session, before it reports.
+    env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
 
     # start_new_session=True puts claude in its own process group so:
     #   1. it does NOT receive the terminal's Ctrl-C (we control it),

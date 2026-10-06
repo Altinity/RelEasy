@@ -15,7 +15,7 @@ from rich.table import Table
 from releasy.config import Config, save_session
 from releasy.github_ops import fetch_pr_by_url, parse_pr_url
 from releasy.state import (
-    find_feature_by_pr_url,
+    find_features_by_pr_url,
     load_state,
     save_state,
 )
@@ -219,9 +219,13 @@ def remove_pr(
     # Check state first so we can refuse atomic-group removals before
     # touching session.
     state = load_state(config)
-    match = find_feature_by_pr_url(state, url)
-    if match is not None:
-        fid, fs = match
+    # A merged group already shipped the PR: it neither blocks the removal
+    # nor gets purged.
+    matches = [
+        (fid, fs) for fid, fs in find_features_by_pr_url(state, url)
+        if not (len(fs.pr_urls) > 1 and fs.status == "merged")
+    ]
+    for fid, fs in matches:
         if len(fs.pr_urls) > 1:
             console.print(
                 f"[red]PR {url} is part of multi-PR group "
@@ -251,11 +255,9 @@ def remove_pr(
             (overlay_groups if g.auto_discovered else removed_from_groups).append(g.id)
         _drop_context(url, g.pr_ai_contexts)
 
-    state_purged = False
-    if match is not None:
-        fid, _fs = match
+    for fid, _fs in matches:
         del state.features[fid]
-        state_purged = True
+    state_purged = bool(matches)
 
     appended_to_exclude = False
     if not keep_discovery:

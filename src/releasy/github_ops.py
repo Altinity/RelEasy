@@ -569,22 +569,55 @@ def parse_cherry_picked_refs(
     seen: set[tuple[str, str, int]] = set()
     for clause in _CHERRY_PICKED_CLAUSE_RE.finditer(body):
         for m in _PR_REF_RE.finditer(clause.group(1)):
-            if m.group("num"):
-                ref = (m.group("owner"), m.group("repo"), int(m.group("num")))
-            elif m.group("slug_num"):
-                ref = (
-                    m.group("slug_owner"),
-                    m.group("slug_repo"),
-                    int(m.group("slug_num")),
-                )
-            elif default_slug and "/" in default_slug:
-                owner, _, repo = default_slug.partition("/")
-                ref = (owner, repo, int(m.group("hash_num")))
-            else:
-                continue
-            if ref not in seen:
+            ref = _pr_ref_from_match(m, default_slug)
+            if ref is not None and ref not in seen:
                 seen.add(ref)
                 out.append(ref)
+    return out
+
+
+def _pr_ref_from_match(
+    m: re.Match, default_slug: str | None,
+) -> tuple[str, str, int] | None:
+    """Canonical ``(owner, repo, number)`` for a ``_PR_REF_RE`` match."""
+    if m.group("num"):
+        return m.group("owner"), m.group("repo"), int(m.group("num"))
+    if m.group("slug_num"):
+        return (
+            m.group("slug_owner"), m.group("slug_repo"), int(m.group("slug_num")),
+        )
+    if default_slug and "/" in default_slug:
+        owner, _, repo = default_slug.partition("/")
+        return owner, repo, int(m.group("hash_num"))
+    return None
+
+
+# "Follow-up for #1", "follow up to https://…/pull/2", "Followup of #3, #4".
+_FOLLOW_UP_RE = re.compile(
+    r"\bfollow[- ]?up(?:\s+(?:for|to|of|on))?\s*:?\s*", re.IGNORECASE,
+)
+_FOLLOW_UP_SEP_RE = re.compile(r"\s*(?:,|&|\band\b)?\s*", re.IGNORECASE)
+
+
+def parse_follow_up_refs(
+    body: str | None, default_slug: str | None,
+) -> list[tuple[str, str, int]]:
+    """PRs a PR body declares itself a follow-up for.
+
+    Only the run of refs directly after the phrase counts, so prose later
+    in the sentence is never picked up. Same ref forms and ``default_slug``
+    handling as :func:`parse_cherry_picked_refs`.
+    """
+    if not body:
+        return []
+    out: list[tuple[str, str, int]] = []
+    for phrase in _FOLLOW_UP_RE.finditer(body):
+        pos = phrase.end()
+        while m := _PR_REF_RE.match(body, pos):
+            ref = _pr_ref_from_match(m, default_slug)
+            if ref is not None and ref not in out:
+                out.append(ref)
+            pos = _FOLLOW_UP_SEP_RE.match(body, m.end()).end()
     return out
 
 
@@ -1411,6 +1444,33 @@ def search_merged_prs_by_base(
     except Exception as exc:
         log.warning("Unexpected error searching merged PRs: %s", exc)
         return []
+
+
+def search_pr_urls(query: str) -> list[str] | None:
+    """PR URLs matching a raw Search-API ``query``, by number ascending.
+
+    None on failure (no token, API error).
+    """
+    token = get_github_token()
+    if not token:
+        log.warning("RELEASY_GITHUB_TOKEN not set — cannot search PRs")
+        return None
+    try:
+        from github import Github, GithubException
+
+        gh = Github(token)
+        found = [
+            (issue.number, issue.html_url)
+            for issue in gh.search_issues(query)
+            if issue.pull_request is not None
+        ]
+        return [url for _, url in sorted(found)]
+    except GithubException as exc:
+        log.warning("Failed to search PRs (%s): %s", query, exc)
+        return None
+    except Exception as exc:
+        log.warning("Unexpected error searching PRs: %s", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------

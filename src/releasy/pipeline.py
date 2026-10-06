@@ -74,6 +74,7 @@ from releasy.state import (
     PipelineState,
     StallReason,
     clear_conflict_markers,
+    find_merged_feature_for_prs,
     load_state,
     make_stall,
     save_state,
@@ -892,6 +893,28 @@ _RECREATABLE: dict[str, tuple[str, str]] = {
 }
 
 
+def _skip_ported_elsewhere(
+    config: Config, state: PipelineState, unit: FeatureUnit,
+) -> bool:
+    """True (and say so) when another, merged unit already ported all of ``unit``'s PRs."""
+    hit = find_merged_feature_for_prs(
+        state, [p.url for p in unit.prs], exclude_feature_id=unit.feature_id,
+    )
+    if hit is None:
+        return False
+    fid, fs = hit
+    primary = unit.primary_pr()
+    ref = pr_ref_label(
+        primary.repo_slug, primary.number, get_origin_repo_slug(config),
+    )
+    via = f" ({fs.rebase_pr_url})" if fs.rebase_pr_url else ""
+    console.print(
+        f"  [dim]{unit.feature_id} ({ref}) — already ported by merged "
+        f"{fid}{via}, skipping[/dim]"
+    )
+    return True
+
+
 def terminal_statuses(config: Config) -> set[str]:
     """Statuses ``releasy run`` will not re-enter, given the opt-ins.
 
@@ -1540,6 +1563,9 @@ def run_pipeline(
                     )
                 _dry_record(state, f"skip-{prev_fs.status}")
             continue
+        if _skip_ported_elsewhere(config, state, unit):
+            _dry_record(state, "skip-merged")
+            continue
         if unit.hold_reason is not None:
             _report_hold(config, state, unit)
             continue
@@ -1823,6 +1849,8 @@ def run_sequential(
             console.print(
                 f"  [dim]{unit.feature_id} ({ref}) — {fs.status}, skipping[/dim]"
             )
+            continue
+        if _skip_ported_elsewhere(config, state, unit):
             continue
 
         if unit.hold_reason is not None:
