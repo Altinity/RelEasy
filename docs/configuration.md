@@ -212,7 +212,7 @@ Options live in `config.yaml` unless marked **(session)**.
 | `graph.prompt_file` | Prompt template for `graph update`. | `prompts/adjust_graph.md` |
 | `graph.timeout_seconds` | Per-invocation Claude timeout for `graph update`. | `7200` |
 | `pr_policy.auto_pr` | Open a PR for every pushed port branch. Needs `push: true`. | `true` |
-| `pr_policy.if_exists` | What to do with an existing port branch: `skip` (leave it) / `recreate` (rebuild from base — only if no rebase PR open yet) / `append` (cherry-pick declared PRs not yet on the branch). | `skip` |
+| `pr_policy.if_exists` | What to do with an existing port branch: `skip` (leave it) / `recreate` (rebuild from base — only if no rebase PR open yet) / `append` (cherry-pick declared PRs not yet on the branch). A group with an open rebase PR always appends members missing from its branch, whatever this is set to. | `skip` |
 | `pr_policy.retry_failed` | Revisit `conflict` entries per their `if_exists`. Override per-run with `--retry-failed`/`--no-retry-failed`. | `true` |
 | `pr_policy.recreate_closed_prs` | If a rebase PR is closed (not merged), allocate `<canonical>-1`, `-2`, … and open a fresh one. The closed entry stays terminal until this flag opts it back in. | `false` |
 | `pr_policy.recreate_reverted_prs` | Same renumbered-branch re-port for an entry marked [`reverted`](commands.md#releasy-mark-reverted) — the port merged, then was reverted on target. Separate from `recreate_closed_prs` and off by default: a closed PR was never in the branch, while a revert means someone took the landed code back out. | `false` |

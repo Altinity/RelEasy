@@ -148,8 +148,9 @@ retry anyway.
 For PRs with an existing rebase PR, `run` doesn't rebuild — it routes
 through the same merge-target flow [`refresh`](#releasy-refresh) uses:
 clean merge → leave alone; conflict → AI-resolve and plain push (never
-force). `if_exists: append` is the only setting that cherry-picks new
-commits on top of an existing PR.
+force). New commits are cherry-picked on top of an existing PR only with
+`if_exists: append`, or for a group that gained members after its PR was
+opened — those are appended whatever `if_exists` says.
 
 ```bash
 releasy run [--onto <ver>] [--work-dir <path>]
@@ -355,7 +356,8 @@ upstream commit can't be fetched — it's flagged `missing-prerequisites`.
   prerequisite first). Move an entry into the main session (drop
   `auto_discovered:`) to make it permanent.
 - An `auto_discovered` group read back on a later run stays auto-owned (it is
-  re-emitted to the overlay, and may grow if a new PR traces into it). Session
+  re-emitted to the overlay, and may grow if a new PR traces into it; `run`
+  appends a new member onto the group's open PR). Session
   groups are never rewritten here; `graph update` reconciles those in place,
   creating the session entry if it's missing.
 - Re-running rewrites the deps file from scratch — hand-edits are lost; use

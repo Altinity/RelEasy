@@ -2962,6 +2962,18 @@ def _decide_append(
     )
 
 
+def _group_branch_missing_members(
+    repo_path: Path,
+    base_ref: str,
+    branch: str,
+    unit: FeatureUnit,
+    origin_slug: str | None,
+) -> bool:
+    """True when ``branch`` lacks some of ``unit``'s PRs and they can be appended."""
+    decision = _decide_append(repo_path, base_ref, branch, unit, origin_slug)
+    return decision.feasible and decision.missing_count > 0
+
+
 def _next_free_renumbered_port_branch(
     repo_path: Path,
     remote: str,
@@ -3451,9 +3463,9 @@ def _process_feature_unit(
     # to ``releasy refresh`` (the maintenance command). Doing it here
     # would touch a PR the user didn't ask us to revisit — even when
     # there's nothing to do (PR is clean, target hasn't moved). The
-    # only exception is ``if_exists: append``: the user explicitly
-    # asked to cherry-pick new sources onto the existing branch, so
-    # we fall through to the append handler below.
+    # exceptions go through the append handler below: ``if_exists:
+    # append``, and a group whose branch lacks some of its declared PRs
+    # (a member added after the PR was opened).
     if (
         on_remote
         and prev_state is not None
@@ -3461,13 +3473,20 @@ def _process_feature_unit(
         and unit.if_exists != "append"
         and not prev_was_dead
     ):
-        console.print(
-            f"\n    [dim]{new_branch} ({label}) — rebase PR already "
-            f"open ({prev_state.rebase_pr_url}); leaving as-is. "
-            "Use [cyan]releasy refresh[/cyan] to merge target in.[/dim]"
-        )
-        _dry_record(state, "skip-existing-pr")
-        return "continue"
+        if unit.is_group and _group_branch_missing_members(
+            repo_path, base_ref,
+            new_branch if on_local else f"{remote}/{new_branch}",
+            unit, origin_slug,
+        ):
+            unit.if_exists = "append"
+        else:
+            console.print(
+                f"\n    [dim]{new_branch} ({label}) — rebase PR already "
+                f"open ({prev_state.rebase_pr_url}); leaving as-is. "
+                "Use [cyan]releasy refresh[/cyan] to merge target in.[/dim]"
+            )
+            _dry_record(state, "skip-existing-pr")
+            return "continue"
 
     # --- if_exists: append ---
     # ``cherry_pick_base`` defaults to ``base_ref`` for the from-scratch
