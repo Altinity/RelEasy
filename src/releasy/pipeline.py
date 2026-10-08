@@ -75,6 +75,7 @@ from releasy.state import (
     PipelineState,
     StallReason,
     clear_conflict_markers,
+    OUTDATABLE_STATUSES,
     find_merged_feature_for_prs,
     load_state,
     make_stall,
@@ -585,20 +586,27 @@ def _prune_superseded_singletons(config: Config, state: PipelineState) -> bool:
     entry is stale. Left alone, ``continue`` would keep pushing it and opening
     a duplicate PR alongside the group's combined PR.
 
-    This helper removes those stale singleton entries from state. Any branches
-    / PRs they already produced are left on GitHub — the user decides whether
-    to close them.
+    This helper removes those stale singleton entries from state. An
+    in-flight singleton's open port PR is closed as superseded by the group,
+    so the group's combined PR is the only port of it — unless the group is
+    on hold, in which case the PR is left open for the user. Branches are
+    left on origin.
 
     Returns True if any entry was removed (so the caller can persist state).
     """
-    group_pr_refs: set[PRRef] = set()
+    group_of: dict[PRRef, str] = {}
     group_feature_ids: set[str] = set()
+    holds = hold_map(config)
+    held_groups: set[str] = set()
     for group in config.pr_sources.groups:
         group_feature_ids.add(group.id)
         for url in group.prs:
             parsed = parse_pr_url(url)
             if parsed is not None:
-                group_pr_refs.add(parsed)
+                group_of.setdefault(parsed, group.id)
+                if parsed in holds:
+                    held_groups.add(group.id)
+    group_pr_refs = set(group_of)
 
     if not group_pr_refs:
         return False
@@ -619,16 +627,27 @@ def _prune_superseded_singletons(config: Config, state: PipelineState) -> bool:
     for fid, fs, ref in stale:
         owner, repo, num = ref
         ref_label = pr_ref_label(f"{owner}/{repo}", num, origin_slug)
-        extra = ""
-        if fs.rebase_pr_url:
-            extra = (
-                f" — open rebase PR {fs.rebase_pr_url} left untouched; "
-                "close it manually if superseded by the group PR"
-            )
+        gid = group_of[ref]
         console.print(
             f"  [yellow]⚠[/yellow] Dropping stale singleton "
-            f"[cyan]{fid}[/cyan] (PR {ref_label} is now in a group){extra}"
+            f"[cyan]{fid}[/cyan] (PR {ref_label} is now in group "
+            f"[cyan]{gid}[/cyan])"
         )
+        if fs.rebase_pr_url and fs.status in OUTDATABLE_STATUSES:
+            if gid in held_groups:
+                console.print(
+                    f"    [dim]group is on hold — port PR {fs.rebase_pr_url} "
+                    "left open[/dim]"
+                )
+            elif _close_port_pr_if_open(
+                config, fs.rebase_pr_url,
+                f"Superseded: {ref_label} is now ported as part of group "
+                f"`{gid}`.",
+            ) is None:
+                console.print(
+                    f"    [red]✗[/red] could not close port PR "
+                    f"{fs.rebase_pr_url} — close it manually"
+                )
         del state.features[fid]
 
     return bool(stale)
@@ -3014,6 +3033,32 @@ def _next_free_renumbered_port_branch(
         n += 1
 
 
+def _close_port_pr_if_open(
+    config: Config, pr_url: str, comment: str,
+) -> str | None:
+    """Close port PR ``pr_url`` with ``comment`` if it is still open.
+
+    Returns the PR's state before the call (``open`` / ``merged`` /
+    ``closed``), or ``None`` when it could not be read or closed.
+    """
+    info = fetch_pr_by_url(config, pr_url, include_closed=True)
+    if info is None:
+        return None
+    if info.state != "open":
+        return info.state
+    parsed = parse_pr_url(pr_url)
+    if parsed is None or not close_pull_request(
+        config, parsed[2], comment=comment,
+    ):
+        return None
+    verb = "would close" if config.dry_run else "closed"
+    console.print(
+        f"\n    [yellow]✗[/yellow] {verb} port PR "
+        f"[link={pr_url}]{pr_url}[/link]"
+    )
+    return "open"
+
+
 def _reset_unit_for_redo(
     config: Config,
     repo_path: Path,
@@ -3052,36 +3097,24 @@ def _reset_unit_for_redo(
             repo_path, remote, canonical,
         )
         # A reverted port's PR is merged on GitHub, by definition.
-        info = None if fs.status == "reverted" else fetch_pr_by_url(
-            config, fs.rebase_pr_url, include_closed=True,
+        was = "merged" if fs.status == "reverted" else _close_port_pr_if_open(
+            config, fs.rebase_pr_url,
+            f"Superseded: re-porting from scratch on `{new_branch}` "
+            + (f"({fs.outdated})." if fs.outdated
+               else "(`releasy run --redo`)."),
         )
-        if info is not None and info.state == "merged":
+        if was == "merged" and fs.status != "reverted":
             console.print(
                 f"\n    [red]✗[/red] [cyan]{unit.feature_id}[/cyan] — port PR "
                 f"{fs.rebase_pr_url} is merged; {merged_hint}"
             )
             return False
-        if fs.status != "reverted" and (info is None or info.state == "open"):
-            parsed = parse_pr_url(fs.rebase_pr_url)
-            closed = parsed is not None and close_pull_request(
-                config, parsed[2],
-                comment=(
-                    f"Superseded: re-porting from scratch on `{new_branch}` "
-                    + (f"({fs.outdated})." if fs.outdated
-                       else "(`releasy run --redo`).")
-                ),
-            )
-            if not closed:
-                console.print(
-                    f"\n    [red]✗[/red] [cyan]{unit.feature_id}[/cyan] — could "
-                    f"not close port PR {fs.rebase_pr_url}; not redoing."
-                )
-                return False
-            verb = "would close" if config.dry_run else "closed"
+        if was is None:
             console.print(
-                f"\n    [yellow]✗[/yellow] {verb} port PR "
-                f"[link={fs.rebase_pr_url}]{fs.rebase_pr_url}[/link]"
+                f"\n    [red]✗[/red] [cyan]{unit.feature_id}[/cyan] — could "
+                f"not close port PR {fs.rebase_pr_url}; not redoing."
             )
+            return False
     else:
         new_branch = fs.branch_name or canonical
 

@@ -170,6 +170,13 @@ marked **outdated** with the reason. The next `run` re-ports it exactly as
 `--redo` would, no flag needed; the graph issue shows `♻ outdated` until
 then. Merged, closed and other terminal ports are never marked.
 
+**A standalone PR folded into a group** stops being its own unit: `run` (and
+[`continue`](#releasy-continue)) drops its state entry and, if its port is
+still in flight, closes its open port PR as superseded by the group — the
+group's combined PR is then the only port of it. A port PR already merged
+or closed on GitHub is left alone, and so is one whose new group is
+[on hold](#releasy-hold). The old branch stays on origin.
+
 ```bash
 releasy run [--onto <ver>] [--work-dir <path>]
             [--resolve-conflicts | --no-resolve-conflicts]

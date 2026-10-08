@@ -10,8 +10,11 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import releasy.dag_discovery as d
+import releasy.pipeline as pl
+from releasy.config import PRGroupConfig
 from releasy.state import FeatureState, PipelineState
 
 from test_graph_update import URL, node, report
@@ -64,6 +67,47 @@ class MarkOutdatedUnits(unittest.TestCase):
             "♻ outdated, re-ported on next run: #3 left the unit",
             d._progress_note(fs, 3),
         )
+
+
+class AbsorbedSingleton(unittest.TestCase):
+    """A standalone port whose PR moved into a group is closed, not duplicated."""
+
+    def prune(self, pr_state="open", on_hold=()):
+        cfg = cfg_with(
+            Path(tempfile.mkdtemp()), on_hold=list(on_hold),
+            groups=[PRGroupConfig(id="grp", prs=[URL(1), URL(2)])],
+        )
+        state = PipelineState(features={
+            "pr-2": FeatureState(
+                status="needs_review", pr_url=URL(2), rebase_pr_url=URL(20),
+            ),
+        })
+        closed = []
+        saved = pl.fetch_pr_by_url, pl.close_pull_request
+        pl.fetch_pr_by_url = lambda c, u, include_closed=False: (
+            SimpleNamespace(state=pr_state)
+        )
+        pl.close_pull_request = (
+            lambda c, n, comment=None: closed.append((n, comment)) or True
+        )
+        try:
+            self.assertTrue(pl._prune_superseded_singletons(cfg, state))
+        finally:
+            pl.fetch_pr_by_url, pl.close_pull_request = saved
+        self.assertNotIn("pr-2", state.features)
+        return closed
+
+    def test_open_port_pr_closed(self):
+        self.assertEqual(
+            self.prune(),
+            [(20, "Superseded: #2 is now ported as part of group `grp`.")],
+        )
+
+    def test_merged_port_pr_not_touched(self):
+        self.assertEqual(self.prune(pr_state="merged"), [])
+
+    def test_held_group_leaves_pr_open(self):
+        self.assertEqual(self.prune(on_hold=[URL(1)]), [])
 
 
 if __name__ == "__main__":
