@@ -52,6 +52,7 @@ from releasy.github_ops import (
     pr_has_label,
     pr_ref_label,
     remove_label_from_pr,
+    remove_pr_from_projects,
     require_origin_repo_slug,
     same_pr_url,
     search_prs_by_labels,
@@ -435,10 +436,11 @@ def _build_group_units(
 
 
 def _prune_superseded_singletons(config: Config, state: PipelineState) -> bool:
-    """Drop singleton state entries for PRs now in a ``pr_sources.groups`` entry.
+    """Drop state entries (singletons or replaced groups) whose primary PR is now in another group.
 
-    An in-flight singleton's open port PR is closed as superseded unless the
-    group is on hold. Branches are left on origin. Returns True if any entry was removed.
+    An in-flight entry's open port PR is closed as superseded and removed
+    from every project board unless the group is on hold. Branches are left
+    on origin. Returns True if any entry was removed.
     """
     group_of: dict[PRRef, str] = {}
     group_feature_ids: set[str] = set()
@@ -462,8 +464,6 @@ def _prune_superseded_singletons(config: Config, state: PipelineState) -> bool:
     for fid, fs in state.features.items():
         if fid in group_feature_ids:
             continue  # the group's own state entry
-        if len(fs.pr_numbers) > 1:
-            continue  # a different multi-PR unit
         if not fs.pr_url:
             continue
         parsed = parse_pr_url(fs.pr_url)
@@ -475,7 +475,7 @@ def _prune_superseded_singletons(config: Config, state: PipelineState) -> bool:
         ref_label = pr_ref_label(f"{owner}/{repo}", num, origin_slug)
         gid = group_of[ref]
         console.print(
-            f"  [yellow]⚠[/yellow] Dropping stale singleton "
+            f"  [yellow]⚠[/yellow] Dropping stale unit "
             f"[cyan]{fid}[/cyan] (PR {ref_label} is now in group "
             f"[cyan]{gid}[/cyan])"
         )
@@ -485,15 +485,24 @@ def _prune_superseded_singletons(config: Config, state: PipelineState) -> bool:
                     f"    [dim]group is on hold — port PR {fs.rebase_pr_url} "
                     "left open[/dim]"
                 )
-            elif _close_port_pr_if_open(
-                config, fs.rebase_pr_url,
-                f"Superseded: {ref_label} is now ported as part of group "
-                f"`{gid}`.",
-            ) is None:
-                console.print(
-                    f"    [red]✗[/red] could not close port PR "
-                    f"{fs.rebase_pr_url} — close it manually"
+            else:
+                prior = _close_port_pr_if_open(
+                    config, fs.rebase_pr_url,
+                    f"Superseded: {ref_label} is now ported as part of group "
+                    f"`{gid}`.",
                 )
+                if prior is None:
+                    console.print(
+                        f"    [red]✗[/red] could not close port PR "
+                        f"{fs.rebase_pr_url} — close it manually"
+                    )
+                elif prior != "merged" and not remove_pr_from_projects(
+                    config, parse_pr_url(fs.rebase_pr_url)[2],
+                ):
+                    console.print(
+                        f"    [red]✗[/red] could not remove port PR "
+                        f"{fs.rebase_pr_url} from its project boards"
+                    )
         del state.features[fid]
 
     return bool(stale)

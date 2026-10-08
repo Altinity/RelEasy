@@ -2369,6 +2369,47 @@ def _delete_item(project_id: str, item_id: str) -> bool:
     return data is not None
 
 
+def remove_pr_from_projects(config: Config, pr_number: int) -> bool:
+    """Delete origin PR ``pr_number``'s card from every project board it is on; True if all went."""
+    if config.dry_run:
+        log.info("[dry-run] would remove PR #%d from its project boards", pr_number)
+        return True
+    try:
+        owner, name = require_origin_repo_slug(config).split("/", 1)
+    except ValueError as exc:
+        log.warning("%s", exc)
+        return False
+    query = """
+    query($owner: String!, $name: String!, $number: Int!) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          projectItems(first: 50) { nodes { id project { id number } } }
+        }
+      }
+    }
+    """
+    data = _gql(query, {"owner": owner, "name": name, "number": pr_number})
+    try:
+        nodes = data["repository"]["pullRequest"]["projectItems"]["nodes"]
+    except (KeyError, TypeError):
+        log.warning("Could not read project cards of PR #%d", pr_number)
+        return False
+    ok = True
+    for node in nodes:
+        if _delete_item(node["project"]["id"], node["id"]):
+            log.info(
+                "Removed PR #%d from project board #%d",
+                pr_number, node["project"]["number"],
+            )
+        else:
+            ok = False
+            log.warning(
+                "Failed to remove PR #%d from project board #%d",
+                pr_number, node["project"]["number"],
+            )
+    return ok
+
+
 STATUS_OPTIONS = [
     "Needs Review",
     "Branch Created",

@@ -63,28 +63,38 @@ class MarkOutdatedUnits(unittest.TestCase):
 
 
 class AbsorbedSingleton(unittest.TestCase):
-    def prune(self, pr_state="open", on_hold=()):
+    def prune(self, pr_state="open", on_hold=(), pr_numbers=()):
         cfg = cfg_with(
             Path(tempfile.mkdtemp()), on_hold=list(on_hold),
-            groups=[PRGroupConfig(id="grp", prs=[URL(1), URL(2)])],
+            groups=[PRGroupConfig(id="grp", prs=[URL(1), URL(2), URL(3)])],
         )
         state = PipelineState(features={
             "pr-2": FeatureState(
                 status="needs_review", pr_url=URL(2), rebase_pr_url=URL(20),
+                pr_numbers=list(pr_numbers),
             ),
         })
         closed = []
-        saved = pl.fetch_pr_by_url, pl.close_pull_request
+        self.unboarded = []
+        saved = (
+            pl.fetch_pr_by_url, pl.close_pull_request, pl.remove_pr_from_projects,
+        )
         pl.fetch_pr_by_url = lambda c, u, include_closed=False: (
             SimpleNamespace(state=pr_state)
         )
         pl.close_pull_request = (
             lambda c, n, comment=None: closed.append((n, comment)) or True
         )
+        pl.remove_pr_from_projects = (
+            lambda c, n: self.unboarded.append(n) or True
+        )
         try:
             self.assertTrue(pl._prune_superseded_singletons(cfg, state))
         finally:
-            pl.fetch_pr_by_url, pl.close_pull_request = saved
+            (
+                pl.fetch_pr_by_url, pl.close_pull_request,
+                pl.remove_pr_from_projects,
+            ) = saved
         self.assertNotIn("pr-2", state.features)
         return closed
 
@@ -93,12 +103,26 @@ class AbsorbedSingleton(unittest.TestCase):
             self.prune(),
             [(20, "Superseded: #2 is now ported as part of group `grp`.")],
         )
+        self.assertEqual(self.unboarded, [20])
+
+    def test_replaced_group_port_pr_closed(self):
+        self.assertEqual(
+            self.prune(pr_numbers=[2, 3]),
+            [(20, "Superseded: #2 is now ported as part of group `grp`.")],
+        )
+        self.assertEqual(self.unboarded, [20])
+
+    def test_closed_port_pr_removed_from_boards(self):
+        self.assertEqual(self.prune(pr_state="closed"), [])
+        self.assertEqual(self.unboarded, [20])
 
     def test_merged_port_pr_not_touched(self):
         self.assertEqual(self.prune(pr_state="merged"), [])
+        self.assertEqual(self.unboarded, [])
 
     def test_held_group_leaves_pr_open(self):
         self.assertEqual(self.prune(on_hold=[URL(1)]), [])
+        self.assertEqual(self.unboarded, [])
 
 
 if __name__ == "__main__":
