@@ -285,6 +285,16 @@ def cli(
          "them reaches the same verdict at full token price — see "
          "pr_policy.honor_stall_reasons.",
 )
+@click.option(
+    "--redo",
+    is_flag=True,
+    default=False,
+    help="Re-port the --only / --pr unit from scratch: drop its state, "
+         "close its open port PR (if any) and rebuild on a renumbered "
+         "branch with a fresh PR. Without a port PR, its branch is "
+         "rebuilt from base in place. Refused for a merged port. Requires "
+         "--only or --pr; not supported in sequential mode.",
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -297,6 +307,7 @@ def run(
     merge_target: bool,
     dry_run: bool,
     ignore_stalls: bool,
+    redo: bool,
 ) -> None:
     """Discover and port new PRs onto the base branch (cherry-pick + open PR)."""
     from releasy.pipeline import (
@@ -313,6 +324,8 @@ def run(
         only_filter = parse_only(only) or parse_pr_url_filter(pr_url)
     except ValueError as e:
         raise click.UsageError(str(e))
+    if redo and only_filter is None:
+        raise click.UsageError("--redo needs --only or --pr.")
 
     with _locked_config(ctx, session="required") as config:
         if not onto:
@@ -331,6 +344,10 @@ def run(
         config.ignore_stalls = ignore_stalls
 
         if config.sequential:
+            if redo:
+                raise click.UsageError(
+                    "--redo is not supported in sequential mode."
+                )
             run_sequential(
                 config, onto, wd,
                 resolve_conflicts=resolve_conflicts,
@@ -347,6 +364,7 @@ def run(
             retry_failed=effective_retry_failed,
             only=only_filter,
             force_merge=merge_target,
+            redo=redo,
         )
         _maybe_sync_graph_progress(config, onto)
 

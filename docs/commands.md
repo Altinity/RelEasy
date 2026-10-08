@@ -152,12 +152,22 @@ force). New commits are cherry-picked on top of an existing PR only with
 `if_exists: append`, or for a group that gained members after its PR was
 opened — those are appended whatever `if_exists` says.
 
+**Redo one unit from scratch** with `--only <id> --redo` (or `--pr <URL>
+--redo`). Its state entry is dropped, so stalls, resume / retry counters
+and partial-group bookkeeping start over. If it has a port PR, an open one
+is closed (with a "Superseded" comment) and the unit is rebuilt from base
+on a renumbered branch (`<id>-1`, `-2`, …) with a fresh PR; without a PR,
+its recorded branch is rebuilt from base in place. The old PR is closed
+before the re-port starts — a failed re-port does not reopen it. Refused
+for a merged port (unless it was [`mark-reverted`](#releasy-mark-reverted))
+and in sequential mode. Every other unit is untouched.
+
 ```bash
 releasy run [--onto <ver>] [--work-dir <path>]
             [--resolve-conflicts | --no-resolve-conflicts]
             [--retry-failed | --no-retry-failed]
             [--merge-target | --no-merge-target]
-            [--only <url-or-id> | --pr <URL>]
+            [--only <url-or-id> | --pr <URL>] [--redo]
             [--ignore-stalls] [--dry-run]
 ```
 
@@ -170,6 +180,7 @@ releasy run [--onto <ver>] [--work-dir <path>]
 | `--merge-target` / `--no-merge-target` | Push a merge commit on PRs even without conflicts. Never force-pushes. | off |
 | `--only <url-or-id>` | Single PR URL **or** group/singleton id. Drops everything else. **Non-zero** if nothing matches. Mutex with `--pr`. | — |
 | `--pr <URL>` | Single PR by URL. Exits **cleanly (0)** when the PR isn't in session scope. Use from webhook/cron callers. Mutex with `--only`. | — |
+| `--redo` | Re-port the `--only` / `--pr` unit from scratch: drop its state; close its open port PR and rebuild on a renumbered branch, or rebuild its PR-less branch in place. Refused for a merged port and in sequential mode. Requires `--only` or `--pr`. | off |
 | `--ignore-stalls` | Re-attempt units parked on a [stall](concepts.md#stall-reasons) that can't clear by itself (waiting for another unit's PR to merge, on a prereq nobody ports, or a conflict whose re-resolution attempts are spent). | off |
 | `--dry-run` | No writes anywhere (state / git / GitHub). Read-only fetches still happen; cannot predict cherry-pick conflicts. | off |
 

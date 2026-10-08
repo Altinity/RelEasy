@@ -48,6 +48,7 @@ from releasy.github_ops import (
     CHERRY_PICK_FROM_RE,
     PRInfo,
     add_label_to_pr,
+    close_pull_request,
     create_pull_request,
     ensure_label,
     fetch_open_prs_with_commits_to_base,
@@ -234,6 +235,9 @@ class FeatureUnit:
     # Processing order is topologically sorted on this field; processing
     # gates on every entry having ``status: merged`` in target.
     depends_on: list[str] = field(default_factory=list)
+    # Port branch to use instead of the canonical one. Set by
+    # :func:`_reset_unit_for_redo` (``releasy run --redo``).
+    port_branch: str | None = None
 
     @property
     def sort_key(self) -> tuple[str, int]:
@@ -1348,6 +1352,7 @@ def run_pipeline(
     retry_failed: bool = True,
     only: OnlyFilter | None = None,
     force_merge: bool = False,
+    redo: bool = False,
 ) -> PipelineState:
     """Port PRs onto ``origin/<base_branch>``.
 
@@ -1364,6 +1369,9 @@ def run_pipeline(
     ``only`` (optional) restricts processing to a single PR (matched by
     URL) or a single group / feature ID. Other discovered units are
     dropped before any side-effects.
+
+    ``redo`` re-ports every kept unit from scratch — see
+    :func:`_reset_unit_for_redo`. The CLI only allows it with ``only``.
     """
     state = load_state(config)
     _prune_superseded_singletons(config, state)
@@ -1522,6 +1530,10 @@ def run_pipeline(
         if unit.feature_id in existing_ids:
             continue
         existing_ids.add(unit.feature_id)
+        if redo and unit.hold_reason is None and not _reset_unit_for_redo(
+            config, repo_path, state, unit, onto, remote,
+        ):
+            continue
         # Skip units already in a terminal state on the local state file —
         # ``merged`` (port already shipped, no work left to do) or ``skipped``
         # (user opted out). Without this, a re-run after `releasy project pull`
@@ -2992,6 +3004,87 @@ def _next_free_renumbered_port_branch(
         n += 1
 
 
+def _reset_unit_for_redo(
+    config: Config,
+    repo_path: Path,
+    state: PipelineState,
+    unit: FeatureUnit,
+    onto: str,
+    remote: str,
+) -> bool:
+    """Discard ``unit``'s prior port so this run re-ports it from base.
+
+    A unit that had a port PR moves to a renumbered branch; a still-open
+    PR is closed first. Without a PR, the recorded branch is rebuilt in
+    place. The state entry is dropped either way. Returns False (unit
+    left untouched) for a merged port.
+    """
+    fs = state.features.get(unit.feature_id)
+    if fs is None:
+        unit.if_exists = "recreate"
+        return True
+
+    canonical = config.feature_branch_name(unit.feature_id, onto)
+    merged_hint = (
+        "not redoing. [dim](mark it with `releasy mark-reverted` first if "
+        "it was reverted on target)[/dim]"
+    )
+    if fs.status == "merged":
+        console.print(
+            f"\n    [red]✗[/red] [cyan]{unit.feature_id}[/cyan] — port already "
+            f"merged ({fs.rebase_pr_url or 'no PR recorded'}); {merged_hint}"
+        )
+        return False
+
+    if fs.rebase_pr_url:
+        new_branch = _next_free_renumbered_port_branch(
+            repo_path, remote, canonical,
+        )
+        # A reverted port's PR is merged on GitHub, by definition.
+        info = None if fs.status == "reverted" else fetch_pr_by_url(
+            config, fs.rebase_pr_url, include_closed=True,
+        )
+        if info is not None and info.state == "merged":
+            console.print(
+                f"\n    [red]✗[/red] [cyan]{unit.feature_id}[/cyan] — port PR "
+                f"{fs.rebase_pr_url} is merged; {merged_hint}"
+            )
+            return False
+        if fs.status != "reverted" and (info is None or info.state == "open"):
+            parsed = parse_pr_url(fs.rebase_pr_url)
+            closed = parsed is not None and close_pull_request(
+                config, parsed[2],
+                comment=(
+                    f"Superseded: re-porting from scratch on `{new_branch}` "
+                    "(`releasy run --redo`)."
+                ),
+            )
+            if not closed:
+                console.print(
+                    f"\n    [red]✗[/red] [cyan]{unit.feature_id}[/cyan] — could "
+                    f"not close port PR {fs.rebase_pr_url}; not redoing."
+                )
+                return False
+            verb = "would close" if config.dry_run else "closed"
+            console.print(
+                f"\n    [yellow]✗[/yellow] {verb} port PR "
+                f"[link={fs.rebase_pr_url}]{fs.rebase_pr_url}[/link]"
+            )
+    else:
+        new_branch = fs.branch_name or canonical
+
+    console.print(
+        f"    [yellow]↻[/yellow] [cyan]{unit.feature_id}[/cyan] — redo: "
+        f"dropping its state ({fs.status}), re-porting from base on "
+        f"[cyan]{new_branch}[/cyan]"
+    )
+    unit.if_exists = "recreate"
+    unit.port_branch = new_branch
+    state.features.pop(unit.feature_id, None)
+    _persist_state(config, state)
+    return True
+
+
 def _is_partial_group(fs: FeatureState | None) -> bool:
     """True for a unit a prior run left mid-cherry-pick.
 
@@ -3442,7 +3535,7 @@ def _process_feature_unit(
     )
     prev_was_dead = recreate is not None
 
-    new_branch = canonical_branch
+    new_branch = unit.port_branch or canonical_branch
     if recreate is not None and not force_retry:
         why, flag = recreate
         new_branch = _next_free_renumbered_port_branch(

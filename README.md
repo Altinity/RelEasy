@@ -23,6 +23,7 @@ All commands need `RELEASY_GITHUB_TOKEN`. The first group works anywhere
 
 - Port everything in scope (discover, cherry-pick, open PRs) → `releasy run`
 - Resume after fixing a conflict by hand → `releasy continue`
+- Throw away one group / PR's port and re-port it from scratch → `releasy run --only <id> --redo`
 - Map PR dependencies before porting → `releasy graph discover` (add `--open-issue` to track it)
 - Tick off ported units on that issue → `releasy graph sync` (automatic after `run` / `refresh`)
 - Update every in-scope PR's branch to the latest target → `releasy refresh --merge-target`
