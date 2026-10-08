@@ -13,10 +13,13 @@ from releasy.termlog import console
 from rich.table import Table
 
 from releasy.config import Config, save_session
-from releasy.github_ops import fetch_pr_by_url, parse_pr_url
+from releasy.github_ops import (
+    fetch_pr_by_url, get_origin_repo_slug, parse_pr_url, pr_ref_label,
+)
 from releasy.state import (
     find_features_by_pr_url,
     load_state,
+    mark_outdated,
     save_state,
 )
 
@@ -205,8 +208,9 @@ def remove_pr(
     refresh's label-driven discovery doesn't re-add it.
 
     Locates the corresponding ``FeatureState`` and deletes it for
-    singleton features. Multi-PR groups are atomic: removing one URL
-    from a state-tracked group is refused with a clear message.
+    singleton features. A multi-PR group's entry is kept; an in-flight
+    port of it is marked outdated, so ``releasy run`` re-ports the group
+    without the PR.
     """
     session = _require_session(config)
 
@@ -216,25 +220,16 @@ def remove_pr(
 
     ps = session.pr_sources
 
-    # Check state first so we can refuse atomic-group removals before
-    # touching session.
     state = load_state(config)
-    # A merged group already shipped the PR: it neither blocks the removal
-    # nor gets purged.
-    matches = [
-        (fid, fs) for fid, fs in find_features_by_pr_url(state, url)
-        if not (len(fs.pr_urls) > 1 and fs.status == "merged")
-    ]
-    for fid, fs in matches:
-        if len(fs.pr_urls) > 1:
-            console.print(
-                f"[red]PR {url} is part of multi-PR group "
-                f"feature '{fid}' (which has {len(fs.pr_urls)} PRs).[/red] "
-                f"Remove the whole group via the session file, or use "
-                f"`releasy clear --branch {fs.branch_name or fid}` to "
-                f"purge state for that group."
-            )
-            return False
+    owner, repo, num = parse_pr_url(url)
+    ref = pr_ref_label(f"{owner}/{repo}", num, get_origin_repo_slug(config))
+    matches: list[str] = []
+    outdated_groups: list[str] = []
+    for fid, fs in find_features_by_pr_url(state, url):
+        if len(fs.pr_urls) <= 1:
+            matches.append(fid)
+        elif mark_outdated(fs, f"{ref} removed"):
+            outdated_groups.append(fid)
 
     removed_from_top = _remove_url_from_list(url, ps.include_prs)
     _drop_context(url, ps.include_pr_contexts)
@@ -255,7 +250,7 @@ def remove_pr(
             (overlay_groups if g.auto_discovered else removed_from_groups).append(g.id)
         _drop_context(url, g.pr_ai_contexts)
 
-    for fid, _fs in matches:
+    for fid in matches:
         del state.features[fid]
     state_purged = bool(matches)
 
@@ -271,6 +266,7 @@ def remove_pr(
         and not removed_from_groups
         and not overlay_groups
         and not state_purged
+        and not outdated_groups
         and not appended_to_exclude
     )
     if nothing_to_do:
@@ -280,7 +276,7 @@ def remove_pr(
         return True
 
     save_session(session)
-    if state_purged:
+    if state_purged or outdated_groups:
         save_state(state, config)
 
     console.print(f"[green]✓[/green] Removed [cyan]{url}[/cyan]")
@@ -298,6 +294,11 @@ def remove_pr(
         )
     if state_purged:
         console.print("[dim]  - purged FeatureState from state file[/dim]")
+    for fid in outdated_groups:
+        console.print(
+            f"[dim]  - marked port of '{fid}' outdated (next `releasy run` "
+            "re-ports it from scratch)[/dim]"
+        )
     if appended_to_exclude:
         console.print("[dim]  - appended to exclude_prs[/dim]")
     elif keep_discovery:

@@ -86,6 +86,8 @@ from releasy.state import (
     PipelineState,
     find_merged_feature_for_prs,
     load_state,
+    mark_outdated,
+    save_state,
 )
 from releasy.termlog import get_console
 
@@ -982,6 +984,7 @@ def run_discover_deps(
                 f"  [green]✓[/green] wrote deps overlay → "
                 f"[cyan]{deps_overlay_path}[/cyan]"
             )
+            _report_outdated(mark_outdated_units(config, report))
     elif config.session and config.session.session_path:
         # We're skipping (--no-write). Note where the overlay *would*
         # have gone so the user knows we noticed and chose to skip.
@@ -2871,6 +2874,39 @@ _DISCARDED_STATUSES: tuple[str, ...] = ("closed", "skipped", "superseded")
 _REVERTED_STATUS = "reverted"
 
 
+def mark_outdated_units(config: Config, report: DiscoveryReport) -> list[str]:
+    """Mark tracked ports carrying PRs their unit in ``report`` no longer has.
+
+    Compares each in-flight port's source PRs (minus auto-added prereqs)
+    with its unit's PRs in ``report``. Returns the unit IDs whose port is
+    outdated, marked now or before; saves state when a mark is new.
+    """
+    state = load_state(config)
+    out: list[str] = []
+    changed = False
+    for n in report.nodes:
+        fs = state.features.get(n.unit_id)
+        if fs is None:
+            continue
+        kept = {parse_pr_url(u) for u in n.pr_urls}
+        dynamic = {parse_pr_url(u) for u in fs.dynamic_prereq_urls}
+        lost = [
+            u for u in (fs.pr_urls or [fs.pr_url])
+            if u and parse_pr_url(u) not in kept | dynamic
+        ]
+        if not lost:
+            continue
+        if mark_outdated(
+            fs, f"{', '.join(_pr_short(u) for u in lost)} left the unit",
+        ):
+            changed = True
+        if fs.outdated:
+            out.append(n.unit_id)
+    if changed and not config.dry_run:
+        save_state(state, config)
+    return out
+
+
 def build_progress_map(
     report: DiscoveryReport, state: PipelineState,
 ) -> dict[str, FeatureState]:
@@ -2995,6 +3031,8 @@ def _progress_note(
             else f" [branch]({fs.branch_url})"
         )
     stall = _stall_note(fs)
+    if fs.outdated:
+        stall += f" · ♻ outdated, re-ported on next run: {fs.outdated}"
     return note + (_to_html_inline(stall) if html else stall)
 
 
@@ -4214,6 +4252,7 @@ def run_graph_update(
 
     newly_held: list[str] = []
     released: list[str] = []
+    outdated: list[str] = []
     if spec_holds is not None:
         newly_held, released, hold_failures = _apply_spec_holds(
             config, spec_holds,
@@ -4233,6 +4272,8 @@ def run_graph_update(
             console.print(f"  [yellow]warning:[/yellow] failed to write overlay: {e}")
         else:
             console.print(f"  [green]✓[/green] wrote deps overlay → [cyan]{overlay_path}[/cyan]")
+            outdated = mark_outdated_units(config, new_report)
+            _report_outdated(outdated)
 
     # --- Refresh the issue + optional summary comment ---
     if open_or_update_graph_issue(
@@ -4261,7 +4302,7 @@ def run_graph_update(
     if post_comment:
         summary = _render_update_comment(
             new_report, added, newly_excluded, len(ingest), failures,
-            newly_held, released,
+            newly_held, released, outdated,
         )
         add_issue_comment(config, new_report.issue_number, summary)
 
@@ -4376,6 +4417,14 @@ def sync_graph_progress(
     return 0
 
 
+def _report_outdated(unit_ids: list[str]) -> None:
+    for uid in unit_ids:
+        console.print(
+            f"  [yellow]♻[/yellow] port of [cyan]{uid}[/cyan] is outdated — "
+            "the next `releasy run` re-ports it from scratch"
+        )
+
+
 def _print_graph_update_summary(
     report: DiscoveryReport, added: list[str], excluded: list[str],
     on_hold: list[str] | None = None,
@@ -4405,6 +4454,7 @@ def _render_update_comment(
     failures: list[str] | None = None,
     newly_held: list[str] | None = None,
     released: list[str] | None = None,
+    outdated: list[str] | None = None,
 ) -> str:
     failures = failures or []
     lines = [
@@ -4431,6 +4481,11 @@ def _render_update_comment(
         lines.append(
             f"- ▶ back in work (removed from `on_hold`): "
             f"{', '.join(_pr_short(u) for u in released)}"
+        )
+    if outdated:
+        lines.append(
+            f"- ♻ outdated ports, re-ported from scratch on the next "
+            f"`releasy run`: {', '.join(f'`{u}`' for u in outdated)}"
         )
     if failures:
         lines.append(

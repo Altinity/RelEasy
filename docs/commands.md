@@ -162,6 +162,14 @@ before the re-port starts — a failed re-port does not reopen it. Refused
 for a merged port (unless it was [`mark-reverted`](#releasy-mark-reverted))
 and in sequential mode. Every other unit is untouched.
 
+**Outdated ports are redone automatically.** When a PR leaves a unit that
+already has an in-flight port (vetoed via [`pr remove`](#pr-membership) or a
+[`graph update`](#releasy-graph-update) comment, or moved to another unit by
+[`graph discover`](#releasy-graph-discover) / `graph update`), the port is
+marked **outdated** with the reason. The next `run` re-ports it exactly as
+`--redo` would, no flag needed; the graph issue shows `♻ outdated` until
+then. Merged, closed and other terminal ports are never marked.
+
 ```bash
 releasy run [--onto <ver>] [--work-dir <path>]
             [--resolve-conflicts | --no-resolve-conflicts]
@@ -394,6 +402,10 @@ re-discovered, not reused.
 Pass **`--redo`** to ignore the prior graph and trial-pick everything from
 scratch.
 
+After writing the deps overlay, discovery marks any tracked in-flight port
+that carries a PR its unit no longer has as **outdated** — the next
+[`run`](#releasy-run) re-ports it from scratch.
+
 When `origin/<base>` has **moved** since the last run, discovery still reuses
 the prior groupings but treats cached branches as stale: reused units are
 emitted `cached: false` (so `run` re-picks them onto the new tip) and a warning
@@ -423,6 +435,11 @@ A member can ask for any change in prose; Claude decides:
 - **release** a held PR ("#2234 can go ahead now") → dropped from
   `on_hold`, ported on the next [`run`](#releasy-run);
 - **regroup** into an atomic unit, or **reorder** via `depends_on`.
+
+A veto or regroup that takes a PR out of a unit already being ported marks
+that port **outdated**: the next [`run`](#releasy-run) re-ports the unit
+from scratch without it (closing its open port PR, if any). The summary
+comment lists the outdated ports.
 
 A PR added here was never trial-picked, so its dependencies are whatever the
 reply declared — usually nothing. Such units are marked
@@ -1334,7 +1351,7 @@ releasy pr list
 | Subcommand | Description |
 |------------|-------------|
 | `add` | Append URL to `pr_sources.include_prs` (or `groups[<id>].prs` with `--group`). Validates the URL via the GitHub API, idempotent on re-add, and clears the URL from `exclude_prs` if it was previously excluded. Optional `--context` sets the per-PR `ai_context` note. |
-| `remove` | Drop the URL from every session list (`include_prs`, every group's `prs`, `on_hold`, both `ai_context` dicts) and purge the matching `FeatureState`. By default also appends the URL to `exclude_prs` so label-driven discovery doesn't re-add it on the next refresh; pass `--keep-discovery` to skip that step. Refuses if the URL is part of a multi-PR group still in state (groups are atomic — use `releasy clear <identifier>` to wipe the whole group). |
+| `remove` | Drop the URL from every session list (`include_prs`, every group's `prs`, `on_hold`, both `ai_context` dicts) and purge the matching singleton `FeatureState`. By default also appends the URL to `exclude_prs` so label-driven discovery doesn't re-add it on the next refresh; pass `--keep-discovery` to skip that step. A multi-PR group's state entry is kept; if its port is still in flight it is marked **outdated**, and the next [`run`](#releasy-run) re-ports the group from scratch without the PR. |
 | `list` | Print every URL the session references — top-level `include_prs`, each group's `prs`, `on_hold` (with its reasons) and `exclude_prs` — with their `ai_context` notes. |
 
 Exit: `1` on a malformed URL, an unreachable PR, a group id that doesn't

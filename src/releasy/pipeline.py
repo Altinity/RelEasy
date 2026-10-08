@@ -1530,8 +1530,18 @@ def run_pipeline(
         if unit.feature_id in existing_ids:
             continue
         existing_ids.add(unit.feature_id)
-        if redo and unit.hold_reason is None and not _reset_unit_for_redo(
-            config, repo_path, state, unit, onto, remote,
+        prev_fs = state.features.get(unit.feature_id)
+        outdated = prev_fs is not None and bool(prev_fs.outdated)
+        if outdated and unit.hold_reason is None:
+            console.print(
+                f"\n    [yellow]♻[/yellow] [cyan]{unit.feature_id}[/cyan] — "
+                f"port outdated ({prev_fs.outdated})"
+            )
+        if (
+            (redo or outdated) and unit.hold_reason is None
+            and not _reset_unit_for_redo(
+                config, repo_path, state, unit, onto, remote,
+            )
         ):
             continue
         # Skip units already in a terminal state on the local state file —
@@ -3016,8 +3026,9 @@ def _reset_unit_for_redo(
 
     A unit that had a port PR moves to a renumbered branch; a still-open
     PR is closed first. Without a PR, the recorded branch is rebuilt in
-    place. The state entry is dropped either way. Returns False (unit
-    left untouched) for a merged port.
+    place. The state entry is dropped either way. Used by ``run --redo``
+    and for a port marked ``outdated``. Returns False (unit left
+    untouched) for a merged port.
     """
     fs = state.features.get(unit.feature_id)
     if fs is None:
@@ -3056,7 +3067,8 @@ def _reset_unit_for_redo(
                 config, parsed[2],
                 comment=(
                     f"Superseded: re-porting from scratch on `{new_branch}` "
-                    "(`releasy run --redo`)."
+                    + (f"({fs.outdated})." if fs.outdated
+                       else "(`releasy run --redo`).")
                 ),
             )
             if not closed:

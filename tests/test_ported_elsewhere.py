@@ -84,17 +84,20 @@ class RemoveSkipsMergedGroup(unittest.TestCase):
         self.assertNotIn(URL(2), cfg.pr_sources.include_prs)
         self.assertIn(URL(2), cfg.pr_sources.exclude_prs)
 
-    def test_unmerged_group_still_refused(self):
+    def test_veto_marks_unmerged_group_outdated(self):
         cfg = cfg_with(Path(tempfile.mkdtemp()), include_prs=[URL(2)])
         state = merged_group_state()
-        state.features["grp"].status = "needs_review"
-        saved = pm.load_state
+        state.features["grp"].status = "build_failed"
+        saved = pm.load_state, pm.save_state
         pm.load_state = lambda c: state
+        pm.save_state = lambda s, c: None
         try:
-            self.assertFalse(pm.remove_pr(cfg, URL(2)))
+            self.assertTrue(pm.remove_pr(cfg, URL(2)))
         finally:
-            pm.load_state = saved
-        self.assertIn("pr-2", state.features)
+            pm.load_state, pm.save_state = saved
+        self.assertEqual(set(state.features), {"grp"})
+        self.assertEqual(state.features["grp"].outdated, "#2 removed")
+        self.assertIn(URL(2), cfg.pr_sources.exclude_prs)
 
 
 if __name__ == "__main__":

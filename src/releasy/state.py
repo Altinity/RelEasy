@@ -438,6 +438,10 @@ class FeatureState:
     # the run gate (skip a retry that cannot succeed yet), `releasy status`
     # and the graph issue.
     stall: StallReason | None = None
+    # Why the port no longer matches its unit's membership (e.g. a member
+    # vetoed or moved out by the graph). ``releasy run`` re-ports a unit
+    # marked so from scratch, as ``run --redo`` would.
+    outdated: str | None = None
 
 
 @dataclass
@@ -514,6 +518,7 @@ def _parse_features(raw_features: dict) -> dict[str, FeatureState]:
             merged_label_applied=bool(fraw.get("merged_label_applied", False)),
             skip_reason=fraw.get("skip_reason"),
             stall=StallReason.from_dict(fraw.get("stall")),
+            outdated=fraw.get("outdated"),
         )
     return features
 
@@ -652,6 +657,8 @@ def save_state(state: PipelineState, config: Config) -> None:
             entry["skip_reason"] = fs.skip_reason
         if fs.stall is not None:
             entry["stall"] = fs.stall.to_dict()
+        if fs.outdated:
+            entry["outdated"] = fs.outdated
         features_data[fid] = entry
 
     data: dict = {
@@ -764,6 +771,21 @@ def find_features_by_pr_url(
             for url in (fs.rebase_pr_url, fs.pr_url, *fs.pr_urls)
         )
     ]
+
+
+# Statuses whose port is still in flight — the ones an ``outdated`` mark
+# can rebuild. Terminal ones (merged, closed, …) are left as they are.
+OUTDATABLE_STATUSES: frozenset[str] = frozenset({
+    "needs_review", "branch_created", "conflict", "build_failed", "blocked",
+})
+
+
+def mark_outdated(fs: FeatureState, reason: str) -> bool:
+    """Mark an in-flight port outdated. True when the mark was set."""
+    if fs.status not in OUTDATABLE_STATUSES or fs.outdated:
+        return False
+    fs.outdated = reason
+    return True
 
 
 def find_merged_feature_for_prs(
