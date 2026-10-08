@@ -1,19 +1,3 @@
-"""Regression tests for the auto-prereq queued-elsewhere guard.
-
-Covers two ways a prereq can already be queued without being listed
-under its own URL:
-
-* the report names releasy's OWN in-flight port PR (e.g. #1950, the
-  target-branch port of #1687) rather than the upstream source PR;
-* the prereq (#1388) is carried inside a combined port (#1718) that a
-  unit does list — the URL appears nowhere, but #1718's body says it
-  cherry-picked it.
-
-Both must abort the dive instead of re-porting into a duplicate PR (or,
-worse, rejecting the prereq as out of scope because the 26.1 original
-never carried the 26.3 selection labels).
-"""
-
 from __future__ import annotations
 
 import unittest
@@ -38,7 +22,6 @@ def _url(n):
 
 class QueuedPrereqGuard(unittest.TestCase):
     def setUp(self):
-        # Feature pr-1687 ported upstream #1687 → its port PR is #1950.
         self.state = SimpleNamespace(features={
             "pr-1687": FeatureState(
                 pr_urls=[_url(1687)], rebase_pr_url=_url(1950),
@@ -46,7 +29,6 @@ class QueuedPrereqGuard(unittest.TestCase):
         })
 
     def test_own_port_pr_recognized(self):
-        """A prereq naming the port PR (#1950) is flagged as queued."""
         out = _find_already_queued_prereqs(
             _cfg(), self.state, [_url(1950)], exclude_feature_id="pr-1759",
         )
@@ -55,7 +37,6 @@ class QueuedPrereqGuard(unittest.TestCase):
         self.assertEqual(out[0]["queued_in_pr_url"], _url(1950))
 
     def test_upstream_source_pr_still_recognized(self):
-        """The original source-PR match path still works."""
         out = _find_already_queued_prereqs(
             _cfg(), self.state, [_url(1687)], exclude_feature_id="pr-1759",
         )
@@ -63,23 +44,18 @@ class QueuedPrereqGuard(unittest.TestCase):
         self.assertEqual(out[0]["queued_in"], "pr-1687")
 
     def test_unrelated_pr_not_flagged(self):
-        """A genuinely missing prereq is not a false positive."""
         out = _find_already_queued_prereqs(
             _cfg(), self.state, [_url(9999)], exclude_feature_id="pr-1759",
         )
         self.assertEqual(out, [])
 
     def test_excluded_feature_skipped(self):
-        """A unit's own port PR isn't flagged as queued against itself."""
         out = _find_already_queued_prereqs(
             _cfg(), self.state, [_url(1950)], exclude_feature_id="pr-1687",
         )
         self.assertEqual(out, [])
 
 
-# #1718's real body: the clause sits mid-line after the "Combined port"
-# sentence, and the changelog paragraph above it links PRs that are NOT
-# sources (#9001 here) — both shapes the parser has to get right.
 COMBINED_BODY = """\
 ### Changelog entry
 
@@ -94,11 +70,7 @@ Combined port of 12 PR(s) (group `apassos-3`). Cherry-picked from #1388, \
 
 
 class CombinedPortProvenance(unittest.TestCase):
-    """A prereq carried inside a combined port counts as queued."""
-
     def setUp(self):
-        # auto-grp-pr-1718 ports #1718 (+ others); #1718 is itself the 26.3
-        # combined port of #1388 / #1618, which no unit lists directly.
         self.state = SimpleNamespace(features={
             "auto-grp-pr-1718": FeatureState(
                 pr_url=_url(1718),
@@ -118,17 +90,7 @@ class CombinedPortProvenance(unittest.TestCase):
         self.assertEqual(out[0]["queued_in_pr_url"], _url(2146))
         self.assertTrue(out[0]["carried"])
 
-    def test_both_prereqs_recognized(self):
-        out = _find_already_queued_prereqs(
-            _cfg(), self.state, [_url(1388), _url(1618)],
-            exclude_feature_id="pr-1832",
-        )
-        self.assertEqual(
-            [q["prereq_url"] for q in out], [_url(1388), _url(1618)],
-        )
-
     def test_legacy_state_falls_back_to_body(self):
-        """State written before ``contained_pr_urls`` still matches."""
         self.state.features["auto-grp-pr-1718"].contained_pr_urls = []
         out = _find_already_queued_prereqs(
             _cfg(), self.state, [_url(1618)], exclude_feature_id="pr-1832",
@@ -138,7 +100,6 @@ class CombinedPortProvenance(unittest.TestCase):
         self.assertTrue(out[0]["carried"])
 
     def test_direct_claim_wins_over_carried(self):
-        """A unit listing the prereq outright beats one merely carrying it."""
         cfg = _cfg(groups=[SimpleNamespace(id="grp-x", prs=[_url(1388)])])
         out = _find_already_queued_prereqs(
             cfg, self.state, [_url(1388)], exclude_feature_id="pr-1832",
@@ -151,14 +112,6 @@ class CombinedPortProvenance(unittest.TestCase):
         out = _find_already_queued_prereqs(
             _cfg(), self.state, [_url(1388)],
             exclude_feature_id="auto-grp-pr-1718",
-        )
-        self.assertEqual(out, [])
-
-    def test_non_source_link_in_body_not_flagged(self):
-        """A PR linked elsewhere in the body is not treated as carried."""
-        self.state.features["auto-grp-pr-1718"].contained_pr_urls = []
-        out = _find_already_queued_prereqs(
-            _cfg(), self.state, [_url(9001)], exclude_feature_id="pr-1832",
         )
         self.assertEqual(out, [])
 

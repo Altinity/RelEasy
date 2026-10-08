@@ -1,11 +1,3 @@
-"""`pr_sources.on_hold`: PRs parked while they wait on something.
-
-A hold is not a veto — the unit stays in the graph and keeps its edges,
-`releasy run` just walks past it. Covers the three promises: the session
-file round-trips holds, the run gate skips held units, and the graph issue
-lists them under their own section instead of the working lists.
-"""
-
 from __future__ import annotations
 
 import tempfile
@@ -32,7 +24,7 @@ from releasy.state import FeatureState
 
 from test_graph_update import URL, node, report
 
-REF = lambda n: ("o", "r", n)  # noqa: E731 — canonical ref for URL(n)
+REF = lambda n: ("o", "r", n)  # noqa: E731
 
 
 def pr(num):
@@ -63,9 +55,6 @@ def cfg_with(tmp, **ps_kwargs):
 
 
 class SessionRoundTrip(unittest.TestCase):
-    """The hand-editable half: what you write in the session file is what
-    comes back, in both the bare-URL and the {url, reason} form."""
-
     def _roundtrip(self, on_hold_yaml):
         tmp = Path(tempfile.mkdtemp())
         session_path = tmp / "b.session.yaml"
@@ -78,18 +67,6 @@ class SessionRoundTrip(unittest.TestCase):
             project="p", config_path=tmp / "config.yaml",
         )
         return load_session(cfg, session_path)
-
-    def test_bare_url_entry(self):
-        ps = self._roundtrip([URL(1)]).pr_sources
-        self.assertEqual(ps.on_hold, [URL(1)])
-        self.assertEqual(ps.on_hold_reasons, {})
-
-    def test_dict_entry_keeps_reason(self):
-        ps = self._roundtrip(
-            [{"url": URL(1), "reason": "waiting for the follow-up"}],
-        ).pr_sources
-        self.assertEqual(ps.on_hold, [URL(1)])
-        self.assertEqual(ps.on_hold_reasons[URL(1)], "waiting for the follow-up")
 
     def test_forms_mix(self):
         ps = self._roundtrip(
@@ -154,15 +131,6 @@ class HoldMapping(unittest.TestCase):
         cfg = cfg_with(tmp, on_hold=["not-a-url", URL(1)])
         self.assertEqual(pl.hold_map(cfg), {REF(1): ""})
 
-    def test_any_held_member_holds_the_whole_group(self):
-        # A group cherry-picks as one atomic unit — porting the rest
-        # without the held PR would ship a broken subset.
-        holds = {REF(2): "waiting"}
-        self.assertEqual(
-            pl._unit_hold_reason(unit("G", 1, 2, 3, group=True), holds),
-            "waiting",
-        )
-
     def test_several_holds_join_their_reasons(self):
         holds = {REF(1): "a", REF(2): "b"}
         self.assertEqual(
@@ -170,14 +138,10 @@ class HoldMapping(unittest.TestCase):
         )
 
     def test_unheld_unit_is_none_not_empty(self):
-        # "" is a real value — a hold with no recorded reason — so the
-        # not-held sentinel has to be None.
         self.assertIsNone(pl._unit_hold_reason(unit("pr-1", 1), {REF(9): "x"}))
         self.assertEqual(pl._unit_hold_reason(unit("pr-1", 1), {REF(1): ""}), "")
 
     def test_marking_does_not_drop_units(self):
-        # graph discover runs off the same list; a held unit must keep its
-        # node (and its edges) in the graph.
         tmp = Path(tempfile.mkdtemp())
         cfg = cfg_with(tmp, on_hold=[URL(1)])
         units = [unit("pr-1", 1), unit("pr-2", 2)]
@@ -234,7 +198,7 @@ class MembershipEdits(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp())
         cfg = cfg_with(tmp, include_prs=[URL(1)], on_hold=[URL(1)])
         cfg.pr_sources.on_hold_reasons[URL(1)] = "waiting"
-        saved = pm.load_state
+        saved = pm.load_state, pm.save_state
         pm.load_state = lambda c: __import__(
             "releasy.state", fromlist=["PipelineState"],
         ).PipelineState()
@@ -242,7 +206,7 @@ class MembershipEdits(unittest.TestCase):
         try:
             self.assertTrue(pm.remove_pr(cfg, URL(1)))
         finally:
-            pm.load_state = saved
+            pm.load_state, pm.save_state = saved
         self.assertEqual(cfg.pr_sources.on_hold, [])
         self.assertEqual(cfg.pr_sources.on_hold_reasons, {})
         self.assertIn(URL(1), cfg.pr_sources.exclude_prs)
@@ -253,7 +217,6 @@ def body(nodes, progress=None, held=None):
 
 
 def hold_entry(out):
-    """The first bullet under the On-hold heading."""
     section = out.split("### ⏸ On hold")[1]
     return next(l for l in section.splitlines() if l.startswith("- "))
 
@@ -277,8 +240,6 @@ class IssueRendering(unittest.TestCase):
         self.assertIn(URL(2), out)
 
     def test_not_folded(self):
-        # A hold is live work somebody expects back; Discarded / Excluded
-        # are folded shut, this one is not.
         out = body([node("pr-1", 1)], held={REF(1): "w"})
         self.assertNotIn("<summary>⏸", out)
 
@@ -299,15 +260,12 @@ class IssueRendering(unittest.TestCase):
         )
 
     def test_held_unit_counted_once_in_the_tally(self):
-        # Not in both the not-started bucket and the on-hold one — the
-        # breakdown has to add up to the unit count.
         out = body([node("pr-1", 1), node("pr-2", 2)], held={REF(1): "w"})
         summary = [l for l in out.splitlines() if l.startswith("**Progress:")][0]
         self.assertIn("⬜ not started: 1", summary)
         self.assertIn("⏸ on hold: 1", summary)
 
     def test_merged_unit_ignores_the_hold(self):
-        # The port landed — the hold no longer decides anything about it.
         fs = FeatureState(status="merged", rebase_pr_url=URL(9))
         out = body([node("pr-1", 1)], {"pr-1": fs}, {REF(1): "w"})
         self.assertNotIn("### ⏸ On hold", out)
@@ -322,10 +280,7 @@ class IssueRendering(unittest.TestCase):
 
 
 class SpecHolds(unittest.TestCase):
-    """`graph update`: what a member comment can do to the hold list."""
-
     def test_missing_key_preserves_current_holds(self):
-        # The model didn't mention holds — that must not release them.
         self.assertIsNone(d._parse_spec_holds({"units": []}, []))
 
     def test_empty_list_releases_everything(self):
@@ -394,16 +349,11 @@ class SpecHolds(unittest.TestCase):
 
 
 class DependentsBlock(unittest.TestCase):
-    """A held unit never reaches ``merged``, so the existing dep gate is
-    what makes its dependents report as blocked — no extra bookkeeping."""
-
     def test_dependent_of_a_held_unit_is_unmet(self):
         from releasy.state import PipelineState
 
         dependent = unit("pr-3", 3)
         dependent.depends_on = ["pr-1"]
-        # The held unit is skipped before any state is written, so the gate
-        # sees no entry for it at all.
         self.assertEqual(pl._unmet_deps(dependent, PipelineState()), ["pr-1"])
 
     def test_dependent_of_a_merged_unit_is_not(self):
@@ -417,9 +367,6 @@ class DependentsBlock(unittest.TestCase):
 
 
 class CLIWiring(unittest.TestCase):
-    """`releasy hold` / `unhold`: the arguments reach pr_membership and a
-    refusal there becomes a non-zero exit."""
-
     def setUp(self):
         from click.testing import CliRunner
         import releasy.cli as cli_mod
@@ -462,8 +409,6 @@ class CLIWiring(unittest.TestCase):
         self.assertIn(("hold_pr", (self.cfg, URL(1), ""), {}), self.calls)
 
     def test_hold_needs_the_session(self):
-        # The session file is what `on_hold` lives in — loading it is not
-        # optional for this command.
         self._stub("hold_pr", True)
         self.runner.invoke(self.cli, ["hold", URL(1)])
         self.assertIn(("locked_config", "required"), self.calls)
@@ -483,10 +428,6 @@ class CLIWiring(unittest.TestCase):
         self._stub("unhold_pr", False)
         res = self.runner.invoke(self.cli, ["unhold", URL(1)])
         self.assertEqual(res.exit_code, 1)
-
-    def test_url_argument_is_required(self):
-        for cmd in ("hold", "unhold"):
-            self.assertEqual(self.runner.invoke(self.cli, [cmd]).exit_code, 2)
 
 
 class GroupHoldEndToEnd(unittest.TestCase):

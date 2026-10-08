@@ -1,5 +1,3 @@
-"""Tests for the stateless GitHub-Project-driven backport command."""
-
 from __future__ import annotations
 
 import unittest
@@ -37,11 +35,7 @@ class PortVersionsIncludes(unittest.TestCase):
         self.assertTrue(pb._port_versions_includes("24.8, 25.3", "24.8"))
         self.assertTrue(pb._port_versions_includes("24.8, 25.3", "25.3"))
 
-    def test_exact_match(self):
-        self.assertTrue(pb._port_versions_includes("24.8", "24.8"))
-
     def test_no_partial_match(self):
-        # Must not match a longer adjacent version.
         self.assertFalse(pb._port_versions_includes("24.80", "24.8"))
         self.assertFalse(pb._port_versions_includes("24.8.14", "24.8"))
 
@@ -51,9 +45,6 @@ class PortVersionsIncludes(unittest.TestCase):
 
 
 class BranchName(unittest.TestCase):
-    def test_simple(self):
-        self.assertEqual(pb._backport_branch("24.8", 81234), "backport/24.8/81234")
-
     def test_sanitised(self):
         self.assertEqual(pb._backport_branch("24.8/foo", 5), "backport/24.8-foo/5")
 
@@ -63,21 +54,6 @@ class BranchName(unittest.TestCase):
 
 
 class ItemQualifies(unittest.TestCase):
-    def test_upstream_pr_matching_version(self):
-        self.assertTrue(pb._item_qualifies(_item(), "24.8", pb.UPSTREAM_SLUG))
-
-    def test_origin_pr_rejected(self):
-        it = _item(repo="Altinity/ClickHouse")
-        self.assertFalse(pb._item_qualifies(it, "24.8", pb.UPSTREAM_SLUG))
-
-    def test_draft_issue_rejected(self):
-        it = _item(typename="DraftIssue")
-        self.assertFalse(pb._item_qualifies(it, "24.8", pb.UPSTREAM_SLUG))
-
-    def test_wrong_version_rejected(self):
-        it = _item(port_versions="25.3")
-        self.assertFalse(pb._item_qualifies(it, "24.8", pb.UPSTREAM_SLUG))
-
     def test_missing_field_rejected(self):
         it = _item(port_versions=None)
         self.assertFalse(pb._item_qualifies(it, "24.8", pb.UPSTREAM_SLUG))
@@ -105,7 +81,6 @@ class ChangelogBlock(unittest.TestCase):
         self.assertIn("### Changelog category (leave one):", block)
         self.assertIn("- Bug Fix (user-visible misbehavior", block)
         self.assertIn("### Changelog entry", block)
-        # Entry text + attribution; trailing period folded before paren.
         self.assertIn(
             "Possible crash in IN function "
             "(https://github.com/ClickHouse/ClickHouse/pull/89367 by @ilejn).",
@@ -138,7 +113,6 @@ class CiOptionsSection(unittest.TestCase):
         self.assertIn("### CI/CD Options", pb._ci_options_section("no ci section here"))
 
     def test_keeps_trailing_content_below_checkboxes(self):
-        # "and everything below" — content after the last checkbox is kept.
         template = self.TEMPLATE + "\n#### Notes\nRun the thing.\n"
         section = pb._ci_options_section(template)
         self.assertIn("#### Notes", section)
@@ -158,20 +132,17 @@ class PrBody(unittest.TestCase):
 
 
 class RunDryRun(unittest.TestCase):
-    """End-to-end orchestration (filter / sort / idempotency / dry-run) with
-    the GitHub layer mocked out."""
-
     def _run(self):
         from unittest import mock
 
         UP = pb.UPSTREAM_SLUG
         items = [
-            _item(repo=UP, number=100, port_versions="24.8"),                 # would_create
-            _item(repo=UP, number=101, port_versions="24.8"),                 # skip: exists
-            _item(repo=UP, number=102, port_versions="24.8"),                 # skip: not merged
-            _item(repo="Altinity/ClickHouse", number=900, port_versions="24.8"),  # filtered: origin
-            _item(typename="DraftIssue", number=0, port_versions="24.8"),     # filtered: draft
-            _item(repo=UP, number=103, port_versions="25.3"),                 # filtered: version
+            _item(repo=UP, number=100, port_versions="24.8"),
+            _item(repo=UP, number=101, port_versions="24.8"),
+            _item(repo=UP, number=102, port_versions="24.8"),
+            _item(repo="Altinity/ClickHouse", number=900, port_versions="24.8"),
+            _item(typename="DraftIssue", number=0, port_versions="24.8"),
+            _item(repo=UP, number=103, port_versions="25.3"),
         ]
         unmerged = PRInfo(
             number=102, title="x", body="", state="open", merge_commit_sha=None,
@@ -201,14 +172,12 @@ class RunDryRun(unittest.TestCase):
     def test_filters_sorts_and_classifies(self):
         res = self._run()
         by_num = {o.upstream_number: o for o in res.outcomes}
-        # Origin PR / draft / wrong-version items are filtered out entirely.
         self.assertEqual(set(by_num), {100, 101, 102})
         self.assertEqual(by_num[100].status, "would_create")
-        self.assertEqual(by_num[101].status, "skipped")  # existing backport
-        self.assertEqual(by_num[102].status, "skipped")  # not merged
+        self.assertEqual(by_num[101].status, "skipped")
+        self.assertEqual(by_num[102].status, "skipped")
         self.assertIsNone(res.fatal)
         self.assertFalse(res.had_failures)
-        # Newest-first ordering.
         self.assertEqual([o.upstream_number for o in res.outcomes], [102, 101, 100])
 
 

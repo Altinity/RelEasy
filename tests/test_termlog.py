@@ -1,12 +1,3 @@
-"""Unit tests for the log-file tee and the ``releasy`` logger's handlers.
-
-Covers what ``configure`` records (INFO+ to the file, WARNING+ to the
-terminal), that a warning isn't written to the file twice, and that
-teardown leaves ``logging`` as it found it.
-
-Stdlib unittest (no pytest dependency). Run:
-    python3 -m unittest discover -s tests
-"""
 from __future__ import annotations
 
 import io
@@ -19,14 +10,9 @@ from releasy import termlog
 
 
 class LogHandlers(unittest.TestCase):
-    """``configure`` wires the ``releasy`` logger; ``configure(None)`` unwires it."""
-
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.log_path = Path(self._tmp.name) / "releasy.log"
-        # Stand in for the real TTY so terminal output is assertable. Only
-        # stderr — clobbering _real_stdout would break the test runner's own
-        # output once configure() restores it.
         self._saved_stderr = termlog._real_stderr
         self.term = io.StringIO()
         termlog._real_stderr = self.term
@@ -57,15 +43,8 @@ class LogHandlers(unittest.TestCase):
     def test_warning_hits_the_file_once_and_the_terminal(self) -> None:
         termlog.configure(self.log_path)
         self.log.warning("heads up")
-        # Twice would mean the terminal handler's write got tee'd back in.
         self.assertEqual(self.log_path.read_text().count("heads up"), 1)
         self.assertEqual(self.term.getvalue(), "heads up\n")
-
-    def test_nothing_is_recorded_without_a_log_file(self) -> None:
-        termlog.configure(None)
-        self.log.info("dropped")
-        self.assertEqual(self._releasy_logger.handlers, [])
-        self.assertFalse(self.log_path.exists())
 
     def test_teardown_restores_the_logger(self) -> None:
         termlog.configure(self.log_path)

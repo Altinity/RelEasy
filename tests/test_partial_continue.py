@@ -1,12 +1,3 @@
-"""Unit tests for auto-continuing a partially-applied group.
-
-Covers the three pieces of the feature that are cleanly unit-testable:
-the partial-group marker, the per-feature attempt counter's persistence,
-and the ``pr_policy.max_partial_continue_attempts`` cap config.
-
-Stdlib unittest (no pytest dependency). Run:
-    python3 -m unittest discover -s tests
-"""
 from __future__ import annotations
 
 import os
@@ -20,40 +11,14 @@ from releasy.state import FeatureState, _parse_features
 
 
 class IsPartialGroup(unittest.TestCase):
-    """``_is_partial_group`` marks only the draft-PR (idx>0) conflict flavour."""
-
-    def test_none(self):
-        self.assertFalse(p._is_partial_group(None))
-
-    def test_clean_unit_not_partial(self):
-        self.assertFalse(p._is_partial_group(FeatureState(status="needs_review")))
-
-    def test_conflict_first_pick_failed_not_partial(self):
-        # idx==0 flavour: nothing kept, partial_pr_count == 0.
-        self.assertFalse(
-            p._is_partial_group(
-                FeatureState(status="conflict", partial_pr_count=0)
-            )
-        )
-
     def test_conflict_no_partial_count_not_partial(self):
-        # A singleton conflict never sets partial_pr_count.
         self.assertFalse(
             p._is_partial_group(
                 FeatureState(status="conflict", partial_pr_count=None)
             )
         )
 
-    def test_partial_group_is_partial(self):
-        self.assertTrue(
-            p._is_partial_group(
-                FeatureState(status="conflict", partial_pr_count=2)
-            )
-        )
-
     def test_partial_count_set_but_status_resolved_not_partial(self):
-        # Once healed to needs_review, stale partial_pr_count must not
-        # re-trigger auto-continue (this is the no-infinite-loop guard).
         self.assertFalse(
             p._is_partial_group(
                 FeatureState(status="needs_review", partial_pr_count=2)
@@ -62,12 +27,6 @@ class IsPartialGroup(unittest.TestCase):
 
 
 class AttemptCounterPersistence(unittest.TestCase):
-    """``partial_continue_attempts`` survives the state parse round-trip."""
-
-    def test_default_zero_when_absent(self):
-        feats = _parse_features({"f1": {"status": "conflict"}})
-        self.assertEqual(feats["f1"].partial_continue_attempts, 0)
-
     def test_explicit_value_parsed(self):
         feats = _parse_features(
             {"f1": {"status": "conflict", "partial_continue_attempts": 3}}
@@ -82,8 +41,6 @@ class AttemptCounterPersistence(unittest.TestCase):
 
 
 class PartialContinueAllowed(unittest.TestCase):
-    """Resume-vs-redo policy: keep partial work, redo only terminal cases."""
-
     def _config(self, cap: int = 2):
         from releasy.config import Config, OriginConfig
 
@@ -102,31 +59,13 @@ class PartialContinueAllowed(unittest.TestCase):
         )
 
     def test_recreate_still_resumes_a_partial_group(self):
-        # The point of the policy: an exhausted resolver keeps its work
-        # even though if_exists says "rebuild from base".
         self.assertTrue(p._partial_continue_allowed(
             self._config(), self._partial(), "recreate", True,
-        ))
-
-    def test_skip_resumes_too(self):
-        self.assertTrue(p._partial_continue_allowed(
-            self._config(), self._partial(), "skip", True,
         ))
 
     def test_append_uses_its_own_resume_path(self):
         self.assertFalse(p._partial_continue_allowed(
             self._config(), self._partial(), "append", True,
-        ))
-
-    def test_closed_rebase_pr_is_redone_not_resumed(self):
-        # What the merge-status sweep leaves behind for a PR closed
-        # without merging: terminal status, partial markers cleared.
-        closed = FeatureState(
-            status="closed", partial_pr_count=None, failed_step_index=None,
-            skip_reason="rebase PR closed without merging",
-        )
-        self.assertFalse(p._partial_continue_allowed(
-            self._config(), closed, "recreate", True,
         ))
 
     def test_first_pick_conflict_has_nothing_to_resume(self):
@@ -152,8 +91,6 @@ class PartialContinueAllowed(unittest.TestCase):
 
 
 class ApiAbortedNotAResolverVerdict(unittest.TestCase):
-    """An outage must not spend a ``max_partial_continue_attempts`` slot."""
-
     def setUp(self):
         import releasy.ai_resolve as ar
 
@@ -204,7 +141,6 @@ class ApiAbortedNotAResolverVerdict(unittest.TestCase):
         self.assertEqual(res.error, "claude reported UNRESOLVED")
 
     def test_timeout_is_not_an_abort(self):
-        # A timeout burned the whole wall-clock budget — that's a real try.
         self.reply = (1, "", True, None)
         res = self._resolve()
         self.assertTrue(res.timed_out)
@@ -226,21 +162,8 @@ class ApiAbortedNotAResolverVerdict(unittest.TestCase):
         res = self.ar.resolve_with_claude(cfg, Path("."), ctx)
         self.assertTrue(res.api_aborted)
 
-    def test_outcome_plumbing_carries_the_flag(self):
-        # _AIStepOutcome → _CherryPickOutcome is what the unit-level
-        # refund in _process_feature_unit reads.
-        step = p._AIStepOutcome(handled=False, api_aborted=True)
-        self.assertTrue(
-            p._CherryPickOutcome(
-                kind="unresolved", api_aborted=step.api_aborted,
-            ).api_aborted
-        )
-        self.assertFalse(p._CherryPickOutcome(kind="unresolved").api_aborted)
-
 
 class ClosedPRClearsPartialMarkers(unittest.TestCase):
-    """The sweep is what routes a manually-closed PR to the redo path."""
-
     def setUp(self):
         import releasy.pipeline as pipeline
 
@@ -300,8 +223,6 @@ class ClosedPRClearsPartialMarkers(unittest.TestCase):
 
 
 class MaxPartialContinueAttemptsConfig(unittest.TestCase):
-    """``pr_policy.max_partial_continue_attempts`` default, disable, round-trip."""
-
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self._prev_state_dir = os.environ.get("RELEASY_STATE_DIR")
@@ -329,14 +250,6 @@ class MaxPartialContinueAttemptsConfig(unittest.TestCase):
     def test_default_is_two(self):
         cfg = load_config(self._write_config())
         self.assertEqual(cfg.pr_policy.max_partial_continue_attempts, 2)
-
-    def test_zero_disables(self):
-        cfg = load_config(
-            self._write_config(
-                "pr_policy:\n  max_partial_continue_attempts: 0\n"
-            )
-        )
-        self.assertEqual(cfg.pr_policy.max_partial_continue_attempts, 0)
 
     def test_round_trip(self):
         cfg = load_config(

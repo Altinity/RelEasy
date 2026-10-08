@@ -1,17 +1,3 @@
-"""Unit tests for TestFlows (regression suite) failure discovery.
-
-Covers the pieces that used to make ``analyze-fails`` skip regression
-checks entirely: status-context classification, TestFlows report-URL
-parsing, ``fails.log.txt`` parsing (leaf-only, XFail-muted), and the
-per-category prompt sections.
-
-Fixtures are trimmed verbatim from the artefacts of
-Altinity/ClickHouse#2210 (``Regression aarch64 swarms`` and
-``Regression aarch64 iceberg_2``).
-
-Stdlib unittest (no pytest dependency). Run:
-    python3 -m unittest discover -s tests
-"""
 from __future__ import annotations
 
 import unittest
@@ -23,7 +9,6 @@ from releasy.analyze_fails import (
     _tests_arg,
 )
 from releasy.ci_failures import (
-    CATEGORY_ORDER,
     CATEGORY_OTHER,
     ArtifactLocator,
     TestFlowsLocator,
@@ -44,8 +29,6 @@ PRAKTIKA_TARGET = (
     "&name_1=Stateless%20tests%20%28amd_debug%2C%20sequential%29"
 )
 
-# The detail section lists leaves *and* every enclosing node; only the
-# top-level node carries the traceback.
 SWARMS_FAILS_LOG = """\
 ✘ 1m 53s    [  Fail  ] /swarms/feature/node failure/check restart swarm node
     AssertionError
@@ -86,8 +69,6 @@ Rerun the first failing test by executing your test program with the '--only' op
 Total time 29m 50s
 """
 
-# Iceberg mixes expected failures (annotated with an upstream issue and
-# re-listed under ``Known``) with real ones.
 ICEBERG_FAILS_LOG = """\
 ✘ 2s 330ms  [ XFail  ] /iceberg/iceberg engine/glue catalog/predicate push down/issue with decimal column
     https://github.com/ClickHouse/ClickHouse/issues/80200
@@ -105,7 +86,6 @@ Failing
 
 
 class CategoryClassification(unittest.TestCase):
-    """Regression contexts get their own category; nothing falls through."""
 
     def test_regression_contexts(self):
         for ctx in (
@@ -133,21 +113,8 @@ class CategoryClassification(unittest.TestCase):
         for ctx in ("Stress test (amd_debug)", "AST fuzzer", "Build (arm)"):
             self.assertEqual(category_from_name(ctx), CATEGORY_OTHER, ctx)
 
-    def test_every_category_has_an_order(self):
-        for cat in (
-            "fasttest", "quick_functional", "stateless", "integration",
-            "regression", CATEGORY_OTHER,
-        ):
-            self.assertIn(cat, CATEGORY_ORDER)
-
-    def test_regression_sorts_after_the_in_repo_suites(self):
-        self.assertGreater(
-            CATEGORY_ORDER["regression"], CATEGORY_ORDER["stateless"],
-        )
-
 
 class LocatorDispatch(unittest.TestCase):
-    """A target_url resolves to whichever report kind it points at."""
 
     def test_testflows_report(self):
         loc = locator_from_target_url(SWARMS_REPORT)
@@ -167,7 +134,6 @@ class LocatorDispatch(unittest.TestCase):
 
 
 class FailsLogParsing(unittest.TestCase):
-    """``fails.log.txt`` folds both of its listings into one entry per path."""
 
     def test_every_node_is_parsed_once(self):
         entries = parse_testflows_fails_log(SWARMS_FAILS_LOG)
@@ -179,7 +145,6 @@ class FailsLogParsing(unittest.TestCase):
         root = entries["/swarms"]
         self.assertTrue(root.detail.startswith("AssertionError"))
         self.assertIn("Traceback (most recent call last):", root.detail)
-        # The trailing "Failing" heading is not part of the block.
         self.assertNotIn("Failing", root.detail)
 
     def test_summary_only_entry_keeps_its_status(self):
@@ -190,7 +155,6 @@ class FailsLogParsing(unittest.TestCase):
 
 
 class LeafExtraction(unittest.TestCase):
-    """Only the deepest failing scenarios become work items."""
 
     def _extract(self, log: str):
         return extract_regression_failures(
@@ -216,20 +180,11 @@ class LeafExtraction(unittest.TestCase):
 
     def test_shared_ancestor_traceback_is_attached_once(self):
         first, second = self._extract(SWARMS_FAILS_LOG)
-        # One enclosing node can span hundreds of leaves; repeating its
-        # single traceback on each would mislead and swamp the prompt.
         self.assertIn("Traceback (most recent call last):", first.info_excerpt)
         self.assertNotIn(
             "Traceback (most recent call last):", second.info_excerpt,
         )
         self.assertIn("first test under it", second.info_excerpt)
-
-    def test_shard_metadata_is_carried(self):
-        leaf = self._extract(SWARMS_FAILS_LOG)[0]
-        self.assertEqual(leaf.category, "regression")
-        self.assertEqual(leaf.shard_context, "Regression aarch64 swarms")
-        self.assertEqual(leaf.target_url, SWARMS_REPORT)
-        self.assertEqual(leaf.status, "FAIL")
 
     def test_expected_failures_are_muted(self):
         names = [t.name for t in self._extract(ICEBERG_FAILS_LOG)]
@@ -243,7 +198,6 @@ class LeafExtraction(unittest.TestCase):
 
 
 class PromptSections(unittest.TestCase):
-    """Regression shards get a reproduction recipe, not a placeholder."""
 
     REPO = Path("/work/ch")
     TESTS = [

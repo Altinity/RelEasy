@@ -1,12 +1,3 @@
-"""Unit tests for keeping a resolution that trips ``settings_history``.
-
-Covers the downgrade decision in ``resolve_with_claude`` (push + warn vs
-discard), the warning rendering shared by every caller, and the config
-knob's round-trip.
-
-Stdlib unittest (no pytest dependency). Run:
-    python3 -m unittest discover -s tests
-"""
 from __future__ import annotations
 
 import unittest
@@ -32,8 +23,6 @@ def _ctx() -> ar.AIResolveContext:
 
 
 class _Stubs:
-    """Patch out everything ``resolve_with_claude`` does besides deciding."""
-
     def __init__(self, test, *, postcondition):
         self.test = test
         self.postcondition = postcondition
@@ -59,8 +48,6 @@ class _Stubs:
 
 
 class DowngradeDecision(unittest.TestCase):
-    """A persistent ``settings_history`` failure keeps the resolution."""
-
     FAILED = (False, "c" * 40, "25 unauthorized setting row(s)", "settings_history")
 
     def _resolve(self, *, warn_on_unfixed: bool, postcondition=None):
@@ -76,7 +63,6 @@ class DowngradeDecision(unittest.TestCase):
         self.assertEqual(result.new_head, "c" * 40)
         self.assertEqual(len(result.warnings), 1)
         self.assertIn("unauthorized setting", result.warnings[0])
-        # The correction budget was spent before giving up.
         self.assertIn("correction pass(es)", result.warnings[0])
 
     def test_discarded_when_knob_off(self):
@@ -86,7 +72,6 @@ class DowngradeDecision(unittest.TestCase):
         self.assertIn("unauthorized setting", result.error or "")
 
     def test_other_postconditions_still_fail(self):
-        # "claude didn't finish" failures are not downgradable.
         result = self._resolve(
             warn_on_unfixed=True,
             postcondition=(False, None, "unmerged paths after claude: a.cpp", None),
@@ -103,8 +88,6 @@ class DowngradeDecision(unittest.TestCase):
 
 
 class WarningRendering(unittest.TestCase):
-    """Warnings survive into a one-line bullet and a PR comment body."""
-
     def test_flatten_squashes_newlines(self):
         lines = ar.flatten_resolve_warnings(
             ["a b\n(still failing after 2 correction pass(es))", "", "  "]

@@ -1,10 +1,3 @@
-"""A port whose unit lost PRs in the graph is marked outdated.
-
-Regression for a `graph update` veto of two members of a tracked
-build_failed group: it was refused as "atomic", so neither the session
-nor the port followed the graph.
-"""
-
 from __future__ import annotations
 
 import tempfile
@@ -70,8 +63,6 @@ class MarkOutdatedUnits(unittest.TestCase):
 
 
 class AbsorbedSingleton(unittest.TestCase):
-    """A standalone port whose PR moved into a group is closed, not duplicated."""
-
     def prune(self, pr_state="open", on_hold=()):
         cfg = cfg_with(
             Path(tempfile.mkdtemp()), on_hold=list(on_hold),

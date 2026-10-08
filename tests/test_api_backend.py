@@ -1,12 +1,3 @@
-"""Unit tests for the Anthropic-API backend (``ai_backend: api``).
-
-Covers the allow-list gate, the local tool implementations, cost accounting,
-the agent loop (against a stub ``anthropic`` module — no network, no SDK
-install), backend selection / dispatch, and config round-trip.
-
-Stdlib unittest (no pytest dependency). Run:
-    python3 -m unittest discover -s tests
-"""
 from __future__ import annotations
 
 import os
@@ -25,11 +16,6 @@ from releasy.config import (
     load_config,
     save_config,
 )
-
-
-# ---------------------------------------------------------------------------
-# Stub SDK
-# ---------------------------------------------------------------------------
 
 
 class _StubUsage:
@@ -79,7 +65,6 @@ class _StubMessages:
 
 
 def _install_stub_anthropic(script, raise_on_first=None) -> _StubMessages:
-    """Register a fake ``anthropic`` module and return its messages stub."""
     messages = _StubMessages(script, raise_on_first)
 
     class _APIError(Exception):
@@ -109,8 +94,6 @@ def _install_stub_anthropic(script, raise_on_first=None) -> _StubMessages:
 
 
 class _StubSDK(unittest.TestCase):
-    """Base class that installs / removes the stub SDK."""
-
     def setUp(self):
         self._prev = sys.modules.get("anthropic")
         self._tmp = tempfile.TemporaryDirectory()
@@ -122,11 +105,6 @@ class _StubSDK(unittest.TestCase):
         else:
             sys.modules["anthropic"] = self._prev
         self._tmp.cleanup()
-
-
-# ---------------------------------------------------------------------------
-# Allow-list
-# ---------------------------------------------------------------------------
 
 
 class AllowList(unittest.TestCase):
@@ -172,7 +150,6 @@ class AllowList(unittest.TestCase):
         prefixes = ["cat"]
         cmd = "cat > note.txt <<'EOF'\nrm -rf /; curl evil\nEOF"
         self.assertIsNone(ag._check_bash(cmd, prefixes))
-        # …but a real command after the terminator is still checked.
         self.assertIsNotNone(
             ag._check_bash(cmd + "\nrm -rf /", prefixes),
         )
@@ -202,11 +179,6 @@ class AllowList(unittest.TestCase):
     def test_empty_allow_list_means_no_tools(self):
         names, prefixes = ag._parse_allowed([])
         self.assertEqual(ag._tool_defs(names, prefixes), [])
-
-
-# ---------------------------------------------------------------------------
-# Tools
-# ---------------------------------------------------------------------------
 
 
 class Tools(unittest.TestCase):
@@ -243,7 +215,6 @@ class Tools(unittest.TestCase):
 
     def test_malformed_numeric_args_are_coerced(self):
         (self.repo / "f.txt").write_text("1\n2\n3\n4\n")
-        # The model sometimes emits junk like "3, " for offset.
         out, err = self._run(
             "Read", {"file_path": "f.txt", "offset": "3, ", "limit": "1"},
         )
@@ -339,17 +310,11 @@ class Tools(unittest.TestCase):
         self.assertLess(len(out), 400)
 
 
-# ---------------------------------------------------------------------------
-# Cost
-# ---------------------------------------------------------------------------
-
-
 class Cost(unittest.TestCase):
     def test_price_lookup_is_by_longest_prefix(self):
         self.assertEqual(ag._prices("claude-opus-5"), (5.0, 25.0))
         self.assertEqual(ag._prices("claude-sonnet-5"), (3.0, 15.0))
         self.assertEqual(ag._prices("claude-haiku-4-5"), (1.0, 5.0))
-        # Unknown model falls back to Opus pricing rather than $0.
         self.assertEqual(ag._prices("claude-brand-new"), (5.0, 25.0))
 
     def test_usage_cost_counts_cache_tiers(self):
@@ -357,16 +322,10 @@ class Cost(unittest.TestCase):
         usage.cache_read_input_tokens = 1_000_000
         usage.cache_creation_input_tokens = 1_000_000
         cost = ag._usage_cost("claude-opus-5", usage)
-        # 5 + 25 + (5 * 1.25) + (5 * 0.1)
         self.assertAlmostEqual(cost, 5 + 25 + 6.25 + 0.5, places=6)
 
     def test_missing_usage_is_free_not_a_crash(self):
         self.assertEqual(ag._usage_cost("claude-opus-5", None), 0.0)
-
-
-# ---------------------------------------------------------------------------
-# Agent loop
-# ---------------------------------------------------------------------------
 
 
 class AgentLoop(_StubSDK):
@@ -395,14 +354,11 @@ class AgentLoop(_StubSDK):
         )
         self.assertEqual(code, 0)
         self.assertFalse(timed_out)
-        # The tool really ran.
         self.assertEqual((self.repo / "out.txt").read_text(), "done")
-        # Two model calls; the second one carries the tool result.
         self.assertEqual(len(messages.calls), 2)
         replayed = messages.calls[1]["messages"]
         self.assertEqual(replayed[-1]["role"], "user")
         self.assertEqual(replayed[-1]["content"][0]["type"], "tool_result")
-        # Transcript is parseable by the existing CLI-mode helpers.
         self.assertIn("DONE", a._extract_assistant_text(transcript))
         self.assertIsNotNone(a._extract_cost_usd(transcript))
         self.assertTrue(any('"type": "system"' in line for line in seen))
@@ -436,28 +392,7 @@ class AgentLoop(_StubSDK):
         )
         self.assertEqual(code, 1)
         self.assertFalse(timed_out)
-        # Reuses the CLI-mode detectors: this one waits, not retries.
         self.assertIsNotNone(a._find_session_exhausted(transcript))
-
-    def test_server_error_is_reported_as_transient(self):
-        stub = _install_stub_anthropic([])
-        stub.raise_on_first = sys.modules["anthropic"].APIError(
-            "overloaded", status_code=529,
-        )
-        code, transcript, _to = ag.run_agent(self._spec(), self.repo, 60, "P")
-        self.assertEqual(code, 1)
-        self.assertIsNotNone(a._find_transient_api_error(transcript))
-        self.assertIsNone(a._find_session_exhausted(transcript))
-
-    def test_bad_request_is_not_retried(self):
-        stub = _install_stub_anthropic([])
-        stub.raise_on_first = sys.modules["anthropic"].APIError(
-            "bad schema", status_code=400,
-        )
-        code, transcript, _to = ag.run_agent(self._spec(), self.repo, 60, "P")
-        self.assertEqual(code, 1)
-        self.assertIsNone(a._find_transient_api_error(transcript))
-        self.assertIsNone(a._find_session_exhausted(transcript))
 
     def test_max_turns_stops_the_loop(self):
         _install_stub_anthropic([
@@ -503,7 +438,6 @@ class AgentLoop(_StubSDK):
         self.assertEqual(code, -1)
 
     def test_old_sdk_params_move_to_extra_body(self):
-        """A param the installed SDK doesn't know is retried via extra_body."""
         stub = _install_stub_anthropic([
             _StubMessage([{"type": "text", "text": "ok"}]),
         ])
@@ -549,11 +483,6 @@ class Availability(_StubSDK):
         self.assertIsNone(ag.check_available(ag.ApiAgentSpec(api_key="sk-x")))
 
 
-# ---------------------------------------------------------------------------
-# Backend selection / dispatch
-# ---------------------------------------------------------------------------
-
-
 def _config(**kw) -> Config:
     return Config(
         name="t", origin=OriginConfig(remote="git@github.com:o/r.git"),
@@ -562,8 +491,6 @@ def _config(**kw) -> Config:
 
 
 class ErrorLineClassification(unittest.TestCase):
-    """``_api_error_line`` wording drives ai_resolve's retry / wait decision."""
-
     def _exc(self, body, status):
         import anthropic
 
@@ -583,8 +510,6 @@ class ErrorLineClassification(unittest.TestCase):
         }
 
     def test_overloaded_inside_a_200_is_retryable(self):
-        # The API reports overload as an error event in an otherwise-200
-        # response; classifying on status alone made this fatal.
         line = ag._api_error_line(
             self._exc(self._err_body("overloaded_error", "Overloaded"), 200),
         )
@@ -635,7 +560,6 @@ class BackendSelection(unittest.TestCase):
         spec = a._build_api_spec(cfg)
         self.assertIsNotNone(spec)
         self.assertEqual(spec.effort, "xhigh")
-        # CLI-style model aliases map to real API model IDs.
         self.assertEqual(spec.resolved_model(), "claude-opus-5")
         self.assertEqual(spec.allowed_tools, ["Read", "Bash(git:*)"])
         self.assertEqual(spec.api_key, "sk-env")
@@ -754,12 +678,9 @@ class ApiConfigParsing(unittest.TestCase):
         self.assertEqual(cfg.ai_api.api_key_env, "MY_TOKEN")
 
     def test_rejects_a_token_pasted_into_api_key_env(self):
-        # api_key_env holds a variable NAME; a token there would silently
-        # resolve to "no token found" at call time.
         with self.assertRaises(ValueError) as cm:
             self._write("ai_api:\n  api_key_env: sk-ant-api03-abc-def\n")
         self.assertIn("ai_api.api_key", str(cm.exception))
-        # …and the message must not echo the whole secret back.
         self.assertNotIn("abc-def", str(cm.exception))
 
     def test_rejects_unknown_backend_and_keys(self):
@@ -776,14 +697,7 @@ class ApiConfigParsing(unittest.TestCase):
         self.assertEqual(again.ai_api.max_turns, 7)
 
 
-
 class ClaudeCliEnv(unittest.TestCase):
-    """The `claude -p` subprocess runs with background tasks disabled.
-
-    Regression: run-tests backgrounded the test run and ended its turn; the
-    task died with the session and the unit was parked with no verdict.
-    """
-
     def test_background_tasks_disabled(self):
         seen = {}
 

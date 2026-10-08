@@ -1,8 +1,3 @@
-"""A group whose port PR is open picks up a member added later.
-
-Stdlib unittest (no pytest dependency). Run:
-    python3 -m unittest discover -s tests
-"""
 from __future__ import annotations
 
 import os
@@ -24,7 +19,6 @@ def _pr(n: int) -> PRInfo:
 
 
 class GroupBranchMissingMembers(unittest.TestCase):
-
     def _git(self, *args):
         return subprocess.run(
             ["git", *args], cwd=self.repo, check=True,
@@ -51,7 +45,6 @@ class GroupBranchMissingMembers(unittest.TestCase):
         self._git("-c", "commit.gpgsign=false", "commit", "--allow-empty",
                   "-q", "-m", "base")
         self.base = self._git("rev-parse", "HEAD")
-        # Port branch carrying PR 1 only.
         self._git("checkout", "-q", "-b", "port")
         self._git("-c", "commit.gpgsign=false", "commit", "--allow-empty",
                   "-q", "-m",

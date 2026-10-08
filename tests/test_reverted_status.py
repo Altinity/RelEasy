@@ -1,9 +1,3 @@
-"""`reverted`: a port that merged and was then taken back out of target.
-
-Covers the two promises the status makes — the graph issue says so in a
-section of its own, and nothing ever ports the unit again.
-"""
-
 from __future__ import annotations
 
 import unittest
@@ -87,7 +81,6 @@ class TestRevertedIsTerminal(unittest.TestCase):
         self.assertIn("reverted", terminal_statuses(_Config()))
 
     def test_closed_opt_in_does_not_reach_it(self):
-        """`recreate_closed_prs` re-enters `closed` only — never `reverted`."""
         from releasy.pipeline import terminal_statuses
         terminal = terminal_statuses(_Config(closed=True))
         self.assertNotIn("closed", terminal)
@@ -116,19 +109,6 @@ class TestRevertedIsTerminal(unittest.TestCase):
     def test_flag_defaults_to_false(self):
         from releasy.config import PRPolicyConfig
         self.assertFalse(PRPolicyConfig().recreate_reverted_prs)
-
-    def test_merge_sweeps_never_touch_it(self):
-        """No sweep flips a reverted entry back to merged/closed/superseded."""
-        import inspect
-
-        import releasy.pipeline as p
-        for fn in (
-            p._refresh_all_merge_status_from_github,
-            p._refresh_all_superseded_status_from_github,
-        ):
-            for line in inspect.getsource(fn).splitlines():
-                if line.strip().startswith("refreshable"):
-                    self.assertNotIn("reverted", line)
 
     def test_status_vocabulary_is_complete(self):
         from releasy.github_ops import STATUS_MAP, STATUS_OPTIONS

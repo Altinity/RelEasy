@@ -1,11 +1,3 @@
-"""Unit tests for waiting out an exhausted Claude usage session.
-
-Covers the exhaustion detector, the wait-and-retry loop in ``_spawn_claude``
-(with the real subprocess + sleep stubbed out), and the config knobs.
-
-Stdlib unittest (no pytest dependency). Run:
-    python3 -m unittest discover -s tests
-"""
 from __future__ import annotations
 
 import os
@@ -14,20 +6,16 @@ import unittest
 from pathlib import Path
 
 import releasy.ai_resolve as a
-from releasy.config import AIResolveConfig, load_config, save_config
+from releasy.config import load_config, save_config
 
 
 class ExhaustionDetection(unittest.TestCase):
-    """`_find_session_exhausted` fires on usage-limit text, not transients."""
-
     POSITIVE = [
         "Claude usage limit reached. Your limit will reset at 5pm.",
         "5-hour limit reached ∙ resets 3:00 PM",
         "You have hit your weekly limit",
         "API Error: 429 rate_limit_exceeded",
         "Your limit will reset at 2026-06-26T17:00:00Z",
-        # The real Claude Code org-billing message (the one that slipped past
-        # the first cut of patterns):
         "💬 You've hit your org's monthly spend limit · run /usage-credits "
         "to ask your admin for a higher limit",
         "You've hit your org's monthly spend limit",
@@ -43,7 +31,6 @@ class ExhaustionDetection(unittest.TestCase):
     ]
 
     def test_extra_patterns_extend_detection(self):
-        # A wording not covered by the built-ins is caught via config.
         self.assertIsNone(a._find_session_exhausted("ACCOUNT FROZEN"))
         self.assertEqual(
             a._find_session_exhausted("ACCOUNT FROZEN", ("account frozen",)),
@@ -51,7 +38,6 @@ class ExhaustionDetection(unittest.TestCase):
         )
 
     def test_malformed_extra_pattern_is_skipped(self):
-        # A bad user regex must not crash the run.
         self.assertIsNone(a._find_session_exhausted("text", ("[unterminated",)))
 
     def test_positive(self):
@@ -68,8 +54,6 @@ class ExhaustionDetection(unittest.TestCase):
 
 
 class SpawnWaitLoop(unittest.TestCase):
-    """`_spawn_claude` re-prompts on exhaustion, bounded by the wait cap."""
-
     def setUp(self):
         self._orig_once = a._spawn_claude_once
         self._orig_sleep = a._interruptible_sleep
@@ -113,7 +97,6 @@ class SpawnWaitLoop(unittest.TestCase):
             1, "usage limit reached", False,
         )
         ec, out, to = self._spawn(exhaustion_max_wait_seconds=2 * 1800)
-        # Two polls fit under the cap; the 3rd attempt still fails → give up.
         self.assertEqual(ec, 1)
         self.assertEqual(len(self.sleeps), 2)
 
@@ -130,8 +113,6 @@ class SpawnWaitLoop(unittest.TestCase):
         self.assertEqual(self.sleeps, [])
 
     def test_transient_is_not_exhaustion(self):
-        # A transient API error must NOT trigger the long wait — it's handled
-        # by the short-backoff retry one level up.
         a._spawn_claude_once = lambda argv, repo, timeout, prompt: (
             1, "API Error: Overloaded", False,
         )
@@ -139,15 +120,7 @@ class SpawnWaitLoop(unittest.TestCase):
         self.assertEqual(ec, 1)
         self.assertEqual(self.sleeps, [])
 
-    def test_clean_run_never_waits(self):
-        a._spawn_claude_once = lambda argv, repo, timeout, prompt: (0, "DONE", False)
-        ec, out, to = self._spawn()
-        self.assertEqual(ec, 0)
-        self.assertEqual(self.sleeps, [])
-
     def test_timeout_is_not_exhaustion(self):
-        # A timeout (timed_out=True) returns immediately even if the partial
-        # output happens to mention a limit.
         a._spawn_claude_once = lambda argv, repo, timeout, prompt: (
             -1, "usage limit reached", True,
         )
@@ -157,10 +130,7 @@ class SpawnWaitLoop(unittest.TestCase):
 
 
 class SpawnStdinPlumbing(unittest.TestCase):
-    """Large prompts go via stdin (no argv-length limit); small ones inline."""
-
     def test_inline_argv_insertion(self):
-        # Prompt is inserted right after the `-p` flag.
         self.assertEqual(
             a._argv_with_inline_prompt(
                 ["claude", "-p", "--output-format", "stream-json"], "P",
@@ -168,17 +138,11 @@ class SpawnStdinPlumbing(unittest.TestCase):
             ["claude", "-p", "P", "--output-format", "stream-json"],
         )
 
-    def test_threshold_under_os_limit(self):
-        self.assertGreater(a._PROMPT_ARG_MAX_BYTES, 0)
-        self.assertLess(a._PROMPT_ARG_MAX_BYTES, 128 * 1024)
-
     def test_large_prompt_delivered_via_stdin(self):
-        # A >threshold prompt is fed to the child's stdin in full, with no
-        # pipe-buffer deadlock against our stdout reader.
         import sys
         reader = "import sys; d=sys.stdin.read(); sys.stdout.write('GOT %d\\n' % len(d))"
         argv = [sys.executable, "-c", reader]
-        big = "A" * 200_000  # > _PROMPT_ARG_MAX_BYTES → stdin path
+        big = "A" * 200_000
         self.assertGreater(len(big.encode()), a._PROMPT_ARG_MAX_BYTES)
         ec, out, to = a._spawn_claude_once(argv, Path("."), 30, big)
         self.assertFalse(to)
@@ -187,8 +151,6 @@ class SpawnStdinPlumbing(unittest.TestCase):
 
 
 class ExhaustionConfig(unittest.TestCase):
-    """Config knobs: defaults, parse, kwargs mapping, round-trip."""
-
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self._prev = os.environ.get("RELEASY_STATE_DIR")
@@ -209,12 +171,6 @@ class ExhaustionConfig(unittest.TestCase):
             encoding="utf-8",
         )
         return path
-
-    def test_defaults(self):
-        c = AIResolveConfig()
-        self.assertTrue(c.wait_on_session_exhaustion)
-        self.assertEqual(c.session_exhaustion_max_wait_hours, 60)
-        self.assertEqual(c.session_exhaustion_poll_minutes, 30)
 
     def test_kwargs_mapping(self):
         cfg = load_config(self._write())

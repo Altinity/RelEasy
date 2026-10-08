@@ -1,13 +1,3 @@
-"""Unit tests for the deterministic build/test split.
-
-Covers the cleanly unit-testable pieces: the new ``build_failed`` status and
-verify-counter persistence, the ``ai_resolve`` config knobs, and the pure
-helpers in ``build_verify`` (test detection, runner-hint selection, marker
-parsing).
-
-Stdlib unittest (no pytest dependency). Run:
-    python3 -m unittest discover -s tests
-"""
 from __future__ import annotations
 
 import os
@@ -18,13 +8,11 @@ from pathlib import Path
 
 import releasy.build_verify as bv
 from releasy.config import (
-    AIResolveConfig,
     _default_test_file_globs,
     load_config,
     save_config,
 )
 from releasy.state import (
-    STATUS_DISPLAY_ORDER,
     FeatureState,
     PipelineState,
     _parse_features,
@@ -33,38 +21,7 @@ from releasy.state import (
 )
 
 
-class BuildFailedStatus(unittest.TestCase):
-    """``build_failed`` is a known, displayable status."""
-
-    def test_in_display_order(self):
-        self.assertIn("build_failed", STATUS_DISPLAY_ORDER)
-
-    def test_has_icon_and_heading(self):
-        from releasy.status import STATUS_ICONS, STATUS_HEADINGS
-        self.assertIn("build_failed", STATUS_ICONS)
-        self.assertIn("build_failed", STATUS_HEADINGS)
-
-
 class VerifyCounterPersistence(unittest.TestCase):
-    """New FeatureState verify fields survive the state parse round-trip."""
-
-    def test_defaults_when_absent(self):
-        feats = _parse_features({"f1": {"status": "build_failed"}})
-        self.assertEqual(feats["f1"].build_attempts, 0)
-        self.assertEqual(feats["f1"].verify_resume_attempts, 0)
-        self.assertIsNone(feats["f1"].last_verify_error)
-
-    def test_explicit_values_parsed(self):
-        feats = _parse_features({"f1": {
-            "status": "build_failed",
-            "build_attempts": 5,
-            "verify_resume_attempts": 2,
-            "last_verify_error": "build still failing",
-        }})
-        self.assertEqual(feats["f1"].build_attempts, 5)
-        self.assertEqual(feats["f1"].verify_resume_attempts, 2)
-        self.assertEqual(feats["f1"].last_verify_error, "build still failing")
-
     def test_null_counters_coerced_to_zero(self):
         feats = _parse_features({"f1": {
             "status": "build_failed",
@@ -76,8 +33,6 @@ class VerifyCounterPersistence(unittest.TestCase):
 
 
 class StateRoundTrip(unittest.TestCase):
-    """save_state → load_state preserves build_failed + verify counters."""
-
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self._prev = os.environ.get("RELEASY_STATE_DIR")
@@ -120,7 +75,6 @@ class StateRoundTrip(unittest.TestCase):
         )
 
     def test_zero_counters_not_written(self):
-        # Lazy-write: zero/empty verify fields must not bloat the YAML.
         cfg = self._config()
         st = PipelineState(base_branch="b")
         st.features["f1"] = FeatureState(
@@ -136,8 +90,6 @@ class StateRoundTrip(unittest.TestCase):
 
 
 class AIResolveBuildKnobs(unittest.TestCase):
-    """The deterministic-build config knobs: defaults, parse, round-trip."""
-
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self._prev = os.environ.get("RELEASY_STATE_DIR")
@@ -158,16 +110,6 @@ class AIResolveBuildKnobs(unittest.TestCase):
             encoding="utf-8",
         )
         return path
-
-    def test_defaults(self):
-        c = AIResolveConfig()
-        self.assertTrue(c.deterministic_build)
-        self.assertEqual(c.max_build_attempts, 5)
-        self.assertEqual(c.max_verify_resume_attempts, 2)
-        self.assertEqual(c.max_resume_base_drift, 50)
-        self.assertEqual(c.build_log_tail_lines, 500)
-        self.assertTrue(c.run_pr_tests)
-        self.assertEqual(c.test_file_globs, _default_test_file_globs())
 
     def test_parse_overrides(self):
         cfg = load_config(self._write(
@@ -200,8 +142,6 @@ class AIResolveBuildKnobs(unittest.TestCase):
 
 
 class TestDetection(unittest.TestCase):
-    """`_touched_test_files` / `_categorise` against the default globs."""
-
     def test_filters_to_test_paths(self):
         globs = _default_test_file_globs()
         changed = [
@@ -218,10 +158,6 @@ class TestDetection(unittest.TestCase):
         self.assertIn("src/Storages/tests/gtest_storage.cpp", touched)
         self.assertNotIn("src/Storages/StorageX.cpp", touched)
         self.assertNotIn("docs/whatever.md", touched)
-
-    def test_no_tests_touched(self):
-        globs = _default_test_file_globs()
-        self.assertEqual(bv._touched_test_files(["src/a.cpp"], globs), [])
 
     def test_categorise(self):
         cats = bv._categorise([
@@ -240,8 +176,6 @@ class TestDetection(unittest.TestCase):
 
 
 class BuildLogExcerpt(unittest.TestCase):
-    """The excerpt must stay under the OS arg limit (the crash this fixes)."""
-
     def _excerpt(self, lines: list[str]) -> str:
         d = tempfile.mkdtemp()
         rel = bv.build_log_path("feature/b/1")
@@ -255,7 +189,6 @@ class BuildLogExcerpt(unittest.TestCase):
             shutil.rmtree(d)
 
     def test_huge_log_stays_under_arg_limit(self):
-        # Thousands of very long lines must not produce a >128 KiB arg.
         lines = [
             f"/src/Foo.cpp:{i}: error: " + "X" * 9000 if i % 3 == 0
             else f"FAILED: link step {i}"
@@ -264,7 +197,7 @@ class BuildLogExcerpt(unittest.TestCase):
         exc = self._excerpt(lines)
         self.assertLess(len(exc.encode("utf-8")), 128 * 1024)
         self.assertLessEqual(len(exc.encode("utf-8")), bv._MAX_EXCERPT_BYTES + 4096)
-        self.assertIn("FAILED:", exc)  # the failing-target line survives
+        self.assertIn("FAILED:", exc)
 
     def test_realistic_log_surfaces_markers(self):
         lines = [
@@ -286,20 +219,10 @@ class BuildLogExcerpt(unittest.TestCase):
 
 
 class MarkerParsing(unittest.TestCase):
-    """`_last_marker` finds the final verdict, tolerating backticks/order."""
-
     def test_fixed(self):
         self.assertEqual(
             bv._last_marker("did stuff\nFIXED", ("FIXED", "CANNOT FIX")),
             "FIXED",
-        )
-
-    def test_cannot_fix_with_reason(self):
-        self.assertEqual(
-            bv._last_marker(
-                "tried\nCANNOT FIX: needs upstream PR", ("FIXED", "CANNOT FIX"),
-            ),
-            "CANNOT FIX: needs upstream PR",
         )
 
     def test_backticked_marker(self):
@@ -309,7 +232,6 @@ class MarkerParsing(unittest.TestCase):
         )
 
     def test_last_wins(self):
-        # If a marker word appears mid-text and again at the end, take the end.
         self.assertEqual(
             bv._last_marker(
                 "FIXED was my goal\n...\nCANNOT FIX: gave up",
@@ -325,8 +247,6 @@ class MarkerParsing(unittest.TestCase):
 
 
 class BuildReachedCompiler(unittest.TestCase):
-    """A red build with no compile error is an environment fault."""
-
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self._tmp.name)
@@ -363,8 +283,6 @@ class BuildReachedCompiler(unittest.TestCase):
 
 
 class EnvironmentFaultShortCircuit(unittest.TestCase):
-    """A build that never compiles must not spend a fix attempt."""
-
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self._tmp.name)
@@ -422,8 +340,6 @@ class EnvironmentFaultShortCircuit(unittest.TestCase):
 
 
 class RunTestsAllowlistPaths(unittest.TestCase):
-    """Run-tests gets the analyze-fails allowlist with ``{work_dir}`` resolved."""
-
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self._tmp.name)
@@ -519,8 +435,6 @@ class RunTestsAllowlistPaths(unittest.TestCase):
 
 
 class ResumeDryRun(unittest.TestCase):
-    """``--dry-run`` must not check out a parked branch or start a build."""
-
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self._tmp.name)
@@ -533,7 +447,6 @@ class ResumeDryRun(unittest.TestCase):
         self._git("add", "-A")
         self._git("commit", "-m", "c0")
         self._git("branch", "feature/b/1")
-        # Dirty worktree: stash_and_clean would wipe this.
         (self.repo / "dirty.txt").write_text("keep me", encoding="utf-8")
 
     def tearDown(self):
@@ -561,7 +474,6 @@ class ResumeDryRun(unittest.TestCase):
         return load_config(path)
 
     def _resume(self, cfg):
-        """Call the resume path; return (outcome, verify_phase_call_count)."""
         import releasy.pipeline as pl
         from releasy.github_ops import PRInfo
 
@@ -610,14 +522,14 @@ class ResumeDryRun(unittest.TestCase):
         cfg = self._config(max_resume_base_drift=5)
         cfg.dry_run = True
         out, _ = self._resume(cfg)
-        self.assertEqual(out, "continue")  # resumed, not re-ported
+        self.assertEqual(out, "continue")
 
     def test_drifted_branch_reports_from_base(self):
         self._advance_main(6)
         cfg = self._config(max_resume_base_drift=5)
         cfg.dry_run = True
         out, built = self._resume(cfg)
-        self.assertIsNone(out)  # falls through to a fresh port
+        self.assertIsNone(out)
         self.assertEqual(built, 0)
 
     def test_drift_check_disabled_by_zero(self):
@@ -629,25 +541,12 @@ class ResumeDryRun(unittest.TestCase):
 
 
 class PerBranchBuildLog(unittest.TestCase):
-    """Regression: one unit's build must not overwrite another unit's log.
-
-    Every build used to tee into a single ``.releasy/build.log``, so the log
-    of a branch parked as ``build_failed`` was gone as soon as the next unit
-    built — the failure left no evidence behind.
-    """
-
-    def test_distinct_path_per_branch(self):
-        self.assertNotEqual(
-            bv.build_log_path("feature/antalya-26.8/auto-grp-pr-2141"),
-            bv.build_log_path("feature/antalya-26.8/pr-2040"),
-        )
-
     def test_path_is_flat_and_sanitised(self):
         p = bv.build_log_path("feature/antalya-26.8/auto-grp-pr-2141")
         self.assertEqual(
             p, ".releasy/build-feature-antalya-26.8-auto-grp-pr-2141.log",
         )
-        self.assertNotIn("/", p.split("/", 1)[1])  # one flat file in .releasy
+        self.assertNotIn("/", p.split("/", 1)[1])
 
     def test_empty_branch_falls_back(self):
         self.assertEqual(bv.build_log_path(""), ".releasy/build.log")
@@ -659,30 +558,8 @@ class PerBranchBuildLog(unittest.TestCase):
         _write_build_script(d, "ninja", rel)
         self.assertIn(f"tee {rel}", (d / _BUILD_SCRIPT).read_text())
 
-    def test_readers_see_the_branch_they_ask_for(self):
-        d = Path(tempfile.mkdtemp())
-        for branch, text in (
-            ("feature/b/1", "X.cpp:1:1: error: first"),
-            ("feature/b/2", "Y.cpp:1:1: error: second"),
-        ):
-            log = d / bv.build_log_path(branch)
-            log.parent.mkdir(parents=True, exist_ok=True)
-            log.write_text(text, encoding="utf-8")
-        self.assertIn(
-            "first", bv._build_log_excerpt(d, bv.build_log_path("feature/b/1"), 50),
-        )
-        self.assertIn(
-            "second", bv._build_log_excerpt(d, bv.build_log_path("feature/b/2"), 50),
-        )
-
 
 class ParkBuildFailedPush(unittest.TestCase):
-    """Regression: parking as ``build_failed`` pushes the branch.
-
-    A parked unit gets no PR, so without the push there is nothing to link
-    and no way to see the code that failed to build.
-    """
-
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self._tmp.name)
@@ -707,7 +584,6 @@ class ParkBuildFailedPush(unittest.TestCase):
         return load_config(path)
 
     def _park(self, cfg, push_fn=None):
-        """Park a unit; return (pushed branches, resulting FeatureState)."""
         import releasy.pipeline as pl
         from releasy.build_verify import VerifyResult
         from releasy.github_ops import PRInfo

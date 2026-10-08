@@ -1,5 +1,3 @@
-"""Tests for the stateless cherry-pick PR-body composition."""
-
 from __future__ import annotations
 
 import unittest
@@ -40,7 +38,6 @@ class CiOptionsSectionTest(unittest.TestCase):
         section = st._ci_options_section(TARGET_TEMPLATE)
         self.assertTrue(section.startswith("### CI/CD Options"))
         self.assertIn("<!---ci_exclude_tsan--> All with TSAN", section)
-        # The changelog heading above it is not swept in.
         self.assertNotIn("Changelog category", section)
 
     def test_falls_back_to_default_block(self):
@@ -79,8 +76,6 @@ class PrBodyTest(unittest.TestCase):
         self.assertTrue(out.startswith(f"Cherry-picked from {body}."))
         self.assertIn("by @alice).", out)
         self.assertIn("### CI/CD Options", out)
-        # The raw upstream body's own "- [ ] Fast test" (no HTML marker) is
-        # not pasted in; only the target template's CI section is.
         self.assertIn("<!---ci_exclude_fast--> Fast test", out)
 
     def test_non_pr_source_has_provenance_and_ci_only(self):

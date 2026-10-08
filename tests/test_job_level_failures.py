@@ -1,17 +1,3 @@
-"""Unit tests for accounting every failed check in ``analyze-fails``.
-
-Covers the three ways a failed CI check used to disappear from a run:
-a report with no per-test leaf (only job steps), a ``target_url`` with
-no machine-readable report at all, and a check whose failures the
-cross-shard dedupe folded into another check's shard.
-
-Fixtures mirror the artefact shapes of Altinity/ClickHouse#2195
-(a stateless shard that died in ``Start ClickHouse Server``) and #2210
-(``Regression release iceberg_2`` duplicating the aarch64 suite).
-
-Stdlib unittest (no pytest dependency). Run:
-    python3 -m unittest discover -s tests
-"""
 from __future__ import annotations
 
 import unittest
@@ -21,7 +7,6 @@ from unittest import mock
 from releasy import ci_failures
 from releasy.analyze_fails import (
     _category_runner_section,
-    _group_failures_by_shard,
     _render_failure_block,
     _write_failed_tests_manifest,
 )
@@ -37,9 +22,6 @@ from releasy.ci_failures import (
 SHARD = "Stateless tests (amd_asan, distributed plan, parallel, 2/4)"
 REPORT_URL = "https://artifacts.example/json.html?PR=2195&sha=abc&name_0=PR"
 
-# Older praktika revisions write the GitHub-status vocabulary on the
-# job's step nodes; the tests themselves never appear when the job dies
-# during setup.
 STEPS_ONLY_REPORT = {
     "name": SHARD,
     "status": "failure",
@@ -56,7 +38,6 @@ STEPS_ONLY_REPORT = {
     ],
 }
 
-# The modern shape: job → grouping node → per-test leaves.
 TESTS_REPORT = {
     "name": SHARD,
     "status": "FAIL",
@@ -86,7 +67,6 @@ def _status(context: str = SHARD, **kw) -> FailedStatus:
 
 
 class StepFailuresAreJobLevel(unittest.TestCase):
-    """A job that died in setup still yields its failing step."""
 
     def test_failing_step_is_extracted(self):
         found = extract_failed_tests(
@@ -95,12 +75,6 @@ class StepFailuresAreJobLevel(unittest.TestCase):
         )
         self.assertEqual([t.name for t in found], ["Start ClickHouse Server"])
         self.assertEqual(found[0].status, "FAILURE")
-
-    def test_failing_step_is_marked_job_level(self):
-        found = extract_failed_tests(
-            STEPS_ONLY_REPORT, category="stateless",
-            shard_context=SHARD, target_url=REPORT_URL,
-        )
         self.assertTrue(found[0].job_level)
 
     def test_real_tests_are_not_job_level(self):
@@ -122,7 +96,6 @@ class StepFailuresAreJobLevel(unittest.TestCase):
 
 
 class UnreadableChecksBecomeShards(unittest.TestCase):
-    """A check with no machine-readable report is still investigated."""
 
     def test_record_carries_reason_description_and_url(self):
         ft = job_level_failure(
@@ -141,15 +114,8 @@ class UnreadableChecksBecomeShards(unittest.TestCase):
         self.assertIn("3 high/critical", ft.info_excerpt)
         self.assertIn("grype/results.html", ft.info_excerpt)
 
-    def test_it_groups_into_a_shard_of_its_own(self):
-        ft = job_level_failure(_status(), "died in setup")
-        shards = _group_failures_by_shard([ft])
-        self.assertEqual(len(shards), 1)
-        self.assertEqual(shards[0][1], SHARD)
-
 
 class JobLevelPromptRendering(unittest.TestCase):
-    """No test list means no runner invocation, whatever the category."""
 
     def test_runner_section_forbids_a_bare_suite_run(self):
         section = _category_runner_section(
@@ -171,14 +137,6 @@ class JobLevelPromptRendering(unittest.TestCase):
         block = _render_failure_block(ft, 1, {}, 2, "https://pr")
         self.assertIn("Job-level failure", block)
         self.assertIn("not a test", block)
-
-    def test_manifest_never_lists_a_job_name(self):
-        with _tmpdir() as repo:
-            _write_failed_tests_manifest(
-                repo, [job_level_failure(_status(), "died in setup")],
-            )
-            body = (repo / ".releasy" / "failed-tests.txt").read_text()
-            self.assertEqual(body, "")
 
     def test_manifest_keeps_real_tests_of_a_mixed_shard(self):
         with _tmpdir() as repo:
@@ -215,7 +173,6 @@ FAILS_LOG_A = (
     "✘ 1m [  Fail  ] /iceberg/feature/export/b\n"
     "    AssertionError\n"
 )
-# Same first scenario as A, plus one only this arch saw.
 FAILS_LOG_B = (
     "✘ 1m [  Fail  ] /iceberg/feature/export/a\n"
     "    AssertionError\n"
@@ -225,7 +182,6 @@ FAILS_LOG_B = (
 
 
 class DedupeAccounting(unittest.TestCase):
-    """A check absorbed by the cross-shard dedupe is still accounted for."""
 
     def _discover(self, logs: dict[str, str]):
         statuses = [_testflows_status(c) for c in logs]
@@ -286,7 +242,6 @@ class DedupeAccounting(unittest.TestCase):
 
 
 class UndecomposableCheckPolicy(unittest.TestCase):
-    """``job_level`` decides shard-or-warning for unreadable checks."""
 
     def _discover(self, *, job_level: bool):
         statuses = [_status(

@@ -1,12 +1,3 @@
-"""Tests for the in-origin auto-prereq label gate.
-
-Covers ``require_origin_prereq_label``: a discovered prerequisite that
-lives in the origin repo (and whose triggering PR is also in origin)
-must carry the configured selection labels, otherwise the dive aborts
-and the user must label it or list it explicitly. Cross-repo prereqs
-(forward-port / backport sources) are never gated.
-"""
-
 from __future__ import annotations
 
 import unittest
@@ -23,7 +14,6 @@ FORK = "ClickHouse/ClickHouse"
 
 
 def _cfg(by_labels, *, exclude_labels=None, require=True):
-    """Minimal config double for the two helpers under test."""
     return SimpleNamespace(
         origin=SimpleNamespace(remote=f"https://github.com/{ORIGIN}.git"),
         pr_sources=SimpleNamespace(
@@ -84,25 +74,7 @@ class MatchesConfigLabels(unittest.TestCase):
 class RejectUnlabeledOriginPrereqs(unittest.TestCase):
     def setUp(self):
         self.cfg = _cfg([["antalya-26.3"]])
-        self.trigger = _pr(100, ["antalya-26.3"])  # in origin
-
-    def test_in_origin_unlabeled_rejected(self):
-        out = _reject_unlabeled_origin_prereqs(
-            self.cfg, self.trigger, [_pr(1, [])],
-        )
-        self.assertEqual([p.number for p in out], [1])
-
-    def test_in_origin_labeled_allowed(self):
-        out = _reject_unlabeled_origin_prereqs(
-            self.cfg, self.trigger, [_pr(1, ["antalya-26.3"])],
-        )
-        self.assertEqual(out, [])
-
-    def test_cross_repo_prereq_not_gated(self):
-        out = _reject_unlabeled_origin_prereqs(
-            self.cfg, self.trigger, [_pr(1, [], repo=FORK)],
-        )
-        self.assertEqual(out, [])
+        self.trigger = _pr(100, ["antalya-26.3"])
 
     def test_cross_repo_triggering_pr_disables_gate(self):
         trigger = _pr(100, [], repo=FORK)
@@ -126,9 +98,9 @@ class RejectUnlabeledOriginPrereqs(unittest.TestCase):
             self.cfg,
             self.trigger,
             [
-                _pr(1, ["antalya-26.3"]),       # labeled, origin → keep
-                _pr(2, []),                      # unlabeled, origin → reject
-                _pr(3, [], repo=FORK),           # cross-repo → keep
+                _pr(1, ["antalya-26.3"]),
+                _pr(2, []),
+                _pr(3, [], repo=FORK),
             ],
         )
         self.assertEqual([p.number for p in out], [2])

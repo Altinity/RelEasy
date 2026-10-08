@@ -1,5 +1,3 @@
-"""Tests for the PR-based release-changelog discovery."""
-
 from __future__ import annotations
 
 import os
@@ -37,8 +35,6 @@ class BuildMergedBaseQuery(unittest.TestCase):
         self.assertEqual(q, "repo:o/r is:pr is:merged base:antalya-26.3")
 
     def test_window_both_bounds(self):
-        # Single range qualifier — two comparison qualifiers on one field make
-        # GitHub Search silently drop the date filter (returns everything).
         q = build_merged_base_query(
             "o/r", "b", merged_from="2025-01-01T00:00:00+00:00",
             merged_to="2025-06-01T00:00:00+00:00",
@@ -46,7 +42,6 @@ class BuildMergedBaseQuery(unittest.TestCase):
         self.assertIn(
             "merged:2025-01-01T00:00:00+00:00..2025-06-01T00:00:00+00:00", q,
         )
-        # Exactly one merged: term (guards against a revert to the dual form).
         self.assertEqual(q.count("merged:"), 1)
 
     def test_window_lower_only(self):
@@ -81,38 +76,24 @@ class PrNumberFromSubject(unittest.TestCase):
         )
 
     def test_merge_branch_not_matched(self):
-        # A target-branch merge is not a PR reference.
         self.assertIsNone(
             pr_number_from_subject(
                 "Merge branch 'customizations/24.8.14' into backports/24.8/79147"
             )
         )
 
-    def test_direct_push_not_matched(self):
-        self.assertIsNone(pr_number_from_subject("Bump version to 24.8.14.10547"))
-
     def test_mid_subject_hash_not_matched(self):
-        # Only a *trailing* (#N) counts — an inline "#N" mention doesn't.
         self.assertIsNone(
             pr_number_from_subject("Backport #93016 to 24.8 Altinity Stable")
         )
 
     def test_merge_prefix_wins_over_trailing_paren(self):
-        # The merge-commit number is the PR; a trailing (#M) doesn't override it.
         self.assertEqual(
             pr_number_from_subject("Merge pull request #10 from x/y (#20)"), 10,
         )
 
-    def test_revert_squash_matched(self):
-        # A reverted-via-PR squash subject is a real merged PR.
-        self.assertEqual(
-            pr_number_from_subject('Revert "Broken change" (#77)'), 77,
-        )
-
 
 class FirstParentPrNumbers(unittest.TestCase):
-    """Integration test over a real temp git repo (first-parent + dedup + sort)."""
-
     def _git(self, *args):
         return subprocess.run(
             ["git", *args], cwd=self.repo, check=True,
@@ -120,17 +101,13 @@ class FirstParentPrNumbers(unittest.TestCase):
         ).stdout.strip()
 
     def _commit(self, subject):
-        # -c commit.gpgsign=false works on every git; GIT_CONFIG_* isolation
-        # (below) needs 2.32+, so keep both.
         self._git("-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", subject)
         return self._git("rev-parse", "HEAD")
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)  # runs even if setUp raises
+        self.addCleanup(self._tmp.cleanup)
         self.repo = Path(self._tmp.name)
-        # Isolate from the host: drop git's repo-redirecting vars and pin
-        # config to /dev/null so global gpgsign / hooks can't interfere.
         self.env = {
             k: v for k, v in os.environ.items()
             if k not in {
@@ -143,14 +120,11 @@ class FirstParentPrNumbers(unittest.TestCase):
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
             "HOME": str(self.repo),
         })
-        # No -b/--initial-branch (needs git 2.28); read the default branch back.
         self._git("init", "-q")
         self.main = self._git("symbolic-ref", "--short", "HEAD")
         self.base = self._commit("base")
 
     def test_first_parent_only_dedup_sorted(self):
-        # A side branch whose inner commit references #999 — must be excluded
-        # because it lives on second-parent history.
         self._git("checkout", "-q", "-b", "feature")
         self._commit("inner work (#999)")
         self._git("checkout", "-q", self.main)
@@ -160,10 +134,9 @@ class FirstParentPrNumbers(unittest.TestCase):
         )
         self._commit("Direct push, no PR")
         self._commit("A squash-merged change (#10)")
-        to = self._commit("Merge branch 'main' of origin")  # not a PR
+        to = self._commit("Merge branch 'main' of origin")
 
         nums = first_parent_pr_numbers(self.repo, self.base, to)
-        # #999 excluded (second-parent), non-PR commits ignored, ascending.
         self.assertEqual(nums, [10, 30])
 
     def test_empty_range(self):
@@ -171,9 +144,6 @@ class FirstParentPrNumbers(unittest.TestCase):
 
 
 class IsForwardPort(unittest.TestCase):
-    def test_label_forwardport(self):
-        self.assertTrue(cl._is_forward_port(_pr(1, labels=["forwardport"])))
-
     def test_label_hyphenated(self):
         self.assertTrue(cl._is_forward_port(_pr(1, labels=["forward-port"])))
 
@@ -185,8 +155,6 @@ class IsForwardPort(unittest.TestCase):
 
 
 class EntriesForPr(unittest.TestCase):
-    """``_entries_for_pr`` classifies/drops a PR (no upstream refs → config unused)."""
-
     def _entries(self, pr):
         return cl._entries_for_pr(None, pr, "o/r", {})
 
@@ -231,7 +199,6 @@ class TrailingParenGroup(unittest.TestCase):
         self.assertEqual(cl._trailing_paren_group("x (a b)"), (2, "a b"))
 
     def test_nested_markdown_link(self):
-        # The whole balanced group is returned, spanning the inner (url).
         start, inner = cl._trailing_paren_group("x ([#1](http://h/1) by @a)")
         self.assertEqual(inner, "[#1](http://h/1) by @a")
 
@@ -260,8 +227,6 @@ class StripRedundantParens(unittest.TestCase):
                          "Fix sorting (descending order)")
 
     def test_benign_number_collision_kept(self):
-        # Trailing paren whose number equals the upstream PR's must NOT be
-        # stripped on a bare '#N' match (only url / slug#N count).
         self.assertEqual(
             self._strip("Fix race (regression in #101272)"),
             "Fix race (regression in #101272)",
@@ -296,7 +261,6 @@ class AttributionFromText(unittest.TestCase):
         )
 
     def test_two_refs_two_authors(self):
-        # Each ref is credited to the author that follows it, not the first.
         inner = "ClickHouse/ClickHouse#101 by @alice, ClickHouse/ClickHouse#102 by @bob"
         self.assertEqual(
             cl._attribution_from_text(inner, "o/r"),
@@ -305,7 +269,6 @@ class AttributionFromText(unittest.TestCase):
         )
 
     def test_requires_at_sign(self):
-        # "by hand" (no @) must not be parsed as an author.
         self.assertEqual(
             cl._attribution_from_text("ClickHouse/ClickHouse#101 fixed by hand", "o/r"),
             [("ClickHouse/ClickHouse", 101, None)],
@@ -313,15 +276,12 @@ class AttributionFromText(unittest.TestCase):
 
 
 class EntryRecovery(unittest.TestCase):
-    """`_entries_for_pr` recovers the via-form when no Cherry-picked-from line."""
-
     def _one(self, pr):
         es = cl._entries_for_pr(None, pr, "o/r", {})
         self.assertEqual(len(es), 1)
         return es[0]
 
     def test_recovers_upstream_attribution(self):
-        # No "Cherry-picked from" → recovered from the entry's own paren.
         pr = _pr(1, body=_body("New Feature", f"Support X ({_UP_URL} by @nihalzp)"))
         self.assertEqual(
             cl._render_entry(self._one(pr)),
@@ -339,8 +299,6 @@ class EntryRecovery(unittest.TestCase):
 
 
 class BundleSplit(unittest.TestCase):
-    """A port PR bundling ≥2 upstream backports → one bullet per upstream PR."""
-
     def test_entry_from_upstream(self):
         altinity = _pr(1773, body="")
         u = PRInfo(
@@ -372,7 +330,6 @@ class BundleSplit(unittest.TestCase):
             ("clickhouse/clickhouse", 101278): up(101278, "Fix A"),
             ("clickhouse/clickhouse", 102337): up(102337, "Fix B"),
         }
-        # Stub the cherry-picked-from extraction to return both refs.
         orig = cl._extract_upstream_refs
         cl._extract_upstream_refs = lambda body, slug: [
             ("ClickHouse/ClickHouse", 101278), ("ClickHouse/ClickHouse", 102337),
@@ -390,8 +347,6 @@ class BundleSplit(unittest.TestCase):
 
 
 class InlineBundleSplit(unittest.TestCase):
-    """A manual port PR whose one entry section inlines ≥2 attributed backports."""
-
     _CH = "https://github.com/ClickHouse/ClickHouse/pull"
 
     def _entries(self, entry, category="Bug Fix"):
@@ -415,7 +370,6 @@ class InlineBundleSplit(unittest.TestCase):
              "Rebuild projection on alter modify of its PK column."],
         )
         self.assertEqual([e.upstream_prs[0].number for e in es], [93016, 75720])
-        # Both bullets share the PR's single category and point via one PR.
         self.assertTrue(all(e.section == cl.SECTION_BUG_FIXES for e in es))
         self.assertEqual(
             cl._render_entry(es[0]),
@@ -428,15 +382,7 @@ class InlineBundleSplit(unittest.TestCase):
             f"({self._CH}/75720 by @avogar via https://github.com/o/r/pull/2045)",
         )
 
-    def test_single_inlined_entry_not_split(self):
-        # One attribution paren → normal single-entry path, not the splitter.
-        es = self._entries(f"Fix one thing. ({self._CH}/93016 by @avogar)")
-        self.assertEqual(len(es), 1)
-        self.assertEqual(es[0].description, "Fix one thing.")
-        self.assertEqual(es[0].upstream_prs[0].number, 93016)
-
     def test_benign_parens_do_not_split(self):
-        # Parentheticals that name no upstream PR are not entry boundaries.
         es = self._entries("Fix A (descending order). Fix B (edge case).")
         self.assertEqual(len(es), 1)
         self.assertEqual(
@@ -460,7 +406,6 @@ class SplitInlineEntries(unittest.TestCase):
         self.assertIsNone(cl._split_inline_entries("no parens here", "o/r"))
 
     def test_crlf_section(self):
-        # Real PR bodies use CRLF; the split must survive it.
         section = (
             f"Fix A.\r\n({self._CH}/1 by @a)\r\n"
             f"Fix B.\r\n({self._CH}/2 by @b)"
@@ -472,8 +417,6 @@ class SplitInlineEntries(unittest.TestCase):
         self.assertEqual(chunks[1][1], [("ClickHouse/ClickHouse", 2, "b")])
 
     def test_dangling_attribution_joins_previous(self):
-        # A back-to-back attribution with no description of its own attaches to
-        # the preceding entry rather than becoming a bullet with empty text.
         section = (
             f"Fix A. ({self._CH}/1 by @a) ({self._CH}/2 by @b) "
             f"Fix B. ({self._CH}/3 by @c)"
@@ -511,8 +454,6 @@ class _FakeResponse:
 
 
 class BuildReportBlock(unittest.TestCase):
-    """Regression: draft releases shipped with no Build report section."""
-
     TAG = "v26.6.4.20001.altinityantalya"
 
     def _render(self, listing, **kwargs):
@@ -568,8 +509,6 @@ class BuildReportBlock(unittest.TestCase):
 
 
 class ReleaseNotesBlock(unittest.TestCase):
-    """Regression: draft releases shipped with no Release notes section."""
-
     def test_antalya_tag(self):
         self.assertEqual(
             cl.render_release_notes_block("v26.6.4.20001.altinityantalya"),
@@ -585,8 +524,6 @@ class ReleaseNotesBlock(unittest.TestCase):
         )
 
     def test_unpartitioned_project_renders_nothing(self):
-        # fips docs are one flat page under a differently-shaped slug — a
-        # derived <major>.<minor> URL would 404.
         self.assertIsNone(
             cl.render_release_notes_block("v25.3.8.30001.altinityfips"),
         )

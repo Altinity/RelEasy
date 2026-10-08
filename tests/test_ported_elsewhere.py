@@ -1,11 +1,3 @@
-"""A PR already ported inside a merged group is not ported again.
-
-Regression for a merged combined port whose node dropped out of the graph:
-its members came back as singletons and `run` opened duplicate port PRs,
-`graph update` re-added them, and vetoing one was refused because the
-merged group "is atomic".
-"""
-
 from __future__ import annotations
 
 import tempfile
@@ -22,7 +14,6 @@ from test_on_hold import cfg_with, unit
 
 
 def merged_group_state():
-    """Merged group ``grp`` (#1, #2) plus a later singleton port of #2."""
     return PipelineState(features={
         "grp": FeatureState(
             status="merged", pr_url=URL(1),

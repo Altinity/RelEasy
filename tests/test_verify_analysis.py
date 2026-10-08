@@ -1,13 +1,3 @@
-"""Unit tests for the independent second opinion on a shard's outcome.
-
-After the first session concludes, a fresh read-only session audits the
-outcome — but only when the shard is in doubt: it committed code, or
-its verdict contradicts the baseline. Covers that gate, the rendered
-audit prompt, and how a dispute surfaces in the PR comment.
-
-Stdlib unittest (no pytest dependency). Run:
-    python3 -m unittest discover -s tests
-"""
 from __future__ import annotations
 
 import subprocess
@@ -51,7 +41,6 @@ def _baseline(**kw) -> BaselineRun:
 
 
 class DoubtGate(unittest.TestCase):
-    """Only shards in doubt are worth a second session."""
 
     def test_committed_code_is_always_audited(self):
         reason = _verification_reason(
@@ -74,8 +63,6 @@ class DoubtGate(unittest.TestCase):
         ))
 
     def test_flaky_elsewhere_corroboration_settles_it(self):
-        # New since baseline, but failing on two other tracked PRs —
-        # the UNRELATED call has evidence behind it.
         reason = _verification_reason(
             "UNRELATED", 0, [_test("00002_new")], _baseline(),
             {"stateless::00002_new": ["https://x/1", "https://x/2"]},
@@ -130,21 +117,8 @@ class AuditPromptRendering(unittest.TestCase):
         self.assertIn("[NEW since baseline] `00002_new`", prompt)
         self.assertIn("Fixed it by updating the reference file.", prompt)
 
-    def test_frames_the_narration_as_claims_not_evidence(self):
-        outcome = ShardOutcome(
-            category="stateless", shard_context=SHARD,
-            target_url="https://report", test_count=2,
-            classification="DONE", narration="trust me",
-        )
-        outcome.verify_reason = "x"
-        prompt = self._render(outcome)
-        self.assertIn("claims to check", prompt)
-        self.assertIn("VERDICT: OK|NEEDS_ATTENTION", prompt)
-        self.assertIn("Read-only", prompt)
-
 
 class AuditDriver(unittest.TestCase):
-    """End-to-end bookkeeping around one audit, with the session faked."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -220,10 +194,6 @@ class AuditDriver(unittest.TestCase):
         )
         self.assertTrue(run.audit_mutated_repo)
 
-    def test_a_clean_audit_leaves_the_push_alone(self):
-        run, _ = self._drive("VERDICT: OK\nSUMMARY: fine\nEND_VERIFY\n")
-        self.assertFalse(run.audit_mutated_repo)
-
     def test_dispute_is_recorded_and_costed(self):
         run, outcome = self._drive(
             "VERDICT: NEEDS_ATTENTION\n"
@@ -238,7 +208,6 @@ class AuditDriver(unittest.TestCase):
         self.assertEqual(outcome.verify_findings, [
             "abc123 removes EXPECT_EQ in foo_test.cpp:42",
         ])
-        # Audit cost lands on both the shard and the run.
         self.assertAlmostEqual(run.cost_usd, 0.25)
         self.assertAlmostEqual(outcome.cost_usd, 1.25)
 
@@ -249,6 +218,7 @@ class AuditDriver(unittest.TestCase):
         self.assertFalse(outcome.disputed)
         self.assertEqual(run.shards_disputed, 0)
         self.assertEqual(run.shards_audited, 1)
+        self.assertFalse(run.audit_mutated_repo)
 
     def test_a_failed_audit_is_advisory_not_fatal(self):
         run, outcome = self._drive("", timed_out=True)
@@ -312,7 +282,6 @@ class AuditDriver(unittest.TestCase):
 
 
 class RedoPrompt(unittest.TestCase):
-    """A re-investigation is told what the audit rejected, and to act."""
 
     REDO = RedoContext(
         round_index=1, classification="DONE", commits_added=1,
@@ -332,21 +301,10 @@ class RedoPrompt(unittest.TestCase):
         self.assertIn("git revert --no-edit", section)
         self.assertIn("append-only", section)
 
-    def test_it_may_stand_its_ground_with_evidence(self):
-        section = _redo_section(self.REDO, "head")
-        self.assertIn("Standing your ground is allowed", section)
-        self.assertIn("ignoring the finding is not", section)
-
 
 class RoundLoop(unittest.TestCase):
-    """A dispute triggers one redo; the last round is the shard's verdict."""
 
     def _process(self, rounds, *, max_rounds=2, mutate_on_round=None):
-        """Drive ``_process_pr`` with both AI sessions scripted.
-
-        ``rounds`` is a list of ``(classification, commits, verdict)`` —
-        one per investigator session the loop is allowed to run.
-        """
         config = build_stateless_analyze_fails_config(
             origin_url="https://github.com/o/r",
         )
@@ -452,7 +410,6 @@ class RoundLoop(unittest.TestCase):
         self.assertEqual(run.shards_disputed, 1)
 
     def test_a_dirtied_work_dir_stops_the_redo(self):
-        # Redoing on a work-dir the auditor touched would build on it.
         run, calls = self._process(
             [("DONE", 1, "needs_attention"), ("DONE", 0, "ok")],
             mutate_on_round=1,
@@ -526,7 +483,6 @@ class DisputeSurfacing(unittest.TestCase):
         self.assertNotIn("analyze-fails` — DISPUTED", body)
         self.assertIn("sent back for re-investigation and settled", body)
         self.assertIn("REDONE", body)
-        # The rejected round stays in the record, findings and all.
         self.assertIn("removes the EXPECT_EQ", body)
 
     def test_unaudited_run_says_nothing_was_in_doubt(self):

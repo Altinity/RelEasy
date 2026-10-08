@@ -1,14 +1,3 @@
-"""Unit tests for the pre-change (baseline) comparison.
-
-``analyze-fails`` reads the last CI run on the target branch that
-predates the PR's diff and labels each failure pre-existing / new /
-uncomparable. Covers baseline-commit selection (release branches are
-mostly merge commits with no run at all), the per-test verdict, and
-what the prompt says in each case.
-
-Stdlib unittest (no pytest dependency). Run:
-    python3 -m unittest discover -s tests
-"""
 from __future__ import annotations
 
 import unittest
@@ -44,7 +33,6 @@ def _run(**kw) -> BaselineRun:
 
 
 class BaselineCommitSelection(unittest.TestCase):
-    """Merge commits carry no CI run; keep walking back until one does."""
 
     def _discover(self, commits, statuses_by_sha, **kw):
         def _list(owner, repo, sha, limit):
@@ -116,7 +104,6 @@ class BaselineCommitSelection(unittest.TestCase):
 
 
 class CategoryAwareSelection(unittest.TestCase):
-    """A run that never ran the failing check answers no question."""
 
     COMMITS = [
         ("newer", "2026-08-13T03:22:37Z"),
@@ -170,8 +157,6 @@ class CategoryAwareSelection(unittest.TestCase):
         )
         self.assertIsNone(err)
         self.assertEqual(run.sha, "newer")
-        # Reported as a plain baseline: its gaps show up per test as
-        # "not covered" rather than as a skipped-newer caveat.
         self.assertEqual(run.skipped_newer, 0)
         self.assertEqual(
             run.verdict_for("regression", "/x"), "not covered",
@@ -179,7 +164,6 @@ class CategoryAwareSelection(unittest.TestCase):
 
 
 class PerTestVerdict(unittest.TestCase):
-    """Absent from the failure list only means "passed" if the check ran."""
 
     def test_failing_at_baseline_is_pre_existing(self):
         self.assertEqual(

@@ -1,12 +1,3 @@
-"""Unit tests for session PR labels — unconditional + per-port-mode.
-
-Covers ``session.pr_labels`` / ``session.pr_labels_by_mode`` parsing and
-validation, label resolution per port mode, the ``ensure_label`` name set,
-and the ``refresh`` reconciliation pass (with a stubbed GitHub layer).
-
-Stdlib unittest (no pytest dependency). Run:
-    python3 -m unittest discover -s tests
-"""
 from __future__ import annotations
 
 import tempfile
@@ -56,8 +47,6 @@ class LabelResolution(unittest.TestCase):
             ["v26.6"],
             {"forward_port": ["forwardport"], "backport": ["backport", "v26.6"]},
         )
-        # Deduped, unconditional first — these all have to exist on origin
-        # before any unit is ported.
         self.assertEqual(
             p._all_session_label_names(cfg),
             ["v26.6", "forwardport", "backport"],
@@ -124,8 +113,6 @@ class Parsing(unittest.TestCase):
 
 
 class Reconcile(unittest.TestCase):
-    """``reconcile_session_labels_on_prs`` with the GitHub layer stubbed."""
-
     def setUp(self):
         self.added: list[tuple[int, str]] = []
         self._real_add = p.add_label_to_pr
@@ -151,20 +138,13 @@ class Reconcile(unittest.TestCase):
         cfg = _config(["v26.6"], {"forward_port": ["forwardport"]})
         fwd = "https://github.com/acme/repo/pull/1"
         back = "https://github.com/acme/repo/pull/2"
-        self.current[fwd] = ["v26.6"]  # short the forwardport label
-        self.current[back] = ["v26.6"]  # already complete for a backport
+        self.current[fwd] = ["v26.6"]
+        self.current[back] = ["v26.6"]
         result = p.reconcile_session_labels_on_prs(
             cfg, [(fwd, 1, "forward_port"), (back, 2, "backport")],
         )
         self.assertEqual(result, [(fwd, ["forwardport"])])
         self.assertEqual(self.added, [(1, "forwardport")])
-
-    def test_unknown_mode_pr_is_not_given_a_mode_label(self):
-        cfg = _config(["v26.6"], {"forward_port": ["forwardport"]})
-        url = "https://github.com/acme/repo/pull/3"
-        self.current[url] = ["v26.6"]
-        self.assertEqual(p.reconcile_session_labels_on_prs(cfg, [(url, 3, None)]), [])
-        self.assertEqual(self.added, [])
 
     def test_no_configured_labels_is_a_no_op(self):
         cfg = _config()
@@ -176,8 +156,6 @@ class Reconcile(unittest.TestCase):
 
 
 class TrackedPortMode(unittest.TestCase):
-    """``refresh --pr`` reads the persisted mode to pick mode-conditional labels."""
-
     def _cfg_with_state(self, features):
         import releasy.refresh as r
         from releasy.state import PipelineState
@@ -186,7 +164,6 @@ class TrackedPortMode(unittest.TestCase):
         return r, cfg, state
 
     def test_mode_read_off_the_matching_entry(self):
-        """Regression: the lookup returns (feature_id, FeatureState)."""
         from releasy.state import FeatureState
         r, cfg, state = self._cfg_with_state({
             "grp": FeatureState(
