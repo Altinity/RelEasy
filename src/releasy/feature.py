@@ -1,9 +1,4 @@
-"""Feature management: add, enable, disable, remove, list.
-
-Features live in the session file (``<target_branch>.session.yaml`` by
-default), not in ``config.yaml``. Every mutation here writes back via
-:func:`save_session`.
-"""
+"""Feature management: add, enable, disable, remove, list (stored in the session file)."""
 
 from __future__ import annotations
 
@@ -14,12 +9,6 @@ from releasy.config import Config, FeatureConfig, save_session
 
 
 def _require_session(config: Config):
-    """Return the live session, or raise a user-facing error.
-
-    All feature subcommands mutate the session, so reaching this with
-    ``config.session is None`` is a harness/CLI bug, not a user-facing
-    condition — the CLI must have loaded the session already.
-    """
     if config.session is None:
         raise RuntimeError(
             "feature subcommands need the session file loaded — this is a "
@@ -35,7 +24,6 @@ def add_feature(
     description: str,
     enabled: bool = True,
 ) -> bool:
-    """Add a new feature to the session."""
     session = _require_session(config)
     if config.get_feature(feature_id):
         console.print(f"[red]Feature '{feature_id}' already exists[/red]")

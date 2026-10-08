@@ -42,11 +42,8 @@ project: {{ project }}
 # exist on origin.
 target_branch: {{ target_branch }}
 
-# ── PR processing policy ───────────────────────────────────────────
-# Knobs that apply to every discovered PR / group. Lives here (not in
-# the session file) because it's infrastructure — what to do with
-# branches, when to retry, whether to open PRs — not *what* to port.
-# All values shown below are defaults; omit the block to accept them.
+# PR processing policy applied to every discovered PR / group.
+# Values shown are defaults; omit the block to accept them.
 # pr_policy:
 #   if_exists: skip           # skip | recreate
 #   auto_pr: true             # open a PR for every pushed port branch

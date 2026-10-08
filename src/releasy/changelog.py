@@ -1,16 +1,5 @@
-"""Generate a release changelog from the PRs in a ``--from``..``--to`` range.
-
-When ``--from`` is an ancestor of ``--to`` (the usual same-branch release)
-the commit range is walked directly — its first-parent PRs are the exact
-delta. Otherwise (e.g. ``--from`` is an upstream fork tag not on the branch)
-it falls back to a date-window Search-API query for PRs whose base is the
-target branch. Either way forward-ports are dropped and the result is
-rendered as categorised markdown in the Altinity release-notes convention.
-An explicit PR set (``--prs`` / ``--prs-file``) bypasses discovery entirely.
-
-Output goes either to a file (``-o``) or to a draft GitHub release on
-the origin repo.
-"""
+"""``releasy changelog``: render release notes for the PRs in ``--from``..``--to``
+to a file or a draft GitHub release."""
 
 from __future__ import annotations
 
@@ -48,15 +37,6 @@ from releasy.termlog import console
 log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-
-# Section headings, in the order they appear in the rendered output.
-# Each ClickHouse "Changelog category" maps 1:1 to a section here —
-# Documentation goes to Documentation, Build/Testing/Packaging gets its
-# own section, etc.
 SECTION_BACKWARD_INCOMPAT = "Backward Incompatible Change"
 SECTION_NEW_FEATURES = "New Features"
 SECTION_PERFORMANCE = "Performance Improvements"
@@ -77,21 +57,13 @@ SECTION_ORDER = (
     SECTION_DOCS,
 )
 
-# Sentinel returned by ``_classify_category`` for the only category
-# that's an explicit opt-out from release notes.
 SECTION_NOT_FOR_CHANGELOG = "__not_for_changelog__"
 
 
-# Maps lowercased "Changelog category" text to a canonical section.
-# Pattern fragments are matched as substrings (case-insensitive) against
-# the category text the PR author wrote. Order matters: the "Not for
-# changelog" drop rule comes first, then more-specific patterns before
-# their substring-shadowing siblings (e.g. "performance improvement"
-# before "improvement", "ci fix" before "build/testing/packaging").
+# Substring patterns over the lowercased category; first match wins, so
+# more specific needles precede the ones they contain.
 _CATEGORY_PATTERNS: list[tuple[str, str]] = [
-    # Drop category — explicit opt-out.
     ("not for changelog", SECTION_NOT_FOR_CHANGELOG),
-    # Real sections.
     ("backward incompatible", SECTION_BACKWARD_INCOMPAT),
     ("new feature", SECTION_NEW_FEATURES),
     ("performance improvement", SECTION_PERFORMANCE),
@@ -104,28 +76,18 @@ _CATEGORY_PATTERNS: list[tuple[str, str]] = [
     ("improvement", SECTION_IMPROVEMENTS),
 ]
 
-# Forward-port detection.
 _FWDPORT_TITLE_RE = re.compile(r"forward[\s\-]?port", re.IGNORECASE)
 _FWDPORT_LABELS = {"forwardport", "forward-port", "forward port"}
 
-# "ClickHouse/ClickHouse#12345" or "owner/repo#N" cross-repo refs in body.
 _CROSSREPO_REF_RE = re.compile(r"\b([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)\b")
-# Markdown link to a github.com/.../pull/N
 _PR_URL_RE = re.compile(
     r"https?://github\.com/([^/\s)]+)/([^/\s)]+?)(?:\.git)?/pull/(\d+)\b",
 )
-# "Cherry-picked from …" line that RelEasy adds to every port PR body.
-# Anchored at line start, matches up to (and excluding) the next blank
-# line so a comma-separated multi-PR list survives wrapping.
+# "Cherry-picked from …" line, continued up to the next blank line.
 _CHERRY_PICKED_FROM_RE = re.compile(
     r"^Cherry-picked from\s+([^\n]+(?:\n(?!\s*$)[^\n]+)*)",
     re.IGNORECASE | re.MULTILINE,
 )
-
-
-# ---------------------------------------------------------------------------
-# Data classes
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -134,11 +96,6 @@ class ChangelogEntry:
     description: str
     section: str
     upstream_prs: list[PRInfo] = field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
-# Markdown / body parsing
-# ---------------------------------------------------------------------------
 
 
 _MD_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$", re.MULTILINE)
@@ -160,17 +117,9 @@ def _section_text(body: str, keyword: str) -> str | None:
 
 
 def _classify_category(category_text: str | None) -> str | None:
-    """Return the canonical section, ``SECTION_NOT_FOR_CHANGELOG`` for
-    drop categories, or ``None`` when no category was provided at all.
-
-    A ``None`` return lets the caller distinguish "PR has no template
-    section" from "PR explicitly opted out" — the former still falls
-    back to the default Improvements section when a description exists.
-    """
+    """Canonical section for a category, or ``None`` when no category was given."""
     if not category_text:
         return None
-    # Strip markdown bullets and template comments before matching so a
-    # body like "- Documentation" is recognised the same as plain text.
     text = re.sub(r"<!--.*?-->", "", category_text, flags=re.DOTALL).lower()
     for needle, section in _CATEGORY_PATTERNS:
         if needle in text:
@@ -179,17 +128,7 @@ def _classify_category(category_text: str | None) -> str | None:
 
 
 def _description_for_pr(pr: PRInfo) -> str | None:
-    """Extract the user-visible changelog description, or ``None``.
-
-    Strict: pulls text from the body's ``Changelog entry`` section. PRs
-    without that section, or whose section is empty / only template
-    placeholders, return ``None``. PR title is **not** used as a
-    fallback — per project rule, PRs without an explicit changelog
-    entry are dropped from the release notes entirely.
-
-    Multi-paragraph entries are joined with a single space so the entry
-    keeps its full prose (e.g. "X. Previously …") on one bullet line.
-    """
+    """Text of the body's ``Changelog entry`` section (never the title), or ``None``."""
     section = _section_text(pr.body or "", "changelog entry")
     if not section:
         return None
@@ -200,14 +139,7 @@ def _description_for_pr(pr: PRInfo) -> str | None:
 
 
 def _strip_template_chrome(section: str) -> str | None:
-    """Drop template comments / placeholder lines and return the rest.
-
-    Removes ``<!-- … -->`` HTML comments, lines that are pure template
-    cruft (``...``, ``Description.``, ``no entry``, ``n/a``), and any
-    leading bullet markers. Joins surviving lines with a single space so
-    a multi-paragraph entry collapses to one prose line. Returns
-    ``None`` when nothing meaningful is left.
-    """
+    """Strip comments, bullets and template placeholders; join lines with spaces."""
     if not section:
         return None
     text = re.sub(r"<!--.*?-->", "", section, flags=re.DOTALL)
@@ -216,12 +148,10 @@ def _strip_template_chrome(section: str) -> str | None:
         line = raw.strip()
         if not line:
             continue
-        # Drop leading bullet/list markers.
         line = re.sub(r"^[\-\*\+]\s+", "", line)
         if not line:
             continue
         low = line.lower()
-        # ClickHouse template placeholders.
         if line == "..." or low in ("description.", "no entry", "n/a"):
             continue
         keep.append(line)
@@ -245,12 +175,7 @@ _BY_AUTHOR_RE = re.compile(r"by\s+@([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)")
 
 
 def _trailing_paren_group(text: str) -> tuple[int, str] | None:
-    """Locate the balanced ``(...)`` group that ends ``text``.
-
-    Returns ``(start_index, inner_text)`` or ``None``. Unlike a simple
-    ``\\(([^()]+)\\)$`` regex, this spans nested parens — so a markdown
-    attribution like ``([#101272](url) by @x)`` is matched whole.
-    """
+    """``(start_index, inner_text)`` of the balanced ``(...)`` ending ``text``, or None."""
     t = text.rstrip()
     if not t.endswith(")"):
         return None
@@ -266,12 +191,7 @@ def _trailing_paren_group(text: str) -> tuple[int, str] | None:
 
 
 def _iter_balanced_parens(text: str):
-    """Yield ``(start, end, inner)`` for each top-level balanced ``(...)`` group.
-
-    ``text[start:end]`` spans the group including its parens; ``inner`` is the
-    text between them (nested parens kept inside). Unbalanced leftovers are
-    ignored.
-    """
+    """Yield ``(start, end, inner)`` for each top-level balanced ``(...)`` group."""
     depth = 0
     start = -1
     for i, ch in enumerate(text):
@@ -286,13 +206,7 @@ def _iter_balanced_parens(text: str):
 
 
 def _paren_names_upstream(inner: str, upstream_prs: list[PRInfo]) -> bool:
-    """True if ``inner`` references any of ``upstream_prs`` by url or slug#N.
-
-    Only the two unambiguous forms count — the full PR url (which is also a
-    substring of a ``[#N](url)`` markdown link) and the ``owner/repo#N``
-    shorthand. A bare ``#N`` is NOT matched: it would strip a benign
-    parenthetical whose number happens to equal an upstream PR's.
-    """
+    """True if ``inner`` names any of ``upstream_prs`` by URL or ``slug#N`` (never bare ``#N``)."""
     for pr in upstream_prs:
         if pr.url and pr.url in inner:
             return True
@@ -304,14 +218,9 @@ def _paren_names_upstream(inner: str, upstream_prs: list[PRInfo]) -> bool:
 def _attribution_from_text(
     inner: str, origin_slug: str,
 ) -> list[tuple[str, int, str | None]]:
-    """Parse cross-repo ``(slug, number, author)`` from an attribution paren.
+    """Cross-repo ``(slug, number, author)`` refs in an attribution paren.
 
-    Only full PR URLs and ``owner/repo#N`` shorthands count (a bare
-    ``#N`` or ``(see notes)`` is ignored), so this won't misread an
-    ordinary trailing parenthetical as an upstream link. Each ref is
-    credited to the ``by @handle`` that follows it (so a paren naming two
-    PRs by different authors attributes each correctly), falling back to
-    the sole author when there's exactly one.
+    Each ref is credited to the next ``by @handle``, else to the sole author.
     """
     authors = [(m.start(), m.group(1)) for m in _BY_AUTHOR_RE.finditer(inner)]
 
@@ -344,21 +253,9 @@ def _attribution_from_text(
 def _split_inline_entries(
     section: str, origin_slug: str,
 ) -> list[tuple[str, list[tuple[str, int, str | None]]]] | None:
-    """Split a Changelog-entry section that inlines ≥2 attributed backports.
+    """Split a section inlining ≥2 ``desc (<upstream-url> by @author)`` entries.
 
-    Manually-authored port PRs (no ``Cherry-picked from`` line) sometimes
-    bundle several backports in one PR, writing one description followed by
-    its own ``(<upstream-url> by @author)`` attribution per backport::
-
-        Fix A.
-        (https://github.com/ClickHouse/ClickHouse/pull/93016 by @avogar)
-        Fix B.
-        (https://github.com/ClickHouse/ClickHouse/pull/75720 by @avogar)
-
-    Split on the attribution parens: each chunk pairs the description text
-    preceding an attribution paren with that paren's parsed refs. Returns
-    ``None`` when fewer than two attribution parens are present (leave the
-    single-entry case to the normal path).
+    Returns ``(description, refs)`` per entry, or ``None`` for fewer than two.
     """
     if not section:
         return None
@@ -390,14 +287,7 @@ def _split_inline_entries(
 def _strip_redundant_upstream_parens(
     description: str, upstream_prs: list[PRInfo],
 ) -> str:
-    """Drop a trailing "(<upstream-url> by @author)" already in the entry.
-
-    Altinity port PRs often copy the upstream PR's own changelog entry
-    verbatim — including its trailing "(<url> by @author)" parenthetical.
-    We re-derive the same info and append " via <altinity-url>", so strip
-    the trailing parenthetical when it names one of the upstream PRs to
-    avoid double-printing. Balanced-paren aware (handles markdown links).
-    """
+    """Drop a trailing parenthetical naming an upstream PR (rendering re-adds it)."""
     if not description or not upstream_prs:
         return description
     grp = _trailing_paren_group(description)
@@ -413,24 +303,7 @@ def _extract_upstream_refs(
     pr_body: str,
     origin_slug: str,
 ) -> list[tuple[str, int]]:
-    """Return cross-repo PR refs listed in the body's ``Cherry-picked from`` line.
-
-    RelEasy stamps every port PR body with a single authoritative
-    ``Cherry-picked from <refs>.`` line. We extract upstream PRs only
-    from that line — never from anywhere else in the body. That
-    eliminates false positives from incidental URLs (e.g.
-    ``Followup to: <url>``, links inside the long description, or PR
-    references inside a "Changelog entry" parenthetical that we already
-    handle separately).
-
-    PRs without a ``Cherry-picked from`` line aren't ports as far as
-    RelEasy is concerned — they render as direct origin entries with
-    no upstream "via" suffix.
-
-    Returns ``(slug, number)`` pairs for every PR in the line that
-    lives in a repo OTHER than ``origin_slug``, preserving first-seen
-    order.
-    """
+    """Non-origin ``(slug, number)`` refs from the ``Cherry-picked from`` line only."""
     if not pr_body:
         return []
     seen: set[tuple[str, int]] = set()
@@ -459,11 +332,6 @@ def _extract_upstream_refs(
     return out
 
 
-# ---------------------------------------------------------------------------
-# Git: ref dates + PR → entry
-# ---------------------------------------------------------------------------
-
-
 def _fetch_upstream_prs(
     config: Config,
     pr: PRInfo,
@@ -487,12 +355,7 @@ def _fetch_upstream_prs(
 def _classify_and_describe(
     src_pr: PRInfo, *, label: str,
 ) -> tuple[str, str] | None:
-    """``(section, description)`` from a PR's body, or ``None`` to drop it.
-
-    Drops ``Not for Changelog`` PRs and PRs with no usable ``Changelog
-    entry`` (PR title is never a fallback); folds a missing category into
-    Improvements. ``label`` names the PR in the skip log.
-    """
+    """``(section, description)`` from a PR's body, or ``None`` to drop it."""
     section = _classify_category(_section_text(src_pr.body or "", "changelog category"))
     if section == SECTION_NOT_FOR_CHANGELOG:
         console.print(f"  [dim]not for changelog: skipping {label}[/dim]")
@@ -505,12 +368,7 @@ def _classify_and_describe(
 
 
 def _stub_upstream_pr(slug: str, number: int, author: str | None) -> PRInfo:
-    """Minimal PRInfo for an upstream ref recovered from entry text.
-
-    Carries only what rendering needs (url, slug, author); body/title stay
-    empty because the description comes from the Altinity PR's own entry,
-    never re-read from the upstream PR.
-    """
+    """Render-only PRInfo (url, slug, author) for an upstream ref found in entry text."""
     return PRInfo(
         number=number, title="", body="", state="merged",
         merge_commit_sha=None, head_sha="",
@@ -542,11 +400,8 @@ def _entry_from_altinity(
         return None
     section, description = cd
 
-    # Copy: never mutate the caller's list (it owns the fetched upstreams).
     upstream_prs = list(upstream_prs)
-    # No ``Cherry-picked from`` line (non-RelEasy / older port): recover the
-    # upstream link + author from the entry's own trailing attribution so we
-    # still render the "via" form instead of crediting the porter.
+    # No ``Cherry-picked from`` line: recover upstream refs from the trailing attribution.
     if not upstream_prs:
         grp = _trailing_paren_group(description)
         if grp is not None:
@@ -562,16 +417,7 @@ def _entry_from_altinity(
 def _entries_from_inline_split(
     pr: PRInfo, origin_slug: str,
 ) -> list[ChangelogEntry] | None:
-    """Bullets for a manually-bundled port PR (≥2 inlined attributed entries).
-
-    Recognises the shape handled by :func:`_split_inline_entries` — one
-    Changelog-entry section carrying several descriptions, each with its own
-    ``(<upstream-url> by @author)`` attribution and no ``Cherry-picked from``
-    line — and emits one bullet per attributed backport, each ``via`` this PR
-    and sharing the PR's single Changelog category. Returns ``None`` to defer
-    to the single-entry path when the section isn't of that shape; an empty
-    list when the shape matched but the category is ``Not for Changelog``.
-    """
+    """One bullet per inlined entry (see :func:`_split_inline_entries`), or ``None``."""
     chunks = _split_inline_entries(
         _section_text(pr.body or "", "changelog entry") or "", origin_slug,
     )
@@ -599,15 +445,7 @@ def _entries_for_pr(
     origin_slug: str,
     upstream_cache: dict[tuple[str, int], PRInfo | None],
 ) -> list[ChangelogEntry]:
-    """Changelog bullets for one merged PR (0, 1, or N).
-
-    A bundle of ≥2 upstream backports yields one bullet per upstream PR —
-    each from its own entry, attributed ``via`` this port PR. The same holds
-    for a manually-bundled port PR whose single Changelog-entry section
-    inlines several attributed descriptions (no ``Cherry-picked from`` line).
-    Otherwise a single bullet from this PR's own entry. Drops forward-ports,
-    ``Not for Changelog`` PRs, and entries with no ``Changelog entry``.
-    """
+    """Changelog bullets for one merged PR: one per bundled backport, else one."""
     if _is_forward_port(pr):
         console.print(f"  [dim]forward-port: skipping #{pr.number}[/dim]")
         return []
@@ -615,28 +453,17 @@ def _entries_for_pr(
     upstream_prs = _fetch_upstream_prs(config, pr, origin_slug, upstream_cache)
 
     if len(upstream_prs) >= 2:
-        # One bullet per upstream PR that carries its own entry. An upstream
-        # PR with no ``Changelog entry`` is dropped (logged) — same as a
-        # standalone PR: a missing entry is the author's opt-out, not a bug.
         entries = [e for e in (_entry_from_upstream(pr, u) for u in upstream_prs) if e]
         if entries:
             return entries
-        # None had a usable entry → fall back to the bundle's own entry.
 
     if len(upstream_prs) < 2:
-        # No ``Cherry-picked from`` bundle: the PR's own entry section may
-        # still inline several attributed backports (manual port PR).
         split = _entries_from_inline_split(pr, origin_slug)
         if split is not None:
             return split
 
     e = _entry_from_altinity(pr, origin_slug, upstream_prs)
     return [e] if e is not None else []
-
-
-# ---------------------------------------------------------------------------
-# Rendering
-# ---------------------------------------------------------------------------
 
 
 def _author_handle(author: str | None) -> str:
@@ -647,13 +474,7 @@ def _author_handle(author: str | None) -> str:
 
 
 def _render_entry(entry: ChangelogEntry) -> str:
-    """Render one bullet line.
-
-    Layout cases:
-      - No upstream refs:     "* {desc} ({altinity-pr-url} by @author)"
-      - Upstream refs found:  groups upstream PRs by author, then appends
-        " via {altinity-pr-url}".
-    """
+    """``* desc (url by @a)``, or ``* desc (upstream urls by @a via url)``."""
     altinity_url = entry.pr.url
     altinity_author = _author_handle(entry.pr.author)
 
@@ -661,7 +482,6 @@ def _render_entry(entry: ChangelogEntry) -> str:
         author_part = f" by {altinity_author}" if altinity_author else ""
         return f"* {entry.description} ({altinity_url}{author_part})"
 
-    # Group upstream PRs by author, preserving first-seen order.
     grouped: list[tuple[str, list[PRInfo]]] = []
     by_author: dict[str, list[PRInfo]] = {}
     for u in entry.upstream_prs:
@@ -691,12 +511,7 @@ _DISPLAY_TITLE_RE = re.compile(
 
 
 def format_display_title(tag: str) -> str:
-    """Turn a release tag into a human-readable heading.
-
-    ``v26.1.6.20001.altinityantalya`` → ``26.1.6.20001 Altinity Antalya``.
-    Tags that don't match the ``…altinity<project>`` shape just lose a
-    leading ``v`` and are returned otherwise as-is.
-    """
+    """``v26.1.6.20001.altinityantalya`` → ``26.1.6.20001 Altinity Antalya``."""
     if not tag:
         return tag
     m = _DISPLAY_TITLE_RE.match(tag.strip())
@@ -708,22 +523,12 @@ def format_display_title(tag: str) -> str:
 
 
 def render_packages_block(tag: str, docker_image_url: str | None = None) -> str | None:
-    """Render the Packages + Docker images sections for an Altinity tag.
-
-    Returns ``None`` for tags that don't fit the ``…altinity<project>``
-    convention; the caller leaves these sections out of the changelog.
-
-    ``docker_image_url`` overrides the default placeholder URL. The
-    default keeps the canonical
-    ``hub.docker.com/layers/altinity/clickhouse-server/<tag>/images/sha256-TBD``
-    shape so the SHA-256 digest can be filled in mechanically after the
-    image is pushed.
-    """
+    """Packages + Docker images sections for an Altinity tag, or ``None``."""
     m = _DISPLAY_TITLE_RE.match((tag or "").strip())
     if not m:
         return None
     ver = m.group("ver")
-    proj_suffix = m.group("proj").lower()  # e.g. "antalya"
+    proj_suffix = m.group("proj").lower()
     docker_tag = f"{ver}.altinity{proj_suffix}"
     builds_anchor = f"altinity{proj_suffix}"
     if docker_image_url is None:
@@ -743,25 +548,17 @@ def render_packages_block(tag: str, docker_image_url: str | None = None) -> str 
     )
 
 
-# Altinity CI publishes every run's artefacts under
-# ``REFs/<ref>/<sha>/<workflow-run-id>/`` in this bucket; the rendered
-# summary is ``ci_run_report.html``.
+# CI artefacts live under ``REFs/<ref>/<sha>/<workflow-run-id>/`` in this bucket.
 _BUILD_ARTIFACTS_BASE = "https://s3.amazonaws.com/altinity-build-artifacts"
 _S3_NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
 _RUN_ID_PLACEHOLDER = "RUN-ID-TBD"
 
 
 def _lookup_ci_run_id(ref: str, sha: str, *, timeout: int = 30) -> str | None:
-    """Find the CI workflow-run id published under ``REFs/<ref>/<sha>/``.
+    """Highest CI workflow-run id published under ``REFs/<ref>/<sha>/``, or None.
 
-    Lists that prefix in the build-artifacts bucket (anonymous read) and
-    returns the highest numeric sub-prefix — one per workflow run.
-    Returns ``None`` when there is none: CI hasn't published for this ref
-    yet, or it ran under a different one (e.g. the branch, not the tag).
-
-    The listing is not paginated: S3 returns prefixes in lexicographic
-    order, so all-digit run ids precede the per-task name prefixes and
-    are always on the first page.
+    Not paginated: S3 lists prefixes lexicographically, so the all-digit
+    run ids come before task-name prefixes on the first page.
     """
     try:
         resp = requests.get(
@@ -799,15 +596,7 @@ def _lookup_ci_run_id(ref: str, sha: str, *, timeout: int = 30) -> str | None:
 def render_build_report_block(
     ref: str, sha: str, build_report_url: str | None = None,
 ) -> str | None:
-    """Render the Build report section for an Altinity tag.
-
-    Returns ``None`` for refs that don't fit the ``...altinity<project>``
-    convention, unless ``build_report_url`` is given explicitly.
-
-    Without an explicit URL the workflow-run id is resolved from the
-    build-artifacts bucket; when nothing is published for ``ref`` yet the
-    link keeps a ``RUN-ID-TBD`` placeholder to fill in by hand.
-    """
+    """Build report section; ``None`` for non-Altinity refs without an explicit URL."""
     if build_report_url is None:
         if not _DISPLAY_TITLE_RE.match((ref or "").strip()):
             return None
@@ -825,9 +614,7 @@ def render_build_report_block(
     return f"## [Build report]({build_report_url})"
 
 
-# docs.altinity.com partitions these projects' release notes by
-# <major>.<minor>. Other Altinity projects (fips) live on a single flat
-# page under a differently-shaped slug, so no link is derived for them.
+# Projects whose docs.altinity.com release notes are split by <major>.<minor>.
 _RELEASE_NOTES_BASE = "https://docs.altinity.com/releasenotes"
 _RELEASE_NOTES_PROJECTS = {"antalya", "stable"}
 
@@ -835,12 +622,7 @@ _RELEASE_NOTES_PROJECTS = {"antalya", "stable"}
 def render_release_notes_block(
     tag: str, release_notes_url: str | None = None,
 ) -> str | None:
-    """Render the Release notes section for an Altinity tag.
-
-    Returns ``None`` for tags outside the ``...altinity<project>``
-    convention and for projects whose docs aren't split by version,
-    unless ``release_notes_url`` is given explicitly.
-    """
+    """Release notes section; ``None`` when no URL is given or derivable."""
     if release_notes_url is None:
         m = _DISPLAY_TITLE_RE.match((tag or "").strip())
         if not m:
@@ -871,12 +653,6 @@ def render_markdown(
     release_notes_block: str | None = None,
     packages_block: str | None = None,
 ) -> str:
-    """Build the changelog markdown body.
-
-    ``display_title`` is the human-friendly form used in the H3 heading
-    (e.g. ``26.1.6.20001 Altinity Antalya``). The GitHub release tag is
-    chosen separately by the caller.
-    """
     if from_url:
         if from_sha:
             compared_to = (
@@ -932,11 +708,6 @@ def render_markdown(
     return "\n".join(lines).rstrip() + "\n"
 
 
-# ---------------------------------------------------------------------------
-# Compared-to URL resolution
-# ---------------------------------------------------------------------------
-
-
 def _looks_like_tag(ref: str) -> bool:
     return bool(re.match(r"^v?\d+\.\d+", ref))
 
@@ -946,16 +717,9 @@ def _resolve_compared_to(
     from_ref: str,
     sha: str,
 ) -> tuple[str, str | None]:
-    """Return (label, url_or_none) for the comparison anchor.
-
-    When the upstream remote is configured and ``from_ref`` resolves to
-    a tag on upstream, link to the upstream release page; failing that,
-    link to the origin commit page.
-    """
-    # Try upstream tag link.
+    """``(label, url)``: upstream release page for tags, else origin commit page."""
     if config.upstream and _looks_like_tag(from_ref):
         upstream_remote = config.upstream.remote
-        # Resolve owner/repo from the upstream URL to build a release page link.
         m = re.match(
             r"(?:git@github\.com:|https://github\.com/)([^/]+)/([^/\s]+?)(?:\.git)?/?$",
             upstream_remote,
@@ -967,17 +731,11 @@ def _resolve_compared_to(
                 f"https://github.com/{slug}/releases/tag/{from_ref}",
             )
 
-    # Origin commit link.
     origin_slug = get_origin_repo_slug(config)
     if origin_slug:
         return from_ref, f"https://github.com/{origin_slug}/commit/{sha}"
 
     return from_ref, None
-
-
-# ---------------------------------------------------------------------------
-# Top-level entry point
-# ---------------------------------------------------------------------------
 
 
 def build_changelog(
@@ -994,23 +752,9 @@ def build_changelog(
     base_branch: str | None = None,
     explicit_prs: list[str] | None = None,
 ) -> tuple[str, str, bool] | None:
-    """Collect the PRs in ``from_ref``..``to_ref`` and render the changelog.
+    """Render the changelog for ``from_ref``..``to_ref``.
 
-    When ``from_ref`` is an ancestor of ``to_ref`` the commit range is walked
-    (its first-parent PRs are the exact delta; ``base_branch`` is not used).
-    Otherwise it falls back to a date-window search for PRs whose base is
-    ``base_branch`` (the target branch) that merged in the window.
-    ``explicit_prs`` (URLs) bypasses discovery and uses exactly that set.
-
-    ``release_name`` is the GitHub release **tag** (e.g.
-    ``v26.1.6.20001.altinityantalya``). ``display_title`` is the
-    human-friendly heading (e.g. ``26.1.6.20001 Altinity Antalya``);
-    when omitted it's auto-derived from ``release_name`` via
-    :func:`format_display_title`.
-
-    Returns ``(markdown, to_sha, to_is_tag)`` on success, ``None`` on
-    failure. ``to_is_tag`` is True iff ``to_ref`` resolves to an actual
-    git tag in the repo (vs. a branch / commit SHA).
+    Returns ``(markdown, to_sha, to_is_tag)``, or ``None`` on failure.
     """
     origin_slug = get_origin_repo_slug(config)
     if not origin_slug:
@@ -1031,12 +775,6 @@ def build_changelog(
     console.print(f"[dim]Repo: {repo_path}[/dim]")
 
     def _try_fetch(remote: str, *, with_tags: bool) -> bool:
-        """Run ``git fetch [--tags] <remote>``; surface stderr on failure.
-
-        Returns True on clean fetch, False otherwise. We don't raise on
-        failure: a tag-collision or auth blip on one remote is not fatal
-        — the resolve_ref / per-tag fallback below still has a chance.
-        """
         argv = ["fetch"]
         if with_tags:
             argv.append("--tags")
@@ -1050,11 +788,8 @@ def build_changelog(
             console.print(f"[dim]{stderr}[/dim]")
         return False
 
-    # ``--tags`` so tags-only-on-the-remote (e.g. upstream stable tags
-    # like v26.1.6.6-stable) are pulled in — both --from and --to commonly
-    # refer to those. Tag fetches occasionally fail on an active fork
-    # because of moved-tag collisions; if they do, fall back to a plain
-    # branch fetch and force-refresh the specific tags we need below.
+    # A --tags fetch can fail on moved-tag collisions; then fetch branches
+    # only and force-refresh the --from / --to tags below.
     origin_tags_fresh = False
     console.print(f"Fetching [cyan]{config.origin.remote_name}[/cyan]...", end=" ")
     if _try_fetch(config.origin.remote_name, with_tags=True):
@@ -1089,15 +824,8 @@ def build_changelog(
                 "--from / --to tags individually below[/dim]"
             )
         else:
-            # Upstream is optional — only used for resolving compared-to tags.
             console.print("[yellow]skipped[/yellow]")
 
-    # Force-refresh the specific --from / --to tags from each configured
-    # remote URL whenever the bulk ``--tags`` fetch was skipped on that
-    # remote. This handles the moved-tag-collision case where the local
-    # clone has a stale tag pointing at a different SHA than the remote:
-    # ``+refs/tags/X:refs/tags/X`` is a forced refspec, so the local tag
-    # gets overwritten.
     candidates: list[tuple[str, bool]] = [
         (config.origin.remote, origin_tags_fresh),
     ]
@@ -1112,9 +840,7 @@ def build_changelog(
                 repo_path, check=False,
             )
 
-    # Resolve both bounds the remote's way (see resolve_ref_prefer_remote):
-    # a release is cut from what's on origin, so a stale local branch of the
-    # same name must never win. Everything below works off these SHAs.
+    # Prefer origin: a stale local branch of the same name must never win.
     remote_name = config.origin.remote_name
     resolved: dict[str, str] = {}
     for flag, ref in (("--from", from_ref), ("--to", to_ref)):
@@ -1146,11 +872,8 @@ def build_changelog(
     )
     to_is_tag = is_tag_ref(repo_path, to_ref)
 
-    # Collect the PR set. Three paths, in priority order:
-    #   1. explicit --prs / --prs-file — exactly that set.
-    #   2. from_ref is an ancestor of to_ref — walk the commit range, which
-    #      IS the exact delta (--base is not consulted).
-    #   3. otherwise — approximate with a date-window search by base branch.
+    # PR set: explicit list; else the first-parent PRs of from..to when
+    # from is an ancestor; else a date-window search by base branch.
     upstream_cache: dict[tuple[str, int], PRInfo | None] = {}
     prs: list[PRInfo] = []
     if explicit_prs:
@@ -1166,8 +889,6 @@ def build_changelog(
                 )
                 continue
             if pr.state != "merged":
-                # Release notes list what shipped; an open / unmerged-closed
-                # PR doesn't belong even when explicitly named.
                 console.print(
                     f"  [yellow]![/yellow] {url} is {pr.state}, not merged "
                     "— skipping"
@@ -1175,8 +896,6 @@ def build_changelog(
                 continue
             prs.append(pr)
     elif ancestry := is_ancestor(repo_path, from_sha, to_sha):
-        # Same-line release: the commit range from_ref..to_ref is the exact
-        # set of changes. Walk its first-parent PRs (--base is not consulted).
         if base_branch:
             console.print("  [dim]--base ignored — walking the commit range[/dim]")
         numbers = first_parent_pr_numbers(repo_path, from_sha, to_sha)
@@ -1213,15 +932,11 @@ def build_changelog(
                 continue
             prs.append(pr)
     else:
-        # No clean commit range: --from isn't an ancestor of --to, or git
-        # couldn't tell. Approximate with a date-window search over PRs whose
-        # base is the target branch.
         anc_unknown = ancestry is None
         base = base_branch or config.target_branch or to_ref
         from_date = commit_date(repo_path, from_sha)
         to_date = commit_date(repo_path, to_sha)
         if from_date is None or to_date is None:
-            # Both bounds required — an unbounded window scans whole history.
             missing = from_ref if from_date is None else to_ref
             console.print(
                 f"[red]Could not read the commit date of {missing!r}.[/red] "
@@ -1229,8 +944,6 @@ def build_changelog(
             )
             return None
         if datetime.fromisoformat(from_date) > datetime.fromisoformat(to_date):
-            # A reversed window (--from newer than --to) yields a garbage /
-            # empty search rather than an error — refuse it up front.
             console.print(
                 f"[red]--from {from_ref!r} is newer than --to {to_ref!r}[/red]; "
                 "the release window is reversed."
@@ -1250,7 +963,6 @@ def build_changelog(
             exclude_labels=sorted(_FWDPORT_LABELS),
         )
         if len(prs) >= 1000:
-            # GitHub Search caps at 1000 results — never silently truncate.
             console.print(
                 "  [yellow]warning:[/yellow] hit GitHub Search's 1000-result "
                 "cap; some PRs may be missing. Narrow the --from..--to window."
@@ -1258,8 +970,6 @@ def build_changelog(
     console.print(f"  [dim]Considering {len(prs)} PR(s)[/dim]")
 
     if not prs:
-        # Empty range (from == to), a swallowed git error, or a genuinely empty
-        # window — never publish an empty changelog silently.
         console.print(
             f"[red]No PRs found in {from_ref}..{to_ref}.[/red] "
             "Nothing to draft — check the --from / --to range."
@@ -1306,14 +1016,9 @@ def emit_changelog(
     base_branch: str | None = None,
     explicit_prs: list[str] | None = None,
 ) -> bool:
-    """Run the changelog build and either write to file or open a draft release.
+    """Build the changelog and write it to ``output_file`` or a draft release.
 
-    ``release_name`` is the GitHub release tag. When ``None``, it
-    defaults to ``to_ref`` for display purposes only — and on the
-    GitHub draft release the tag field is left blank if ``to_ref`` is
-    not an actual tag (so we don't mint a tag from a commit SHA).
-
-    Returns True on success.
+    Without ``release_name`` the draft's tag is ``to_ref`` only when it is a tag.
     """
     name_explicit = release_name is not None
     effective_name = release_name or to_ref
@@ -1342,11 +1047,6 @@ def emit_changelog(
         console.print(f"[green]Wrote changelog to[/green] {output_file}")
         return True
 
-    # The release name on GitHub gets the prettified title; the tag
-    # stays as the raw ref so it round-trips with origin and
-    # ``git fetch``. But when --name was not provided and --to is a
-    # commit / branch (not a tag), leave the tag field blank — we don't
-    # want to mint a brand-new tag from a commit SHA.
     if name_explicit or to_is_tag:
         tag_name = effective_name
     else:
@@ -1370,6 +1070,5 @@ def emit_changelog(
         )
         return False
     console.print(f"[green]Draft release created:[/green] {url}")
-    # Plain stdout for scripting.
-    print(url)
+    print(url)  # bare URL on stdout for scripts
     return True

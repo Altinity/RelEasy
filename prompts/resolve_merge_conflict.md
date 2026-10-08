@@ -1,1 +1,0 @@
-../src/releasy/prompts/resolve_merge_conflict.md

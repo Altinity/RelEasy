@@ -1,31 +1,4 @@
-"""Auto-discover a PR dependency DAG and emit a recommended grouping.
-
-The engine behind the ``releasy graph discover`` command:
-
-1. Walks the candidate PR set defined by ``config.pr_sources``, treating
-   each user-declared group as a single super-node.
-2. Excludes units already merged into the target branch (state.yaml +
-   ``Source-PR:`` trailers + ``git cherry``).
-3. Trial-cherry-picks each remaining unit onto the target tip in a
-   scratch git worktree (``git worktree add --detach``).
-4. On a clean pick, emits the unit as a leaf in the DAG.
-5. On conflict, looks up older un-ported units that touched the
-   conflicting files (via ``git log target..source -- <file>`` mapped
-   through merge-commit / Source-PR: trailer / merge-containment rules),
-   then optionally hands the candidates to Claude to confirm.
-6. After all units are processed, computes weakly-connected components
-   → the recommended groups, with articulation points called out as
-   ``recommend_first``.
-
-The command is read-only: it never writes ``state.yaml`` and never
-touches the main worktree. By default it also writes a deps overlay
-to ``<session-stem>.deps.yaml`` next to the session file (override via
-``pr_sources.deps_file:`` in the session) — the session loader merges
-that file's ``groups[]`` into ``pr_sources.groups`` on the next
-``releasy run``. Pass ``--no-write`` to skip the overlay write
-(preview mode), or ``--deps-file <path>`` to redirect it to a one-off
-path. The main session file is never modified.
-"""
+"""PR dependency DAG discovery: engine behind ``releasy graph discover`` and ``graph update``."""
 
 from __future__ import annotations
 
@@ -41,7 +14,9 @@ import yaml
 from releasy.ai_resolve import (
     AIResolveContext,
     _MISSING_PREREQS_RE,
+    _fill_placeholders,
     _parse_missing_prereqs,
+    _prompt_path,
     attempt_ai_resolve,
     synthesize_text,
 )
@@ -53,7 +28,6 @@ from releasy.git_ops import (
     ensure_work_repo,
     fetch_commit,
     fetch_remote,
-    get_conflict_files,
     is_operation_in_progress,
     local_branch_exists,
     run_git,
@@ -94,46 +68,30 @@ from releasy.termlog import get_console
 console = get_console()
 
 
-# ---------------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class _PickOutcome:
     clean: bool
     conflict_files: list[str]
     error_message: str | None = None
-    # Index into ``unit.feature_unit.prs`` of the PR whose cherry-pick
-    # failed. ``None`` for clean outcomes.
+    # Index into ``unit.feature_unit.prs`` of the PR whose cherry-pick failed.
     conflicting_pr_idx: int | None = None
-    # Name of the local branch the cache was attempted on. Always set;
-    # the caller decides whether to keep or delete it based on outcome
-    # and AI fallback result.
     cache_branch: str | None = None
 
 
 @dataclass
 class _CandidateUnit:
-    """A unit (singleton or group) under consideration.
+    """A unit (singleton or group) under consideration during dep discovery.
 
-    Wraps a :class:`FeatureUnit` with bookkeeping fields that only matter
-    during dep discovery (e.g. earliest merge timestamp for the latest →
-    oldest queue order).
-
-    ``is_group`` = the unit cherry-picks several PRs as one. ``is_user_group``
-    = that group entry is hand-curated in ``pr_sources.groups``, so this code
-    must not rewrite it. The two differ for overlay groups (``graph discover``
-    owns those): keeping them apart is what stops an auto group from being
-    mistaken for user-declared when the overlay is read back, which would
-    strand it in neither file.
+    ``is_group``: the unit cherry-picks several PRs as one. ``is_user_group``:
+    the group is hand-curated in ``pr_sources.groups`` and must not be
+    rewritten. They differ for overlay (auto) groups.
     """
     unit_id: str
     is_group: bool
     is_user_group: bool
     prs: list[PRInfo]
     earliest_merged_at: str | None
-    feature_unit: FeatureUnit  # Backing FeatureUnit, used for cherry-pick order
+    feature_unit: FeatureUnit
 
 
 @dataclass
@@ -146,20 +104,12 @@ class DAGNode:
     deps: list[str]
     # "trial-clean" | "git-graph" | "git-graph+claude" |
     # "ai-resolve" | "ai-resolve-clean" | "depth-cutoff" | "grouped" |
-    # "reused-group-member" | "graph-update" |
-    # "graph-update-unanalysed" (added from an issue comment, never picked)
+    # "reused-group-member" | "graph-update" | "graph-update-unanalysed"
     discovery_method: str
     conflict_files_at_discovery: list[str] = field(default_factory=list)
-    # ``True`` iff a local port branch was preserved at
-    # ``feature/<base>/<unit_id>`` for ``releasy run`` to reuse.
-    # ``True`` for trial-clean and AI-resolved outcomes. ``False`` for
-    # conflict-with-empty-deps (we couldn't resolve), refinement-only
-    # (no resolution attempted), or depth-cutoff. The presence of the
-    # branch lets ``run`` skip the cherry-pick step entirely.
+    # A port branch was preserved at ``feature/<base>/<unit_id>`` for ``run`` to reuse.
     cached: bool = False
-    # Merge-commit SHAs of this unit's PRs (parallel to ``pr_urls``). Used
-    # by incremental re-discovery to detect when a PR was re-merged (same
-    # URL, new SHA) so a stale cached branch isn't reused.
+    # Merge-commit SHAs parallel to ``pr_urls``; detects re-merged PRs on re-discovery.
     merge_shas: list[str] = field(default_factory=list)
 
 
@@ -178,44 +128,24 @@ class DiscoveryReport:
     generated_at: str
     candidate_unit_count: int
     # Total PRs across all candidate units, after group-claim dedup.
-    # ``candidate_unit_count`` is the unit count (where a user-declared
-    # group is one super-node); this is the underlying PR count so the
-    # summary can show e.g. "26 PRs across 15 units" — answering the
-    # question "where did the 26 PRs from `by_labels` go?" without the
-    # reader having to re-do the arithmetic.
     candidate_pr_count: int
     skipped_already_in_target: list[str]
     nodes: list[DAGNode]
     components: list[DAGComponent]
     singletons: list[str]
     warnings: list[str] = field(default_factory=list)
-    # Diff of auto-discovered unit IDs between this run and the existing
-    # deps overlay file (if one was found at ``deps_overlay_path``).
-    # Populated only when there's an existing file to compare against
-    # AND the diff is non-empty. ``removed_since_last_run`` typically
-    # means "landed in target since last run"; ``added_since_last_run``
-    # means "newly discovered candidates / dependencies".
+    # Diff of auto-discovered unit IDs vs the existing deps overlay file.
     refresh_removed: list[str] = field(default_factory=list)
     refresh_added: list[str] = field(default_factory=list)
-    # GitHub issue this graph was posted to via ``releasy graph discover
-    # --open-issue`` (``None`` until posted). ``last_ingested_at`` is the
-    # ``created_at`` of the newest issue comment already folded in by
-    # ``releasy graph update`` — used as the default ``--since`` so a
-    # re-run only considers comments posted after the last ingest.
     issue_number: int | None = None
     issue_url: str | None = None
+    # ``created_at`` of the newest issue comment already ingested; default ``--since``.
     last_ingested_at: str | None = None
     # Member-vetoed PRs [{"url","reason"}]; enforced via exclude_prs.
     excluded: list[dict] = field(default_factory=list)
 
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
-
-
 def _resolve_base_branch(config: Config, onto: str | None) -> str:
-    """Base branch shared by discover + update: ``--onto``, else target_branch."""
     if onto:
         return config.base_branch_name(onto)
     if config.target_branch:
@@ -226,15 +156,7 @@ def _resolve_base_branch(config: Config, onto: str | None) -> str:
 
 
 def _carried_session_fields(prior: DiscoveryReport | None) -> dict:
-    """Session facts a re-discover inherits rather than recomputes.
-
-    The graph issue the report was posted to, how far its comments have
-    been ingested, and the member vetoes. Every :class:`DiscoveryReport`
-    a run builds — each checkpoint and the final one — is constructed
-    with these, so no path can write a report that drops the issue link
-    and orphans the graph issue. Returns a fresh ``excluded`` list per
-    call, so two reports never share one.
-    """
+    """Session fields (issue link, ingest cursor, vetoes) every rebuilt report inherits."""
     if prior is None:
         return {}
     return {
@@ -260,12 +182,7 @@ def run_discover_deps(
     open_issue: bool = False,
     issue_title: str | None = None,
 ) -> DiscoveryReport:
-    """Run dep discovery and write the report (and optionally the sidecar).
-
-    Returns the in-memory :class:`DiscoveryReport`. The caller is expected
-    to print a summary; the YAML output(s) are written here as a side effect.
-    """
-    # --- Resolve target branch + scratch worktree ---
+    """Run dep discovery; write the report (and the deps overlay unless --no-write)."""
     base_branch = _resolve_base_branch(config, onto)
 
     wd = config.resolve_work_dir(work_dir)
@@ -276,24 +193,14 @@ def run_discover_deps(
             f"/ merge / rebase) — finish or abort it first, then re-run "
             "graph discover."
         )
-    # Scratch parent is always the user-blessed work_dir. Plan §6:
-    # ``<work_dir>/.releasy-discover-deps-<short_id>``. We deliberately
-    # don't use ``repo_path.parent`` because ``ensure_work_repo`` returns
-    # ``repo_path == work_dir`` when work_dir already has a ``.git``, in
-    # which case ``repo_path.parent`` would be the user's home directory.
+    # Not ``repo_path.parent``: repo_path may equal work_dir, whose parent is outside it.
     scratch_parent = wd
     scratch_parent.mkdir(parents=True, exist_ok=True)
 
     remote = config.origin.remote_name
-    # Broad fetch first — pulls history needed to classify conflict
-    # commits (origin/master, PR merge SHAs, etc.).
     console.print(f"  [dim]Fetching {remote}...[/dim]")
     fetch_remote(repo_path, remote)
-    # Then an explicit targeted fetch of the target branch. Two
-    # benefits over relying on the broad fetch alone: (1) fails fast
-    # with a clear message if ``base_branch`` doesn't exist on origin
-    # — the alternative is silently resolving an empty SHA later;
-    # (2) guarantees freshness even if origin's refspec is unusual.
+    # Explicit fetch fails fast if base_branch is missing on origin.
     console.print(
         f"  [dim]Fetching latest [cyan]{base_branch}[/cyan] from {remote}...[/dim]"
     )
@@ -315,35 +222,22 @@ def run_discover_deps(
             "object database is in an unexpected state."
         )
 
-    # Caching is enabled iff we're also writing the deps overlay file —
-    # i.e. NOT in ``--no-write`` mode. ``--no-write`` is "true dry-run":
-    # no deps file, no cache branches, no persistent state changes
-    # beyond the diagnostic report.
+    # --no-write is a true dry run: no deps file, no cache branches.
     cache_enabled = deps_overlay_path is not None
     origin_slug = get_origin_repo_slug(config)
 
-    # --- Incremental re-discovery (default) ---
-    # Reuse every unit already in the prior report — standalone PRs AND
-    # groups — and only trial-pick PRs that are new since the last run.
-    # ``--redo`` forces a full from-scratch scan. When the base moved since
-    # the prior run we still reuse the grouping decisions (they usually
-    # hold), but treat cached branches as stale: nodes are emitted
-    # ``cached=False`` so ``run`` re-picks them, plus a warning nudging
-    # toward ``--redo``.
+    # Incremental by default: reuse prior units, trial-pick only new PRs.
+    # If the base moved, groupings are reused but cached branches are stale.
     report_path = output_path or _default_report_path(config, base_branch)
     warnings_acc: list[str] = []
-    # Read whenever a report exists: its nodes drive reuse (opted out of by
-    # --redo / --no-write), and it is the source of the session fields every
-    # report this run builds inherits (see ``_carried_session_fields``).
+    # Read even under --redo / --no-write: it carries the session fields.
     prior_report: DiscoveryReport | None = None
     target_moved = False
     if report_path.exists():
         try:
             prior_report = load_report(report_path)
         except Exception:
-            # Incremental reuse is a pure optimization — a corrupt / stale /
-            # hand-edited prior report must degrade to a full re-scan, never
-            # crash discovery (YAML errors, KeyError, TypeError, …).
+            # A corrupt prior report degrades to a full re-scan.
             prior_report = None
     reuse_prior = prior_report if (cache_enabled and not redo) else None
     reuse_index: dict[str, DAGNode] = {}
@@ -368,22 +262,15 @@ def run_discover_deps(
         for n in reuse_prior.nodes:
             if n.discovery_method == "grouped":
                 prior_groups.append(n)
-            # Every node is also indexed under its own id: once a group's
-            # overlay entry is merged back into ``pr_sources.groups`` it
-            # returns as ONE candidate unit carrying that id, so the
-            # member-level path below never sees it.
+            # Overlay groups merged back into pr_sources.groups return as one
+            # candidate unit carrying the group id.
             reuse_index[n.unit_id] = n
 
-    # Capture the auto-discovered unit IDs from the existing overlay (if
-    # any) so we can show a refresh diff after the new overlay is built.
-    # ``deps_overlay_path`` is None in --no-write mode; in that case we
-    # skip the diff (nothing's being rewritten anyway).
     previous_auto_unit_ids: set[str] = (
         _read_previous_overlay_auto_ids(deps_overlay_path)
         if deps_overlay_path is not None else set()
     )
 
-    # --- Build candidate units ---
     units = discover_feature_units(config)
     candidates = _build_candidate_unit_set(units, config)
     if pr_limit is not None and len(candidates) > pr_limit:
@@ -396,7 +283,6 @@ def run_discover_deps(
         f"already in {base_branch}…[/dim]"
     )
 
-    # --- Detect already-merged units ---
     state = load_state(config)
     state_already = _state_already_in_target(candidates, state)
     # Port branches `run` tracks: discovery never resets or deletes them.
@@ -414,10 +300,6 @@ def run_discover_deps(
         if all(p.url in pr_in_target for p in cu.prs):
             fully_merged_units.add(cu.unit_id)
 
-    # ``include_already_merged`` only changes the *report* (already-merged
-    # units are appended as zero-edge nodes near the end of the function);
-    # the trial-pick traversal always operates on the active set, since
-    # there is nothing to learn from re-picking an already-applied PR.
     active_for_traversal = [
         cu for cu in candidates if cu.unit_id not in fully_merged_units
     ]
@@ -427,12 +309,8 @@ def run_discover_deps(
         f"{len(active_for_traversal)} to trial-pick[/dim]"
     )
 
-    # Build pr_url → unit_id and merge_sha → unit_id indices for unit
-    # projection in the conflict-mapping step. Filter merge SHAs to those
-    # actually present in the local object DB — cross-repo PRs from
-    # ``include_prs`` typically aren't fetched, and including their SHAs
-    # in ``git log --not target_ref <shas...>`` makes git error out and
-    # drop the whole file's classification.
+    # Only index merge SHAs present locally: an unknown SHA in
+    # ``git log --not ...`` makes git error out (cross-repo PRs aren't fetched).
     pr_url_to_unit: dict[str, str] = {}
     merge_sha_to_unit: dict[str, str] = {}
     skipped_remote_sha: list[str] = []
@@ -459,17 +337,14 @@ def run_discover_deps(
 
     carried_pr_url_to_unit = _carried_pr_url_index(candidates, pr_url_to_unit)
 
-    # --- Run trial picks in scratch worktree ---
     nodes: dict[str, DAGNode] = {}
     edges: set[tuple[str, str]] = set()
     reused: list[str] = []
     by_unit_id: dict[str, _CandidateUnit] = {cu.unit_id: cu for cu in candidates}
     merge_containment_cache: dict[str, str] | None = None
 
-    # --- Incremental: prior groups reusable as-is ---
-    # Skip the members' trial-picks and re-inject a prereq chain so the
-    # component-collapse rebuilds each unchanged group (a new PR that
-    # conflicts into a member still attaches via its own traced edge).
+    # Unchanged prior groups skip member trial-picks; their prereq chain is
+    # re-injected so the component collapse rebuilds them.
     url_to_sha = {
         p.url: (p.merge_commit_sha or "")
         for cu in candidates for p in cu.prs
@@ -480,8 +355,6 @@ def run_discover_deps(
         )
     )
 
-    # Recursion cap for upstream-backport pull-in: `--max-depth` overrides,
-    # else ai_resolve.auto_add_prerequisite_prs.max_prereq_depth.
     cap = (
         max_depth if max_depth is not None
         else config.ai_resolve.auto_add_prerequisite_prs.max_prereq_depth
@@ -489,10 +362,8 @@ def run_discover_deps(
 
     scratch = _open_scratch_worktree(repo_path, scratch_parent, target_ref)
     try:
-        # Process oldest-merged-at first (ascending), so a prereq is always
-        # trial-picked before any dependent — no in-set recursion needed.
-        # Out-of-set upstream prereqs (cross-repo backports) are appended to
-        # the queue with depth+1 and bounded by max_depth.
+        # Oldest first, so an in-set prereq is always picked before its
+        # dependents. Pulled upstream prereqs are appended with depth+1.
         queue: list[tuple[str, int]] = [
             (cu.unit_id, 0)
             for cu in sorted(
@@ -509,17 +380,7 @@ def run_discover_deps(
         )
 
         def _checkpoint() -> None:
-            """Persist the units discovered so far, so a killed run resumes.
-
-            Written before each unit is picked (and once the queue drains):
-            an interrupted run leaves the same report a completed one would
-            have for the units it got through, and the next run reuses them
-            instead of re-picking + re-resolving. Prior-run nodes for units
-            not yet reached are carried over — the next run re-verifies each
-            before reusing it — as is the issue link, so an interruption
-            never loses ground. Components / singletons need the whole
-            traversal, so a checkpoint has none; the final write adds them.
-            """
+            """Persist units discovered so far (plus unreached prior nodes) so a killed run resumes."""
             carried = [
                 n for n in (reuse_prior.nodes if reuse_prior else [])
                 if n.unit_id not in nodes
@@ -550,9 +411,6 @@ def run_discover_deps(
                 continue
             cu = by_unit_id.get(unit_id)
             if cu is None:
-                # An edge pointed at a unit that isn't in the candidate set
-                # (or is fully merged). Caller's filtering should have
-                # prevented this; warn and continue.
                 warnings_acc.append(
                     f"unit {unit_id!r} referenced as a dep but not in candidate set; skipping"
                 )
@@ -563,9 +421,6 @@ def run_discover_deps(
                     "upstream prerequisites may be incomplete"
                 )
                 # Still record the node so edges pointing at it resolve.
-                # Use a distinct ``discovery_method`` so the YAML reader
-                # can tell "we never trial-picked this" from "we picked
-                # it and it was clean".
                 nodes[unit_id] = _make_node(
                     cu, deps=[], method="depth-cutoff",
                     conflict_files=[],
@@ -573,9 +428,6 @@ def run_discover_deps(
                 console.print(f"  [dim]· {unit_id}: depth-cutoff[/dim]")
                 continue
 
-            # Incremental reuse: reused group member. Skip the trial-pick —
-            # the prereq chain in ``preseeded_edges`` rebuilds the group at
-            # collapse time (this node is folded into the group there).
             if unit_id in reused_group_member_ids:
                 nodes[unit_id] = _make_node(
                     cu, deps=[], method="reused-group-member",
@@ -585,20 +437,9 @@ def run_discover_deps(
                 console.print(f"  [dim]· {unit_id}: reused (group member)[/dim]")
                 continue
 
-            # Incremental reuse: a prior unit — a single PR or a whole group
-            # carried as one candidate — whose PRs (and merge SHAs) are
-            # unchanged is reused as-is: skip the (re-)trial-pick and any AI.
-            #
-            # A clean/resolved unit is reused ``cached`` while its branch is
-            # still anchored to the target tip (the anchor check guards
-            # against a branch left on a stale/diverged base — interrupted
-            # run, force-push). A unit that CONFLICTED has no branch to
-            # verify: its result is the traced prereq list, so it is reused
-            # whatever the ref namespace looks like, and its edges are
-            # re-recorded below so the same group re-forms. With the base
-            # moved, we still skip the expensive re-pick but emit
-            # ``cached=False`` and drop any stale branch so ``run`` re-picks
-            # onto the new tip.
+            # Reuse an unchanged prior unit: ``cached`` only while its branch
+            # is anchored to the target tip; a conflicted unit is reused for
+            # its traced deps; a stale branch is dropped so ``run`` re-picks.
             cache_br = _cache_branch_name(base_branch, unit_id)
             prior_n = reuse_index.get(unit_id)
             if (
@@ -623,9 +464,7 @@ def run_discover_deps(
                         cached=branch_live,
                     )
                     if prior_n.discovery_method == "grouped":
-                        # Carrying the method keeps this node in the group
-                        # cache-branch builder's scope; tell it the combined
-                        # branch is unchanged so it doesn't re-pick it.
+                        # Tell the group cache builder the combined branch is unchanged.
                         prior_group_pr_urls[unit_id] = list(prior_n.pr_urls)
                     for dep in prior_n.deps:
                         edges.add((unit_id, dep))
@@ -642,11 +481,6 @@ def run_discover_deps(
                     console.print(f"  [dim]· {unit_id}: reused{suffix}[/dim]")
                     continue
 
-            # Cache branch path: when caching is enabled (the default),
-            # trial-pick onto a named branch ``feature/<base>/<unit_id>``
-            # so a successful pick is preserved for ``releasy run`` to
-            # reuse. When caching is disabled (``--no-write``), the
-            # trial runs detached and always resets — pure dry-run.
             # A branch `run` owns is trial-picked detached instead.
             cache_branch = (
                 cache_br
@@ -659,11 +493,9 @@ def run_discover_deps(
                 is_group=cu.is_group,
                 origin_slug=origin_slug,
             )
-            cache_kept = False  # decided below
+            cache_kept = False
 
             if outcome.clean:
-                # Trial-clean: keep the cache branch (it carries the
-                # cherry-pick at target_ref tip, ready for ``run``).
                 cache_kept = bool(cache_branch)
                 if cache_branch:
                     _release_cache_branch(
@@ -682,11 +514,6 @@ def run_discover_deps(
                     f"conflict files: {outcome.error_message}"
                 )
 
-            # --- Conflict path ---
-            # Worktree is on cache_branch in conflict state (when caching)
-            # OR detached at target_ref already-reset (when --no-write).
-            # Either way we can compute the deterministic candidate-deps
-            # via ``git log``, which doesn't depend on worktree state.
             console.print(
                 f"  [dim]· {unit_id}: conflict in {len(outcome.conflict_files)} "
                 "file(s), tracing prerequisites…[/dim]"
@@ -707,16 +534,9 @@ def run_discover_deps(
             )
 
             method = "git-graph"
-            ai_path_invoked = False
 
             if use_ai:
                 if cand_dep_unit_ids:
-                    # Refinement path: deterministic gave candidates,
-                    # confirm them via lightweight Claude call. We
-                    # never keep the cache branch on this path — the
-                    # cherry-pick conflicted and we didn't try to
-                    # resolve, so the branch would carry conflict
-                    # markers. Drop it.
                     confirmed = _ask_claude_for_prereqs(
                         config, cu, outcome.conflict_files,
                         cand_dep_unit_ids, by_unit_id, base_branch,
@@ -725,16 +545,13 @@ def run_discover_deps(
                     if confirmed is not None:
                         cand_dep_unit_ids = confirmed
                         method = "git-graph+claude"
-                    ai_path_invoked = True
                 elif (
                     cache_branch
                     and outcome.conflicting_pr_idx is not None
                     and outcome.conflict_files
                 ):
-                    # Fallback path: deterministic empty AND we have the
-                    # conflict state preserved in the cache branch. Hand
-                    # it directly to the AI resolver — no need to
-                    # recreate the conflict.
+                    # Nothing traced: hand the conflict preserved on the
+                    # cache branch to the AI resolver. Skipped under --no-write.
                     fb = _ai_resolve_fallback(
                         config, scratch, base_branch, cache_branch, cu,
                         outcome.conflicting_pr_idx,
@@ -742,7 +559,6 @@ def run_discover_deps(
                         fully_merged_units,
                         outcome.conflict_files, warnings_acc,
                     )
-                    ai_path_invoked = True
                     if fb is None:
                         warnings_acc.append(
                             f"unit {unit_id!r}: AI resolver could not "
@@ -752,11 +568,6 @@ def run_discover_deps(
                         cand_dep_unit_ids = fb.deps
                         method = fb.method or "git-graph"
                         cache_kept = fb.resolved
-                        # Upstream-backport recursion: pull out-of-set
-                        # prereqs from upstream for cross-repo units, gated
-                        # on auto_add_prerequisite_prs.enabled + upstream +
-                        # depth cap. The pulled unit is queued (depth+1) and
-                        # grouped via the dependency edge.
                         pulled: set[str] = set()
                         if (
                             fb.external_prereq_urls
@@ -781,9 +592,6 @@ def run_discover_deps(
                                     f"  [dim]· {unit_id}: pulled upstream "
                                     f"prereq {new_cu.unit_id}[/dim]"
                                 )
-                        # Whatever the gate above declined to pull is a real
-                        # prerequisite nobody in the graph provides. Say so:
-                        # dropping it silently reads as "no dependency".
                         unresolved = [
                             u for u in fb.external_prereq_urls
                             if u not in pulled
@@ -801,14 +609,7 @@ def run_discover_deps(
                                 f"{len(unresolved)} unprovided prereq(s): "
                                 f"{', '.join(unresolved)}"
                             )
-                # In ``--no-write`` (no cache_branch), we skip the AI
-                # fallback entirely — without the conflict state
-                # preserved we'd have to recreate it, defeating the
-                # caching simplification. Use whatever the deterministic
-                # mapping gave us.
 
-            # Drop dep references to unit IDs not in the candidate set —
-            # ``--limit`` truncation, already-merged exclusion, etc.
             dropped_deps: list[str] = []
             deps: list[str] = []
             for d in cand_dep_unit_ids:
@@ -824,10 +625,6 @@ def run_discover_deps(
                     "--limit or already-merged exclusion"
                 )
 
-            # Always end the unit's processing with scratch detached at
-            # target_ref. ``cache_kept`` decides whether the branch
-            # stays in the ref namespace for ``releasy run`` to find or
-            # gets hard-deleted.
             if cache_branch:
                 _release_cache_branch(
                     scratch, target_ref, cache_branch, keep=cache_kept,
@@ -840,9 +637,6 @@ def run_discover_deps(
             )
             detail = f" → groups with: {', '.join(deps)}" if deps else ""
             console.print(f"  [dim]· {unit_id}: {method}{detail}[/dim]")
-            # Record the directed prereq edges (dependent → prereq) used to
-            # order PRs within the collapsed group. Oldest-first means every
-            # in-set prereq is already processed; no recursion needed here.
             for d in deps:
                 edges.add((unit_id, d))
 
@@ -855,8 +649,6 @@ def run_discover_deps(
                 "previous run[/dim]"
             )
 
-        # Re-inject reused groups' prereq chains so the collapse rebuilds
-        # them (and lets any new PR that conflicted into a member attach).
         edges |= preseeded_edges
 
         edges |= _declared_edges(candidates, nodes, warnings_acc)
@@ -865,9 +657,6 @@ def run_discover_deps(
             warnings_acc,
         )
 
-        # --- Collapse components into groups, then build + cache each
-        # combined group branch while the scratch worktree is still open
-        # so `run` can reuse it instead of re-doing the cherry-picks ---
         sort_keys = _sort_keys_from_candidates(by_unit_id)
         edges = _break_cycles(edges, sort_keys, warnings_acc)
         components, _singletons = _components(nodes, edges, sort_keys)
@@ -875,10 +664,6 @@ def run_discover_deps(
             nodes, components, warnings_acc,
         )
         if cache_enabled:
-            # Build feature/<base>/<group-id> (clean → cached), then drop
-            # the now-superseded per-member branches. A reused group whose
-            # membership is unchanged and whose branch is still anchored is
-            # kept as-is (no re-pick); a moved base forces a rebuild.
             _build_group_cache_branches(
                 scratch, base_branch, target_ref, nodes, by_unit_id,
                 origin_slug, warnings_acc, config=config, repo_path=repo_path,
@@ -893,8 +678,6 @@ def run_discover_deps(
             console.print(
                 f"  [dim]grouped {len(folded)} unit(s) into combined port(s)[/dim]"
             )
-        # `components` now holds only the kept (user-group-bearing)
-        # components; singletons are the true standalone single-PR units.
         _in_component = {uid for c in components for uid in c.unit_ids}
         singletons = sorted(
             n.unit_id for n in nodes.values()
@@ -905,23 +688,16 @@ def run_discover_deps(
     finally:
         _close_scratch_worktree(repo_path, scratch)
 
-    # --- Build report ---
-    # A unit whose PRs have all landed in target since the last run keeps
-    # the node it had. It is done, and dropping it would erase its entry —
-    # a group's membership and apply order included — from the graph issue
-    # that tracks it as merged.
+    # A prior unit whose PRs have all landed keeps its node so the graph
+    # issue still shows it as merged; its deps are dropped.
     carried_merged_urls: set[str] = set()
     for pn in (prior_report.nodes if prior_report is not None else []):
         if pn.unit_id in nodes or not pn.pr_urls:
             continue
         if all(url in pr_in_target for url in pn.pr_urls):
-            # Deps go: the unit is done, so nothing gates it any more, and
-            # a prereq that dropped out of this run would dangle.
             nodes[pn.unit_id] = replace(pn, deps=[])
             carried_merged_urls.update(pn.pr_urls)
 
-    # Units carried above are full graph nodes now, so they don't also
-    # belong in the bare already-in-target id list.
     skipped = sorted(
         uid for uid in fully_merged_units
         if uid not in nodes
@@ -936,14 +712,6 @@ def run_discover_deps(
                     conflict_files=[],
                 )
 
-    # --- Refresh diff: what changed since the previous overlay file? ---
-    # Compares the auto-discovered unit IDs the new run would write to
-    # the ones that were in the existing deps overlay (if any).
-    # ``removed`` = present in old, absent in new — typically "landed in
-    # target since last run" or "no longer needs porting because a
-    # dependency was satisfied by something else".
-    # ``added``   = present in new, absent in old — "newly discovered
-    # candidate / dependency since last run".
     new_auto_unit_ids: set[str] = {
         nid for nid, n in nodes.items() if not n.is_user_group
     }
@@ -966,12 +734,7 @@ def run_discover_deps(
         **_carried_session_fields(prior_report),
     )
 
-    # --- Write outputs ---
-    # Deps-file overlay first so any failure-to-write warning lands in
-    # the diagnostic report's on-disk YAML (``report.warnings`` and
-    # ``warnings_acc`` are the same list object). Any failure writing
-    # the overlay is captured as a warning rather than propagated, so
-    # the diagnostic report — the durable artifact — always lands.
+    # Overlay first so a write failure lands in report.warnings (same list).
     if deps_overlay_path is not None:
         try:
             _write_session_overlay(report, deps_overlay_path)
@@ -986,8 +749,6 @@ def run_discover_deps(
             )
             _report_outdated(mark_outdated_units(config, report))
     elif config.session and config.session.session_path:
-        # We're skipping (--no-write). Note where the overlay *would*
-        # have gone so the user knows we noticed and chose to skip.
         from releasy.config import resolve_deps_file_path
         target = resolve_deps_file_path(
             config.session.session_path,
@@ -1000,8 +761,7 @@ def run_discover_deps(
 
     output_path = report_path
 
-    # Open/refresh the issue before the final write so issue_number
-    # persists in the same report.
+    # Before the final write so issue_number persists in the same report.
     if open_issue:
         title = issue_title or f"Port graph for {base_branch}"
         if open_or_update_graph_issue(config, report, title=title) is None:
@@ -1017,19 +777,10 @@ def run_discover_deps(
     return report
 
 
-# ---------------------------------------------------------------------------
-# Candidate set + already-merged detection
-# ---------------------------------------------------------------------------
-
-
 def _build_candidate_unit_set(
     units: list[FeatureUnit], config: Config,
 ) -> list[_CandidateUnit]:
-    """Flatten ``discover_feature_units`` output into _CandidateUnit's.
-
-    Sort by earliest merged_at ascending (oldest first); the traversal
-    later iterates this in reverse for the "latest → oldest" walk.
-    """
+    """Wrap feature units as candidates, sorted oldest-merged first."""
     out: list[_CandidateUnit] = []
     for u in units:
         merged = [p.merged_at for p in u.prs if p.merged_at]
@@ -1037,7 +788,6 @@ def _build_candidate_unit_set(
         out.append(_CandidateUnit(
             unit_id=u.feature_id,
             is_group=u.is_group,
-            # An overlay group is ours to rewrite, not the user's.
             is_user_group=u.is_group and not u.auto_discovered,
             prs=list(u.prs),
             earliest_merged_at=earliest,
@@ -1053,13 +803,9 @@ def _build_candidate_unit_set(
 def _carried_pr_url_index(
     candidates: list[_CandidateUnit], pr_url_to_unit: dict[str, str],
 ) -> dict[str, str]:
-    """PRs a candidate carries *inside* a combined port → its unit id.
+    """PRs cherry-picked *inside* a candidate's combined port → its unit id.
 
-    A conflict or a prereq report names the PR that introduced the code
-    (#1388), while the unit that brings it here lists only the combined
-    port that cherry-picked it (#1718). ``pr_url_to_unit`` covers literal
-    listings; this covers what those listings carry, and never overrides
-    them — a unit that lists a PR outright wins.
+    Never overrides ``pr_url_to_unit``: a unit listing a PR outright wins.
     """
     out: dict[str, str] = {}
     for cu in candidates:
@@ -1079,16 +825,7 @@ def _declared_edges(
     nodes: dict[str, DAGNode],
     warnings_acc: list[str],
 ) -> set[tuple[str, str]]:
-    """Edges a user hand-declared via ``groups[].depends_on``.
-
-    ``depends_on`` is an INPUT to discovery, not only an output: a user
-    group asserting a dependency keeps it even when this run found no
-    conflict to re-derive it from (the prereq may be semantic, or the
-    trial-pick may have stopped at an earlier member). Auto-discovered
-    overlay entries are deliberately excluded — replaying discovery's own
-    prior output would make an edge impossible to un-discover once the
-    prereq lands in the base branch.
-    """
+    """Edges hand-declared via user groups' ``depends_on`` (overlay groups excluded)."""
     out: set[tuple[str, str]] = set()
     for cu in candidates:
         if not cu.is_user_group or cu.unit_id not in nodes:
@@ -1112,12 +849,7 @@ def _follow_up_edges(
     carried_pr_url_to_unit: dict[str, str],
     warnings_acc: list[str],
 ) -> set[tuple[str, str]]:
-    """Edges from a PR body saying it is a follow-up for another PR.
-
-    The follow-up depends on the PR it follows. A referenced PR that is a
-    candidate already in target needs no edge; one that is no candidate at
-    all is warned about.
-    """
+    """Edges from a PR body declaring it a follow-up for another PR."""
     out: set[tuple[str, str]] = set()
     for cu in candidates:
         if cu.unit_id not in nodes:
@@ -1144,7 +876,7 @@ def _follow_up_edges(
 def _state_already_in_target(
     candidates: list[_CandidateUnit], state: PipelineState,
 ) -> set[str]:
-    """PR URLs whose unit is already recorded as merged/branch_created in state."""
+    """Candidate PR URLs whose feature is recorded as merged in state."""
     out: set[str] = set()
     state_urls: set[str] = set()
     for fs in state.features.values():
@@ -1163,11 +895,11 @@ def _state_already_in_target(
 def _trailer_scan(
     repo_path: Path, target_ref: str, candidate_urls: set[str],
 ) -> set[str]:
-    """Scan target's recent history for ``Source-PR:`` trailers; return matched URLs."""
+    """Candidate URLs found in ``Source-PR:`` trailers of target's recent history."""
     if not candidate_urls:
         return set()
     rev_range = f"{target_ref}~2000..{target_ref}"
-    # If target has fewer than 2000 commits, fall back to full history.
+    # Falls back to full history if target has fewer than 2000 commits.
     result = run_git(
         ["log", rev_range,
          "--format=%(trailers:key=Source-PR,unfold=true,valueonly=true)"],
@@ -1194,44 +926,11 @@ def _git_cherry_already(
     repo_path: Path, target_ref: str,
     candidates: list[_CandidateUnit], warnings_acc: list[str],
 ) -> set[str]:
-    """For each candidate PR's merge_commit_sha, ask ``git cherry`` whether
-    every commit the PR introduced has a patch-id equivalent in target.
+    """PR URLs whose own commits all have a patch-id equivalent in target (``git cherry``).
 
-    Implementation note (was a bug, now fixed):
-
-    ``git cherry <upstream> <head>`` walks ``<upstream>..<head>`` —
-    EVERY non-merge commit between the merge-base and ``<head>``. For a
-    PR's merge commit on master, that's typically *hundreds* of master
-    commits, including unrelated PRs the user may have cherry-picked
-    into target. Marking the candidate PR as "already in target"
-    because *any* of those master commits had a patch-id match is
-    wrong — that's what produced false positives where PRs that were
-    never ported showed up under ``skipped_already_in_target``.
-
-    Two scoping changes:
-
-    1. Constrain the walk to the PR's *own* commits via the
-       ``<limit>`` argument: ``git cherry <target> <head> <limit>``
-       walks ``<limit>..<head>`` only.
-       * For a true merge commit (2+ parents), ``<limit>`` is
-         ``parents[0]`` and ``<head>`` is ``parents[1]`` — the PR
-         branch's own commits.
-       * For a single-parent commit (squash-merged PR — and rebase-
-         merged PRs whose ``merge_commit_sha`` happens to be the last
-         commit), ``<limit>`` is ``<sha>~1``. For squashes this
-         walks exactly the squash commit; for rebase-merged PRs with
-         multiple commits this is an under-approximation (we only
-         check the last one), which is a deliberate trade-off:
-         missing a true positive (false negative) is far less harmful
-         than mistakenly skipping a PR that needs porting.
-
-    2. Require *every* line in the constrained output to start with
-       ``- `` (patch-id match) before marking the PR as already-in-
-       target. The previous "any match" policy was the actual source
-       of false positives even after scoping is corrected.
-
-    Cross-repo / unfetched merge SHAs are skipped silently via the
-    ``cat-file -e`` precheck, same as before.
+    The walk is limited to the PR's commits (merge: ``p1..p2``; squash /
+    rebase: just the merge SHA) so unrelated history can't match, and every
+    commit must match. Rebase-merged multi-commit PRs are under-checked.
     """
     out: set[str] = set()
     for cu in candidates:
@@ -1239,16 +938,13 @@ def _git_cherry_already(
             sha = p.merge_commit_sha
             if not sha:
                 continue
-            # Verify the SHA is present locally; otherwise skip — cross-repo
-            # PRs from include_prs may not have been fetched.
+            # Cross-repo PRs may not have been fetched.
             check = run_git(
                 ["cat-file", "-e", sha], repo_path, check=False,
             )
             if check.returncode != 0:
                 continue
 
-            # Determine the right (head, limit) pair for ``git cherry``
-            # by inspecting the merge commit's parents.
             parents_res = run_git(
                 ["rev-list", "--parents", "-n", "1", sha],
                 repo_path, check=False,
@@ -1256,8 +952,6 @@ def _git_cherry_already(
             if parents_res.returncode != 0 or not parents_res.stdout.strip():
                 continue
             parts = parents_res.stdout.strip().split()
-            # parts: [<sha>, <p1>] for non-merge commits (squash / rebase).
-            # parts: [<sha>, <p1>, <p2>, ...] for merge commits.
             if len(parts) >= 3:
                 _, p1, p2 = parts[0], parts[1], parts[2]
                 cherry = run_git(
@@ -1270,7 +964,6 @@ def _git_cherry_already(
                     repo_path, check=False,
                 )
             else:
-                # Initial commit / no parents — can't scope; skip.
                 continue
             if cherry.returncode != 0:
                 continue
@@ -1280,42 +973,20 @@ def _git_cherry_already(
                 if line.strip()
             ]
             if not lines:
-                # Empty range (degenerate merge / no commits to compare).
-                # Be conservative: don't mark.
                 continue
-            # Strict: every PR commit must have a patch-id equivalent in
-            # target before we conclude the PR is already there.
             if all(line.startswith("- ") for line in lines):
                 out.add(p.url)
     return out
 
 
-# ---------------------------------------------------------------------------
-# Trial cherry-pick environment
-# ---------------------------------------------------------------------------
-
-
-# Module-level registry of cleanup flags keyed on scratch worktree path.
-# Stored separately from the ``Path`` object because 3.12+ slots out
-# arbitrary attribute assignment on ``pathlib.Path``. Each entry is
-# ``[bool]`` (single-element list, used as a mutable cell) so the
-# atexit closure and the explicit close path can both flip it from True
-# to indicate "already cleaned, skip the redundant `worktree remove`".
+# Scratch worktree path → "already cleaned" cell shared by atexit and explicit close.
 _SCRATCH_CLEANUP_FLAGS: dict[str, list[bool]] = {}
 
 
 def _open_scratch_worktree(
     repo_path: Path, scratch_parent: Path, target_ref: str,
 ) -> Path:
-    """Create a detached scratch worktree at ``target_ref`` under
-    ``scratch_parent`` and register a best-effort cleanup via
-    :mod:`atexit` (in addition to the caller's try/finally).
-
-    The parent is the user-blessed work_dir, never derived from
-    ``repo_path.parent`` (see :func:`run_discover_deps` for the rationale).
-    """
-    # Reuse the project's standard short-id helper so scratch dirs sort
-    # alongside other releasy-managed names.
+    """Create a detached scratch worktree at ``target_ref``; atexit removes it as a fallback."""
     from releasy.cli import _short_id
 
     short_id = _short_id()
@@ -1357,23 +1028,14 @@ _AUTO_GRP_PREFIX = "auto-grp-"
 
 
 def _auto_group_id(lead_unit_id: str) -> str:
-    """Group id derived from the lead (prereq-most) member's unit id.
-
-    Idempotent: when the lead is already an auto group that grew by
-    absorbing new units, its id is kept rather than nested into
-    ``auto-grp-auto-grp-…`` (which would orphan its cache branch and
-    state entry).
-    """
+    """Group id from the lead (prereq-most) member's id; idempotent for auto groups."""
     if lead_unit_id.startswith(_AUTO_GRP_PREFIX):
         return lead_unit_id
     return f"{_AUTO_GRP_PREFIX}{lead_unit_id}"
 
 
 def _cache_branch_name(base_branch: str, unit_id: str) -> str:
-    """Same naming convention :func:`Config.feature_branch_name` uses,
-    so a branch left here by ``discover-deps`` is automatically picked
-    up by ``releasy run`` via its existing ``if_exists`` policy.
-    """
+    """Same naming as :meth:`Config.feature_branch_name`, so ``run`` picks the branch up."""
     return f"feature/{base_branch}/{unit_id}"
 
 
@@ -1385,34 +1047,15 @@ def _trial_pick_unit(
     is_group: bool,
     origin_slug: str | None,
 ) -> _PickOutcome:
-    """Sequentially cherry-pick every PR in the unit onto a named branch.
+    """Cherry-pick every PR of the unit onto ``cache_branch`` the way ``run`` does.
 
-    Each PR is picked the way ``releasy run`` picks it
-    (:func:`releasy.pipeline._cherry_pick_pr`): merged PRs by merge commit,
-    open PRs by their ``refs/pull/<n>/merge`` ref.
-
-    On clean: returns ``clean=True``; the worktree is left on
-    ``cache_branch`` at ``target_ref + unit_PRs`` (caller decides whether
-    to keep it). For multi-PR groups, each commit gets a ``Source-PR:``
-    trailer mirroring the convention ``releasy run`` uses, so the
-    resulting PR's commit list is self-attributing.
-
-    On conflict: returns ``clean=False`` with the offending PR's index
-    and conflict files. The worktree is **left in conflict state on
-    ``cache_branch``** so the caller can hand it to the AI resolver
-    without having to recreate the conflict.
-
-    No automatic reset — the caller drives cleanup based on the outcome
-    and any AI fallback decision.
-
-    When ``cache_branch`` is ``None`` (e.g. ``--no-write`` mode), the
-    worktree stays detached at ``target_ref`` and the function ALWAYS
-    resets afterwards regardless of outcome — pure dry-run behaviour.
+    On conflict the worktree is left in conflict state on ``cache_branch``
+    for the AI fallback; the caller does cleanup. With no ``cache_branch``
+    the pick runs detached and is always reset.
     """
     prs = _ordered_prs_for_pick(unit)
 
     if cache_branch is None:
-        # Pure dry-run mode: detached HEAD, always reset.
         try:
             for idx, p in enumerate(prs):
                 res = _cherry_pick_pr(scratch, config, p)
@@ -1429,15 +1072,11 @@ def _trial_pick_unit(
             run_git(["reset", "--hard", target_ref], scratch, check=False)
             run_git(["clean", "-fdx"], scratch, check=False)
 
-    # Caching path: switch scratch to the cache branch, force-resetting
-    # any prior cache for this unit. ``-B`` is "create-or-reset to ref".
     run_git(["checkout", "-B", cache_branch, target_ref], scratch, check=False)
 
     for idx, p in enumerate(prs):
         res = _cherry_pick_pr(scratch, config, p)
         if not res.success:
-            # Leave the worktree in conflict state on cache_branch — the
-            # caller's AI fallback path can operate on it directly.
             return _PickOutcome(
                 clean=False,
                 conflict_files=list(res.conflict_files),
@@ -1445,9 +1084,6 @@ def _trial_pick_unit(
                 conflicting_pr_idx=idx,
                 cache_branch=cache_branch,
             )
-        # Tag commit with Source-PR trailer for multi-PR groups, mirroring
-        # ``pipeline._tag_commit_with_source_pr``. Singletons skip this —
-        # the branch IS the source PR, trailer would be redundant noise.
         if is_group and len(prs) > 1:
             from releasy.github_ops import pr_ref_label
             ref = pr_ref_label(p.repo_slug, p.number, origin_slug)
@@ -1465,17 +1101,7 @@ def _release_cache_branch(
     scratch: Path, target_ref: str, branch_name: str | None,
     *, keep: bool,
 ) -> None:
-    """Detach scratch from the cache branch and (optionally) delete it.
-
-    ``keep=True``: branch persists in the main repo's ref namespace —
-    ``releasy run`` will find it via its ``if_exists`` policy.
-    ``keep=False``: branch is hard-deleted (used when caching wasn't
-    appropriate for this unit, e.g. AI fallback failed).
-
-    Always aborts any in-progress op and resets the scratch worktree
-    to a detached state at ``target_ref`` so the next unit starts
-    from a clean slate.
-    """
+    """Reset scratch to a clean detached ``target_ref``; delete the branch unless ``keep``."""
     abort_in_progress_op(scratch)
     # Detach so the branch (if kept) isn't holding a checkout lock.
     run_git(["checkout", "--detach", target_ref], scratch, check=False)
@@ -1485,43 +1111,24 @@ def _release_cache_branch(
 
 
 def _ordered_prs_for_pick(unit: _CandidateUnit) -> list[PRInfo]:
-    """Return the unit's PRs in cherry-pick order — same logic
-    :func:`_build_group_units` uses (group.sort honoured).
-    """
-    fu = unit.feature_unit
-    if fu.is_group:
-        # The FeatureUnit was already sorted in _build_group_units when
-        # group.sort == "merged_at". For "listed", keep current order.
-        return list(fu.prs)
-    return list(fu.prs)
-
-
-# ---------------------------------------------------------------------------
-# Conflict file → candidate unit mapping
-# ---------------------------------------------------------------------------
+    """The unit's PRs in cherry-pick order (already sorted by ``_build_group_units``)."""
+    return list(unit.feature_unit.prs)
 
 
 def _build_merge_containment_map(
     repo_path: Path, target_ref: str,
     candidates: list[_CandidateUnit], warnings_acc: list[str],
 ) -> dict[str, str]:
-    """Return ``{non_merge_sha: enclosing_merge_sha}`` for commits between
-    target_ref and any candidate merge commit's first-parent diff.
-
-    Only candidate merge commits matter — drift commits don't get
-    classified anyway. Built once per discover-deps run.
-    """
+    """``{commit_sha: enclosing_merge_sha}`` for the branch commits of each candidate merge."""
     containment: dict[str, str] = {}
     for cu in candidates:
         for p in cu.prs:
             mc = p.merge_commit_sha
             if not mc:
                 continue
-            # Verify object exists locally
             chk = run_git(["cat-file", "-e", mc], repo_path, check=False)
             if chk.returncode != 0:
                 continue
-            # Get the merge's parents
             parents_res = run_git(
                 ["rev-list", "--parents", "-n", "1", mc],
                 repo_path, check=False,
@@ -1530,7 +1137,6 @@ def _build_merge_containment_map(
                 continue
             parts = parents_res.stdout.strip().split()
             if len(parts) < 3:
-                # Not a merge commit (only 1 parent) — skip.
                 continue
             p1, p2 = parts[1], parts[2]
             log_res = run_git(
@@ -1557,15 +1163,7 @@ def _candidate_deps_for_conflict(
     exclude_unit_ids: set[str],
     already_in_target_units: set[str],
 ) -> list[str]:
-    """Map conflict files back to candidate unit IDs that touched them.
-
-    Algorithm: for each conflict file, run ``git log --not target_ref
-    <merge_shas...> -- file`` to enumerate commits reachable from any
-    candidate but not target that touched the file. Classify each commit
-    via merge-commit match → Source-PR trailer → containment map. Project
-    PR URLs to unit IDs. Drop the trial-pick's own unit and units already
-    in target.
-    """
+    """Candidate unit IDs whose not-yet-in-target commits touched the conflict files."""
     if not conflict_files or not candidate_merge_shas:
         return []
     cand_set = set(candidate_merge_shas)
@@ -1610,19 +1208,12 @@ def _classify_commit_to_unit(
     carried_pr_url_to_unit: dict[str, str],
     merge_containment: dict[str, str],
 ) -> str | None:
-    """Three-rule precedence:
-    1. ``sha`` is a candidate's merge_commit_sha → direct lookup.
-    2. Commit carries a ``Source-PR:`` trailer matching a candidate URL —
-       either one a unit lists, or one it carries in a combined port.
-    3. Commit is contained in one of the candidate merge commits (merge_containment).
-    """
-    # Rule 1: direct merge match
+    """Unit owning ``sha``: candidate merge SHA, then ``Source-PR:`` trailer, then containment."""
     if sha in candidate_merge_shas:
         uid = merge_sha_to_unit.get(sha)
         if uid is not None:
             return uid
 
-    # Rule 2: Source-PR trailer
     show = run_git(
         ["show", "-s",
          "--format=%(trailers:key=Source-PR,unfold=true,valueonly=true)",
@@ -1638,7 +1229,6 @@ def _classify_commit_to_unit(
                 if url in carried_pr_url_to_unit:
                     return carried_pr_url_to_unit[url]
 
-    # Rule 3: containment in a candidate merge commit
     enclosing = merge_containment.get(sha)
     if enclosing:
         uid = merge_sha_to_unit.get(enclosing)
@@ -1646,11 +1236,6 @@ def _classify_commit_to_unit(
             return uid
 
     return None
-
-
-# ---------------------------------------------------------------------------
-# Claude integration
-# ---------------------------------------------------------------------------
 
 
 def _ask_claude_for_prereqs(
@@ -1662,21 +1247,8 @@ def _ask_claude_for_prereqs(
     base_branch: str,
     warnings_acc: list[str],
 ) -> list[str] | None:
-    """Ask Claude to confirm/refine the deterministic candidate-deps list.
-
-    Renders ``prompts/discover_prereqs.md`` and parses the model's
-    ``MISSING_PREREQS:`` output. Returns the confirmed subset (URLs
-    mapped back to unit_ids) or ``None`` to signal "AI unavailable, use
-    deterministic candidates as-is".
-    """
-    prompt_path = (
-        config.config_path.parent / "prompts" / "discover_prereqs.md"
-    )
-    if not prompt_path.exists():
-        # Fallback to bundled template
-        prompt_path = (
-            Path(__file__).parent / "prompts" / "discover_prereqs.md"
-        )
+    """Ask Claude to confirm the traced candidate deps; ``None`` means keep them as-is."""
+    prompt_path = _prompt_path(config, "prompts/discover_prereqs.md")
     if not prompt_path.exists():
         warnings_acc.append(
             "discover_prereqs.md prompt template not found; "
@@ -1694,8 +1266,7 @@ def _ask_claude_for_prereqs(
             continue
         for p in cu.prs:
             url_to_unit[p.url] = cuid
-            # Claude may answer with the PR that introduced the code rather
-            # than the combined port this unit lists; both mean this unit.
+            # Claude may name a PR carried inside this unit's combined port.
             for owner, repo, number in parse_cherry_picked_refs(
                 p.body, p.repo_slug,
             ):
@@ -1717,11 +1288,7 @@ def _ask_claude_for_prereqs(
         "base_branch": base_branch,
     }
 
-    def _replace(match: re.Match[str]) -> str:
-        key = match.group(1)
-        return placeholders.get(key, match.group(0))
-
-    rendered = re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", _replace, template)
+    rendered = _fill_placeholders(template, placeholders)
 
     res = synthesize_text(
         config, rendered,
@@ -1736,10 +1303,7 @@ def _ask_claude_for_prereqs(
         )
         return None
 
-    # Distinguish "Claude said no prereqs" (a deliberate empty list under a
-    # ``MISSING_PREREQS:`` line) from "Claude misformatted" (no marker line
-    # at all). Without this check, both look identical to the parser and a
-    # malformed response would silently look like a confident "no prereqs".
+    # No marker line means malformed, not "no prereqs".
     if _MISSING_PREREQS_RE.search(res.text) is None:
         warnings_acc.append(
             f"Claude refinement for {unit.unit_id!r}: response did not "
@@ -1768,26 +1332,12 @@ def _ask_claude_for_prereqs(
 
 @dataclass
 class _AIFallbackResult:
-    """Outcome of the AI-resolve fallback path. Distinguishes the cases
-    so the caller can pick a ``discovery_method`` AND decide whether to
-    keep the cache branch.
-    """
-    # Confirmed missing-prereq unit IDs, mapped from URLs Claude returned.
-    # Empty list when the resolver found no real prereqs.
     deps: list[str]
-    # ``True``  — resolver advanced HEAD with a real resolution. Caller
-    #             should keep the cache branch (it carries the
-    #             AI-resolved cherry-pick).
-    # ``False`` — resolver couldn't resolve cleanly. Caller should drop
-    #             the cache branch.
+    # The resolver produced a resolution; keep the cache branch.
     resolved: bool
-    # ``"ai-resolve"``       — deps populated, resolver gave up, prereqs
-    #                          point at older un-ported units.
-    # ``"ai-resolve-clean"`` — resolver succeeded without prereqs (drift).
-    # ``None``               — neither: resolver failed without info.
+    # "ai-resolve" (prereqs found) | "ai-resolve-clean" (resolved, no prereqs) | None
     method: str | None
-    # Prereq PR URLs the resolver named that are NOT in the candidate set —
-    # candidates for upstream-backport recursion (cross-repo pull-in).
+    # Named prereq URLs outside the candidate set (upstream pull-in candidates).
     external_prereq_urls: list[str] = field(default_factory=list)
 
 
@@ -1804,34 +1354,7 @@ def _ai_resolve_fallback(
     conflict_files: list[str],
     warnings_acc: list[str],
 ) -> _AIFallbackResult | None:
-    """Heavyweight fallback: hand an *existing* conflict state to the
-    full AI resolver and read its missing-prereqs / resolution outcome.
-
-    Caller guarantees the worktree is currently in conflict state on
-    ``unit.feature_unit.prs[conflicting_pr_idx]`` (left there by the
-    trial-pick on the cache branch). We don't recreate the conflict —
-    we just hand it to ``attempt_ai_resolve`` and read the result.
-
-    Three possible returns:
-
-    * ``_AIFallbackResult(deps=[...], resolved=True, method="ai-resolve")``
-      — Claude reported ``MISSING_PREREQS`` AND advanced HEAD. Deps
-      populated; cache branch carries the resolution.
-    * ``_AIFallbackResult(deps=[...], resolved=False, method="ai-resolve")``
-      — Claude reported ``MISSING_PREREQS`` but did NOT resolve.
-      Deps populated; cache branch should be dropped.
-    * ``_AIFallbackResult(deps=[], resolved=True,
-      method="ai-resolve-clean")`` — Claude resolved cleanly without
-      prereqs (drift). Cache branch carries the resolution.
-    * ``None`` — resolver failed uncertainly (no resolution, no
-      missing-prereq info). Caller should fall back to empty deps and
-      drop the cache.
-
-    On resolver failure ``attempt_ai_resolve`` already resets HEAD to
-    ``ctx.start_sha`` (which is the cache branch's tip BEFORE the
-    failing pick — i.e. the prefix that DID apply cleanly for groups).
-    The caller's branch-disposal logic resets to ``target_ref`` afterwards.
-    """
+    """Hand the existing conflict state to the AI resolver; ``None`` if it failed without info."""
     try:
         prs = unit.feature_unit.prs
         if not (0 <= conflicting_pr_idx < len(prs)):
@@ -1855,17 +1378,13 @@ def _ai_resolve_fallback(
             )
 
         if result.missing_prereq_prs:
-            # Map URLs → unit IDs; collect out-of-set URLs separately so the
-            # caller can pull them in from upstream (cross-repo backports).
             confirmed: list[str] = []
             external: list[str] = []
             seen: set[str] = set()
             for url in result.missing_prereq_prs:
                 uid = pr_url_to_unit.get(url)
                 if uid is None:
-                    # Nobody lists it — but a combined port in the set may
-                    # carry it (#1388 lives inside #1718). That's an in-set
-                    # dep, not an external prereq to pull from upstream.
+                    # A combined port in the set may carry it: an in-set dep.
                     uid = carried_pr_url_to_unit.get(url)
                     if uid is not None and uid != unit.unit_id:
                         warnings_acc.append(
@@ -1887,15 +1406,13 @@ def _ai_resolve_fallback(
                 confirmed.append(uid)
             return _AIFallbackResult(
                 deps=confirmed,
-                # ``MISSING_PREREQS`` always pairs with success=False per
-                # the resolver's contract — no resolution happened.
+                # MISSING_PREREQS always pairs with success=False.
                 resolved=False,
                 method="ai-resolve",
                 external_prereq_urls=external,
             )
 
         if result.success:
-            # Resolved cleanly without prereqs → drift.
             for w in result.warnings:
                 warnings_acc.append(
                     f"unit {unit.unit_id!r}: cached AI resolution kept with "
@@ -1905,7 +1422,6 @@ def _ai_resolve_fallback(
                 deps=[], resolved=True, method="ai-resolve-clean",
             )
 
-        # Failed without info.
         return None
     except Exception as e:  # pragma: no cover — defensive
         warnings_acc.append(
@@ -1915,7 +1431,6 @@ def _ai_resolve_fallback(
 
 
 def _is_cross_repo(cu: _CandidateUnit, origin_slug: str | None) -> bool:
-    """True if any of the unit's PRs lives in a repo other than origin."""
     if not origin_slug:
         return False
     return any((p.repo_slug or origin_slug) != origin_slug for p in cu.prs)
@@ -1930,13 +1445,7 @@ def _pull_upstream_prereq(
     merge_sha_to_unit: dict[str, str],
     warnings_acc: list[str],
 ) -> _CandidateUnit | None:
-    """Fetch an out-of-set upstream prerequisite PR and register it as a unit.
-
-    Returns the new (or already-registered) ``_CandidateUnit``, or ``None``
-    if it can't be fetched / its merge commit can't be made available. Needs
-    ``config.upstream``. Best-effort: any failure degrades to ``None`` so the
-    prereq is just flagged, never crashing discovery.
-    """
+    """Fetch an out-of-set upstream prereq PR and register it as a unit; ``None`` on failure."""
     if url in pr_url_to_unit:
         return by_unit_id.get(pr_url_to_unit[url])
     if config.upstream is None:
@@ -1952,7 +1461,6 @@ def _pull_upstream_prereq(
             f"upstream prereq {url!r}: unreachable or no merge commit; flagging missing"
         )
         return None
-    # Make the merge commit available locally from the upstream remote.
     ensure_remote(repo_path, config.upstream.remote_name, config.upstream.remote)
     run_git(
         ["fetch", config.upstream.remote_name, pr.merge_commit_sha],
@@ -1981,21 +1489,12 @@ def _pull_upstream_prereq(
     return cu
 
 
-# ---------------------------------------------------------------------------
-# Components and articulation
-# ---------------------------------------------------------------------------
-
-
 def _components(
     nodes: dict[str, DAGNode],
     edges: set[tuple[str, str]],
     sort_keys: dict[str, tuple[str, int]],
 ) -> tuple[list[DAGComponent], list[str]]:
-    """Return (components, singletons). Components are the WCCs with ≥ 2
-    nodes OR with at least one edge; singletons are leaf nodes with no
-    edges in either direction.
-    """
-    # Build undirected adjacency
+    """Weakly-connected components with at least one edge, and edgeless singletons."""
     adj: dict[str, set[str]] = {nid: set() for nid in nodes}
     for a, b in edges:
         if a in adj and b in adj:
@@ -2011,7 +1510,6 @@ def _components(
     for nid in sorted_ids:
         if nid in visited:
             continue
-        # BFS the WCC
         comp_nodes: list[str] = []
         stack = [nid]
         while stack:
@@ -2050,10 +1548,7 @@ def _topo_sort_within(
     edges: set[tuple[str, str]],
     sort_keys: dict[str, tuple[str, int]],
 ) -> list[str]:
-    """Topo-sort a single component so deps come before dependents.
-
-    Edge ``(a, b)`` means ``a`` depends on ``b``, so ``b`` should come first.
-    """
+    """Topo-sort a component so deps come first (edge ``(a, b)``: a depends on b)."""
     in_set = set(comp_nodes)
     indeg: dict[str, int] = {n: 0 for n in comp_nodes}
     succ: dict[str, list[str]] = {n: [] for n in comp_nodes}
@@ -2082,7 +1577,6 @@ def _topo_sort_within(
                         hi = mid
                 ready.insert(lo, s)
     if len(out) != len(comp_nodes):
-        # Cycle — shouldn't happen post-cycle-break, but be defensive.
         leftover = [n for n in comp_nodes if n not in out]
         out.extend(sorted(leftover))
     return out
@@ -2091,12 +1585,7 @@ def _topo_sort_within(
 def _sort_key(
     sort_keys: dict[str, tuple[str, int]], unit_id: str,
 ) -> tuple[str, int]:
-    """Topo/cycle tie-break key for ``unit_id`` (``(merged_at, pr_number)``).
-
-    Decoupled from :class:`_CandidateUnit` so the same graph algorithms
-    serve both fresh discovery (keys built from candidates) and
-    ``releasy graph update`` (keys rebuilt from :class:`DAGNode`s).
-    """
+    """Topo/cycle tie-break key ``(merged_at, pr_number)`` for ``unit_id``."""
     return sort_keys.get(unit_id, ("9999", 0))
 
 
@@ -2128,13 +1617,7 @@ def _sort_keys_from_nodes(
 def _articulation_points(
     comp_nodes: list[str], adj: dict[str, set[str]],
 ) -> set[str]:
-    """Tarjan's articulation-point algorithm on the undirected subgraph.
-
-    Iterative implementation — Python's default recursion limit (~1000)
-    isn't enough for a long-chain component (200+ PRs in series), and
-    raising ``setrecursionlimit`` is fragile. The state machine below is
-    the standard "neighbour iterator on the stack" formulation.
-    """
+    """Tarjan's articulation points, iterative to avoid the recursion limit on long chains."""
     if not comp_nodes:
         return set()
     disc: dict[str, int] = {}
@@ -2151,13 +1634,11 @@ def _articulation_points(
         children_count[root] = 0
         disc[root] = low[root] = timer
         timer += 1
-        # Stack entries: (node, iterator over its neighbours).
         stack: list[tuple[str, "iter"]] = [(root, iter(sorted(adj[root])))]
         while stack:
             u, it = stack[-1]
             v = next(it, None)
             if v is None:
-                # Done visiting u — propagate low-link to parent on pop.
                 stack.pop()
                 p = parent.get(u)
                 if p is not None:
@@ -2174,7 +1655,6 @@ def _articulation_points(
                 stack.append((v, iter(sorted(adj[v]))))
             elif v != parent.get(u):
                 low[u] = min(low[u], disc[v])
-        # Root-of-DFS is articulation iff it has > 1 DFS child.
         if children_count.get(root, 0) > 1:
             art.add(root)
     return art
@@ -2185,15 +1665,8 @@ def _break_cycles(
     sort_keys: dict[str, tuple[str, int]],
     warnings_acc: list[str],
 ) -> set[tuple[str, str]]:
-    """Drop reverse edges in any 2-cycle to keep the graph acyclic.
-
-    Spec calls for ``older→newer`` to be kept and ``newer→older`` dropped,
-    keyed on ``(merged_at, number)``. For longer cycles we don't try to
-    do anything clever — just warn.
-    """
+    """Break 2-cycles, keeping the newer-depends-on-older edge."""
     out = set(edges)
-    # Iterate in deterministic order so the warning ordering is stable
-    # across runs and a re-run produces a byte-identical YAML report.
     seen_pairs: set[tuple[str, str]] = set()
     for (a, b) in sorted(edges):
         pair = (a, b) if a < b else (b, a)
@@ -2203,16 +1676,7 @@ def _break_cycles(
             seen_pairs.add(pair)
             ka = _sort_key(sort_keys, a)
             kb = _sort_key(sort_keys, b)
-            # Convention: an edge ``(x, y)`` means "x depends on y", so
-            # we want to keep the edge that points from the NEWER unit
-            # to the OLDER one (newer-depends-on-older).
             if ka == kb:
-                # Same merged_at + same PR number across two distinct
-                # units (degenerate but possible if a candidate has
-                # ``merged_at=None``). Tie-break on unit_id lexically so
-                # we drop a deterministic edge instead of leaving both
-                # in place (which would produce a true 2-cycle and
-                # break the topological sort downstream).
                 if a < b:
                     out.discard((a, b))
                     warnings_acc.append(
@@ -2226,7 +1690,6 @@ def _break_cycles(
                         f"{a!r} → {b!r} (lexical tie-break: identical merge_at)"
                     )
             elif ka < kb:
-                # a is older; b is newer. Keep (b, a) — newer depends on older.
                 out.discard((a, b))
                 warnings_acc.append(
                     f"cycle broken between {a!r} and {b!r}; kept {b!r} → {a!r} "
@@ -2239,11 +1702,6 @@ def _break_cycles(
                     "(newer depends on older)"
                 )
     return out
-
-
-# ---------------------------------------------------------------------------
-# Output writers
-# ---------------------------------------------------------------------------
 
 
 def _make_node(
@@ -2271,21 +1729,11 @@ def _node_sort_key(node: DAGNode) -> tuple[str, str]:
 def _is_reusable_unit(
     prior_node: DAGNode, cu: _CandidateUnit, active_unit_ids: set[str],
 ) -> bool:
-    """Can a prior run's node be reused as-is (skip re-trial-picking)?
+    """Can a prior node be reused without re-trial-picking?
 
-    Reusable when this run would re-derive the same outcome: same unit id,
-    same PR list in the same apply order, same merge SHAs (a re-merged PR
-    means a stale result). Applies to a group carried as one candidate unit
-    as much as to a single PR.
-
-    The recorded outcome must also still hold. For a clean / AI-resolved
-    unit that's the cached ``feature/<base>/<id>`` branch — the caller
-    additionally verifies it's anchored to the target tip. For a unit that
-    conflicted it's the traced prerequisites, which need nothing on disk but
-    must still name active candidates, since the reused edges have to
-    re-form the same group. A conflict that traced NO prerequisite is not a
-    result — it's a trace that came up empty, worth retrying — so it is
-    never reused.
+    Needs the same PRs in the same order with the same merge SHAs, and an
+    outcome that still holds: a cached branch, or traced deps that are all
+    still active. A conflict that traced no deps is retried.
     """
     if prior_node.pr_urls != [p.url for p in cu.prs]:
         return False
@@ -2293,9 +1741,6 @@ def _is_reusable_unit(
         return False
     if not set(prior_node.deps) <= active_unit_ids:
         return False
-    # Merge SHAs must match too (re-merged PR → stale branch → re-pick).
-    # A prior report without merge_shas (older format) can't be verified —
-    # don't reuse, to be safe.
     return bool(prior_node.merge_shas) and (
         prior_node.merge_shas == [p.merge_commit_sha or "" for p in cu.prs]
     )
@@ -2307,20 +1752,11 @@ def _reusable_prior_groups(
     fully_merged_units: set[str],
     url_to_sha: dict[str, str],
 ) -> tuple[set[str], set[tuple[str, str]], dict[str, list[str]]]:
-    """Which prior ``grouped`` nodes can be reused wholesale this run?
+    """Prior groups whose member PRs are all active with unchanged merge SHAs.
 
-    A group is reusable when every member PR is still an active (not-yet-
-    merged) candidate with an unchanged merge SHA. For each such group we:
-
-    * mark its member unit_ids reused (caller skips their trial-picks),
-    * synthesise a prereq chain ``member[i] → member[i-1]`` over its
-      apply-ordered ``pr_urls`` so the component-collapse rebuilds the same
-      ``auto-grp-<lead>`` group (a new PR that conflicts into a member still
-      attaches via its own traced edge — the group simply grows), and
-    * record the group's ordered member urls so the cache-branch builder can
-      skip a group whose membership is unchanged.
-
-    Returns ``(reused_member_ids, preseeded_edges, prior_group_pr_urls)``.
+    Returns ``(reused_member_ids, preseeded_edges, prior_group_pr_urls)``:
+    the preseeded ``member[i] → member[i-1]`` chain lets the component
+    collapse rebuild the same group.
     """
     reused_member_ids: set[str] = set()
     preseeded_edges: set[tuple[str, str]] = set()
@@ -2349,8 +1785,7 @@ def _reusable_prior_groups(
 
 
 def _branch_anchored_to(repo_path: Path, branch: str, base_ref: str) -> bool:
-    """True if ``base_ref`` is an ancestor of ``branch`` — i.e. the cache
-    branch was built on top of the current target tip (not a stale base)."""
+    """True if ``base_ref`` is an ancestor of ``branch``."""
     return run_git(
         ["merge-base", "--is-ancestor", base_ref, branch],
         repo_path, check=False,
@@ -2362,19 +1797,10 @@ def _collapse_components_to_groups(
     components: list[DAGComponent],
     warnings_acc: list[str],
 ) -> tuple[set[str], list[DAGComponent]]:
-    """Merge each PURE-auto component into one ordered group node.
+    """Merge each all-auto component into one group node, in topo (prereq-first) order.
 
-    A real (non-cosmetic) dependency means the PRs port together, so a
-    component of only auto-discovered units collapses into a single group
-    whose ``pr_urls`` are in the component's topological (prereq-first)
-    order. A component that ALSO contains a user-declared group is NOT
-    merged (the user owns that entry) — it's kept as-is so its ``depends_on``
-    edges still reach the overlay; we only warn about user-group→auto deps
-    that can't be applied without editing the session.
-
-    Mutates ``nodes``. Returns ``(folded_member_ids, kept_components)`` —
-    folded ids for cache-branch cleanup, kept_components (the un-merged,
-    user-group-bearing ones) for the report so the overlay still emits them.
+    Components containing a user group are kept unmerged. Mutates ``nodes``;
+    returns ``(folded_member_ids, kept_components)``.
     """
     folded: set[str] = set()
     kept_components: list[DAGComponent] = []
@@ -2383,9 +1809,6 @@ def _collapse_components_to_groups(
         auto_ids = [uid for uid in member_ids if not nodes[uid].is_user_group]
         user_ids = [uid for uid in member_ids if nodes[uid].is_user_group]
         if user_ids:
-            # Can't merge across a user-declared group: keep the component
-            # as depends_on edges (auto nodes' deps reach the overlay). Warn
-            # only about user-group→auto deps we can't auto-apply.
             kept_components.append(comp)
             for uid in user_ids:
                 ug_deps = [d for d in nodes[uid].deps if d in member_ids]
@@ -2409,8 +1832,6 @@ def _collapse_components_to_groups(
             merge_shas.extend(n.merge_shas)
             if n.earliest_merged_at:
                 merged_ats.append(n.earliest_merged_at)
-        # Key the group id on the lead (prereq-most) unit id, which is
-        # globally unique — `auto-grp-<min PR number>` collides across repos.
         gid = _auto_group_id(auto_ids[0])
         for uid in auto_ids:
             del nodes[uid]
@@ -2432,12 +1853,7 @@ def _collapse_components_to_groups(
 def _ensure_member_commits(
     scratch: Path, prs: list[PRInfo], origin_slug: str | None,
 ) -> list[str]:
-    """Make each PR's merge commit available locally, fetching cross-repo
-    members from their own repo (the broad origin fetch doesn't cover them).
-    Returns short refs for commits that still couldn't be obtained (empty =
-    all present), so the caller can skip caching cleanly instead of letting
-    the cherry-pick fail and misreport it as a conflict.
-    """
+    """Fetch missing merge commits (cross-repo from their own repo); return refs still missing."""
     missing: list[str] = []
     for p in prs:
         sha = p.merge_commit_sha
@@ -2467,18 +1883,10 @@ def _build_group_cache_branches(
     reusable_group_urls: dict[str, list[str]] | None = None,
     run_branches: set[str] | frozenset[str] = frozenset(),
 ) -> None:
-    """Build + cache each collapsed group's combined branch.
+    """Build each collapsed group's combined branch; keep it (``cached``) only if clean.
 
-    Cherry-picks a group's members in apply order onto a
-    ``feature/<base>/<group-id>`` branch. Clean → keep it and set
-    ``cached=True`` so ``run`` reuses it via ``if_exists: skip`` instead of
-    re-doing the work. Conflict → reset and leave ``cached=False`` (``run``
-    rebuilds and resolves). No AI here — discovery stays light; a group that
-    needs resolution falls back to ``run``'s resolver.
-
-    ``reusable_group_urls`` (gid → ordered member urls from the prior run)
-    lets an incremental re-run skip rebuilding a group whose membership is
-    unchanged and whose combined branch is still anchored to the target tip.
+    ``reusable_group_urls`` (gid → prior member urls) skips groups whose
+    membership is unchanged and whose branch is still anchored.
     """
     reusable_group_urls = reusable_group_urls or {}
     url_to_pr: dict[str, PRInfo] = {
@@ -2487,9 +1895,7 @@ def _build_group_cache_branches(
     for node in [n for n in nodes.values() if n.discovery_method == "grouped"]:
         cache_branch = _cache_branch_name(base_branch, node.unit_id)
         if cache_branch in run_branches:
-            # `run` owns this branch (its port lives there); leave it alone.
             continue
-        # Unchanged reused group with a still-anchored branch: keep as-is.
         if (
             reusable_group_urls.get(node.unit_id) == node.pr_urls
             and local_branch_exists(repo_path, cache_branch)
@@ -2507,10 +1913,7 @@ def _build_group_cache_branches(
                 "not caching (run will build it)"
             )
             continue
-        # Ensure each member's merge commit is present locally — cross-repo
-        # (include_prs / upstream) members aren't in the broad origin fetch.
-        # If one can't be fetched, skip caching with an accurate message
-        # (run fetches + builds it); don't run the pick and misreport it.
+        # Skip up front so a missing commit isn't misreported as a conflict.
         missing = _ensure_member_commits(scratch, prs, origin_slug)
         if missing:
             warnings_acc.append(
@@ -2521,7 +1924,7 @@ def _build_group_cache_branches(
         group_cu = _CandidateUnit(
             unit_id=node.unit_id,
             is_group=True,
-            is_user_group=False,  # we minted this group; the overlay owns it
+            is_user_group=False,
             prs=prs,
             earliest_merged_at=node.earliest_merged_at,
             feature_unit=FeatureUnit(
@@ -2542,8 +1945,6 @@ def _build_group_cache_branches(
         else:
             _release_cache_branch(scratch, target_ref, cache_branch, keep=False)
             node.cached = False
-            # Distinguish a real merge conflict from a non-conflict failure
-            # (empty / already-applied member) — both arrive as clean=False.
             reason = (
                 f"combined cherry-pick conflicts ({len(outcome.conflict_files)} "
                 "file(s))"
@@ -2562,13 +1963,7 @@ def _default_report_path(config: Config, base_branch: str) -> Path:
 
 
 def _read_previous_overlay_auto_ids(overlay_path: Path) -> set[str]:
-    """Extract auto-discovered unit IDs from an existing deps overlay file.
-
-    Used to compute the refresh diff (which units disappeared / were
-    added since the last run). Best-effort: any read / parse error
-    returns an empty set so a malformed previous file doesn't block
-    the new run.
-    """
+    """Auto-discovered unit IDs in an existing deps overlay; empty on any error."""
     if not overlay_path.exists():
         return set()
     try:
@@ -2656,8 +2051,7 @@ def _write_report(report: DiscoveryReport, path: Path) -> None:
         for n in report.nodes
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Atomic: the report is checkpointed after every unit, so a kill
-    # mid-write must not leave a truncated file to resume from.
+    # Atomic: a kill mid-checkpoint must not leave a truncated report.
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w") as f:
         yaml.dump(data, f, default_flow_style=False, sort_keys=False)
@@ -2667,17 +2061,10 @@ def _write_report(report: DiscoveryReport, path: Path) -> None:
 def _write_session_overlay(
     report: DiscoveryReport, overlay_path: Path,
 ) -> None:
-    """Emit the deps overlay file at the path declared in
-    ``pr_sources.deps_file``.
-
-    Only writes entries for units that participate in the DAG (≥ 1 edge
-    in or out). Pure singletons are omitted — the loader doesn't need
-    them, they'll be re-discovered by ``by_labels`` / ``include_prs``.
-    """
+    """Write the deps overlay: auto units in a component, plus multi-PR auto groups."""
     relevant_unit_ids: set[str] = set()
     for c in report.components:
         relevant_unit_ids.update(c.unit_ids)
-    # Keep multi-PR auto groups even without edges (their PRs are atomic).
     for n in report.nodes:
         if not n.is_user_group and len(n.pr_urls) > 1:
             relevant_unit_ids.add(n.unit_id)
@@ -2690,9 +2077,6 @@ def _write_session_overlay(
     ):
         node = nodes_by_id[uid]
         if node.is_user_group:
-            # Don't replicate user groups in the overlay — they live in
-            # the main session. We only emit deps as a separate single-PR
-            # group when we own the entry (auto_discovered unit).
             continue
         entry: dict = {
             "id": uid,
@@ -2700,8 +2084,7 @@ def _write_session_overlay(
             "auto_discovered": True,
         }
         if len(node.pr_urls) > 1:
-            # prs are in apply order (prereq first) — honor it verbatim,
-            # don't re-sort by merged_at at port time (breaks cross-repo).
+            # prs are already in apply (prereq-first) order.
             entry["sort"] = "listed"
         if node.deps:
             entry["depends_on"] = list(node.deps)
@@ -2725,15 +2108,7 @@ def _write_session_overlay(
 
 
 def load_report(path: Path) -> DiscoveryReport:
-    """Reconstruct a :class:`DiscoveryReport` from a YAML written by
-    :func:`_write_report`.
-
-    Inverse of the writer; tolerant of its omit-when-empty conventions
-    (a missing ``deps`` / ``conflict_files_at_discovery`` → ``[]``, a
-    missing ``cached`` → ``False``) and re-tuples the 2-element edge
-    lists. Used by ``releasy graph update`` to reload the last
-    discovered graph without re-running the (expensive) trial picks.
-    """
+    """Inverse of :func:`_write_report`."""
     with open(path) as f:
         raw = yaml.safe_load(f) or {}
     if not isinstance(raw, dict):
@@ -2796,16 +2171,7 @@ def load_report(path: Path) -> DiscoveryReport:
 def recompute_components(
     report: DiscoveryReport,
 ) -> tuple[list[DAGComponent], list[str]]:
-    """Recompute WCCs / topo order / articulation points from a report's
-    nodes and their ``deps``.
-
-    Used by ``releasy graph update`` after human corrections have mutated
-    the node/edge set: it mirrors the component-derivation step of
-    :func:`run_discover_deps` but works purely from :class:`DAGNode`
-    data — no ``_CandidateUnit`` or git worktree required. Edges are
-    re-derived from ``node.deps`` (the canonical per-node dependency
-    list), so a corrected ``deps`` is all the caller needs to mutate.
-    """
+    """Recompute components and singletons from the report nodes' ``deps``."""
     node_map = {n.unit_id: n for n in report.nodes}
     edges: set[tuple[str, str]] = {
         (n.unit_id, dep)
@@ -2817,11 +2183,6 @@ def recompute_components(
     return _components(node_map, edges, sort_keys)
 
 
-# ---------------------------------------------------------------------------
-# Graph issue: render + open/update  (`graph discover --open-issue`)
-# ---------------------------------------------------------------------------
-
-# Marker hidden in the issue body so the issue is self-identifying.
 def _issue_marker(base_branch: str) -> str:
     return f"<!-- releasy-graph:{base_branch} -->"
 
@@ -2829,7 +2190,6 @@ def _issue_marker(base_branch: str) -> str:
 # Marker on RelEasy's own comments so graph update skips them on ingest.
 _GRAPH_BOT_MARKER = "<!-- releasy-graph-bot -->"
 
-# Marker shown after a unit's entry, per tracked status.
 _PROGRESS_MARKER: dict[str, str] = {
     "needs_review": "🟡 in review",
     "branch_created": "🟠 branch pushed, no PR yet",
@@ -2843,7 +2203,6 @@ _PROGRESS_MARKER: dict[str, str] = {
     "reverted": "↩ reverted (do not re-port)",
 }
 
-# Order the progress summary lists status counts in.
 _PROGRESS_SUMMARY_ORDER: tuple[str, ...] = (
     "merged", "needs_review", "branch_created", "build_failed",
     "conflict", "blocked", "closed", "superseded", "reverted", "skipped",
@@ -2851,35 +2210,23 @@ _PROGRESS_SUMMARY_ORDER: tuple[str, ...] = (
 
 _NOT_STARTED_MARKER = "⬜ not started"
 
-# Shown for a unit parked by ``pr_sources.on_hold``. Not a BranchStatus:
-# a hold is a session-level decision that leaves whatever state the unit
-# already had untouched, so it prefixes the progress note rather than
-# replacing it.
+# Not a BranchStatus: a hold prefixes the progress note instead of replacing it.
 _HOLD_MARKER = "⏸ on hold"
 
-# Statuses whose group is folded shut in the issue: the port landed, there
-# is nothing left to look at. Everything else stays expanded.
+# Statuses whose group is folded shut in the issue.
 _FOLDED_STATUSES: frozenset[str] = frozenset({"merged"})
 
-# Terminal statuses that move a unit out of the working lists into the
-# folded "Discarded" section: the port PR was rejected, the user (or an
-# empty cherry-pick) dropped it, or another PR already carried the change.
-# Units are listed in this order inside the section.
+# Terminal statuses listed (in this order) under the folded "Discarded" section.
 _DISCARDED_STATUSES: tuple[str, ...] = ("closed", "skipped", "superseded")
 
-# ``reverted`` also leaves the working lists, but into a section of its
-# own, unfolded: it is the one terminal status that reverses a port that
-# had already landed, and the next person reading the graph has to see
-# that before they think about porting it again.
+# Gets its own unfolded section so nobody re-ports it.
 _REVERTED_STATUS = "reverted"
 
 
 def mark_outdated_units(config: Config, report: DiscoveryReport) -> list[str]:
     """Mark tracked ports carrying PRs their unit in ``report`` no longer has.
 
-    Compares each in-flight port's source PRs (minus auto-added prereqs)
-    with its unit's PRs in ``report``. Returns the unit IDs whose port is
-    outdated, marked now or before; saves state when a mark is new.
+    Returns the unit IDs whose port is outdated (marked now or before).
     """
     state = load_state(config)
     out: list[str] = []
@@ -2910,13 +2257,7 @@ def mark_outdated_units(config: Config, report: DiscoveryReport) -> list[str]:
 def build_progress_map(
     report: DiscoveryReport, state: PipelineState,
 ) -> dict[str, FeatureState]:
-    """Map each graph unit to its tracked state entry (units with none omitted).
-
-    Matches on ``unit_id`` first — graph unit IDs and state feature IDs
-    are the same namespace — then falls back to source-PR URLs so a unit
-    tracked under a different ID (renamed group, hand-edited session)
-    still shows its progress.
-    """
+    """Map each graph unit to its state entry, by unit_id then by source-PR URL."""
     by_pr: dict[tuple, FeatureState] = {}
     for fs in state.features.values():
         for url in ([fs.pr_url] if fs.pr_url else []) + list(fs.pr_urls):
@@ -2939,15 +2280,7 @@ def build_progress_map(
 
 
 def _unit_ported(fs: FeatureState | None) -> bool:
-    """True once releasy has opened a port PR for the unit.
-
-    Includes the draft PR of a partially-applied group. Neither ``closed``
-    (the PR was rejected) nor ``superseded`` (someone else's PR carried the
-    change) counts — the tally measures what *releasy* ported, and both are
-    listed under Discarded with their own markers. ``reverted`` doesn't
-    count either: the port landed and was then taken back out, so the
-    change is not in the target branch.
-    """
+    """True once releasy has opened a port PR for the unit (not closed/superseded/reverted)."""
     if fs is None:
         return False
     if fs.status in ("superseded", _REVERTED_STATUS):
@@ -2968,13 +2301,7 @@ def _picks_landed(fs: FeatureState | None, total: int) -> int:
 
 
 def _stall_note(fs: FeatureState) -> str:
-    """`` · <why>`` for a unit that stopped short, else ``""``.
-
-    The point is the stalled-with-a-draft-PR case: the PR link alone says
-    "somebody look at this" without saying what releasy is waiting for.
-    ``blocked`` and ``skipped`` already spell their reason out in the
-    marker, so they don't repeat it here.
-    """
+    """`` · <why>`` for a stalled unit, else ``""`` (blocked/skipped markers already say why)."""
     if fs.stall is None or fs.status in ("blocked", "skipped"):
         return ""
     why = fs.stall.summary(max_detail=60)
@@ -2989,14 +2316,7 @@ def _progress_note(
 ) -> str:
     """``<lead><marker> [#N](url) · <why>`` suffix for a unit's issue entry.
 
-    A unit with no port PR falls back to its pushed branch, so a parked
-    ``build_failed`` entry still links the code it failed to build.
-
-    ``html`` renders the PR link as an ``<a>`` tag for use inside a
-    ``<summary>``: that content sits in a raw HTML block, where GitHub does
-    not run the markdown parser. ``lead`` is the separator the note opens
-    with — the On-hold section passes ``" · "`` so its entries read as one
-    clause after the hold reason instead of a second dash.
+    ``html``: for use inside ``<summary>``, where GitHub doesn't parse markdown.
     """
     if fs is None:
         return f"{lead}{_NOT_STARTED_MARKER}"
@@ -3006,9 +2326,7 @@ def _progress_note(
     elif fs.status == "skipped" and fs.skip_reason:
         marker += f": {fs.skip_reason}"
     elif fs.status == "superseded" and fs.skip_reason:
-        # Every superseded reason opens with the word "superseded" ("… by
-        # merged #40" / "… (merged #40, open #41)"), so graft the tail onto
-        # the marker instead of saying it twice.
+        # Superseded reasons open with "superseded"; avoid saying it twice.
         reason = fs.skip_reason
         marker += (
             reason[len("superseded"):] if reason.startswith("superseded")
@@ -3041,11 +2359,7 @@ def _code(text: str, html: bool) -> str:
 
 
 def _to_html_inline(text: str) -> str:
-    """Turn the little markdown we emit inside ``<summary>`` into HTML.
-
-    Only backtick spans and ``&``/``<``/``>`` — a stall summary is a short
-    phrase with unit IDs in it, nothing richer.
-    """
+    """Escape ``&<>`` and turn backtick spans into ``<code>`` for use inside ``<summary>``."""
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     return re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
 
@@ -3053,12 +2367,7 @@ def _to_html_inline(text: str) -> str:
 def _node_hold_reason(
     node: DAGNode, held: dict[tuple, str] | None,
 ) -> str | None:
-    """The hold parking ``node``, or ``None``.
-
-    ``held`` maps canonical PR refs → reason (``pipeline.hold_map``).
-    Matches ``pipeline._unit_hold_reason``: any held PR holds the whole
-    node, and several holds on one node join their reasons.
-    """
+    """Hold reason for ``node`` (any held PR holds it), or ``None``. Mirrors ``pipeline._unit_hold_reason``."""
     if not held:
         return None
     reasons = [
@@ -3071,12 +2380,7 @@ def _node_hold_reason(
 
 
 def _hold_note(reason: str, fs: FeatureState | None, total: int) -> str:
-    """`` — ⏸ on hold: <why> · <progress>`` suffix for an On-hold entry.
-
-    The progress half is appended only when the unit has state at all —
-    a hold usually lands before anything was ported, and "⬜ not started"
-    after "on hold" says nothing.
-    """
+    """`` — ⏸ on hold: <why> · <progress>`` suffix; progress only if the unit has state."""
     note = f" — {_HOLD_MARKER}" + (f": {reason}" if reason else "")
     if fs is not None:
         note += _progress_note(fs, total, lead=" · ")
@@ -3087,12 +2391,7 @@ def _progress_summary(
     report: DiscoveryReport, progress: dict[str, FeatureState],
     held_ids: set[str] | None = None,
 ) -> str:
-    """One-line tally: ported / total, then a per-status breakdown.
-
-    A held unit is counted once, under on-hold: its status (usually "not
-    started") is not what is stopping it, and listing it in both buckets
-    would make the breakdown add up to more than the unit count.
-    """
+    """One-line tally: ported / total, then per-status counts (held units only under on-hold)."""
     held_ids = held_ids or set()
     counts: dict[str, int] = {}
     ported = 0
@@ -3123,12 +2422,7 @@ def render_graph_issue_body(
 ) -> str:
     """Render a DiscoveryReport as a GitHub issue body (markdown).
 
-    ``progress`` (from :func:`build_progress_map`) ticks the checkbox of
-    every unit releasy has already opened a port PR for and annotates it
-    with its status and PR link. Omitted / empty → every box unticked.
-
-    ``held`` (from :func:`pipeline.hold_map`) maps canonical PR refs → hold
-    reason; the units carrying them move to their own **On hold** section.
+    ``progress``: from :func:`build_progress_map`. ``held``: from :func:`pipeline.hold_map`.
     """
     progress = progress or {}
     lines: list[str] = [_issue_marker(report.base_branch)]
@@ -3139,10 +2433,6 @@ def render_graph_issue_body(
     )
     lines.append("")
     all_groups = [n for n in report.nodes if len(n.pr_urls) > 1]
-    # Terminal units get their own folded section at the bottom — they stay
-    # in the graph (and in the progress breakdown) but out of the working
-    # lists above. Sorted by status; ``sorted`` is stable, so units keep
-    # their graph order within a status.
     _rank = {s: i for i, s in enumerate(_DISCARDED_STATUSES)}
     discarded = sorted(
         (n for n in report.nodes
@@ -3150,18 +2440,13 @@ def render_graph_issue_body(
          and progress[n.unit_id].status in _rank),
         key=lambda n: _rank[progress[n.unit_id].status],
     )
-    # Reverted units leave the working lists too, but into their own
-    # unfolded section — see _REVERTED_STATUS.
     reverted = [
         n for n in report.nodes
         if progress.get(n.unit_id) is not None
         and progress[n.unit_id].status == _REVERTED_STATUS
     ]
     parked_ids = {n.unit_id for n in discarded} | {n.unit_id for n in reverted}
-    # On hold: parked by ``pr_sources.on_hold``, so `run` skips them — but
-    # still live graph units, unlike anything above. A held unit whose port
-    # already merged stays where it is: the work is done, the hold no
-    # longer decides anything about it.
+    # A held unit whose port already merged stays where it is.
     hold_reasons = {
         n.unit_id: reason
         for n in report.nodes
@@ -3220,12 +2505,7 @@ def render_graph_issue_body(
         return "[x]" if done else "[ ]"
 
     def _parked_entry(n: DAGNode, note: str | None = None) -> list[str]:
-        """One bullet for a unit that left the working lists (no checkbox).
-
-        A group becomes a headed bullet with its member PRs beneath it;
-        a singleton is the one line. Used by On hold, Reverted and
-        Discarded; ``note`` overrides the trailing progress annotation.
-        """
+        """Checkbox-less bullet for a parked unit; ``note`` overrides the progress note."""
         fs = progress.get(n.unit_id)
         total = len(n.pr_urls)
         if total == 1:
@@ -3246,7 +2526,6 @@ def render_graph_issue_body(
         ]
         return out
 
-    # --- Groups (port together, in order) ---
     if groups:
         lines.append("### Groups (port together, in apply order)")
         lines.append("")
@@ -3254,7 +2533,6 @@ def render_graph_issue_body(
             fs = progress.get(n.unit_id)
             total = len(n.pr_urls)
             landed = _picks_landed(fs, total)
-            # Folded once the port is done; open while it still needs eyes.
             folded = fs is not None and fs.status in _FOLDED_STATUSES
             glyph = "☑" if _unit_ported(fs) else "☐"
             lines.append("<details>" if folded else "<details open>")
@@ -3262,8 +2540,7 @@ def render_graph_issue_body(
                 f"<summary>{glyph} <b><code>{n.unit_id}</code></b> "
                 f"· {total} PRs{_progress_note(fs, total, html=True)}</summary>"
             )
-            # The blank line ends the raw-HTML block, so what follows is
-            # parsed as markdown (checkboxes and links included).
+            # Blank line ends the raw-HTML block so the list renders as markdown.
             lines.append("")
             for i, url in enumerate(n.pr_urls):
                 lines.append(
@@ -3274,7 +2551,6 @@ def render_graph_issue_body(
             lines.append("</details>")
             lines.append("")
 
-    # --- Standalone PRs ---
     if singles:
         lines.append("### Standalone PRs")
         lines.append("")
@@ -3287,10 +2563,6 @@ def render_graph_issue_body(
             )
         lines.append("")
 
-    # --- On hold (waiting on something; not vetoed) ---
-    # Above Reverted and unfolded: these are live units somebody expects to
-    # come back, and the reader has to see them before assuming the working
-    # lists above are the whole remaining scope.
     if on_hold:
         lines.append("### ⏸ On hold — not being ported right now")
         lines.append("")
@@ -3313,10 +2585,6 @@ def render_graph_issue_body(
             )
         lines.append("")
 
-    # --- Reverted (merged, then taken back out of the target branch) ---
-    # Not folded, and not inside Discarded: those units releasy dropped on
-    # its own, while a revert is a decision a human made *after* the port
-    # landed. Anyone about to re-port one has to read that first.
     if reverted:
         lines.append("### ↩ Reverted — do NOT re-port")
         lines.append("")
@@ -3332,10 +2600,6 @@ def render_graph_issue_body(
             lines += _parked_entry(n)
         lines.append("")
 
-    # --- Discarded (closed / skipped / superseded + already-in-target) ---
-    # No checkboxes here: nothing in this section is on the working list.
-    # The section is its own foldable, shut by default. Each entry's marker
-    # carries WHY it was discarded, so the section needs no sub-headings.
     in_target = report.skipped_already_in_target
     if discarded or in_target:
         tally = f"{len(discarded)} unit(s)"
@@ -3347,9 +2611,7 @@ def render_graph_issue_body(
         for n in discarded:
             lines += _parked_entry(n)
         lines.append("")
-        # Dropped by discovery before they reached the graph — the report
-        # keeps only their unit IDs (no PR URLs, no titles), so this is a
-        # bare ID list, not links.
+        # The report keeps only unit IDs for these, so no links.
         if in_target:
             lines.append(
                 "Already in target at discovery time (never ported): "
@@ -3359,7 +2621,6 @@ def render_graph_issue_body(
         lines.append("</details>")
         lines.append("")
 
-    # --- Excluded ---
     if report.excluded:
         lines.append("<details>")
         lines.append(
@@ -3375,7 +2636,6 @@ def render_graph_issue_body(
         lines.append("</details>")
         lines.append("")
 
-    # --- Footer ---
     lines.append("---")
     lines.append(
         "Org members can **comment on this issue** to change the graph — "
@@ -3393,7 +2653,7 @@ def render_graph_issue_body(
 
 
 def _pr_short(url: str) -> str:
-    """``owner/repo#N`` or ``#N`` short label for a PR URL (fallback: url)."""
+    """``#N`` short label for a PR URL (fallback: url)."""
     m = _PR_NUMBER_RE.search(url)
     return f"#{m.group(1)}" if m else url
 
@@ -3405,10 +2665,7 @@ def open_or_update_graph_issue(
     """Create the graph issue on origin, or update its body if it exists.
 
     Sets report.issue_number/issue_url on create. Returns (number, url) or
-    None on failure/dry-run. ``progress`` defaults to the current pipeline
-    state, so every writer of the issue body keeps the checkboxes intact;
-    the On-hold section is read straight from the session, so a hand-edit
-    to ``pr_sources.on_hold`` shows up on the next write of the issue.
+    None on failure/dry-run. ``progress`` defaults to the current state.
     """
     if progress is None:
         progress = build_progress_map(report, load_state(config))
@@ -3419,10 +2676,9 @@ def open_or_update_graph_issue(
             return report.issue_number, (report.issue_url or "")
         if res is False:
             return None  # transient failure — keep the number, retry later
-        # res is None → issue was deleted; fall through to recreate.
+        # None: issue was deleted; recreate.
         report.issue_number = None
         report.issue_url = None
-    # Configured labels + the target-branch name, created if missing.
     labels: list[str] = []
     for name in list(config.graph.issue_labels) + [report.base_branch]:
         if name and name not in labels:
@@ -3438,11 +2694,6 @@ def open_or_update_graph_issue(
     return number, url
 
 
-# ---------------------------------------------------------------------------
-# `releasy graph update` — refine the graph from trusted issue comments
-# ---------------------------------------------------------------------------
-
-# A fenced ```yaml block holding the new graph spec Claude returns.
 _GRAPH_SPEC_FENCE_RE = re.compile(
     r"```(?:ya?ml)?\s*\n(.*?)```", re.DOTALL,
 )
@@ -3465,11 +2716,7 @@ def _comment_is_trusted(comment, config: Config) -> bool:  # noqa: ANN001
 
 
 def _normalize_spec(parsed: object) -> dict | None:
-    """Coerce a parsed fenced block into ``{'units': [...], ...}`` or None.
-
-    Tolerates the model's common format drift: ``units`` as a mapping of
-    id→fields, or a bare top-level list of unit mappings.
-    """
+    """Coerce a parsed block into ``{'units': [...], ...}`` (also from an id→fields map or a bare list)."""
     if isinstance(parsed, dict):
         units = parsed.get("units")
         if isinstance(units, list):
@@ -3492,11 +2739,7 @@ def _normalize_spec(parsed: object) -> dict | None:
 
 
 def _parse_graph_spec(text: str) -> dict | None:
-    """Parse the fenced YAML graph spec from Claude's reply, or None.
-
-    Scans every fenced block and keeps the last that normalises to a
-    mapping with a `units` list (skips leading example/prose fences).
-    """
+    """The last fenced YAML block in Claude's reply that normalises to a spec, or None."""
     chosen: dict | None = None
     for block in _GRAPH_SPEC_FENCE_RE.findall(text):
         try:
@@ -3505,14 +2748,12 @@ def _parse_graph_spec(text: str) -> dict | None:
             continue
         norm = _normalize_spec(parsed)
         if norm is not None:
-            chosen = norm  # keep scanning — last valid block wins
+            chosen = norm
     return chosen
 
 
 def _handle_comments(comments: list) -> list[tuple[str, object]]:  # noqa: ANN001
-    """Assign each comment a stable ``C<n>`` handle. Single source of truth
-    shared by the prompt renderer and the addressed→minimize map so the two
-    can never drift out of sync."""
+    """Assign each comment a stable ``C<n>`` handle."""
     return [(f"C{i}", c) for i, c in enumerate(comments, start=1)]
 
 
@@ -3629,12 +2870,8 @@ def _ask_claude_for_new_graph(
     handled: list[tuple[str, object]],
     warnings_acc: list[str],
 ) -> dict | None:
-    """Render the adjust-graph prompt, run Claude (text-only), parse the
-    spec. ``handled`` is the (handle, comment) list. Returns the spec
-    mapping or None on any failure."""
-    prompt_path = config.config_path.parent / config.graph.prompt_file
-    if not prompt_path.exists():
-        prompt_path = Path(__file__).parent / "prompts" / "adjust_graph.md"
+    """Run the adjust-graph prompt through Claude and parse the spec; None on failure."""
+    prompt_path = _prompt_path(config, config.graph.prompt_file)
     if not prompt_path.exists():
         warnings_acc.append(
             "adjust_graph.md prompt template not found; cannot run graph update"
@@ -3656,10 +2893,7 @@ def _ask_claude_for_new_graph(
         ),
     }
 
-    def _replace(match: re.Match[str]) -> str:
-        return placeholders.get(match.group(1), match.group(0))
-
-    rendered = re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", _replace, template)
+    rendered = _fill_placeholders(template, placeholders)
 
     res = synthesize_text(
         config, rendered,
@@ -3676,8 +2910,6 @@ def _ask_claude_for_new_graph(
     spec = _parse_graph_spec(res.text)
     last_text = res.text
     if spec is None:
-        # The model sometimes returns only a prose "changes made" summary.
-        # Retry once, demanding the full graph as YAML and nothing else.
         retry = synthesize_text(
             config, rendered + _GRAPH_UPDATE_RETRY_SUFFIX,
             label="graph-update-retry",
@@ -3689,8 +2921,6 @@ def _ask_claude_for_new_graph(
             spec = _parse_graph_spec(retry.text)
 
     if spec is None:
-        # Don't silently drop a paid reply: persist it so the user can
-        # inspect / hand-apply, and point at the file.
         note = "Claude reply had no parseable YAML graph spec; changing nothing"
         reply_path = _default_report_path(config, report.base_branch).with_name(
             f"graph-update-reply.{report.base_branch}.md"
@@ -3710,14 +2940,7 @@ def _fetch_spec_pr_metadata(
     prior_urls: set[str],
     warnings_acc: list[str],
 ) -> dict[str, PRInfo]:
-    """Fetch the PRs a spec introduces that the prior graph never saw.
-
-    ``graph update`` runs no git and no trial-picks, so everything it knows
-    about a PR it copies from the prior graph. A PR a member asks for by
-    number is in no prior graph, and without this lands as a blank row —
-    no title, no merge date, no merge SHA. One fetch per genuinely new PR;
-    a failure degrades to that blank row rather than failing the update.
-    """
+    """Fetch metadata for PRs the spec introduces that the prior graph never saw."""
     wanted: list[str] = []
     seen: set[str] = set()
     for u in spec.get("units", []) or []:
@@ -3754,18 +2977,14 @@ def _build_report_from_spec(
     config: Config | None = None,
     state: PipelineState | None = None,
 ) -> DiscoveryReport | None:
-    """Build a new DiscoveryReport from Claude's spec + the prior graph.
+    """Build a new DiscoveryReport from Claude's spec + the prior graph; None on a cycle.
 
-    Validates URLs/deps, rejects cycles (returns None), recomputes
-    components. No git, no trial-picks. With ``config``, PRs the prior
-    graph never saw are fetched for their title / merge date / merge SHA;
-    without it those fields stay blank (the pure-logic path used by tests).
-    With ``state``, a new PR that a merged unit already ported is dropped.
+    With ``config``, new PRs' metadata is fetched. With ``state``, a new PR
+    a merged unit already ported is dropped.
     """
     title_map: dict[str, str] = {}
     merged_map: dict[str, str | None] = {}
     sha_map: dict[str, str] = {}
-    # Keep is_user_group for prior user-declared groups (overlay skips them).
     prior_user_groups = {n.unit_id for n in prior.nodes if n.is_user_group}
     prior_methods = {n.unit_id: n.discovery_method for n in prior.nodes}
     for n in prior.nodes:
@@ -3838,17 +3057,10 @@ def _build_report_from_spec(
             warnings_acc.append(f"graph update: unit {uid!r} has no valid PRs; skipping")
             continue
         deps = [str(d).strip() for d in (u.get("depends_on", []) or [])]
-        # A unit holding a PR the graph has never seen was never trial-picked,
-        # so its (usually empty) deps are a guess. Mark it distinctly — same
-        # reason "depth-cutoff" exists — so the YAML reader can tell an
-        # unanalysed node from one discovery actually cleared. Units carried
-        # over unchanged keep whatever method discovered them.
         if has_new_pr:
             method = "graph-update-unanalysed"
         else:
             method = prior_methods.get(uid) or "graph-update"
-        # A freshly fetched PR knows its own title / merge date / SHA; for
-        # everything else the prior graph is the only source.
         titles: list[str] = []
         merged_ats: list[str] = []
         shas: list[str] = []
@@ -3880,7 +3092,6 @@ def _build_report_from_spec(
         warnings_acc.append("graph update: spec produced no units; changing nothing")
         return None
 
-    # Drop dangling dep references, then reject cycles.
     valid_ids = {n.unit_id for n in nodes}
     for n in nodes:
         kept = [d for d in n.deps if d in valid_ids]
@@ -3898,8 +3109,7 @@ def _build_report_from_spec(
         )
         return None
 
-    # Exclusions = prior vetoes + this spec's vetoes − any PR now in a unit
-    # (a veto persists unless the PR is re-added, which un-vetoes it).
+    # Prior vetoes + this spec's vetoes, minus any PR re-added to a unit.
     excluded_map: dict[str, str] = {
         e["url"]: e.get("reason", "")
         for e in prior.excluded
@@ -3921,7 +3131,7 @@ def _build_report_from_spec(
             warnings_acc.append(f"graph update: exclude entry has bad URL {e!r}; skipping")
             continue
         excluded_map[url] = str(e.get("reason", "")).strip()
-    for url in declared_urls:  # a live unit PR cannot also be excluded
+    for url in declared_urls:
         excluded_map.pop(url, None)
     excluded = [{"url": u, "reason": r} for u, r in excluded_map.items()]
 
@@ -3948,12 +3158,7 @@ def _build_report_from_spec(
 def _parse_spec_holds(
     spec: dict, warnings_acc: list[str],
 ) -> dict[str, str] | None:
-    """Read the spec's ``on_hold`` block as URL → reason, or ``None``.
-
-    ``None`` means the key was absent — the model didn't touch holds, so
-    the session's current list stands. An explicit empty list is the way
-    to release everything, and is returned as an empty mapping.
-    """
+    """The spec's ``on_hold`` block as URL → reason; ``None`` if absent (holds untouched)."""
     if "on_hold" not in spec:
         return None
     raw = spec.get("on_hold") or []
@@ -3988,14 +3193,7 @@ def _parse_spec_holds(
 def _apply_spec_holds(
     config: Config, holds: dict[str, str],
 ) -> tuple[list[str], list[str], list[str]]:
-    """Make ``pr_sources.on_hold`` match ``holds``. Returns
-    ``(newly_held, released, failures)``.
-
-    The spec's list replaces the session's outright — that is what lets a
-    comment put a PR back in work by leaving it out. A hold on a URL no
-    unit carries is applied anyway and survives until the PR turns up;
-    ``discover_feature_units`` is what points out the mismatch.
-    """
+    """Make ``pr_sources.on_hold`` match ``holds``; returns ``(newly_held, released, failures)``."""
     from releasy import pr_membership
 
     ps = config.pr_sources
@@ -4015,7 +3213,7 @@ def _apply_spec_holds(
         reason = holds[url]
         was_held = key in current
         if was_held and reasons.get(current[key], "") == reason:
-            continue  # already parked for the same reason
+            continue
         if not pr_membership.hold_pr(config, url, reason):
             failures.append(f"hold {_pr_short(url)}")
             continue
@@ -4067,14 +3265,7 @@ def _has_cycle(nodes: list[DAGNode]) -> bool:
 def _reconcile_session_user_groups(
     config: Config, report: DiscoveryReport, warnings_acc: list[str],
 ) -> int:
-    """Write member edits to user-declared groups back into session.groups[]
-    (the overlay skips user groups). Returns the count changed; saves if any.
-
-    A flagged user group with no session entry is created rather than
-    skipped: the overlay refuses to carry user groups, so warning and
-    moving on would leave the group in the report (and the issue) but in
-    neither file ``run`` reads — every member would port as its own PR.
-    """
+    """Write user-group edits back into session groups (creating missing ones); returns count changed."""
     if config.session is None:
         return 0
     from releasy.config import PRGroupConfig
@@ -4087,8 +3278,7 @@ def _reconcile_session_user_groups(
             continue
         g = groups_by_id.get(n.unit_id)
         if g is None:
-            # if_exists must track pr_policy, as the session loader would
-            # have applied it — a bare PRGroupConfig would pin "skip".
+            # if_exists as the session loader would apply it (default would pin "skip").
             g = PRGroupConfig(
                 id=n.unit_id, prs=[], if_exists=config.pr_policy.if_exists,
             )
@@ -4157,7 +3347,7 @@ def run_graph_update(
     ingest: list = []
     for c in res.comments:
         if _GRAPH_BOT_MARKER in (c.body or ""):
-            continue  # never ingest our own summary comments
+            continue
         if cutoff and c.created_at and c.created_at <= cutoff:
             continue
         if not _comment_is_trusted(c, config):
@@ -4175,7 +3365,7 @@ def run_graph_update(
         f"  [dim]Feeding {len(ingest)} trusted comment(s) to Claude...[/dim]"
     )
     warnings_acc: list[str] = []
-    handled = _handle_comments(ingest)  # single source for the C<n> handles
+    handled = _handle_comments(ingest)
     spec = _ask_claude_for_new_graph(config, report, handled, warnings_acc)
     for w in warnings_acc:
         console.print(f"  [yellow]warning:[/yellow] {w}")
@@ -4192,7 +3382,6 @@ def run_graph_update(
         return 1
     new_report.warnings = build_warnings
 
-    # Stamp the ingest watermark to the newest comment we folded in.
     new_report.last_ingested_at = max(c.created_at for c in ingest)
 
     prior_urls = {url for n in report.nodes for url in n.pr_urls}
@@ -4206,10 +3395,6 @@ def run_graph_update(
     excluded_urls = [e["url"] for e in new_report.excluded]
     # Only enforce vetoes new this run (prior ones already in exclude_prs).
     newly_excluded = [u for u in excluded_urls if u not in prior_excluded_urls]
-    # A missing `on_hold` key means the reply didn't touch holds; an empty
-    # list means "release everything". Warnings get their own list: the
-    # build_warnings print loop above has already run, and a skipped URL
-    # has to reach the terminal, not just the report file.
     hold_warnings: list[str] = []
     spec_holds = _parse_spec_holds(spec, hold_warnings)
     for w in hold_warnings:
@@ -4225,9 +3410,6 @@ def run_graph_update(
         console.print("[dim](--dry-run: no report / overlay / session / issue writes)[/dim]")
         return 0
 
-    # --- Reconcile the session so `run` honors the changes ---
-    # Honor add_pr/remove_pr False (unreachable PR / token / locked group):
-    # collect failures so we don't claim a change the session never got.
     failures: list[str] = []
     for url in added:
         if not pr_membership.add_pr(config, url):
@@ -4259,7 +3441,6 @@ def run_graph_update(
         )
         failures += hold_failures
 
-    # --- Persist the new graph (report + overlay) ---
     _write_report(new_report, report_path)
     if config.session and config.session.session_path:
         overlay_path = resolve_deps_file_path(
@@ -4275,7 +3456,6 @@ def run_graph_update(
             outdated = mark_outdated_units(config, new_report)
             _report_outdated(outdated)
 
-    # --- Refresh the issue + optional summary comment ---
     if open_or_update_graph_issue(
         config, new_report, title=f"Port graph for {base_branch}",
     ) is None:
@@ -4283,11 +3463,9 @@ def run_graph_update(
     else:
         console.print(f"  [green]✓[/green] updated issue #{new_report.issue_number}")
 
-    # --- Collapse the comments the update actually addressed ---
-    # Unaddressed comments (questions, 👍, requests Claude didn't action)
-    # stay visible so a human can see what's still pending.
+    # Minimize only addressed comments; the rest stay visible as pending.
     if config.graph.minimize_addressed_comments:
-        handle_to_comment = dict(handled)  # same handles shown to Claude
+        handle_to_comment = dict(handled)
         addressed = _normalize_addressed(spec.get("addressed"))
         n_min = 0
         for handle in addressed:
@@ -4317,25 +3495,14 @@ def run_graph_update(
     return 0
 
 
-# ---------------------------------------------------------------------------
-# `releasy graph sync` — push port progress to the graph issue
-# ---------------------------------------------------------------------------
-
-
 def sync_graph_progress(
     config: Config, *, onto: str | None = None, quiet: bool = False,
     open_issue: bool = False,
 ) -> int:
-    """Re-render the graph issue with progress from the pipeline state.
+    """Re-render the graph issue with progress from state; returns an exit code.
 
-    No git, no AI, no comment ingest — reads the saved graph plus
-    ``state.yaml`` and edits the issue body in place. ``quiet`` silences
-    the "no graph / no issue" cases (the automatic post-``run`` /
-    post-``refresh`` hook, where they just mean "not using the issue").
-    ``open_issue`` opens one from the saved graph when it has none, so a
-    ``discover`` run that forgot ``--open-issue`` doesn't have to be redone;
-    it stays opt-in so the automatic hook never opens an issue by itself.
-    Returns an exit code.
+    ``quiet`` silences the "no graph / no issue" cases (automatic hook).
+    ``open_issue`` opens an issue from the saved graph when it has none.
     """
     try:
         base_branch = _resolve_base_branch(config, onto)
@@ -4386,8 +3553,7 @@ def sync_graph_progress(
     )
     if res is None:
         if opening and config.dry_run:
-            # ``create_issue`` reports a dry run by returning None; nothing
-            # failed, there's just no issue to point at.
+            # ``create_issue`` returns None on dry run.
             console.print(
                 f"  [dim]would open a graph issue for {base_branch}[/dim]"
             )
@@ -4495,11 +3661,6 @@ def _render_update_comment(
     lines.append("")
     lines.append("The graph above has been updated. Comment again to refine further.")
     return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Misc helpers
-# ---------------------------------------------------------------------------
 
 
 def _resolve_sha(repo_path: Path, ref: str) -> str:

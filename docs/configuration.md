@@ -1,440 +1,303 @@
 # Configuration reference
 
-Two YAML files: `config.yaml` (stable) and `<target_branch>.session.yaml`
-(per-effort). Templates in [`config.yaml.example`](../config.yaml.example)
-and [`session.yaml.example`](../session.yaml.example). Conceptual model:
-[concepts.md → files](concepts.md#files-releasy-reads--writes).
+Two YAML files per project:
 
-## config.yaml (stable infrastructure)
+- `config.yaml` — stable settings. Annotated template:
+  [`config.yaml.example`](../config.yaml.example).
+- `<target_branch>.session.yaml` — what to port. Annotated template:
+  [`session.yaml.example`](../session.yaml.example).
 
-```yaml
-# Unique slug for this project on this machine (required).
-# Keys ${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml
-# (and the session file when target_branch is unset).
-name: antalya-26.3
+File locations: [concepts.md → Files](concepts.md#files).
 
-# Optional: override session file path. Relative paths resolve against
-# this config's directory. CLI --session-file always wins.
-# session_file: sessions/antalya-26.3.session.yaml
+## Session: PR selection
 
-push: true                          # push branches + open PRs (default: false)
-work_dir: /path/to/ClickHouse       # existing local clone (default: cwd)
-project: antalya                    # used in derived branch names
-
-origin:
-  remote: https://github.com/Altinity/ClickHouse.git
-
-target_branch: antalya-26.3         # when set, --onto becomes optional
-
-# Optional: stamp this label on a rebase PR when it merges into target,
-# and strip the same label from each source PR it ported. Cross-repo
-# source PRs are skipped (releasy never writes outside origin).
-# merged_label: port-antalya
-# merged_label_color: "8B5CF6"      # used only when creating the label
-
-# pr_policy:                         # all optional — defaults shown
-#   if_exists: skip                  # skip | recreate | append
-#   auto_pr: true
-#   retry_failed: true
-#   recreate_closed_prs: false
-#   recreate_reverted_prs: false
-#   detect_superseded: true
+```
+union(by_labels) − exclude_labels − exclude_authors
+∩ (include_authors when set)
++ include_prs − exclude_prs − on_hold
 ```
 
-## `<target_branch>.session.yaml` (per-effort source data)
-
-```yaml
-features:
-  - id: s3-disk
-    description: "Custom S3 disk improvements"
-    source_branch: feature/antalya-s3-disk
-
-# Set arithmetic:
-#   union(by_labels) − exclude_labels − exclude_authors
-#   ∩ (include_authors when set)
-#   + include_prs − exclude_prs − on_hold
-# include_prs bypasses label & author filters.
-pr_sources:
-  by_labels:
-    - labels: ["forward-port", "v26.3"]
-      merged_only: true
-      # mode: auto    # auto (default) | backport | forward_port
-
-  exclude_labels: ["do-not-port"]
-  exclude_authors: ["dependabot[bot]"]
-  # include_authors: ["alice", "bob"]
-  # forward_port_labels: ["forward-port"]   # treat these PRs as forward-ports
-
-  include_prs:
-    - https://github.com/Altinity/ClickHouse/pull/123
-    - https://github.com/ClickHouse/ClickHouse/pull/12345   # cross-repo OK
-
-  exclude_prs:
-    - https://github.com/Altinity/ClickHouse/pull/789
-
-  # Parked, not vetoed: `run` skips these, `graph discover` still keeps
-  # them (and their edges) in the graph, and the graph issue lists them
-  # under "On hold". Drop the entry to put one back in work.
-  on_hold:
-    - https://github.com/Altinity/ClickHouse/pull/2234
-    - url: https://github.com/Altinity/ClickHouse/pull/2249
-      reason: waiting for the upstream follow-up
-
-  # Cherry-pick multiple PRs onto ONE branch, open ONE combined PR.
-  # sort: listed (default, walks `prs:`) | merged_at
-  # depends_on: other unit IDs that must merge first
-  groups:
-    - id: iceberg-rest
-      description: "Iceberg REST catalog support"
-      # depends_on: [pr-100, some-other-group-id]
-      prs:
-        - https://github.com/Altinity/ClickHouse/pull/1500
-        - https://github.com/Altinity/ClickHouse/pull/1512
-
-  # Optional: override deps overlay path (default <session-stem>.deps.yaml)
-  # deps_file: deps/26.3.yaml
-
-# Labels applied to every rebase PR opened this session (auto-created on
-# origin; `refresh` reconciles them onto tracked PRs that are missing one).
-# pr_labels: ["antalya-26.3"]
-
-# Extra labels applied only to ports of a given mode (see `mode` below).
-# pr_labels_by_mode:
-#   forward_port: ["forwardport"]
-```
-
-If a PR URL appears in two of `include_prs` / `exclude_prs` / a group's
-`prs`, you get a one-line stderr warning. The pipeline still resolves
-deterministically (group wins over `include_prs`; `exclude_prs` is final).
-A URL in both `on_hold` and `exclude_prs` warns too — the veto already
-keeps it out.
+- `include_prs` bypasses label and author filters. URLs may point to any
+  public GitHub repo.
+- Every PR in a `groups[]` entry is ported in that group (one branch, one
+  combined PR) regardless of labels; exclusions still drop individual members.
+- PR URLs match by full owner/repo/number.
+- A URL listed in two of `include_prs` / `exclude_prs` / a group's `prs`
+  warns; group wins over `include_prs`, `exclude_prs` always wins.
 
 ### On hold vs. excluded
 
-`exclude_prs` is a veto: the PR leaves the graph and stops being a
-candidate. `on_hold` is a pause — the PR keeps its unit, its dependency
-edges and any port PR it already has, `releasy run` just walks past it,
-and anything that declares its unit in `depends_on` reports as blocked
-(a held unit never reaches `merged`). Holding any PR of a group holds the
-whole group: its members cherry-pick as one atomic unit.
+`exclude_prs` is a veto: the PR leaves the graph. `on_hold` is a pause: the
+unit keeps its dependency edges and any existing port PR, `run` skips it, and
+units that `depends_on` it report `blocked`. Holding one PR of a group holds
+the whole group.
 
-Three ways in and out, all reflected on the graph issue at the next write:
-[`releasy hold`](commands.md#releasy-hold) /
-[`releasy unhold`](commands.md#releasy-unhold), a comment on the graph issue
-followed by [`releasy graph update`](commands.md#releasy-graph-update), or
-editing `pr_sources.on_hold` by hand.
+Change holds with [`releasy hold`](commands.md#releasy-hold) /
+[`unhold`](commands.md#releasy-unhold), a graph-issue comment +
+[`graph update`](commands.md#releasy-graph-update), or by editing
+`pr_sources.on_hold`.
 
 ## Key options
 
-Options live in `config.yaml` unless marked **(session)**.
+`config.yaml` unless marked **(session)**.
+
+### General
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `name` | Project slug (required). Matches `[A-Za-z0-9._-]{1,64}`. | — |
-| `session_file` | Override session file path. | `<config-dir>/<target_branch>.session.yaml` (or `<name>` when unset) |
-| `push` | Push branches + open PRs. | `false` |
-| `work_dir` | Repo clone path. | cwd |
+| `name` | Project slug (required), `[A-Za-z0-9._-]{1,64}`. Keys state file + lock. | — |
+| `project` | Short id used in branch names and PR titles (required). | — |
 | `origin.remote` | Origin repo URL (required). | — |
-| `project` | Short project id used in branch names. | — |
-| `target_branch` | Explicit base branch; makes `--onto` optional. | derived |
-| `sequential` | One PR per invocation, gated on the previous rebase PR merging. See [Sequential mode](commands.md#sequential-mode). Incompatible with `pr_sources.groups`. | `false` |
-| `update_existing_prs` | Reuse existing PR and overwrite its title/body. | `false` |
-| `upstream.remote` | Optional fetch-only upstream remote (URL). Used **only** for `git log -S` prereq detection during AI resolve — never pushed to, never read for code. Sub-keys `upstream.remote_name` (`upstream`), `upstream.branch` (`master`). | unset |
-| `ai_model` | Model for **every** AI call (resolve, changelog, review, analyze-fails, graph). Alias or full id (`opus`, `sonnet`, `claude-opus-4-8`). Not used by `ai_backend: codex`. | claude CLI default |
-| `ai_effort` | Reasoning effort for every AI call. One of `low`/`medium`/`high`/`xhigh`/`max`. Not used by `ai_backend: codex`. | claude CLI default |
-| `ai_backend` | How every AI call reaches the model: `cli` spawns `claude` (`<section>.command`), `codex` spawns `codex exec`, `api` talks to the Anthropic API with a token. See [AI backends](#ai-backends). | `cli` |
-| `ai_codex.*` | Settings for `ai_backend: codex`. See [AI backends](#ai-backends). | — |
-| `ai_api.*` | Settings for `ai_backend: api`. See [AI backends](#ai-backends). | — |
-| `ai_resolve.enabled` | Master switch for the AI conflict resolver. When off, conflicts always stop the pipeline. | `false` |
-| `ai_resolve.build_command` | Shell command for the build. RelEasy runs it (deterministic flow), or Claude runs it (legacy). | `cd build && ninja` |
-| `ai_resolve.deterministic_build` | Claude resolves only; RelEasy builds + runs the PR's tests, looping fresh-context build fixes. `false` = legacy single-session resolve+build. | `true` |
-| `ai_resolve.max_build_attempts` | Consecutive build-fix attempts per run before parking as `build_failed`. Resets each run. | `5` |
-| `ai_resolve.max_dead_end_attempts` | How many consecutive runs may re-resolve a unit whose last resolution reached a dead end — `unresolvable` or `prereq_search_exhausted`; the unit is then parked (see [stall reasons](concepts.md#stall-reasons)). `0` re-resolves on every run. | `2` |
-| `ai_resolve.max_verify_resume_attempts` | How many times a `build_failed` branch is resumed on later runs before it's left for a human. `0` disables resume. | `2` |
-| `ai_resolve.max_resume_base_drift` | Re-port from base instead of resuming when a parked branch is this many commits behind base. `0` disables the check. | `50` |
-| `ai_resolve.max_verify_iterations` | Overall cap on build↔test iterations within one verify pass. | `12` |
-| `ai_resolve.build_log_tail_lines` | Lines of the branch's `.releasy/build-<branch>.log` fed to the fix-build prompt (plus grepped errors). | `500` |
-| `ai_resolve.build_timeout_seconds` | RelEasy's wall-clock cap for one build subprocess. | `7200` |
-| `ai_resolve.run_pr_tests` | After a green build, run the source PR's own tests (Claude-driven). | `true` |
-| `ai_resolve.test_file_globs` | Globs marking a changed file as a runnable test. | ClickHouse defaults |
-| `ai_resolve.test_timeout_seconds` | Wall-clock cap for one run-tests invocation. | `3600` |
-| `ai_resolve.max_iterations` | Legacy build attempts per conflict (only when `deterministic_build: false`). | `5` |
-| `ai_resolve.api_retries` | Retries on transient Anthropic API errors (short backoff). | `3` |
-| `ai_resolve.wait_on_session_exhaustion` | When the Claude session usage limit is hit (incl. the CLI's misleadingly-worded "monthly spend limit · /usage-credits" message — it's a session reset, not a billing cap), wait and re-prompt on a schedule instead of failing. Applies to every Claude call; Ctrl-C aborts. | `true` |
-| `ai_resolve.session_exhaustion_max_wait_hours` | Cap on cumulative waiting for the session to reset. | `60` |
-| `ai_resolve.session_exhaustion_poll_minutes` | Sleep between re-prompts while waiting. | `30` |
-| `ai_resolve.session_exhaustion_extra_patterns` | Extra regexes (OR-ed with the built-ins) for recognising a limit message, for a CLI wording the defaults miss. | `[]` |
-| `ai_resolve.postcondition_retries` | Corrective Claude passes when a landed resolution trips a content-correctable postcondition (the append-only `SettingsChangesHistory.cpp` whitelist). `0` disables. | `2` |
-| `ai_resolve.warn_on_unfixed_postconditions` | Once those passes are spent and the check still fails: keep + push the resolution and flag it on the PR (comment + `verify_label`). `false` discards the resolution instead. | `true` |
-| `ai_resolve.label` | Label for AI-resolved PRs. | `ai-resolved` |
-| `ai_resolve.needs_attention_label` | Label for partial-group draft PRs. | `ai-needs-attention` |
-| `ai_resolve.prompt_file` | Prompt for cherry-pick conflicts. | `prompts/resolve_conflict.md` |
-| `ai_resolve.merge_prompt_file` | Prompt for merge conflicts (`refresh`). | `prompts/resolve_merge_conflict.md` |
-| `ai_resolve.split_conflict_commit` | Record the raw conflict and its resolution as two separate commits (clearer history). | `true` |
-| `ai_resolve.split_prompt_file` | Prompt used for the split-commit resolution pass. | `prompts/resolve_conflict_split.md` |
-| `ai_resolve.auto_add_prerequisite_prs` | Auto-pull a missing prerequisite PR when the resolver detects one. Bool sugar, or `{enabled, max_prereq_depth}`. | `enabled: false`, `max_prereq_depth: 7` |
-| `ai_changelog.enabled` | Synthesize one CHANGELOG entry per multi-PR group. Singletons reuse the source PR's entry. | `false` |
-| `ai_changelog.command` | Claude executable. | `claude` |
-| `ai_changelog.prompt_file` | Prompt template. | `prompts/synthesize_changelog.md` |
-| `ai_changelog.timeout_seconds` | Per-call timeout. | `300` |
-| `ai_changelog.max_pr_body_chars` | Per-PR body trim before inlining. | `3000` |
-| `review_response.trusted_associations` | GitHub `author_association` values whose comments the AI is allowed to act on. The default gate handles the common case on its own. | `["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"]` |
-| `review_response.trusted_reviewers` | Extra GitHub-login allowlist, additive on top of `trusted_associations` (case-insensitive). Combined with `--reviewer`. Empty is fine. | `[]` |
-| `review_response.reply_to_non_addressable` | In-thread reply on non-actionable comments. | `true` |
-| `review_response.post_summary_comment` | Also post a top-level summary comment. | `false` |
-| `review_response.prompt_file` | Prompt template. | `prompts/address_review.md` |
-| `review_response.max_iterations` | Build-attempt cap. | `15` |
-| `review_response.timeout_seconds` | Per-invocation Claude timeout. | `7200` |
-| `analyze_fails.command` | Claude executable. | `claude` |
-| `analyze_fails.prompt_file` | Prompt template. | `prompts/analyze_fails.md` |
-| `analyze_fails.categories` | Check categories to investigate; empty = every failed check. Known: `fasttest`, `quick_functional`, `stateless`, `integration`, `regression`, `other`. | `[]` |
-| `analyze_fails.job_level_failures` | Investigate failed checks with no per-test results (build / packaging / image / scan checks, jobs killed before their test phase, job-log `target_url`s). They become a shard carrying the failure reason and report URL instead of a test list. Off = report as warnings. | `true` |
-| `analyze_fails.baseline_check` | Compare each PR's failures against the last CI run on the target branch that predates its diff, and tell Claude which were already red. See [Baseline](commands.md#baseline-what-was-red-before-the-change). | `true` |
-| `analyze_fails.baseline_scan_commits` | How far back from the merge base to look for a commit that has a CI run at all (release-branch merge commits mostly have none). | `25` |
-| `analyze_fails.verify_outcome` | After a shard's investigation, have a second independent session audit the outcome — but only when the shard is in doubt. See [Second opinion](commands.md#second-opinion-auditing-the-outcome). | `true` |
-| `analyze_fails.max_investigation_rounds` | Investigator sessions one shard may get. A disputed outcome hands the audit's findings to a fresh investigator that starts from the disputed round's tip and can revert it. `1` = no redo (report and leave it). | `2` |
-| `analyze_fails.verify_prompt_file` | Prompt template for that audit. | `prompts/verify_analysis.md` |
-| `analyze_fails.verify_timeout_seconds` | Timeout for one audit (read-only, no build). | `1800` |
-| `analyze_fails.verify_label` | Label applied when an audit disputes a shard. | `ai-needs-verify` |
-| `analyze_fails.timeout_seconds` | Per-invocation Claude timeout. | `7200` |
-| `analyze_fails.max_iterations` | Build attempts per failed test. | `6` |
-| `analyze_fails.max_prs_per_run` | Cap on tracked PRs when `--pr` omitted (0 = no cap). | `0` |
-| `analyze_fails.flaky_elsewhere_threshold` | Failure seen on this many other PRs ⇒ flagged as master-side flake. `0` disables. | `2` |
-| `analyze_fails.flaky_check_prs` | Cap on PRs scanned for the flaky-elsewhere map. | `12` |
-| `analyze_fails.post_comment_to_pr` | Post summary comment per PR. | `true` |
-| `graph.trusted_associations` | GitHub `author_association` values whose comments `graph update` feeds to Claude. | `["OWNER", "MEMBER", "COLLABORATOR"]` |
-| `graph.trusted_reviewers` | Extra GitHub-login allowlist, additive on top of `trusted_associations` (case-insensitive). | `[]` |
-| `graph.issue_labels` | Labels on the graph issue (the target-branch name is always added too; created on origin if missing). | `["releasy"]` |
-| `graph.post_comment` | Post a summary comment on the issue after each `graph update`. | `true` |
-| `graph.sync_progress` | Refresh the graph issue's progress checkboxes at the end of `run` / `refresh` (same as `releasy graph sync`). | `true` |
-| `graph.apply_exclusions` | Enforce member "don't port" vetoes by adding the PR to the session's `exclude_prs`. | `true` |
-| `graph.minimize_addressed_comments` | After an update, collapse (mark **Outdated**) the comments it actually addressed; unaddressed ones stay visible. | `true` |
-| `graph.prompt_file` | Prompt template for `graph update`. | `prompts/adjust_graph.md` |
-| `graph.timeout_seconds` | Per-invocation Claude timeout for `graph update`. | `7200` |
-| `pr_policy.auto_pr` | Open a PR for every pushed port branch. Needs `push: true`. | `true` |
-| `pr_policy.if_exists` | What to do with an existing port branch: `skip` (leave it) / `recreate` (rebuild from base — only if no rebase PR open yet) / `append` (cherry-pick declared PRs not yet on the branch). A group with an open rebase PR always appends members missing from its branch, whatever this is set to. | `skip` |
-| `pr_policy.retry_failed` | Revisit `conflict` entries per their `if_exists`. Override per-run with `--retry-failed`/`--no-retry-failed`. | `true` |
-| `pr_policy.recreate_closed_prs` | If a rebase PR is closed (not merged), allocate `<canonical>-1`, `-2`, … and open a fresh one. The closed entry stays terminal until this flag opts it back in. | `false` |
-| `pr_policy.recreate_reverted_prs` | Same renumbered-branch re-port for an entry marked [`reverted`](commands.md#releasy-mark-reverted) — the port merged, then was reverted on target. Separate from `recreate_closed_prs` and off by default: a closed PR was never in the branch, while a revert means someone took the landed code back out. | `false` |
-| `pr_policy.detect_superseded` | Each refresh / run sweeps the target branch's recent git log AND open PRs targeting the same base for `(cherry picked from commit <sha>)` footers citing any tracked entry's source PR. Matches mark the entry `superseded` — terminal, no more retries. | `true` |
-| `pr_policy.max_partial_continue_attempts` | How many times `run` auto-resumes a **partially-applied group** (a prior run landed some of the group's PRs, then a conflict — often an AI token/budget exhaustion — left a draft PR labelled `ai-needs-attention`). Each run appends the not-yet-applied PRs and re-resolves (no need to set `if_exists: append` by hand); after the cap it leaves the draft PR for manual help. Wins over `if_exists: recreate` — only terminal cases (closed PR, first-pick conflict) redo from base. `0` disables, restoring plain `if_exists` handling. | `2` |
-| `pr_policy.honor_stall_reasons` | Skip a unit whose recorded [stall](concepts.md#stall-reasons) can't clear on its own — waiting for another unit's PR to merge, or on a prereq nobody ports. Re-resolving those reaches the same verdict at full token price; the stall is dropped (and the unit retried) as soon as what it waits on changes. Override per run with `run --ignore-stalls`. | `true` |
-| `pr_sources.by_labels[].labels` **(session)** | Labels a PR must have (AND). | — |
-| `pr_sources.by_labels[].merged_only` **(session)** | Only merged PRs. | `false` |
-| `pr_sources.by_labels[].if_exists` **(session)** | Override `pr_policy.if_exists`. | inherits |
-| `pr_sources.by_labels[].ai_context` **(session)** | AI resolver hint applied to every matched PR. | `""` |
-| `pr_sources.by_labels[].mode` / `groups[].mode` **(session)** | Port direction: `auto` / `backport` / `forward_port`. | `auto` |
-| `pr_sources.forward_port_labels` **(session)** | Labels that mark a PR as a forward-port. | `[]` |
-| `pr_sources.deps_file` **(session)** | Override the deps overlay path. | `<session-stem>.deps.yaml` |
-| `pr_sources.exclude_labels` **(session)** | Drop PRs with any of these. | `[]` |
-| `pr_sources.include_authors` **(session)** | Allowlist of GitHub logins. Bypassed by `include_prs`. | `[]` |
-| `pr_sources.exclude_authors` **(session)** | Denylist of GitHub logins. Bypassed by `include_prs`. | `[]` |
-| `pr_sources.include_prs` **(session)** | Always include. Bare URL or `{url, ai_context}`. | `[]` |
-| `pr_sources.exclude_prs` **(session)** | Always exclude. | `[]` |
-| `pr_sources.on_hold` **(session)** | Park without vetoing: `run` skips the unit, the graph keeps it. Bare URL or `{url, reason}`. | `[]` |
-| `pr_sources.groups[].id` **(session)** | Group id → branch name. | — |
-| `pr_sources.groups[].prs` **(session)** | Ordered PR list. Bare URL or `{url, ai_context}`. | — |
-| `pr_sources.groups[].description` **(session)** | Combined PR title. | id |
-| `pr_sources.groups[].if_exists` **(session)** | Override. | inherits |
-| `pr_sources.groups[].sort` **(session)** | `listed` or `merged_at` (PR number breaks ties). | `listed` |
-| `pr_sources.groups[].ai_context` **(session)** | Hint for every cherry-pick step in the group. | `""` |
-| `pr_sources.groups[].depends_on` **(session)** | Other unit IDs that must port/merge first. | `[]` |
-| `pr_labels` **(session)** | Labels applied to every rebase PR opened this session (auto-created on origin). | `[]` |
-| `pr_labels_by_mode` **(session)** | Extra labels per detected port mode (`forward_port` / `backport`). A PR of unknown mode gets `pr_labels` only. | `{}` |
-| `features[].id` **(session)** | Feature id → branch suffix. | — |
-| `features[].source_branch` **(session)** | Branch holding the commits. | — |
-| `features[].description` **(session)** | PR title + board text. | — |
-| `features[].enabled` **(session)** | Active on next run. | `true` |
-| `features[].depends_on` **(session)** | Feature ids that must port first. | `[]` |
-| `features[].ai_context` **(session)** | Hint on porting conflicts. | `""` |
+| `origin.remote_name` | Git remote alias. | `origin` |
+| `target_branch` | Base branch; makes `--onto` optional. Must exist on origin. | derived from `--onto` |
+| `session_file` | Session file path (relative to the config dir). `--session-file` wins. | `<config-dir>/<target_branch>.session.yaml` |
+| `work_dir` | Local clone used for git operations. | cwd |
+| `log_file` | Append a full transcript plus INFO logs here (relative to the config dir). | unset |
+| `push` | Push branches and open PRs. | `false` |
+| `sequential` | One PR per `run` / `continue`, gated on the previous one merging. See [Sequential mode](commands.md#sequential-mode). | `false` |
+| `update_existing_prs` | Overwrite title/body of an existing rebase PR. | `false` |
+| `merged_label` | Label added to a rebase PR when it merges and removed from its origin-repo source PRs. Needs `push: true`. | unset |
+| `merged_label_color` | Color used when creating `merged_label`. | `8B5CF6` |
+| `upstream.remote` | Fetch-only upstream URL, used for prerequisite detection. Also `upstream.remote_name` (`upstream`), `upstream.branch` (`master`). | unset |
+
+### `pr_policy`
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `auto_pr` | Open a PR for every pushed port branch. | `true` |
+| `if_exists` | Existing port branch without a rebase PR: `skip`, `recreate` (rebuild from base) or `append` (cherry-pick missing declared PRs on top). A branch with an open rebase PR is never rebuilt; a group with an open PR always gets new members appended. | `skip` |
+| `retry_failed` | Re-process `conflict` entries per `if_exists`. CLI: `--retry-failed` / `--no-retry-failed`. | `true` |
+| `recreate_closed_prs` | Re-port a closed (unmerged) rebase PR on a renumbered branch (`<id>-1`, `-2`, …). | `false` |
+| `recreate_reverted_prs` | Same, for entries marked [`reverted`](commands.md#releasy-mark-reverted). | `false` |
+| `detect_superseded` | Mark an entry `superseded` when the target's history or an open PR into the base carries `(cherry picked from commit …)` for its source. | `true` |
+| `max_partial_continue_attempts` | Times `run` resumes a partially applied group. `0` disables. | `2` |
+| `honor_stall_reasons` | Skip units whose [stall](concepts.md#stall-reasons) can't clear on its own. CLI: `run --ignore-stalls`. | `true` |
+
+### AI (shared)
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `ai_backend` | `cli`, `codex` or `api`. See [AI backends](#ai-backends). | `cli` |
+| `ai_model` | Model for every AI call (alias or full id). Ignored by `codex`. | CLI default |
+| `ai_effort` | `low` / `medium` / `high` / `xhigh` / `max`. Ignored by `codex`. | CLI default |
+
+Each AI section (`ai_resolve`, `review_response`, `analyze_fails`, `graph`,
+`ai_changelog`) has `command` (default `claude`), `prompt_file` and
+`timeout_seconds`. `ai_resolve`, `review_response` and `analyze_fails` also
+take `allowed_tools` (Claude Code tool allowlist) and, with `graph`,
+`extra_args` (extra CLI flags). Relative prompt paths resolve against the
+config dir, falling back to the prompts bundled with releasy.
+
+### `ai_resolve`
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `enabled` | Use AI to resolve conflicts. | `false` |
+| `timeout_seconds` | Per-invocation timeout. | `7200` |
+| `build_command` | Build command. | `cd build && ninja` |
+| `deterministic_build` | AI resolves only; RelEasy builds and runs the PR's tests, looping fresh-context build fixes. `false` = single AI session resolves and builds. | `true` |
+| `max_build_attempts` | Build-fix attempts per run before parking as `build_failed`. | `5` |
+| `max_verify_resume_attempts` | Runs that resume a `build_failed` branch. `0` disables. | `2` |
+| `max_resume_base_drift` | Re-port instead of resuming when the branch is this many commits behind base. `0` disables. | `50` |
+| `max_verify_iterations` | Build↔test iterations per verify pass. | `12` |
+| `build_log_tail_lines` | Build-log lines fed to the fix-build prompt. | `500` |
+| `build_timeout_seconds` | Timeout for one build. | `7200` |
+| `run_pr_tests` | Run the source PR's tests after a green build. | `true` |
+| `test_file_globs` | Globs that mark a changed file as a test. | ClickHouse test paths |
+| `test_timeout_seconds` | Timeout for one test run. | `3600` |
+| `max_iterations` | Build attempts per conflict when `deterministic_build: false`. | `5` |
+| `max_dead_end_attempts` | Runs that may re-resolve a unit stalled `unresolvable` / `prereq_search_exhausted`. `0` = no cap. | `2` |
+| `split_conflict_commit` | Commit the raw conflict and its resolution separately. | `true` |
+| `prompt_file` / `merge_prompt_file` / `split_prompt_file` | Prompts for cherry-pick, merge (`refresh`) and split-commit resolution. | `prompts/resolve_conflict.md` / `prompts/resolve_merge_conflict.md` / `prompts/resolve_conflict_split.md` |
+| `resolve_only_prompt_file` / `fix_build_prompt_file` / `run_tests_prompt_file` | Prompts for the deterministic flow. | `prompts/resolve_conflict_nobuild.md` / `prompts/fix_build.md` / `prompts/run_tests.md` |
+| `api_retries` / `api_retry_backoff_seconds` | Retries on transient API errors. | `3` / `15` |
+| `wait_on_session_exhaustion` | On a usage-limit message, wait and re-prompt instead of failing (all AI calls). | `true` |
+| `session_exhaustion_max_wait_hours` | Total wait cap. | `60` |
+| `session_exhaustion_poll_minutes` | Interval between re-prompts. | `30` |
+| `session_exhaustion_extra_patterns` | Extra regexes recognised as a limit message. | `[]` |
+| `postcondition_retries` | AI passes to fix a failed content postcondition (`SettingsChangesHistory.cpp` whitelist). | `2` |
+| `warn_on_unfixed_postconditions` | When still failing: keep and flag the resolution (`true`) or discard it (`false`). | `true` |
+| `auto_add_prerequisite_prs` | Auto-add a detected missing prerequisite PR. Bool, or `{enabled, max_prereq_depth, require_origin_prereq_label}`. | `false`, `7`, `true` |
+| `verify_resolution` | Read-only AI audit of each resolution; findings → `verify_label` + comment. | `false` |
+| `verify_prompt_file` / `verify_timeout_seconds` | Audit prompt and timeout. | `prompts/verify_resolution.md` / `1800` |
+| `label` / `label_color` | Label on AI-resolved PRs. | `ai-resolved` / `8B5CF6` |
+| `needs_attention_label` / `_color` | Label on partial-group draft PRs. | `ai-needs-attention` / `D93F0B` |
+| `missing_prereqs_label` / `_color` | Label on PRs whose conflict is a missing prerequisite. | `missing-prerequisites` / `E4E669` |
+| `auto_prereq_label` / `_color` | Label when a prerequisite was auto-added. | `auto-prereq-added` / `0E8A16` |
+| `verify_label` / `_color` | Label when the audit finds issues. | `ai-needs-verify` / `FBCA04` |
+
+`require_origin_prereq_label`: an origin-repo prerequisite (for an origin PR)
+must match a `by_labels` entry to be auto-added.
+
+### `ai_changelog`
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `enabled` | AI-synthesize one changelog entry per multi-PR group (singletons reuse the source entry). | `false` |
+| `prompt_file` | Prompt. | `prompts/synthesize_changelog.md` |
+| `timeout_seconds` | Timeout. | `300` |
+| `max_pr_body_chars` | Per-PR body trim. | `3000` |
+
+### `review_response` (`refresh --address-review`)
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `trusted_associations` | `author_association` values whose comments the AI acts on. | `[OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR]` |
+| `trusted_reviewers` | Extra trusted logins (case-insensitive). | `[]` |
+| `reply_to_non_addressable` | Reply in-thread on non-actionable comments. | `true` |
+| `post_summary_comment` | Also post a top-level summary. | `false` |
+| `prompt_file` | Prompt. | `prompts/address_review.md` |
+| `max_iterations` | Build attempts. | `15` |
+| `timeout_seconds` | Timeout. | `7200` |
+
+### `analyze_fails`
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `categories` | Check categories to investigate (`fasttest`, `quick_functional`, `stateless`, `integration`, `regression`, `other`); empty = all. | `[]` |
+| `job_level_failures` | Investigate failed checks without per-test results (build, packaging, killed jobs); off = warn only. | `true` |
+| `baseline_check` | Compare against the last target-branch CI run predating the PR. | `true` |
+| `baseline_scan_commits` | Commits to walk back looking for that run. | `25` |
+| `verify_outcome` | Audit in-doubt shard outcomes with a second read-only session. | `true` |
+| `max_investigation_rounds` | Investigator rounds per shard after a disputed audit. `1` = no redo. | `2` |
+| `verify_prompt_file` / `verify_timeout_seconds` | Audit prompt and timeout. | `prompts/verify_analysis.md` / `1800` |
+| `verify_label` / `verify_label_color` | Label when a dispute remains. | `ai-needs-verify` / `FBCA04` |
+| `prompt_file` | Prompt. | `prompts/analyze_fails.md` |
+| `timeout_seconds` | Timeout. | `7200` |
+| `max_iterations` | Build attempts per failed test. | `6` |
+| `max_prs_per_run` | Cap on tracked PRs when `--pr` is omitted (`0` = none). | `0` |
+| `flaky_elsewhere_threshold` | Failing on this many other PRs ⇒ treated as a flake. `0` disables. | `2` |
+| `flaky_check_prs` | PRs scanned for that map. | `12` |
+| `post_comment_to_pr` | Post a summary comment per PR. | `true` |
+
+`allowed_tools` entries may use `{work_dir}` (aliases `{repo_dir}`, `{cwd}`),
+e.g. `Bash({work_dir}/build/programs/clickhouse:*)`.
+
+### `graph`
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `trusted_associations` | Associations whose issue comments `graph update` reads. | `[OWNER, MEMBER, COLLABORATOR]` |
+| `trusted_reviewers` | Extra trusted logins. | `[]` |
+| `issue_labels` | Graph-issue labels (target-branch name always added). | `[releasy]` |
+| `post_comment` | Summary comment after `graph update`. | `true` |
+| `sync_progress` | Run `graph sync` at the end of `run` / `refresh`. | `true` |
+| `apply_exclusions` | Add vetoed PRs to `exclude_prs`. | `true` |
+| `minimize_addressed_comments` | Collapse addressed comments as Outdated. | `true` |
+| `prompt_file` | Prompt. | `prompts/adjust_graph.md` |
+| `timeout_seconds` | Timeout. | `7200` |
+
+### `notifications`
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `github_project` | GitHub Projects v2 URL to sync. See [board](#github-project-board). | unset |
+| `assignee_dev_options` / `assignee_qa_options` | Options for the `Assignee Dev` / `Assignee QA` fields when first created. | built-in list |
+| `assignee_dev_login_map` | GitHub login → `Assignee Dev` option, seeded from the source PR author. | built-in map |
+
+### Session file
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `features[]` | Static branches: `id`, `source_branch`, `description`, `enabled` (`true`), `depends_on`, `ai_context`. Managed by [`releasy feature`](commands.md#feature-management). | `[]` |
+| `pr_sources.by_labels[]` | `labels` (all required), `merged_only` (`false`), `description` (PR title prefix), `if_exists`, `ai_context`, `mode`. | `[]` |
+| `pr_sources.exclude_labels` | Drop PRs with any of these labels. | `[]` |
+| `pr_sources.include_authors` / `exclude_authors` | Author allow/deny lists (case-insensitive). | `[]` |
+| `pr_sources.include_prs` | Always include. URL or `{url, ai_context}`. | `[]` |
+| `pr_sources.exclude_prs` | Always exclude. | `[]` |
+| `pr_sources.on_hold` | Park. URL or `{url, reason}`. | `[]` |
+| `pr_sources.groups[]` | `id` (branch name), `prs` (URL or `{url, ai_context}`), `description` (PR title), `sort` (`listed` / `merged_at`), `depends_on` (unit ids that must merge first), `if_exists`, `ai_context`, `mode`. | `[]` |
+| `pr_sources.forward_port_labels` | Labels marking a PR as a forward-port. | `[]` |
+| `pr_sources.deps_file` | Deps overlay path (relative to the session file). | `<session-stem>.deps.yaml` |
+| `pr_labels` | Labels added to every rebase PR of this session. | `[]` |
+| `pr_labels_by_mode` | Extra labels per port mode (`backport` / `forward_port`). | `{}` |
+
+`mode` (`auto` / `backport` / `forward_port`): `backport` lets the resolver
+adapt code and declare a prerequisite only when unavoidable; `forward_port` is
+strict. `auto` picks `forward_port` for PRs with a `forward_port_labels` label,
+`backport` for cross-repo PRs or when `upstream` is set, else `forward_port`.
 
 ## AI backends
 
-Every AI call — conflict resolve, build fixes, run-tests, verify, review
-response, analyze-fails, changelog synthesis, graph discovery — goes through
-one of three backends, selected by `ai_backend`.
+`ai_backend` selects how every AI call reaches the model:
 
-**`cli` (default)** spawns the agent binary named by the section's `command`
-(`ai_resolve.command`, `analyze_fails.command`, …) as `claude -p
---output-format stream-json`. It uses whatever credentials that CLI is
-logged in with (subscription or `ANTHROPIC_API_KEY`), and `extra_args` is
-passed through to it.
-
-**`codex`** spawns the OpenAI Codex CLI as `codex exec --json` and uses
-whatever it is logged in with (ChatGPT subscription via `codex login`, or an
-API key). Its events are translated into the same transcript format, so
-prompts, result markers, `api_retries` and the session-exhaustion wait work
-unchanged. Cost isn't reported (codex gives token counts only).
-
-```yaml
-ai_backend: codex
-
-ai_codex:
-  model: gpt-5.5            # unset = codex's own config default
-  reasoning_effort: high
-```
-
-The per-section `command` / `extra_args`, `ai_model` and `ai_effort` are
-claude settings and are ignored. Codex has no per-tool allowlist, so
-`allowed_tools` only picks the sandbox: a call granted no `Edit` / `Write`
-tool (changelog / graph text, both verifiers) runs with
-`--sandbox read-only` — no file writes, no network, so the verifier's
-`gh pr diff` cross-check fails there. Every other call runs with
-`--dangerously-bypass-approvals-and-sandbox` (full access, like the
-claude `Bash(git:*)` / `Bash(gh:*)` defaults but without any command
-filter).
+- **`cli`** (default) — runs each section's `command` (`claude -p`) with its
+  own login. `extra_args` are passed through.
+- **`codex`** — runs `codex exec --json` with its own login. `command`,
+  `extra_args`, `ai_model` and `ai_effort` are ignored. Calls without
+  `Edit`/`Write` in `allowed_tools` run `--sandbox read-only`; others run
+  `--dangerously-bypass-approvals-and-sandbox`. Cost is not reported.
+- **`api`** — calls the Anthropic API directly with a token
+  (`export ANTHROPIC_API_KEY=...`); RelEasy executes the tools (`Bash`, `Read`,
+  `Write`, `Edit`, `Glob`, `Grep`, plus server-side `WebSearch` / `WebFetch`
+  when allowed). `allowed_tools` is enforced locally; `command` and
+  `extra_args` are ignored.
 
 | Option | Description | Default |
 |--------|-------------|---------|
 | `ai_codex.command` | Codex executable. | `codex` |
-| `ai_codex.model` | Passed as `--model`. | codex config default |
-| `ai_codex.reasoning_effort` | Passed as `-c model_reasoning_effort="…"` (e.g. `low`/`medium`/`high`/`xhigh`). | codex config default |
-| `ai_codex.extra_args` | Extra `codex exec` flags (e.g. `["--ephemeral"]`). | `[]` |
-
-**`api`** drops the subprocess: RelEasy talks to the Anthropic Messages API
-with a token and runs the tool calls itself. The `anthropic` SDK ships as a
-regular dependency, so all it needs is a token:
-
-```sh
-export ANTHROPIC_API_KEY=sk-ant-...
-```
-
-```yaml
-ai_backend: api
-
-ai_api:
-  model: claude-opus-5      # falls back to ai_model, then claude-opus-5
-  max_turns: 300            # cap on model round-trips per invocation
-```
-
-What carries over unchanged in API mode: `allowed_tools` (same
-Claude-Code syntax — `Read`, `Bash(git:*)`; enforced locally, and unlike the
-CLI compound commands are allowed as long as every segment's head is in the
-list), `timeout_seconds`, `api_retries` / `api_retry_backoff_seconds`, the
-session-exhaustion wait, per-run cost reporting, and every prompt template.
-What is ignored: `command` and `extra_args` (no process is spawned).
-
-Tools available to the model: `Bash`, `Read`, `Write`, `Edit`, `Glob`,
-`Grep`, plus Anthropic's server-side `WebSearch` / `WebFetch` when the
-section's `allowed_tools` grants them (`analyze_fails` does by default).
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `ai_api.api_key_env` | Env var holding the token. Checked before `api_key`. | `ANTHROPIC_API_KEY` |
-| `ai_api.api_key` | Inline token. Only used when the env var is unset — prefer the env var. | unset |
-| `ai_api.base_url` | Gateway / proxy base URL. | Anthropic API |
-| `ai_api.model` | Model id. Overrides `ai_model`. | `claude-opus-5` |
-| `ai_api.max_tokens` | Output cap per model response. | `64000` |
-| `ai_api.max_turns` | Hard cap on model round-trips per invocation. | `300` |
+| `ai_codex.model` | `--model`. | codex default |
+| `ai_codex.reasoning_effort` | `-c model_reasoning_effort=…`. | codex default |
+| `ai_codex.extra_args` | Extra `codex exec` flags. | `[]` |
+| `ai_api.api_key_env` | Env var holding the token (checked before `api_key`). | `ANTHROPIC_API_KEY` |
+| `ai_api.api_key` | Inline token. | unset |
+| `ai_api.base_url` | Gateway / proxy URL. | Anthropic API |
+| `ai_api.model` | Model id; overrides `ai_model`. | `claude-opus-5` |
+| `ai_api.max_tokens` | Output cap per response. | `64000` |
+| `ai_api.max_turns` | Model round-trips per invocation. | `300` |
 | `ai_api.thinking` | Adaptive extended thinking. | `true` |
-| `ai_api.max_retries` | SDK-level retries for 429/5xx before the failure reaches RelEasy's own retry ladder. | `5` |
-| `ai_api.request_timeout_seconds` | Per-request HTTP timeout. | `1800` |
-| `ai_api.bash_timeout_seconds` | Default cap for one `Bash` tool call (also bounded by `timeout_seconds`). | `3600` |
-| `ai_api.tool_output_max_chars` | Tool results are middle-truncated past this. | `30000` |
-| `ai_api.system_prompt_extra` | Appended to the built-in system prompt. | `""` |
+| `ai_api.max_retries` | SDK retries on 429/5xx. | `5` |
+| `ai_api.request_timeout_seconds` | Per-request timeout. | `1800` |
+| `ai_api.bash_timeout_seconds` | Per `Bash` call timeout. | `3600` |
+| `ai_api.tool_output_max_chars` | Tool output truncation. | `30000` |
+| `ai_api.system_prompt_extra` | Appended to the system prompt. | `""` |
 
-`--ai-backend cli|codex|api` overrides `ai_backend` on `refresh`,
-`analyze-fails`, `cherry-pick`, and `project-backport` (the last two have no
-config file, so codex / API mode there uses the defaults above, plus
-`$ANTHROPIC_API_KEY` for API mode).
+`--ai-backend` overrides `ai_backend` on `refresh` and `analyze-fails`
+(`cli|codex|api`), and on `cherry-pick` and `project-backport` (`cli|api`).
 
 ## Environment variables
 
 | Variable | Purpose |
 |----------|---------|
-| `RELEASY_GITHUB_TOKEN` | GitHub PAT — PR discovery, PR creation, Project sync. |
-| `RELEASY_SSH_KEY_PATH` | SSH key for git. Optional; defaults to agent. |
-| `RELEASY_STATE_DIR` | Override state + lock dir. Default: `${XDG_STATE_HOME:-~/.local/state}/releasy`. |
-| `ANTHROPIC_API_KEY` | Anthropic token for `ai_backend: api` (rename via `ai_api.api_key_env`). |
+| `RELEASY_GITHUB_TOKEN` | GitHub token (`repo`; plus `project` for board sync). Required. |
+| `RELEASY_SSH_KEY_PATH` | SSH key for git. Optional. |
+| `RELEASY_STATE_DIR` | State + lock directory. Default `${XDG_STATE_HOME:-~/.local/state}/releasy`. |
+| `ANTHROPIC_API_KEY` | Token for `ai_backend: api` (rename via `ai_api.api_key_env`). |
 
 ## Per-PR / per-group `ai_context`
 
-Free-form note passed to the AI conflict resolver under a *User-supplied
-context* section — only invoked when this PR/group/feature actually
-conflicts.
-
-Supported on: `pr_sources.by_labels[].ai_context`,
-`pr_sources.groups[].ai_context`, `pr_sources.groups[].prs[]` (dict form),
-`pr_sources.include_prs[]` (dict form), `features[].ai_context`.
+A free-form note passed to the AI resolver only when that unit conflicts.
+Accepted on `features[]`, `by_labels[]`, `groups[]`, and dict-form entries in
+`include_prs[]` and `groups[].prs[]` (added to the group's note).
 
 ```yaml
 pr_sources:
   include_prs:
-    - https://github.com/Altinity/ClickHouse/pull/100    # bare URL
     - url: https://github.com/Altinity/ClickHouse/pull/200
-      ai_context: |
-        Base renamed `Foo::run` to `Foo::execute`. Adapt the call sites.
-
-  groups:
-    - id: iceberg-rest-catalog
-      ai_context: |
-        These PRs depend on the new IcebergCatalog interface on master.
-      prs:
-        - https://github.com/Altinity/ClickHouse/pull/1500
-        - url: https://github.com/Altinity/ClickHouse/pull/1530
-          ai_context: "Renames list_tables → list_namespaces."
+      ai_context: Base renamed `Foo::run` to `Foo::execute`. Adapt the call sites.
 ```
-
-The note complements the source PR's diff; it never overrides it.
 
 ## GitHub Project board
 
-Sync branch status to a GitHub Projects v2 board. One-time UI setup, then
-auto-maintained.
+Syncs unit status to a Projects v2 board (only with `push: true`).
 
-### Setup
+Setup: run [`releasy setup-project`](commands.md#releasy-setup-project), or
+create a table project by hand with Status options `Needs Review`,
+`Branch Created`, `Conflict`, `Blocked`, `Skipped`, `Merged`, `Closed`,
+`Superseded`, `Reverted`, then set:
 
-1. **Create the project** at `https://github.com/orgs/<org>/projects` →
-   New project → Table layout.
-2. **Status field options** — set to exactly: `Needs Review`,
-   `Branch Created`, `Conflict`, `Blocked`, `Skipped`, `Merged`,
-   `Closed`, `Superseded`.
-3. **Token permissions** — `RELEASY_GITHUB_TOKEN` needs `repo` + `project`
-   scopes (classic) or "Projects" read/write (fine-grained).
-4. **Wire into config:**
+```yaml
+notifications:
+  github_project: https://github.com/orgs/Altinity/projects/1
+```
 
-   ```yaml
-   push: true   # project sync only runs when push is enabled
-   notifications:
-     github_project: https://github.com/orgs/Altinity/projects/1
-   ```
+The token needs the `project` scope. RelEasy owns the Status field:
+non-canonical options are dropped.
 
-Or skip the UI: [`releasy setup-project`](commands.md#releasy-setup-project)
-creates the project, sets canonical Status options, provisions `AI Cost`,
-runs an initial sync.
+Per base branch it maintains a view; per unit a card with Status, `AI Cost`
+(USD), `Assignee Dev` (seeded once from the source PR author via
+`assignee_dev_login_map`) and `Assignee QA` (left empty). Assignee option
+lists are only set when the field is created; edit them in GitHub afterwards.
 
-> **Destructive:** the Status field is fully owned by RelEasy. Non-canonical
-> options (e.g. legacy `Ok` / `Resolved`) get dropped. To keep custom
-> options, edit `STATUS_OPTIONS` in `src/releasy/github_ops.py`.
-
-### What gets synced
-
-After each state change (when `push: true`):
-
-- A **view (tab)** per rebase, named after the base branch.
-- Real PR attached (or draft-issue stub for `Branch Created`).
-- **Status** matches local pipeline state.
-- **AI Cost** (USD) — cumulative Anthropic spend across all Claude calls
-  (resolve, refresh, analyze-fails); `0` for untouched cards.
-- **Assignee Dev** seeded once with the source PR's author (via
-  `notifications.assignee_dev_login_map`). Never overwritten.
-- **Assignee QA** left empty; QA team fills in.
-- Card body: base commit, conflict files, compare URL (when no PR yet).
-
-One project, multiple views — each rebase gets its own tab automatically.
-
-### View settings to flip on (once per view)
-
-Projects v2 GraphQL doesn't expose view-config writes, so these are manual:
-
-| Setting | Path | Why |
-|---------|------|-----|
-| Group by Status | ⋯ → Group → Status | Mirrors the [`releasy status`](commands.md#releasy-status) layout. |
-| Show `AI Cost` column | ⋯ → Fields → toggle on | Field exists on every card but isn't auto-added to views. |
-| Show `Assignee Dev` / `Assignee QA` | ⋯ → Fields → toggle on | Same limitation. |
-
-Field option lists come from `notifications.assignee_dev_options` /
-`assignee_qa_options`. On a fresh board, RelEasy provisions exactly those
-options; on subsequent runs **never edits the option list** — manual
-additions/removals stick. To add a team member: edit the option list in
-GitHub, then add the login → label entry to `assignee_dev_login_map`.
+Views can't be configured via the API — set *Group by Status* and show the
+`AI Cost` / `Assignee Dev` / `Assignee QA` fields manually.

@@ -1,37 +1,10 @@
-# RelEasy session file — per-effort source data.
-#
-# This file drives *what* to port on a given run. It is the mutable,
-# session-level companion to config.yaml:
-#
-#   * `features:`    — static feature branches to rebase onto the base.
-#   * `pr_sources:`  — PR discovery rules (labels, explicit URLs, groups,
-#                      author filters).
-#
-# Policy knobs for how units are processed (auto_pr, if_exists,
-# retry_failed, recreate_closed_prs) live in config.yaml under
-# `pr_policy:`.
-#
+# RelEasy session file — what to port.
 # Default path: <config-dir>/<target_branch>.session.yaml
-#   — named after config.yaml's `target_branch:` (falling back to `name:`
-#     when target_branch is unset), where <config-dir> is the directory
-#     containing config.yaml. Override with `session_file:` in config.yaml
-#     or `--session-file` on the CLI.
-#
-# `--stateless` (e.g. `releasy refresh --address-review --stateless`)
-# deliberately SKIPS this file — AI settings come from config.yaml and
-# everything else from CLI flags.
+# Selection rules and every key: docs/configuration.md
 
-# ── Static feature branches ────────────────────────────────────────
-# Each feature is rebased onto the base branch as a separate branch.
-# PRs can be auto-created into the base branch (if push +
-# pr_policy.auto_pr in config.yaml).
-#
-# Optional: `ai_context:` is a free-form note appended to the AI
-# conflict-resolver prompt for this entry. Use it to call out gotchas
-# the model can't infer from the diff alone (e.g. "this depends on the
-# auth refactor — prefer the local change in case of doubt").
+# ── Static feature branches ─────────────────────────────────────────
 features:
-  - id: s3-disk
+  - id: s3-disk                     # branch feature/<base>/<id>
     description: "Custom S3 disk improvements"
     source_branch: feature/antalya-s3-disk
     enabled: true
@@ -40,194 +13,69 @@ features:
     description: "Keeper config extensions"
     source_branch: feature/antalya-keeper-cfg
     enabled: true
-    # ai_context: |
-    #   Conflicts here usually come from the keeper-config rename in
-    #   master. Prefer keeping our snake_case keys.
+    # ai_context: |                 # hint for the AI resolver on conflict
+    #   Prefer keeping our snake_case keys.
 
   - id: observability
     description: "Observability hooks"
     source_branch: feature/antalya-observability
     enabled: false
 
-  # Feature that depends on another:
   # - id: disk-cache
   #   description: "Shared disk cache layer"
   #   source_branch: feature/antalya-disk-cache
-  #   depends_on: [s3-disk]
+  #   depends_on: [s3-disk]         # ported after these features
   #   enabled: true
 
-# ── PR sources ────────────────────────────────────────────────────
-# Discover, include, and exclude PRs from the origin repo.
-# Each matching PR becomes its own feature branch.
-# Requires RELEASY_GITHUB_TOKEN.
-#
-# Set arithmetic (evaluated in order):
-#
-#   union(by_labels) − exclude_labels + include_prs − exclude_prs
-#
-# by_labels — label-based discovery. Each entry uses AND logic (PR
-#   must carry ALL listed labels). Multiple entries are unioned.
-#   Per-entry options:
-#     merged_only: true — skip open PRs, only cherry-pick merged ones.
-#     if_exists: skip|recreate|append — overrides pr_policy.if_exists
-#                                (in config.yaml) for this entry. See
-#                                config.yaml.example for the full
-#                                description of each value; "append"
-#                                tops up an existing branch with newly
-#                                added PRs instead of rebuilding it.
-#     description: prefix prepended to the PR title for the feature name.
-#     ai_context: free-form note appended to the AI conflict-resolver
-#                 prompt for every PR matched by this entry. Keep it
-#                 short and high-signal — the model already gets the
-#                 source PR body and diff.
-#     mode: auto|backport|forward_port — port-direction override.
-#                 `auto` (default) runs the ladder; `backport` unlocks
-#                 bucket-0 (drop optional missing-prereq surfaces);
-#                 `forward_port` keeps the MISSING_PREREQS flow.
-#
-# exclude_labels — drop any PR carrying at least one of these labels,
-#   even if it matched a by_labels entry.
-#
-# include_prs — always include these PRs by URL, even if they don't
-#   match any labels or carry an excluded label. URLs may point to ANY
-#   public GitHub repo (not just origin); cross-repo PRs are fetched
-#   directly from the URL — no extra git remote is added. Their port
-#   branches get a slug-prefixed name (feature/<base>/<owner>-<repo>-pr-<N>)
-#   so a same-numbered origin PR can never clash.
-#
-#   Each entry is either a bare URL string, OR a mapping:
-#       - url: https://github.com/owner/repo/pull/N
-#         ai_context: |
-#           Free-form note attached to this specific PR. Surfaced to
-#           the AI conflict resolver if (and only if) this PR conflicts.
-#   Mix and match freely.
-#
-# exclude_prs — always exclude these PRs by URL. Final override —
-#   a PR listed here is never processed. Matched by full owner/repo/number,
-#   so excluding e.g. ClickHouse/ClickHouse#42 won't drop Altinity/ClickHouse#42.
-#
-# on_hold — park a PR without vetoing it: `releasy run` skips the unit
-#   carrying it, but `graph discover` keeps that unit (and its dependency
-#   edges) in the graph, and the graph issue lists it under "On hold".
-#   Units that depend on a held one report as blocked. Holding any PR of a
-#   group holds the whole group — its members port as one atomic unit.
-#   Entries are a bare URL or {url, reason}; drop the entry to put the PR
-#   back in work on the next run. A trusted comment on the graph issue can
-#   do the same via `releasy graph update`.
-#
-# include_authors (when non-empty) — restrict discovered PRs to those
-#   authored by one of the listed GitHub logins. Case-insensitive.
-#   Bypassed for PRs explicitly listed in include_prs.
-#
-# exclude_authors — drop PRs by the listed authors. Same logic.
-#
-# PRs are processed in merge order (earliest merged first).
-#
+# ── PR sources (needs RELEASY_GITHUB_TOKEN) ─────────────────────────
 # pr_sources:
-#   by_labels:
+#   by_labels:                      # each entry: PR must carry ALL labels; entries are unioned
 #     - labels: ["forward-port", "v26.1"]
-#       description: "Forward-ported changes"
+#       description: "Forward-ported changes"   # PR title prefix
 #       merged_only: true
-#       # if_exists: recreate    # override per-group
+#       # if_exists: recreate       # overrides pr_policy.if_exists
+#       # ai_context: "..."         # resolver hint for every matched PR
+#       # mode: auto                # auto | backport | forward_port
 #
 #   exclude_labels: ["do-not-port", "wontfix"]
+#   include_authors: []             # restrict to these logins (when non-empty)
+#   exclude_authors: ["dependabot[bot]"]
 #
-#   include_prs:
+#   include_prs:                    # always included; any public repo
 #     - https://github.com/Altinity/ClickHouse/pull/123
-#     - https://github.com/Altinity/ClickHouse/pull/456
-#     # Cross-repo PR — fetched directly from the source repo by URL.
 #     - https://github.com/ClickHouse/ClickHouse/pull/12345
-#     # Dict form — attach an AI resolver note to a specific PR:
-#     - url: https://github.com/Altinity/ClickHouse/pull/789
+#     - url: https://github.com/Altinity/ClickHouse/pull/456
 #       ai_context: |
-#         The base branch renamed `Foo::run` to `Foo::execute`.
-#         Adapt the PR's call sites accordingly.
+#         The base renamed `Foo::run` to `Foo::execute`. Adapt call sites.
 #
-#   exclude_prs:
+#   exclude_prs:                    # never processed
 #     - https://github.com/Altinity/ClickHouse/pull/789
 #
-#   on_hold:
+#   on_hold:                        # parked, not vetoed; `run` skips the unit
 #     - https://github.com/Altinity/ClickHouse/pull/2234
 #     - url: https://github.com/Altinity/ClickHouse/pull/2249
 #       reason: waiting for the upstream follow-up
 #
-#   # Sequential PR groups: cherry-pick multiple PRs onto a SINGLE port
-#   # branch and open ONE combined PR for the whole group. Use this when
-#   # PR #B depends on PR #A and they should land together. The group
-#   # `id` becomes the feature id and the branch name
-#   # (feature/<base>/<id>). Each PR can appear in at most ONE group;
-#   # PRs in groups are removed from the singleton stream.
-#   #
-#   # Cherry-pick order is controlled by `sort`:
-#   #   - "listed"     (default) walk `prs` top-to-bottom — use when
-#   #                  ordering encodes a logical dependency.
-#   #   - "merged_at"  sort by GitHub merge timestamp ascending; PR
-#   #                  number breaks ties. Convenient when you just want
-#   #                  the chronological replay and don't care about the
-#   #                  exact list order.
-#   #
-#   # `exclude_prs` and `exclude_labels` still drop individual PRs from
-#   # a group; if a group ends up empty it is skipped with a warning.
-#   # `on_hold` is different: it parks the WHOLE group, members intact.
-#   #
-#   # AI conflict resolution works per cherry-pick step inside a group:
-#   # if any PR in the group conflicts, Claude resolves+builds+commits
-#   # locally, then the next PR in the group is cherry-picked. Each PR
-#   # produces one commit on the branch (with a `Source-PR: #N` trailer
-#   # for clean attribution). After all PRs are applied, RelEasy pushes
-#   # the branch and opens ONE combined PR; if any step needed AI, the
-#   # PR is tagged `ai_resolve.label`.
-#   groups:
-#     - id: iceberg-rest-catalog
-#       description: "Iceberg REST catalog support"
-#       # ai_context: free-form note appended to the AI conflict-resolver
-#       # prompt for EVERY cherry-pick step in this group. Use it for
-#       # cross-cutting guidance ("all three PRs depend on the catalog
-#       # interface introduced in master commit abc123 — adapt to its
-#       # current shape").
-#       # ai_context: |
-#       #   These three PRs all depend on the new IcebergCatalog interface
-#       #   on master. If a hunk references the old `Catalog` shim, port
-#       #   it to the new interface.
+#   groups:                         # several PRs → one branch, one combined PR
+#     - id: iceberg-rest-catalog    # branch feature/<base>/<id>
+#       description: "Iceberg REST catalog support"   # PR title
+#       # ai_context: "..."         # hint for every step in the group
 #       prs:
-#         - https://github.com/Altinity/ClickHouse/pull/1500   # base change
-#         - https://github.com/Altinity/ClickHouse/pull/1512   # follow-up
-#         # Dict form — attach a per-PR ai_context that is added on top
-#         # of the group-level one (concatenated, blank-line separated).
-#         - url: https://github.com/Altinity/ClickHouse/pull/1530   # final fix
-#           ai_context: |
-#             This one specifically renames `IcebergCatalog::list_tables`
-#             to `list_namespaces`. Update call sites added by #1500.
-#       # if_exists: skip       # override pr_policy.if_exists.
-#       #                       # "append" adds newly-listed PRs onto the
-#       #                       # existing branch tip without rebuilding.
-#       # sort: merged_at       # default "listed"
-#       # mode: backport       # override port direction (see by_labels.mode).
-#       # depends_on:           # other unit IDs (group ids, pr-<N>) that
-#       #   - pr-100            # must be `merged` in target before this
-#       #   - prereq-group      # group is processed. `releasy run` skips
-#       #                       # the dependent and marks it `blocked`
-#       #                       # until the parent merges upstream.
+#         - https://github.com/Altinity/ClickHouse/pull/1500
+#         - https://github.com/Altinity/ClickHouse/pull/1512
+#         - url: https://github.com/Altinity/ClickHouse/pull/1530
+#           ai_context: "Renames list_tables to list_namespaces."
+#       # sort: listed              # listed | merged_at
+#       # if_exists: skip
+#       # mode: backport
+#       # depends_on: [pr-123]      # unit ids (group id or pr-<N>) that must merge first
 #
-#   # Source-PR labels that flip the detection ladder to forward-port
-#   # (case-insensitive). Use this when your team tags earlier-branch
-#   # PRs being pulled forward into a newer branch in the same repo.
-#   forward_port_labels:
-#     - port-antalya
-#     - port-stable-26
-#
-#   # Optional: override the deps overlay path. The default is
-#   # `<session-stem>.deps.yaml` (e.g. `antalya-26.3.session.deps.yaml`)
-#   # next to this session file — `releasy graph discover` writes there
-#   # by default and the loader picks it up automatically. Set this
-#   # field only if you want the deps file somewhere else. Relative
-#   # paths resolve against this session file's directory.
-#   # deps_file: deps/26.3.yaml
+#   forward_port_labels: [port-antalya]   # PRs with these are forward-ports
+#   # deps_file: deps/26.3.yaml     # default <session-stem>.deps.yaml
 
-# ── Session-wide PR labels ─────────────────────────────────────────
-# Labels applied to EVERY rebase PR opened during this session. Each
-# name is auto-created on origin (releasy's default purple) the first
-# time it's needed, and `releasy refresh` reconciles them onto tracked
-# PRs that are missing one. Handy for tagging a whole porting effort.
+# ── Labels on every rebase PR of this session ───────────────────────
 # pr_labels:
 #   - antalya-26.3
+# pr_labels_by_mode:                # extra labels per port mode
+#   forward_port: [forwardport]
+#   backport: [backport]

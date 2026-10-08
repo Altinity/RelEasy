@@ -1,30 +1,6 @@
-"""Discover failed CI checks on a PR and parse the human-readable reports.
+"""Discover failed CI checks on a PR and parse their praktika / TestFlows reports.
 
-Altinity ClickHouse CI surfaces test results in three ways:
-
-1. **GitHub Actions check-runs** — opaque job logs (e.g. ``PR / Fast test
-   (pull_request)``). These are the raw workflow output; we deliberately
-   ignore them.
-2. **GitHub commit statuses** whose ``target_url`` points at a hosted
-   ``json.html`` viewer (the ``praktika`` report). The viewer fetches a
-   sibling ``result_<task>.json`` from the same S3 bucket and renders
-   it; that JSON is the structured, machine-readable form of "which
-   tests passed / failed".
-3. **GitHub commit statuses** whose ``target_url`` is a TestFlows
-   ``report.html`` — the ``Regression <arch> <suite>`` checks. Those
-   suites live in the separate ``Altinity/clickhouse-regression`` repo
-   and publish no praktika JSON; their machine-readable failure list is
-   the sibling ``fails.log.txt``.
-
-This module is the bridge between (2)/(3) and a list of failed-test
-records ``analyze-fails`` can hand to Claude. Neither report shape is
-formally documented anywhere — what's encoded here is the result of
-reverse-engineering the live viewer code and the published artefacts.
-
-Pure functions only. No git, no Claude, no state. Network access is
-limited to the GitHub statuses API and an S3 bucket holding the
-artefacts; both are read-only.
-"""
+Read-only: GitHub statuses API and the S3 artefact bucket; no git, no Claude, no state."""
 
 from __future__ import annotations
 
@@ -42,14 +18,7 @@ from releasy.config import Config, get_github_token
 from releasy.github_ops import parse_pr_url
 
 
-# ---------------------------------------------------------------------------
-# Status / target_url parsing
-# ---------------------------------------------------------------------------
-
-
-# The viewer normalises a task display name into a filename slug by
-# lower-casing, mapping every non-alphanumeric run to ``_``, and stripping
-# trailing underscores. Mirrored from the JS so we hit the same S3 keys.
+# Mirrors the praktika viewer's JS so we hit the same S3 keys.
 def _normalize_task_name(name: str) -> str:
     s = name.lower()
     s = re.sub(r"[^a-z0-9]", "_", s)
@@ -59,15 +28,7 @@ def _normalize_task_name(name: str) -> str:
 
 @dataclass
 class ArtifactLocator:
-    """Coordinates pinning a single ``result_*.json`` artefact in S3.
-
-    ``base_url`` is the bucket host (with no trailing slash) — the same
-    origin that served ``json.html``. ``pr`` / ``ref`` are mutually
-    exclusive: GitHub PR runs key by ``PRs/<number>/``, while branch /
-    ref runs key by ``REFs/<refname>/``. We only ever construct the PR
-    flavour here, but the field is kept so the dataclass mirrors the
-    shape the viewer accepts.
-    """
+    """Coordinates of a praktika ``result_*.json`` artefact (keyed by ``pr`` or ``ref``)."""
     base_url: str
     pr: str | None
     sha: str
@@ -76,7 +37,6 @@ class ArtifactLocator:
     ref: str | None = None
 
     def result_json_url(self) -> str:
-        """Compose the S3 URL of the JSON artefact for this locator's leaf task."""
         leaf = self.name_1 if self.name_1 else self.name_0
         if self.pr:
             suffix = f"PRs/{urllib.parse.quote(self.pr, safe='')}"
@@ -92,22 +52,14 @@ class ArtifactLocator:
 
 
 def _artifact_locator_from_target_url(url: str) -> ArtifactLocator | None:
-    """Parse a ``json.html?...`` target URL into the artefact coordinates.
-
-    Returns ``None`` for anything that isn't a recognisable praktika
-    viewer URL (e.g. a GitHub Actions job log) — callers use this as a
-    classifier for "is this status a parsed-report status, or just a
-    GitHub job log?".
-    """
+    """Parse a praktika ``json.html?...`` target URL; ``None`` if it isn't one."""
     try:
         parts = urllib.parse.urlsplit(url)
     except ValueError:
         return None
     if not parts.scheme or not parts.netloc:
         return None
-    if not parts.path.endswith("/json.html") and not parts.path.endswith(
-        "json.html",
-    ):
+    if not parts.path.endswith("json.html"):
         return None
 
     qs = urllib.parse.parse_qs(parts.query, keep_blank_values=False)
@@ -123,10 +75,7 @@ def _artifact_locator_from_target_url(url: str) -> ArtifactLocator | None:
     if base_url_qs:
         base_url = base_url_qs.rstrip("/")
     else:
-        # The viewer falls back to ``window.location.origin + dirname``
-        # when no base_url is supplied. For the canonical
-        # ``…/json.html`` URL the dirname is ``/``, so the bucket origin
-        # is the right base.
+        # The viewer falls back to the page's origin + dirname: the bucket origin.
         base_url = f"{parts.scheme}://{parts.netloc}"
     return ArtifactLocator(
         base_url=base_url, pr=pr, sha=sha, name_0=name_0, name_1=name_1,
@@ -136,15 +85,7 @@ def _artifact_locator_from_target_url(url: str) -> ArtifactLocator | None:
 
 @dataclass
 class TestFlowsLocator:
-    """Coordinates of a TestFlows regression report directory in S3.
-
-    The ``Regression <arch> <suite>`` checks publish a rendered
-    ``report.html`` plus sibling artefacts, keyed by
-    ``REFs/<pr>/merge/<sha>/regression/<arch>/…/<suite>/``. Unlike
-    praktika there is no key to compose — the status ``target_url`` is
-    the report itself, so we just remember its directory and read
-    ``fails.log.txt`` next to it.
-    """
+    """Directory of a TestFlows ``report.html`` (the ``Regression …`` checks)."""
     report_dir: str  # absolute URL, no trailing slash
 
     def fails_log_url(self) -> str:
@@ -173,21 +114,13 @@ def _testflows_locator_from_target_url(url: str) -> TestFlowsLocator | None:
 def locator_from_target_url(
     url: str,
 ) -> ArtifactLocator | TestFlowsLocator | None:
-    """Classify a status ``target_url`` into whichever report it points at.
-
-    ``None`` means we can't read this status's results at all (a raw
-    GitHub-Actions job log, an empty ``target_url``, …).
-    """
+    """Locator of the report a status ``target_url`` points at; ``None`` if unreadable."""
     return (
         _artifact_locator_from_target_url(url)
         or _testflows_locator_from_target_url(url)
     )
 
 
-# Every failed check gets processed. The category decides which
-# reproduction recipe and triage prior :mod:`releasy.analyze_fails`
-# hands Claude; checks we have no recipe for land in ``CATEGORY_OTHER``
-# and are handed over with instructions to find the runner first.
 TestCategory = str
 
 CATEGORY_OTHER: TestCategory = "other"
@@ -205,9 +138,7 @@ _NAME_CATEGORY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
-# Processing / display order: cheap-and-broad first (one Fast test fix
-# routinely flips the rest green), regression last — it needs an
-# external repo and hours of docker to reproduce.
+# Cheap-and-broad first, regression (slowest to reproduce) last.
 CATEGORY_ORDER: dict[str, int] = {
     "fasttest": 0,
     "quick_functional": 1,
@@ -219,31 +150,16 @@ CATEGORY_ORDER: dict[str, int] = {
 
 
 def category_from_name(name: str) -> TestCategory:
-    """Classify a status context name into a test category.
-
-    Falls back to :data:`CATEGORY_OTHER` rather than ``None``: an
-    unrecognised check is still a failed check worth investigating.
-    """
+    """Test category of a status context name; :data:`CATEGORY_OTHER` if unrecognised."""
     for cat, pat in _NAME_CATEGORY_PATTERNS:
         if pat.search(name):
             return cat
     return CATEGORY_OTHER
 
 
-# ---------------------------------------------------------------------------
-# Failed-status discovery via GitHub commit statuses
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class FailedStatus:
-    """One failed CI status with enough context to fetch its report.
-
-    ``locator`` is ``None`` when the status's ``target_url`` points at
-    neither a praktika nor a TestFlows report (e.g. a raw GitHub Actions
-    job log) — those are surfaced for the operator to see but don't
-    drive per-test analysis.
-    """
+    """One CI status; ``locator`` is ``None`` when its report is unreadable."""
     context: str
     state: str  # "failure" | "error"
     target_url: str
@@ -254,38 +170,31 @@ class FailedStatus:
 
     @property
     def is_aggregate(self) -> bool:
-        """True for the workflow-level rolled-up report (the ``PR`` status).
-
-        Praktika publishes one report per job *plus* one for the whole
-        workflow; the latter carries no ``name_1`` and its tree contains
-        every job's failures. Walking it would duplicate every per-job
-        failure we already collect from the individual statuses.
-        """
+        """True for the workflow-level rolled-up report, which duplicates per-job ones."""
         return (
             isinstance(self.locator, ArtifactLocator)
             and not self.locator.name_1
         )
 
 
+def _gh_headers(token: str) -> dict[str, str]:
+    return {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
 def _fetch_combined_statuses(
     owner: str, repo: str, sha: str, token: str,
 ) -> list[dict[str, Any]]:
-    """Page through the commit-statuses endpoint and return the raw entries.
-
-    The endpoint returns the most-recent status per page in descending
-    ``updated_at`` order; we collect every page so we can dedupe by
-    ``context`` to the latest update across the whole list.
-    """
+    """All raw entries of the commit-statuses endpoint, newest first."""
     out: list[dict[str, Any]] = []
     url = (
         f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}/statuses"
         f"?per_page=100"
     )
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
+    headers = _gh_headers(token)
     seen_pages = 0
     while url and seen_pages < 50:  # 5000 statuses ought to be enough
         resp = requests.get(url, headers=headers, timeout=30)
@@ -295,9 +204,7 @@ def _fetch_combined_statuses(
                 f"{resp.text[:300]}"
             )
         out.extend(resp.json() or [])
-        # Pagination is exposed via the Link header.
-        nxt = _next_link(resp.headers.get("Link", ""))
-        url = nxt
+        url = _next_link(resp.headers.get("Link", ""))
         seen_pages += 1
     return out
 
@@ -315,16 +222,7 @@ def _next_link(link_header: str) -> str | None:
 def fetch_statuses(
     owner: str, repo: str, sha: str, *, failed_only: bool = True,
 ) -> tuple[list[FailedStatus], str | None]:
-    """Return the CI statuses on ``sha`` (latest entry per context).
-
-    ``failed_only`` (the default) keeps only ``failure``/``error``.
-    Pass ``False`` to get every state — a baseline comparison needs to
-    know which checks *ran*, not just which failed, since "absent from
-    the failure list" only means "passed" for a check that ran at all.
-
-    Errors return ``(partial_list_or_empty, message)``. Successful runs
-    return ``([…], None)``.
-    """
+    """CI statuses on ``sha``, latest entry per context. Returns ``(statuses, error)``."""
     token = get_github_token()
     if not token:
         return [], (
@@ -335,8 +233,7 @@ def fetch_statuses(
     except Exception as exc:
         return [], f"GitHub statuses lookup failed: {exc}"
 
-    # Latest entry per context wins. The endpoint returns
-    # most-recent-first, so the first occurrence is authoritative.
+    # Newest first, so the first entry per context is authoritative.
     seen: dict[str, dict[str, Any]] = {}
     for entry in raw:
         ctx = entry.get("context") or ""
@@ -376,20 +273,10 @@ def fetch_failed_statuses(
     return fetch_statuses(owner, repo, sha, failed_only=True)
 
 
-# ---------------------------------------------------------------------------
-# JSON-report fetching + walking
-# ---------------------------------------------------------------------------
-
-
 def fetch_report_json(
     locator: ArtifactLocator, *, timeout: int = 60,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Fetch and decode the praktika ``result_*.json`` for ``locator``.
-
-    Returns ``(json, None)`` on success, ``(None, message)`` on failure.
-    The bucket gzip-encodes responses regardless of extension; we let
-    ``requests`` transparently decompress.
-    """
+    """Fetch the praktika ``result_*.json``. Returns ``(json, error)``."""
     url = locator.result_json_url()
     try:
         resp = requests.get(url, timeout=timeout)
@@ -411,37 +298,9 @@ def fetch_report_json(
         return None, f"Could not parse JSON from {url}: {exc}"
 
 
-# Statuses that mean "this leaf is broken and worth handing to Claude".
-#
-# Grounded in upstream ``ci/praktika/result.py``:
-#
-#   - ``Result.is_failure()`` →  ``FAILED``/``FAIL``/``XPASS``
-#   - ``Result.is_error()``   →  ``ERROR`` (both ``Status`` and ``StatusExtended``)
-#   - ``Result.is_ok()``      →  ``OK``/``SUCCESS``/``SKIPPED``/``BROKEN``/``XFAIL``
-#
-# ``BROKEN`` looks like a failure but isn't: upstream classifies it as
-# OK (``ci/jobs/integration_test_job.py`` actively *downgrades* a FAIL
-# to BROKEN when the test matches the known-broken rules — that's the
-# project's way of muting expected-broken results). Same for ``XFAIL``
-# (expected-failure annotation, also is_ok). ``UNKNOWN`` (set in
-# functional_tests_results.py after a server crash to mute noise) is
-# also deliberately excluded.
-#
-# ``Timeout`` (note: literal mixed case, written by
-# ``functional_tests_results.py`` for the ``Timeout!`` marker) is a
-# real failure — counted in ``failed`` upstream. We upper-case before
-# comparing, so the lookup key is ``TIMEOUT``.
-#
-# ``XPASS`` (pytest "unexpected pass") IS a failure per praktika's
-# ``is_failure()`` — included so integration tests' xpassed leaves
-# don't slip through silently.
-#
-# ``FAILURE`` is the GitHub-status vocabulary (``Result.GHStatus``):
-# reports produced by older praktika revisions — still what an older
-# release branch's CI publishes — write ``failure``/``success`` on the
-# job's *step* nodes ("Start ClickHouse Server", "Install ClickHouse").
-# Those steps are where a job that died before its test phase records
-# what happened, so treat ``FAILURE`` as a failing leaf too.
+# Per praktika's ``Result.is_failure()`` / ``is_error()``; ``BROKEN`` and
+# ``XFAIL`` are muted results (``is_ok()``). ``TIMEOUT`` is upper-cased
+# ``Timeout``. ``FAILURE`` is what older praktika writes on step nodes.
 _FAILED_LEAF_STATUSES = frozenset({
     "FAIL",
     "FAILURE",
@@ -451,26 +310,14 @@ _FAILED_LEAF_STATUSES = frozenset({
 })
 
 
-# Praktika fasttest reports bundle a runner-level pseudo-leaf named
-# ``clickhouse-test`` alongside the real per-test leaves. Emitted by
-# ``ci/jobs/fast_test.py`` when the ``clickhouse-test`` invocation
-# itself errors out (status=FAIL, info="clickhouse-test error"). It
-# mirrors the umbrella failure rather than carrying independent
-# diagnostic value, so feeding it to Claude would just have it re-run
-# the entire suite. Skipped at extraction time.
+# Runner-level pseudo-leaves mirroring the umbrella failure; passing one to
+# the runner would re-run the entire suite.
 _META_LEAF_NAMES = frozenset({"clickhouse-test"})
 
 
 @dataclass
 class FailedTest:
-    """One failed individual test extracted from a praktika report.
-
-    ``shard_context`` is the commit-status context that surfaced the
-    failure (e.g. ``Stateless tests (arm_asan, azure, parallel, 2/4)``).
-    ``info_excerpt`` is the parsed report's per-test info string trimmed
-    so the prompt stays compact — Claude can still hit the artefact URL
-    if it needs the full thing.
-    """
+    """One failed test (or, with ``job_level``, one failed check)."""
     name: str
     status: str
     category: TestCategory
@@ -479,36 +326,13 @@ class FailedTest:
     info_excerpt: str = ""
     files: list[str] = field(default_factory=list)
     links: list[str] = field(default_factory=list)
-    # True for the stand-in record of a check that failed as a whole
-    # without per-test results (see :func:`job_level_failure`). Callers
-    # must not feed its ``name`` to a test runner — it's a job name.
-    job_level: bool = False
+    job_level: bool = False  # ``name`` is a job name: never pass it to a test runner
 
 
 def _iter_failed_leaves(
     node: dict[str, Any], *, depth: int = 0,
 ) -> Iterable[tuple[dict[str, Any], int]]:
-    """Yield ``(leaf, depth)`` for every failing leaf of the report tree.
-
-    The praktika report is recursive: ``results`` may hold further
-    ``results`` nodes. We treat a node as a "leaf failure" when its
-    status is in ``_FAILED_LEAF_STATUSES`` AND it has no ``results`` of
-    its own — that filters out aggregate "Tests" failure rows that just
-    summarise per-test failures we'd otherwise count twice.
-
-    ``depth`` lets the caller tell a per-test leaf from a job-level one.
-    The top two levels are the job and its steps ("Install ClickHouse",
-    "Build ClickHouse", "Start ClickHouse Server"); real tests hang off
-    a grouping node below them. A failing step is what a job that died
-    before its test phase leaves behind — worth investigating, but its
-    name must never reach a test runner.
-
-    Praktika meta-leaves listed in :data:`_META_LEAF_NAMES` (e.g.
-    ``clickhouse-test`` in Fast test / Stateless tests reports) are
-    skipped — they mirror the rolled-up status, not an independent
-    failure, so handing them to Claude would only widen the runner
-    invocation pointlessly.
-    """
+    """Yield ``(leaf, depth)`` for every failing childless node, skipping meta-leaves."""
     children = node.get("results") or []
     status = (node.get("status") or "").upper()
     name = (node.get("name") or "").strip()
@@ -525,8 +349,7 @@ def _iter_failed_leaves(
 
 _INFO_EXCERPT_MAX = 4000
 
-# Report depth at which per-test leaves start. 0 is the job itself, 1 is
-# its steps; tests hang off a grouping node at 2 or deeper.
+# 0 is the job, 1 its steps; tests hang off a grouping node at 2+.
 _FIRST_TEST_DEPTH = 2
 
 
@@ -558,25 +381,15 @@ def extract_failed_tests(
             info_excerpt=info,
             files=files,
             links=links,
-            # The job and its steps are not tests — see
-            # _iter_failed_leaves.
             job_level=depth < _FIRST_TEST_DEPTH,
         ))
     return out
 
 
-# ---------------------------------------------------------------------------
-# TestFlows (regression suite) report fetching + parsing
-# ---------------------------------------------------------------------------
-
-
 def fetch_testflows_fails_log(
     locator: TestFlowsLocator, *, timeout: int = 60,
 ) -> tuple[str | None, str | None]:
-    """Fetch the TestFlows ``fails.log.txt`` sitting next to a report.
-
-    Returns ``(text, None)`` on success, ``(None, message)`` on failure.
-    """
+    """Fetch the TestFlows ``fails.log.txt``. Returns ``(text, error)``."""
     url = locator.fails_log_url()
     try:
         resp = requests.get(url, timeout=timeout)
@@ -596,14 +409,7 @@ def fetch_testflows_fails_log(
     return resp.text, None
 
 
-# TestFlows result names that mean "this test really failed".
-#
-# The ``X`` flavours (``XFail`` / ``XError`` / ``XNull``) are *expected*
-# failures: the suite annotated them as known-broken, usually with an
-# upstream issue link, and the report lists them under its ``Known``
-# section rather than ``Failing``. They are the TestFlows counterpart of
-# praktika's ``XFAIL``/``BROKEN`` and are muted here for the same
-# reason. ``Skip`` never ran at all.
+# ``X``-prefixed results are expected (known-broken) failures and stay muted.
 _FAILED_TESTFLOWS_STATUSES = frozenset({"FAIL", "ERROR", "NULL"})
 
 
@@ -632,22 +438,14 @@ class TestFlowsEntry:
 
 
 def parse_testflows_fails_log(text: str) -> dict[str, TestFlowsEntry]:
-    """Parse a TestFlows ``fails.log.txt`` into ``{test path: entry}``.
-
-    Folds both shapes of the file into one entry per path, keeping the
-    detail block when the detail section carried one. Test names are
-    unambiguous keys: TestFlows escapes ``/`` and quotes inside a test
-    name with lookalike codepoints, so a raw ``/`` is always a path
-    separator.
-    """
+    """Parse a TestFlows ``fails.log.txt`` into ``{test path: entry}``."""
     entries: dict[str, TestFlowsEntry] = {}
     lines = text.splitlines()
     i = 0
     while i < len(lines):
         line = lines[i]
         i += 1
-        # Summary first: its status bracket would otherwise let the
-        # detail pattern misparse a path containing a ``[``.
+        # Summary first: the detail pattern would misparse a path containing ``[``.
         summary = _TF_SUMMARY_RE.match(line)
         if summary is not None:
             path = summary.group("path")
@@ -660,8 +458,7 @@ def parse_testflows_fails_log(text: str) -> dict[str, TestFlowsEntry]:
             continue
         path = detail_match.group("path").rstrip()
         status = detail_match.group("status").upper()
-        # Everything indented (or blank) underneath belongs to this
-        # entry; the next entry, or a section heading, is flush-left.
+        # The indented (or blank) lines below belong to this entry.
         block: list[str] = []
         while i < len(lines):
             nxt = lines[i]
@@ -681,9 +478,7 @@ def parse_testflows_fails_log(text: str) -> dict[str, TestFlowsEntry]:
     return entries
 
 
-# A leaf whose own detail block is shorter than this is treated as
-# uninformative (``AssertionError`` and nothing else), which triggers
-# the ancestor-traceback lookup below.
+# Shorter leaf details trigger the ancestor-traceback lookup.
 _TF_THIN_DETAIL = 200
 
 
@@ -706,23 +501,10 @@ def extract_regression_failures(
     shard_context: str,
     target_url: str,
 ) -> list[FailedTest]:
-    """Collect the leaf failures from a TestFlows ``fails.log.txt``.
+    """Deepest failing nodes from a TestFlows ``fails.log.txt``.
 
-    TestFlows reports every node on the path to a failure, so one broken
-    scenario surfaces as itself *plus* every enclosing feature and the
-    module. We keep only the deepest nodes — a failing path that no
-    other failing path extends — because the ancestors carry no
-    independent diagnostic value and would multiply the work.
-
-    The ancestors do often carry the *traceback*, though: TestFlows
-    prints the full assertion detail on the enclosing node and a bare
-    ``AssertionError`` on the leaf. When a leaf's own block is too thin
-    to act on, the nearest substantial ancestor block is attached — but
-    only to the first leaf under that ancestor, and labelled as
-    possibly belonging to a sibling. One enclosing node routinely spans
-    hundreds of leaves, so its single traceback is a representative
-    sample, not per-test truth, and repeating it verbatim on every leaf
-    would both mislead and swamp the prompt.
+    A thin leaf borrows its nearest detailed ancestor's traceback; only the
+    first leaf under that ancestor gets it, the rest get a pointer.
     """
     entries = parse_testflows_fails_log(fails_log)
     failing = {
@@ -770,22 +552,8 @@ def extract_regression_failures(
     return out
 
 
-# ---------------------------------------------------------------------------
-# Job-level failures (checks with no per-test results)
-# ---------------------------------------------------------------------------
-
-
 def job_level_failure(status: FailedStatus, reason: str) -> FailedTest:
-    """Stand-in record for a failed check that reported no failing tests.
-
-    A build, packaging, image or scan check has nothing per-test to
-    report; a job killed before its test phase publishes a report with
-    no failing leaf; a check whose ``target_url`` is a plain job log
-    publishes nothing we can read at all. All three are still red CI on
-    the PR, so they become one ``job_level`` record — the shard Claude
-    is handed carries the reason, the status description and the report
-    URL instead of a test list.
-    """
+    """Stand-in record for a failed check that reported no failing tests."""
     parts = [reason.strip()]
     if status.description:
         parts.append(f"CI status description: {status.description}")
@@ -809,13 +577,7 @@ def decompose_statuses(
     job_level: bool = True,
     pr_number: int | None = None,
 ) -> tuple[list[FailedTest], list[str]]:
-    """Turn failed statuses into per-test records. No dedupe.
-
-    Shared by the PR path and the baseline-commit path, so a run on the
-    target branch is decomposed exactly like the PR's own — otherwise
-    the two failure sets wouldn't be comparable. Returns
-    ``(failed_tests, warnings)``.
-    """
+    """Turn failed statuses into per-test records (no dedupe). Returns ``(tests, warnings)``."""
     cat_set = set(categories) if categories else None
     failed_tests: list[FailedTest] = []
     warnings: list[str] = []
@@ -856,7 +618,6 @@ def decompose_statuses(
             )
         else:
             if st.locator.pr is None and pr_number is not None:
-                # Replace any missing PR coordinate with the one we know.
                 st.locator.pr = str(pr_number)
             report, ferr = fetch_report_json(st.locator)
             if ferr or report is None:
@@ -877,9 +638,6 @@ def decompose_statuses(
             continue
         failed_tests.extend(leaves)
 
-    # The rolled-up report duplicates the per-job statuses — unless none
-    # of them is red, in which case it's the only evidence there is and
-    # saying "covered elsewhere" would be a lie.
     for ctx in aggregates:
         warnings.append(
             f"{ctx}: workflow-level rolled-up report — the per-job "
@@ -893,32 +651,17 @@ def decompose_statuses(
     return failed_tests, warnings
 
 
-# ---------------------------------------------------------------------------
-# Baseline: the last CI run that predates the change under investigation
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class BaselineRun:
-    """One CI run on the target branch, taken before the PR's diff.
-
-    ``failing`` keys are ``(category, test name)`` — the same key the
-    PR-side records use, so membership answers "was this already red
-    without this PR?". ``categories_run`` records which check families
-    that run actually exercised: a test missing from ``failing`` only
-    means "did not fail" if its category ran at all.
-    """
+    """One CI run on the target branch, taken before the PR's diff."""
     sha: str
     committed_at: str
     checks_total: int
     checks_failed: int
-    failing: dict[tuple[str, str], str]  # → the shard that reported it
+    failing: dict[tuple[str, str], str]  # (category, test) → shard that reported it
     categories_run: set[str]
     warnings: list[str] = field(default_factory=list)
-    # Newer runs that were passed over because they never exercised the
-    # checks under investigation. Non-empty means this baseline is older
-    # than it had to be, which the prompt says out loud.
-    skipped_newer: int = 0
+    skipped_newer: int = 0  # newer runs passed over for lacking the needed checks
 
     def verdict_for(self, category: str, name: str) -> str:
         """``"failed"`` / ``"passed"`` / ``"not covered"`` for one test."""
@@ -930,11 +673,7 @@ class BaselineRun:
 def merge_base_sha(
     owner: str, repo: str, base_ref: str, head_sha: str,
 ) -> tuple[str | None, str | None]:
-    """SHA where ``head_sha`` diverged from ``base_ref``.
-
-    That commit is the newest state of the branch that does *not*
-    contain the PR's diff — the anchor for "before the change".
-    """
+    """SHA where ``head_sha`` diverged from ``base_ref``."""
     token = get_github_token()
     if not token:
         return None, "RELEASY_GITHUB_TOKEN not set — cannot compare refs"
@@ -942,11 +681,7 @@ def merge_base_sha(
         f"https://api.github.com/repos/{owner}/{repo}/compare/"
         f"{urllib.parse.quote(base_ref, safe='')}...{head_sha}"
     )
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
+    headers = _gh_headers(token)
     try:
         resp = requests.get(url, headers=headers, timeout=30)
     except Exception as exc:
@@ -974,11 +709,7 @@ def _list_commits(
         f"?sha={urllib.parse.quote(sha, safe='')}"
         f"&per_page={max(1, min(limit, 100))}"
     )
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
+    headers = _gh_headers(token)
     try:
         resp = requests.get(url, headers=headers, timeout=30)
     except Exception as exc:
@@ -1008,23 +739,10 @@ def baseline_run_before(
     exclude_sha: str | None = None,
     require_categories: frozenset[str] | None = None,
 ) -> tuple[BaselineRun | None, str | None]:
-    """Find and decompose the newest usable CI run at or before ``from_sha``.
+    """Decompose the newest CI run at or before ``from_sha``.
 
-    Walks back until a commit with CI statuses turns up: most commits
-    on a release branch are GitHub merge commits that no workflow ever
-    ran on, while the merged PR's own head commits carry a full run.
-
-    ``require_categories`` (the check families the comparison needs to
-    say anything about) makes the walk skip runs that never exercised
-    them — a run with no ``fasttest`` check answers no question about a
-    Fast test failure. If nothing within range covers them, the newest
-    run found is used anyway and its gaps surface as "not covered"
-    verdicts. Only the chosen run's reports are fetched; the others cost
-    one status call each.
-
-    Returns ``(run, None)``, or ``(None, reason)`` when no run is
-    reachable within ``max_commits`` — a missing baseline is normal
-    (fresh branch, pruned artefacts), never fatal.
+    Prefers runs covering ``require_categories``, falling back to the newest
+    run found. Returns ``(run, None)`` or ``(None, reason)``.
     """
     commits, err = _list_commits(owner, repo, from_sha, max_commits)
     if err:
@@ -1054,8 +772,6 @@ def baseline_run_before(
     skipped = 0
     for csha, when in commits:
         if exclude_sha and csha == exclude_sha:
-            # Degenerate compare (PR already merged): its own run is not
-            # a baseline for itself.
             continue
         statuses, serr = fetch_statuses(owner, repo, csha, failed_only=False)
         if serr or not statuses:
@@ -1077,38 +793,6 @@ def baseline_run_before(
     )
 
 
-def discover_baseline_failures(
-    owner: str,
-    repo: str,
-    base_ref: str,
-    head_sha: str,
-    *,
-    max_commits: int = 25,
-    categories: tuple[TestCategory, ...] | None = None,
-    job_level: bool = True,
-    require_categories: frozenset[str] | None = None,
-) -> tuple[BaselineRun | None, str | None]:
-    """The last CI run on ``base_ref`` that predates ``head_sha``'s diff.
-
-    Anchors on the merge base — the newest state of the branch without
-    the change under investigation — then takes the newest usable run
-    at or before it.
-    """
-    mb, err = merge_base_sha(owner, repo, base_ref, head_sha)
-    if err or not mb:
-        return None, err or "no merge base"
-    return baseline_run_before(
-        owner, repo, mb, max_commits=max_commits, categories=categories,
-        job_level=job_level, exclude_sha=head_sha,
-        require_categories=require_categories,
-    )
-
-
-# ---------------------------------------------------------------------------
-# High-level: discover failures for one PR
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class PRFailures:
     """All actionable CI failures on a single PR's head commit."""
@@ -1119,9 +803,7 @@ class PRFailures:
     statuses: list[FailedStatus]
     failed_tests: list[FailedTest]
     skipped_status_warnings: list[str] = field(default_factory=list)
-    # One line per failed check whose failures the cross-shard dedupe
-    # folded into another check's shard. Without it such a check
-    # vanishes from every count — it contributes no shard of its own.
+    # Checks whose failures were all deduped into another check's shard.
     covered_elsewhere: list[str] = field(default_factory=list)
 
 
@@ -1135,22 +817,10 @@ def discover_pr_failures(
     categories: tuple[TestCategory, ...] | None = None,
     job_level: bool = True,
 ) -> tuple[PRFailures | None, str | None]:
-    """Resolve a PR's head, list failed statuses, and parse each report.
+    """Resolve a PR's head, then decompose and dedupe its failed CI statuses.
 
-    ``categories`` restricts which categories are decomposed into
-    per-test records; ``None`` (the default) processes **every** failed
-    check.
-
-    A check that publishes no failing test — a job log for a
-    ``target_url``, an unreadable artefact, a report with no failing
-    leaf — still yields one :func:`job_level_failure` record so it gets
-    investigated rather than dropped. Pass ``job_level=False`` to have
-    those reported in ``skipped_status_warnings`` instead. The only
-    status skipped unconditionally is the workflow-level rolled-up
-    report, which duplicates the per-job ones.
-
-    Lookups are best-effort per status — a single broken artefact URL
-    costs that status its per-test detail, not the whole call.
+    ``categories=None`` processes every failed check. With ``job_level=False``
+    checks without failing tests go to ``skipped_status_warnings``.
     """
     parsed = parse_pr_url(pr_url)
     if parsed is None:
@@ -1162,10 +832,9 @@ def discover_pr_failures(
         if not token:
             return None, "RELEASY_GITHUB_TOKEN not set — cannot fetch PR head"
         try:
-            from github import Github  # noqa: F401  — type-check that it imports
+            from github import Github
 
-            from github import Github as _Github
-            gh = _Github(token)
+            gh = Github(token)
             ghrepo = gh.get_repo(f"{owner}/{repo}")
             pr = ghrepo.get_pull(number)
             head_sha = head_sha or pr.head.sha
@@ -1183,10 +852,7 @@ def discover_pr_failures(
         pr_number=number,
     )
 
-    # Dedupe: the same test name commonly fails in multiple shards of the
-    # same suite. Keep the first occurrence so callers get one record per
-    # (category, name) pair, but remember the other shards in
-    # ``info_excerpt`` so Claude knows it's not shard-specific.
+    # One record per (category, name); other shards are noted in info_excerpt.
     seen: dict[tuple[str, str], FailedTest] = {}
     extra_shards: dict[tuple[str, str], list[str]] = {}
     contributed: Counter[str] = Counter()
@@ -1215,8 +881,6 @@ def discover_pr_failures(
             ft.info_excerpt = (ft.info_excerpt + note).strip()
         deduped.append(ft)
 
-    # A check whose failures all duplicate another's contributes no shard
-    # of its own, so it would otherwise disappear from every count.
     covered: list[str] = []
     for ctx, count in absorbed.items():
         into = absorbed_into.get(ctx) or []

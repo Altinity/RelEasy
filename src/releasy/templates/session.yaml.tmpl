@@ -1,13 +1,7 @@
-# RelEasy session — per-effort source data.
-#
-# This file drives *what* to port on a given run: the list of static
-# feature branches and the PR discovery/filtering rules. Policy knobs
-# (auto_pr, if_exists, retry_failed, recreate_closed_prs) live in
-# config.yaml under `pr_policy:` because they don't change between
-# efforts.
-#
-# Edit this file freely between runs. `releasy feature add/enable/
-# disable/remove` also mutates it in place.
+# RelEasy session — *what* to port: static feature branches and PR
+# discovery rules. Policy knobs live in config.yaml under `pr_policy:`.
+# Edit freely between runs; `releasy feature add/enable/disable/remove`
+# also mutates it in place.
 
 # Static feature branches — each rebased onto the base branch as its
 # own port branch.

@@ -1,33 +1,9 @@
-"""``releasy analyze-fails`` — investigate failed CI tests on a PR.
+"""``releasy analyze-fails``: investigate failed CI tests on a PR.
 
-Per **failed CI shard** (e.g. one ``Stateless tests (arm_asan, azure,
-parallel, 2/4)`` row, or the single ``Fast test`` row), Claude is given
-the full bundled list of failures and asked to run the iterative loop:
-
-1. Read every failure, classify each as RELATED or LIKELY-UNRELATED.
-2. Group by likely root cause and pick the highest-leverage fix.
-3. Make the smallest possible change.
-4. Build.
-5. Re-run **all** the failed tests in this shard (one go, not one by
-   one).
-6. See what remains failing.
-7. Repeat 2–6 until everything is fixed, the rest is UNRELATED, or the
-   build budget is exhausted.
-
-This is dramatically cheaper than per-test Claude invocations when many
-tests share a root cause — fixing one regression frequently flips
-dozens of tests green at once. The iterative shape is encoded in the
-prompt; the orchestrator just bundles, invokes, and tallies.
-
-This module owns: discover failures via :mod:`releasy.ci_failures`,
-group them per shard, render the bundled prompt, invoke Claude
-(reusing the streaming machinery from :mod:`ai_resolve`), and push at
-the end if Claude appended commits.
-"""
+One Claude session per failed CI shard runs the fix-build-rerun loop."""
 
 from __future__ import annotations
 
-import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,9 +19,12 @@ from releasy.ai_resolve import (
     _exhaustion_kwargs,
     _extract_assistant_text,
     _extract_cost_usd,
+    _fill_placeholders,
     _find_transient_api_error,
     _parse_verify_output,
+    _prompt_path,
     _resolve_backend,
+    _section_config,
     _spawn_claude,
     _write_build_script,
     build_log_path,
@@ -55,7 +34,6 @@ from releasy.ci_failures import (
     CATEGORY_OTHER,
     BaselineRun,
     FailedTest,
-    PRFailures,
     baseline_run_before,
     discover_pr_failures,
     merge_base_sha,
@@ -73,16 +51,13 @@ from releasy.github_ops import (
     add_label_to_pr,
     ensure_label,
     fetch_pr_by_url,
+    fetch_pr_head,
     get_origin_repo_slug,
     parse_pr_url,
+    require_origin_repo_slug,
 )
 from releasy.state import PipelineState, load_state, save_state
 from releasy.termlog import console
-
-
-# ---------------------------------------------------------------------------
-# Result types
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -94,27 +69,15 @@ class ShardOutcome:
     test_count: int
     classification: str  # "DONE" | "PARTIAL" | "UNRELATED" | "UNRESOLVED"
     summary: str = ""
-    # Full assistant-prose narration captured from the streaming
-    # transcript — used for the PR comment so the operator has the
-    # whole investigation transcript without scrolling the cropped
-    # local terminal output. Empty for shards that bailed before
-    # claude produced text (timeout / spawn error).
-    narration: str = ""
+    narration: str = ""  # full assistant prose, for the PR comment
     cost_usd: float | None = None
     commits_added: int = 0
-    # Independent second-session audit. ``verify_reason`` is why this
-    # shard was picked for one (``None`` = it wasn't in doubt, so no
-    # session ran); ``verify_verdict`` is "ok" / "needs_attention" /
-    # "unknown" (unknown = the audit itself failed, advisory only).
-    verify_reason: str | None = None
-    verify_verdict: str | None = None
+    verify_reason: str | None = None  # None = not audited
+    verify_verdict: str | None = None  # "ok" | "needs_attention" | "unknown"
     verify_summary: str = ""
     verify_findings: list[str] = field(default_factory=list)
-    # 1 for the first investigation, 2+ for a redo the audit triggered.
-    # ``superseded`` marks a round a later one replaced — kept for the
-    # record, but it isn't this shard's verdict any more.
-    round_index: int = 1
-    superseded: bool = False
+    round_index: int = 1  # 2+ for a redo the audit triggered
+    superseded: bool = False  # replaced by a later round
 
     @property
     def disputed(self) -> bool:
@@ -147,13 +110,11 @@ class PRRunResult:
     shards_unresolved: int = 0
     shards_audited: int = 0
     shards_disputed: int = 0
-    # The read-only auditor touched the repo — a contract violation, so
-    # what it observed no longer describes what we'd push.
     audit_mutated_repo: bool = False
 
     @property
     def open_disputes(self) -> int:
-        """Disputes still standing — a redo that fixed one doesn't count."""
+        """Disputes not settled by a later round."""
         return sum(
             1 for o in self.outcomes if o.disputed and not o.superseded
         )
@@ -163,12 +124,7 @@ class PRRunResult:
     comment_url: str | None = None
     outcomes: list[ShardOutcome] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
-    # Failed checks whose failures the cross-shard dedupe folded into
-    # another check's shard — they get no shard of their own, so this is
-    # the only place they're accounted for.
     covered_elsewhere: list[str] = field(default_factory=list)
-    # The pre-change CI run the failures were compared against, and how
-    # the comparison came out.
     baseline_sha: str | None = None
     baseline_committed_at: str | None = None
     baseline_note: str | None = None
@@ -181,34 +137,13 @@ class AnalyzeFailsResult:
     success: bool
     error: str | None = None
     runs: list[PRRunResult] = field(default_factory=list)
-    flaky_elsewhere_map: dict[str, list[str]] = field(default_factory=dict)
-
-
-# ---------------------------------------------------------------------------
-# Tracked-PR enumeration & flaky-elsewhere map
-# ---------------------------------------------------------------------------
 
 
 def tracked_pr_urls(
     state: PipelineState | None,
     only: OnlyFilter | None = None,
 ) -> list[str]:
-    """Every PR URL ``releasy run`` has opened that's still in state.
-
-    Skips entries without a ``rebase_pr_url`` (those are still pending
-    a PR — nothing to analyse), entries the local state already marks
-    ``merged`` or ``skipped`` (no point poking dead PRs), and
-    de-duplicates while preserving insertion order. Returns ``[]`` when
-    ``state`` is ``None``.
-
-    The authoritative open/merged/closed check still happens per-PR
-    inside :func:`_process_pr` against GitHub, so a stale local
-    ``needs_review`` for a PR merged externally is caught there. This
-    prefilter just avoids one round-trip per obvious dead entry.
-
-    ``only`` (optional) restricts the result to the single tracked
-    feature whose URL or feature-id matches the filter.
-    """
+    """Deduplicated PR URLs of tracked features not already finished locally."""
     if state is None:
         return []
     seen: set[str] = set()
@@ -231,15 +166,7 @@ def tracked_pr_urls(
 def flaky_scan_extra_for(
     state: PipelineState | None, primary_pr_urls: list[str],
 ) -> list[str] | None:
-    """Pick the flaky-elsewhere scan set for a single-PR-scope run.
-
-    The flaky-elsewhere heuristic needs *other* PRs as evidence; if the
-    primary is one specific PR, the scan must reach beyond it. Returns
-    the every-other-tracked-PR list, or ``None`` when state is missing
-    (caller falls back to ``primary_pr_urls`` — which is correct for
-    multi-PR walks where the primary list itself provides enough
-    cross-evidence).
-    """
+    """Every other tracked PR, as flaky-elsewhere evidence; ``None`` without state."""
     if state is None:
         return None
     primary_set = set(primary_pr_urls)
@@ -250,13 +177,7 @@ def _build_flaky_elsewhere_map(
     config: Config,
     pr_urls: list[str],
 ) -> tuple[dict[str, list[str]], list[str]]:
-    """Return ``{(category, test_name): [pr_url, …]}`` across ``pr_urls``.
-
-    Every PR contributes its full failed-test list — there is no
-    primary/other distinction at build time. Per-PR exclusion is left
-    to the lookup site (so a test failing on the PR being analysed
-    doesn't count as "elsewhere" evidence about itself).
-    """
+    """``{_flaky_key(category, test): [pr_url, …]}`` across ``pr_urls``."""
     flaky_map: dict[str, list[str]] = defaultdict(list)
     warnings: list[str] = []
 
@@ -290,28 +211,6 @@ def _configured_categories(config: Config) -> tuple[str, ...] | None:
     return tuple(config.analyze_fails.categories) or None
 
 
-# ---------------------------------------------------------------------------
-# Per-shard reproduction commands + category-specific priors
-# ---------------------------------------------------------------------------
-
-
-# Each entry is a small markdown block that biases Claude's triage step
-# in favour of (or against) classifying a failure as caused-by-this-PR.
-# The runtime characteristics of each category give different priors:
-#
-#   - Fast test runs inline on every PR against a debug-built binary
-#     against a deterministic set of cheap tests. Flakes are rare —
-#     when something there fails, the prior is overwhelmingly "this
-#     PR broke it", and flaky-elsewhere evidence is more likely
-#     "several rebased PRs share a broken baseline" than "master-side
-#     flake".
-#   - Stateless / Integration / Regression tests hit real storage,
-#     docker, network — genuine flakes are common and flaky-elsewhere
-#     annotations are load-bearing UNRELATED evidence.
-#
-# These priors *bias* the triage step; they don't override the
-# scoping rule ("only fix tests this PR broke" still stands). The
-# generic rule applies when a category has no specific entry.
 _CATEGORY_PRIORS: dict[str, str] = {
     "fasttest": (
         "**Fast test** runs inline on every PR against a deterministic, "
@@ -383,9 +282,6 @@ _CATEGORY_PRIORS: dict[str, str] = {
 }
 
 
-# Used instead of the category prior when the check failed as a whole
-# and published no per-test results — the category says nothing useful
-# about a job that never reached its test phase.
 _JOB_LEVEL_PRIOR = (
     "This check failed **as a whole**, without per-test results. "
     "Typical causes: the job died before its test phase (runner OOM, "
@@ -401,7 +297,6 @@ _JOB_LEVEL_PRIOR = (
 
 
 def _category_prior_section(category: str, *, job_level: bool = False) -> str:
-    """Render the category-specific scoping prior, or a no-op fallback."""
     if job_level:
         return _JOB_LEVEL_PRIOR
     prior = _CATEGORY_PRIORS.get(category)
@@ -413,14 +308,7 @@ def _category_prior_section(category: str, *, job_level: bool = False) -> str:
     return prior
 
 
-# Each entry is a small markdown block telling Claude how to invoke the
-# right test runner for the category. ``{tests_arg}`` is substituted
-# with a space-separated quoted list of the failing test names (for
-# regression: TestFlows ``--only`` patterns), ``{shard_context}`` with
-# the CI status context, and ``{repo_dir}`` with the absolute repo path.
-# Claude is told that the test list is the ground truth for "what was
-# failing" and that it must re-invoke the runner with a (possibly
-# shrinking) subset on every iteration of the fix-build-rerun loop.
+# Placeholders: {tests_arg}, {shard_context}, {repo_dir}, {report_dir}.
 _CATEGORY_RUNNER_HINTS: dict[str, str] = {
     "fasttest": (
         "Fast test runs the bulk of stateless tests. Locally, the "
@@ -535,10 +423,8 @@ _CATEGORY_RUNNER_HINTS: dict[str, str] = {
 }
 
 
-# Used for a check that published no per-test failures at all. There is
-# no test list to re-run, so the category recipe must NOT be used —
-# interpolating an empty test list into `tests/clickhouse-test` would
-# run the entire suite.
+# The category recipe must not be used here: an empty test list makes
+# `tests/clickhouse-test` run the entire suite.
 _JOB_LEVEL_RUNNER_HINT = (
     "**There is no test list for this check** — it failed as a whole, so "
     "`{failed_tests_file}` is empty and there is nothing to re-run. Do "
@@ -561,9 +447,6 @@ _JOB_LEVEL_RUNNER_HINT = (
 )
 
 
-# Fallback for a failed check with no recipe of its own. Deliberately
-# points at the job definition instead of guessing an invocation: in
-# praktika, ``Job.Config.command`` is verbatim what CI ran.
 _GENERIC_RUNNER_HINT = (
     "RelEasy has no runner recipe for this check, so find the "
     "invocation before touching any code. Strip the parenthesised "
@@ -582,7 +465,6 @@ _GENERIC_RUNNER_HINT = (
 
 
 def _quote_for_shell(name: str) -> str:
-    """Single-quote ``name`` for safe inclusion in a shell command line."""
     if not name:
         return "''"
     if all(c.isalnum() or c in "_-./:[]=+@" for c in name):
@@ -591,20 +473,14 @@ def _quote_for_shell(name: str) -> str:
 
 
 def _tests_arg(category: str, test_names: list[str]) -> str:
-    """Render failing test names as the runner's test arguments.
-
-    TestFlows selects by path pattern rather than by exact name, so
-    regression tests get the trailing ``/*`` its ``--only`` expects.
-    """
+    """Failing test names as runner args; TestFlows ``--only`` patterns for regression."""
     if category == "regression":
         return " ".join(_quote_for_shell(f"{n}/*") for n in test_names)
     return " ".join(_quote_for_shell(n) for n in test_names)
 
 
-# Appended when a regression shard has more failing paths than fit on a
-# command line. The other categories inline ``$(cat …)`` instead, which
-# only works because their test names contain no spaces — TestFlows
-# paths do, so they have to go through an array.
+# TestFlows paths contain spaces, so unlike other categories they can't
+# be inlined via ``$(cat …)`` and go through an array instead.
 _REGRESSION_OVERFLOW_NOTE = (
     "_This shard has {count} failing test paths — more than fit on one "
     "command line. All of them are in `.releasy/failed-tests.txt`, one "
@@ -639,9 +515,6 @@ def _category_runner_section(
             "{count}", str(len(test_names)),
         )
     else:
-        # Too many to fit on one shell command line cleanly; tell
-        # Claude to use a temp file. Inline the first few as a teaser
-        # so the prompt reads sensibly without the file detour.
         head = _tests_arg(category, test_names[:max_inline])
         tests_arg = (
             f"$(cat .releasy/failed-tests.txt)  # the full list lives "
@@ -653,8 +526,6 @@ def _category_runner_section(
         .replace("{tests_arg}", tests_arg)
         .replace("{shard_context}", shard_context)
         .replace("{repo_dir}", str(repo_path))
-        # TestFlows artefacts are siblings of the report the status
-        # links to, so the report's directory is where to look.
         .replace("{report_dir}", target_url.rsplit("/", 1)[0])
     )
     if overflow_note:
@@ -662,25 +533,11 @@ def _category_runner_section(
     return section
 
 
-# ---------------------------------------------------------------------------
-# Bundled-failure prompt rendering
-# ---------------------------------------------------------------------------
-
-
-# Per-test info excerpts can be massive; we trim each one before
-# bundling so the prompt stays readable. Claude can always fetch the
-# full report via the shard's `target_url` if it needs more.
 _PER_TEST_EXCERPT_MAX = 1000
-
-# When a shard has more failures than this, the bundled list is split
-# into "first N (verbatim)" + "remaining count" — Claude is told the
-# canonical list lives in ``.releasy/failed-tests.txt`` and is
-# encouraged to consult it.
 _INLINE_FAILURE_LIMIT = 30
 
 
 def _baseline_line(test: FailedTest, baseline: BaselineRun | None) -> str:
-    """The one-line pre-change verdict shown under a failure block."""
     if baseline is None:
         return "baseline: no pre-change run available."
     verdict = baseline.verdict_for(test.category, test.name)
@@ -759,7 +616,6 @@ def _baseline_section(
     tests: list[FailedTest], baseline: BaselineRun | None,
     base_branch: str, unavailable_reason: str | None = None,
 ) -> str:
-    """Render the shard's pre-change comparison for the prompt."""
     if baseline is None:
         return (
             "RelEasy found **no CI run on "
@@ -834,7 +690,6 @@ def _baseline_section(
 
 
 def _redo_section(redo: RedoContext | None, pr_branch: str) -> str:
-    """Tell a re-investigation what the audit objected to, and to fix it."""
     if redo is None:
         return (
             "_(First look at this shard — no prior round to correct.)_"
@@ -860,22 +715,22 @@ def _redo_section(redo: RedoContext | None, pr_branch: str) -> str:
         "Those commits are **still on the branch** — you start from the "
         "tip that includes them. Act on the findings:",
         "",
-        f"- If a finding says a commit silences a test rather than "
-        f"fixing it (assertion weakened or deleted, reference output "
-        f"rewritten, tolerance widened, test skipped), `git revert "
-        f"--no-edit <sha>` it first, then either fix the cause properly "
-        f"or classify the failure honestly. A reverted bad fix plus an "
-        f"accurate `[unrelated]` is a **better** outcome than a fix that "
-        f"hides a regression.\n"
-        f"- If a finding says an edit is out of scope, revert that "
-        f"commit.\n"
-        f"- If a finding says a verdict contradicts the evidence, "
-        f"re-triage that failure specifically — do not restate the "
-        f"previous conclusion without new evidence.\n"
-        f"- If you still believe the previous conclusion after checking, "
-        f"say so explicitly and give the evidence that answers the "
-        f"finding. Standing your ground is allowed; ignoring the "
-        f"finding is not.",
+        "- If a finding says a commit silences a test rather than "
+        "fixing it (assertion weakened or deleted, reference output "
+        "rewritten, tolerance widened, test skipped), `git revert "
+        "--no-edit <sha>` it first, then either fix the cause properly "
+        "or classify the failure honestly. A reverted bad fix plus an "
+        "accurate `[unrelated]` is a **better** outcome than a fix that "
+        "hides a regression.\n"
+        "- If a finding says an edit is out of scope, revert that "
+        "commit.\n"
+        "- If a finding says a verdict contradicts the evidence, "
+        "re-triage that failure specifically — do not restate the "
+        "previous conclusion without new evidence.\n"
+        "- If you still believe the previous conclusion after checking, "
+        "say so explicitly and give the evidence that answers the "
+        "finding. Standing your ground is allowed; ignoring the "
+        "finding is not.",
         "",
         f"Revert, never rewrite: history on `{pr_branch}` stays "
         "append-only (see the linear-history section below).",
@@ -899,15 +754,11 @@ def _render_shard_prompt(
     baseline_note: str | None = None,
     redo: RedoContext | None = None,
 ) -> str:
-    raw = config.analyze_fails.prompt_file
-    prompt_path = Path(raw)
-    if not prompt_path.is_absolute():
-        prompt_path = (config.repo_dir / prompt_path).resolve()
+    prompt_path = _prompt_path(config, config.analyze_fails.prompt_file)
     if not prompt_path.exists():
         raise FileNotFoundError(
             f"analyze_fails prompt template not found: {prompt_path}. "
-            "Set analyze_fails.prompt_file in config, or copy the "
-            "bundled prompts/analyze_fails.md alongside config.yaml."
+            "Set analyze_fails.prompt_file in config."
         )
     template = prompt_path.read_text(encoding="utf-8")
 
@@ -930,9 +781,7 @@ def _render_shard_prompt(
             "for the test arguments in the runner command.)_"
         )
 
-    # Job-level records name a job or one of its steps, never a test —
-    # they must not reach the runner command line. A shard left with no
-    # real test name is a job-level shard.
+    # Job-level records name a job, not a test: keep them off the runner command line.
     runnable = [t.name for t in tests if not t.job_level]
     job_level = not runnable
     runner_section = _category_runner_section(
@@ -966,25 +815,13 @@ def _render_shard_prompt(
         "failed_tests_file": ".releasy/failed-tests.txt",
     }
 
-    def _replace(match: re.Match[str]) -> str:
-        key = match.group(1)
-        return placeholders.get(key, match.group(0))
-
-    return re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", _replace, template)
+    return _fill_placeholders(template, placeholders)
 
 
 def _write_failed_tests_manifest(
     repo_path: Path, tests: list[FailedTest],
 ) -> None:
-    """Drop the canonical failed-test list as a sibling of build.sh.
-
-    Claude reads this file when the test list is too long to embed
-    cleanly in the runner command line. Unconditional write so the file
-    always reflects the *current* shard's failure set, not the previous
-    one. Job-level records name a CI job, not a test, so they leave the
-    file empty — feeding one to a runner would select nothing (or, with
-    ``clickhouse-test``, everything).
-    """
+    """Write the shard's runnable test names to ``.releasy/failed-tests.txt``."""
     names = [t.name for t in tests if not t.job_level]
     target = repo_path / ".releasy" / "failed-tests.txt"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -993,21 +830,11 @@ def _write_failed_tests_manifest(
     )
 
 
-# ---------------------------------------------------------------------------
-# Claude invocation
-# ---------------------------------------------------------------------------
-
-
 _TERMINAL_TOKENS = ("DONE", "PARTIAL", "UNRELATED", "UNRESOLVED")
 
 
 def _classify_outcome(text: str) -> tuple[str, str]:
-    """Inspect the AI's tail output and pick a terminal classification.
-
-    Returns ``(token, summary)``. Falls back to ``UNRESOLVED`` when no
-    recognised terminal line is found. ``DONE`` / ``PARTIAL`` /
-    ``UNRELATED`` / ``UNRESOLVED`` mirror the prompt's contract.
-    """
+    """``(token, summary)`` from the narration's last terminal line, else UNRESOLVED."""
     if not text.strip():
         return "UNRESOLVED", "(no narration captured)"
     tail = text.strip().splitlines()[-30:]
@@ -1023,26 +850,11 @@ def _classify_outcome(text: str) -> tuple[str, str]:
     return found, summary
 
 
-# Placeholders accepted inside ``analyze_fails.allowed_tools`` /
-# ``extra_args`` entries so users don't have to hardcode their absolute
-# work-dir path. Resolved per-invocation against the live repo path.
 _TOOL_PATH_PLACEHOLDERS = ("{work_dir}", "{repo_dir}", "{cwd}")
 
 
 def _resolve_tool_paths(items: list[str], repo_path: Path) -> list[str]:
-    """Substitute ``{work_dir}``-style placeholders in tool/arg specs.
-
-    Lets ``config.yaml`` carry a portable allowlist like::
-
-        allowed_tools:
-          - Bash({work_dir}/build/programs/clickhouse:*)
-
-    and have it resolve to the actual repo path each invocation, even
-    when ``work_dir`` is overridden via CLI or differs between
-    machines. Aliases (``{repo_dir}``, ``{cwd}``) all resolve to the
-    same path — callers can pick whichever name reads most natural for
-    their entry.
-    """
+    """Replace ``{work_dir}`` / ``{repo_dir}`` / ``{cwd}`` with ``repo_path``."""
     repo_str = str(repo_path)
     out: list[str] = []
     for entry in items:
@@ -1063,21 +875,8 @@ def _verification_reason(
     threshold: int,
     pr_url: str,
 ) -> str | None:
-    """Why this shard's outcome needs a second opinion — ``None`` if not.
-
-    Two things count as doubt:
-
-    * **Code landed.** A commit is about to be pushed to someone's PR
-      on the strength of one session's judgement.
-    * **The verdict contradicts the evidence.** "Nothing here is mine"
-      over a failure that passed at the baseline and fails on no other
-      tracked PR is exactly the call that must not go unchallenged.
-
-    Everything else is left alone: a shard that changed nothing and
-    whose failures all predate the PR is already evidenced, and
-    UNRESOLVED without commits has no conclusion to audit — a human is
-    needed either way.
-    """
+    """Why this shard needs an audit (commits landed, or the verdict contradicts
+    the baseline); ``None`` if it doesn't."""
     if commits_added > 0:
         return (
             f"the session committed {commits_added} change(s) to the PR "
@@ -1121,16 +920,11 @@ def _render_verify_prompt(
     outcome: ShardOutcome,
     commit_range: str,
 ) -> str:
-    raw = config.analyze_fails.verify_prompt_file
-    prompt_path = Path(raw)
-    if not prompt_path.is_absolute():
-        prompt_path = (config.repo_dir / prompt_path).resolve()
+    prompt_path = _prompt_path(config, config.analyze_fails.verify_prompt_file)
     if not prompt_path.exists():
         raise FileNotFoundError(
             f"analyze_fails verify prompt not found: {prompt_path}. Set "
-            "analyze_fails.verify_prompt_file, copy the bundled "
-            "prompts/verify_analysis.md alongside config.yaml, or turn "
-            "the audit off with analyze_fails.verify_outcome: false."
+            "analyze_fails.verify_prompt_file, or turn the audit off with analyze_fails.verify_outcome: false."
         )
     template = prompt_path.read_text(encoding="utf-8")
 
@@ -1176,101 +970,45 @@ def _render_verify_prompt(
         "failed_tests_file": ".releasy/failed-tests.txt",
     }
 
-    def _replace(match: re.Match[str]) -> str:
-        return placeholders.get(match.group(1), match.group(0))
+    return _fill_placeholders(template, placeholders)
 
-    return re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", _replace, template)
+
+def _spawn_session(
+    config: Config, repo_path: Path, prompt: str,
+    tools: list[str], extra: list[str], timeout: int,
+) -> tuple[int, str, bool, float | None]:
+    """Run one session with the analyze-fails command and the given tools/args."""
+    section = _section_config(config, config.analyze_fails.command, tools, extra)
+    argv = _build_claude_argv(section)  # type: ignore[arg-type]
+    api = _build_api_spec(section)  # type: ignore[arg-type]
+    exit_code, output, timed_out = _spawn_claude(
+        argv, repo_path, timeout,
+        prompt=prompt, api=api, **_exhaustion_kwargs(config),
+    )
+    return exit_code, output, timed_out, _extract_cost_usd(output)
 
 
 def _invoke_verifier(
     config: Config, repo_path: Path, prompt: str,
 ) -> tuple[int, str, bool, float | None]:
     """Spawn the read-only auditor in a fresh session."""
-
-    class _ResolveShim:
-        command = config.analyze_fails.command
-        allowed_tools = list(_VERIFY_ALLOWED_TOOLS)
-        extra_args = list(config.analyze_fails.extra_args)
-
-    class _ConfigShim:
-        ai_resolve = _ResolveShim
-        ai_model = config.ai_model
-        ai_effort = config.ai_effort
-        ai_backend = config.ai_backend
-        ai_api = config.ai_api
-        ai_codex = config.ai_codex
-
-    argv = _build_claude_argv(_ConfigShim)  # type: ignore[arg-type]
-    api = _build_api_spec(_ConfigShim)  # type: ignore[arg-type]
-    exit_code, output, timed_out = _spawn_claude(
-        argv, repo_path, config.analyze_fails.verify_timeout_seconds,
-        prompt=prompt, api=api, **_exhaustion_kwargs(config),
+    return _spawn_session(
+        config, repo_path, prompt,
+        list(_VERIFY_ALLOWED_TOOLS),
+        _resolve_tool_paths(list(config.analyze_fails.extra_args), repo_path),
+        config.analyze_fails.verify_timeout_seconds,
     )
-    return exit_code, output, timed_out, _extract_cost_usd(output)
 
 
 def _invoke_claude(
     config: Config, repo_path: Path, prompt: str,
 ) -> tuple[int, str, bool, float | None]:
-    resolved_tools = _resolve_tool_paths(
-        list(config.analyze_fails.allowed_tools), repo_path,
+    return _spawn_session(
+        config, repo_path, prompt,
+        _resolve_tool_paths(list(config.analyze_fails.allowed_tools), repo_path),
+        _resolve_tool_paths(list(config.analyze_fails.extra_args), repo_path),
+        config.analyze_fails.timeout_seconds,
     )
-    resolved_extra = _resolve_tool_paths(
-        list(config.analyze_fails.extra_args), repo_path,
-    )
-
-    class _ResolveShim:
-        command = config.analyze_fails.command
-        allowed_tools = resolved_tools
-        extra_args = resolved_extra
-
-    class _ConfigShim:
-        ai_resolve = _ResolveShim
-        ai_model = config.ai_model
-        ai_effort = config.ai_effort
-        ai_backend = config.ai_backend
-        ai_api = config.ai_api
-        ai_codex = config.ai_codex
-
-    argv = _build_claude_argv(_ConfigShim)  # type: ignore[arg-type]
-    api = _build_api_spec(_ConfigShim)  # type: ignore[arg-type]
-    exit_code, output, timed_out = _spawn_claude(
-        argv, repo_path, config.analyze_fails.timeout_seconds,
-        prompt=prompt, api=api, **_exhaustion_kwargs(config),
-    )
-    cost = _extract_cost_usd(output)
-    return exit_code, output, timed_out, cost
-
-
-# ---------------------------------------------------------------------------
-# Per-PR / per-shard flow
-# ---------------------------------------------------------------------------
-
-
-def _fetch_pr_meta(
-    pr_url: str,
-) -> tuple[str, str, str, str, int] | None:
-    """Resolve PR head ref / head repo / base ref / head SHA / number."""
-    token = get_github_token()
-    if not token:
-        return None
-    parsed = parse_pr_url(pr_url)
-    if parsed is None:
-        return None
-    owner, repo, number = parsed
-    try:
-        from github import Github
-
-        gh = Github(token)
-        ghrepo = gh.get_repo(f"{owner}/{repo}")
-        pr = ghrepo.get_pull(number)
-        head_repo = (
-            pr.head.repo.full_name if pr.head.repo is not None
-            else f"{owner}/{repo}"
-        )
-        return pr.head.ref, head_repo, pr.base.ref, pr.head.sha, pr.number
-    except Exception:
-        return None
 
 
 def _checkout_pr_head(
@@ -1320,14 +1058,7 @@ def _verify_post_run_cleanliness(repo_path: Path) -> str | None:
 def _group_failures_by_shard(
     failed_tests: list[FailedTest],
 ) -> list[tuple[str, str, str, list[FailedTest]]]:
-    """Bucket failures by ``(category, shard_context, target_url)``.
-
-    Returns a list of ``(category, shard_context, target_url, tests)``
-    in :data:`CATEGORY_ORDER` — fasttest first (single shard, broad
-    blast radius), regression last (external repo, slowest to
-    reproduce) — and within a category alphabetical by shard, so the
-    output is reproducible.
-    """
+    """``(category, shard_context, target_url, tests)`` sorted by category order, then shard."""
     groups: dict[
         tuple[str, str, str], list[FailedTest],
     ] = {}
@@ -1344,10 +1075,7 @@ def _group_failures_by_shard(
     )
 
 
-# Baseline runs are decomposed once per merge base, not once per PR:
-# a batch of rebase PRs cut from the same target-branch commit shares
-# one, and decoding a run means re-fetching every failed shard's report.
-# Keyed by everything that changes the result; process-lifetime only.
+# Per merge base: rebase PRs cut from one target commit share a baseline.
 _BASELINE_CACHE: dict[
     tuple[str, str, tuple[str, ...] | None, bool, frozenset[str]],
     tuple[BaselineRun | None, str | None],
@@ -1355,7 +1083,6 @@ _BASELINE_CACHE: dict[
 
 
 def _tally_outcome(result: PRRunResult, outcome: ShardOutcome) -> None:
-    """Count a shard's *final* outcome and print its marker."""
     field_name = {
         "DONE": "shards_done",
         "PARTIAL": "shards_partial",
@@ -1376,12 +1103,8 @@ def _run_investigation_round(
     target_url: str,
     test_count: int,
 ) -> tuple[ShardOutcome, str, bool]:
-    """One investigator session plus the checks that make it pushable.
-
-    Returns ``(outcome, head_sha_after, unsafe)``. ``unsafe`` means the
-    branch is no longer append-only, so the caller must stop touching
-    this PR — nothing after that point can be trusted or pushed.
-    """
+    """One investigator session. Returns ``(outcome, head_sha_after, unsafe)``;
+    ``unsafe`` means history is no longer append-only."""
     def _failed(summary: str, narration: str, cost: float | None) -> ShardOutcome:
         return ShardOutcome(
             category=category, shard_context=shard_ctx,
@@ -1483,14 +1206,7 @@ def _audit_shard_outcome(
     flaky_map: dict[str, list[str]],
     commit_range: str,
 ) -> None:
-    """Second opinion on one shard's outcome, when the shard is in doubt.
-
-    Advisory throughout: findings are recorded on ``outcome`` and drive
-    the PR comment and label. Nothing is reverted, and the push is not
-    blocked — the operator decides what to do with a dispute. A failed
-    audit (timeout, unparsable verdict) is likewise never fatal; it
-    just leaves ``verify_verdict`` at ``"unknown"``.
-    """
+    """Advisory second opinion on a shard in doubt; results land on ``outcome``."""
     if not config.analyze_fails.verify_outcome:
         return
     reason = _verification_reason(
@@ -1539,10 +1255,7 @@ def _audit_shard_outcome(
         console.print(f"      [yellow]![/yellow] audit {why}")
         return
 
-    # The auditor is told it is read-only, and its allowlist has no
-    # editing tools — but `Bash(git:*)` is broad enough to commit, so
-    # confirm rather than assume. A verifier that wrote to the repo has
-    # invalidated what we were about to push.
+    # `Bash(git:*)` in the auditor's allowlist is broad enough to commit.
     after = run_git(["rev-parse", "--verify", "HEAD"], repo_path, check=False)
     moved = after.returncode != 0 or after.stdout.strip() != head_before
     if moved or _verify_post_run_cleanliness(repo_path):
@@ -1584,15 +1297,7 @@ def _resolve_baseline(
     head_sha: str,
     needed_categories: frozenset[str],
 ) -> tuple[BaselineRun | None, str | None]:
-    """Fetch the pre-change CI run for this PR, or explain why not.
-
-    ``needed_categories`` are the check families the PR actually failed
-    in — a run that never exercised them is skipped in favour of an
-    older one that did.
-
-    Never fatal: a PR whose target branch has no reachable run is
-    triaged the old way, from the diff and the flaky-elsewhere map.
-    """
+    """The pre-change CI run covering ``needed_categories``, or ``(None, reason)``."""
     if not config.analyze_fails.baseline_check:
         return None, "disabled (analyze_fails.baseline_check)"
     owner, _, repo = origin_slug.partition("/")
@@ -1629,12 +1334,6 @@ def _process_pr(
     dry_run: bool,
 ) -> PRRunResult:
     """Drive the per-shard Claude loop + push for ONE PR."""
-    # Authoritative open-state check. analyze-fails pushes commits to
-    # the PR's head branch; doing that on a merged or closed PR is
-    # either pointless (merged — branch is no longer the source of
-    # truth) or harmful (closed — the author already decided not to
-    # land it). Skip with a one-line explanation so the operator sees
-    # which PRs were excluded.
     pr_info = fetch_pr_by_url(config, pr_url, include_closed=True)
     if pr_info is None:
         return PRRunResult(
@@ -1653,7 +1352,7 @@ def _process_pr(
             pr_url=pr_url, head_sha=pr_info.head_sha, head_ref="",
         )
 
-    head = _fetch_pr_meta(pr_url)
+    head = fetch_pr_head(pr_url)
     if head is None:
         return PRRunResult(
             pr_url=pr_url, head_sha="", head_ref="",
@@ -1729,8 +1428,6 @@ def _process_pr(
         )
     elif baseline_note:
         result.baseline_note = baseline_note
-        # An operator who turned the pass off doesn't need warning about
-        # it on every PR.
         if config.analyze_fails.baseline_check:
             console.print(f"  [yellow]![/yellow] baseline: {baseline_note}")
         else:
@@ -1813,11 +1510,7 @@ def _process_pr(
             result.error = f"Could not stage shard manifest: {exc}"
             return result
 
-        # Investigate, audit, and — when the audit disputes what came
-        # out — hand the findings to a fresh investigator and try once
-        # more. Bounded by max_investigation_rounds; each round starts
-        # from the previous round's tip, so a redo can revert what the
-        # audit objected to.
+        # Investigate, audit, and redo with the findings while disputed.
         redo: RedoContext | None = None
         outcome: ShardOutcome | None = None
         unsafe = False
@@ -1856,8 +1549,6 @@ def _process_pr(
                     f"from {start_sha[:10]} to {new_sha[:10]}; commits "
                     "kept locally."
                 )
-            # Walk the linear-history baseline forward: later rounds and
-            # later shards baseline against the now-extended tip.
             round_start_sha, start_sha = start_sha, new_sha
 
             _audit_shard_outcome(
@@ -1879,8 +1570,6 @@ def _process_pr(
                 )
                 break
             if result.audit_mutated_repo:
-                # The work-dir is no longer trustworthy; a redo would
-                # build on it.
                 break
             outcome.superseded = True
             redo = RedoContext(
@@ -1899,7 +1588,6 @@ def _process_pr(
             result.shards_processed += 1
             _tally_outcome(result, outcome)
         if unsafe:
-            # Stop — local branch state is unsafe for further shards.
             break
 
     final_head = run_git(
@@ -1950,20 +1638,7 @@ def _process_pr(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# PR comment formatting + posting
-# ---------------------------------------------------------------------------
-
-
-# Per-shard narration excerpt cap for the PR comment. Long enough to
-# carry Claude's investigation summary verbatim (which routinely runs
-# 1-3k chars), short enough that a noisy 6-shard PR doesn't blow the
-# comment past GitHub's 65k-char limit.
+# Keeps a many-shard comment under GitHub's 65k-char limit.
 _NARRATION_CAP_PER_SHARD = 6000
 
 
@@ -1978,15 +1653,7 @@ def _utc_now_iso() -> str:
 
 
 def _trim_narration_for_comment(narration: str) -> str:
-    """Trim a Claude transcript to a comment-safe excerpt.
-
-    Strategy:
-      * Strip leading/trailing whitespace.
-      * Cap to ``_NARRATION_CAP_PER_SHARD`` chars; when over, keep the
-        last 3/4 of the budget (the conclusion is more useful than the
-        thinking-out-loud preamble) and prepend an ``…(truncated)``
-        marker.
-    """
+    """Trim a transcript for the PR comment, keeping its tail (the conclusion)."""
     text = (narration or "").strip()
     if not text:
         return "_(no narration captured)_"
@@ -1997,10 +1664,7 @@ def _trim_narration_for_comment(narration: str) -> str:
 
 
 def _format_pr_comment(run: PRRunResult) -> str:
-    """Build the markdown body posted to the PR after a per-PR run."""
     overall = (
-        # A shard whose audit still stands rejected is never a clean
-        # result, whatever the session concluded.
         "DISPUTED" if run.open_disputes else
         "DONE" if run.shards_unresolved == 0 and run.shards_partial == 0
         and run.shards_done > 0 and run.shards_processed > 0 else
@@ -2175,20 +1839,7 @@ def _attribute_cost_to_feature(
     pr_url: str,
     cost_usd: float,
 ) -> str | None:
-    """Add ``cost_usd`` to the matching feature's ``ai_cost_usd`` total.
-
-    Returns the feature id when a match was found and updated, ``None``
-    otherwise. Mirrors the ``refresh`` flow's accumulation pattern:
-
-        prior = fs.ai_cost_usd or 0.0
-        fs.ai_cost_usd = prior + cost_usd
-
-    so the GitHub Project board's "AI Cost" column shows the
-    cumulative spend across cherry-pick resolution, refresh-merge
-    resolution, AND analyze-fails investigation on this same feature.
-    No-op when state is missing, the PR isn't tracked, or the run
-    incurred zero cost.
-    """
+    """Add ``cost_usd`` to the matching feature's ``ai_cost_usd``; return its id."""
     if state is None or cost_usd <= 0:
         return None
     parsed = parse_pr_url(pr_url)
@@ -2225,14 +1876,9 @@ def _apply_verify_label(config: Config, pr_url: str) -> None:
 
 
 def _post_pr_comment(
-    pr_url: str, body: str,
+    config: Config, pr_url: str, body: str,
 ) -> tuple[str | None, str | None]:
-    """POST a top-level comment to ``pr_url``. Returns ``(comment_url, error)``.
-
-    Best-effort: any GitHub API error is captured and returned without
-    raising, so a comment-posting failure never breaks the
-    investigation flow that's already done its real work.
-    """
+    """Best-effort top-level comment on an origin PR. Returns ``(comment_url, error)``."""
     token = get_github_token()
     if not token:
         return None, "RELEASY_GITHUB_TOKEN not set — cannot post comment"
@@ -2241,13 +1887,20 @@ def _post_pr_comment(
         return None, f"Could not parse PR URL: {pr_url!r}"
     owner, repo, number = parsed
     try:
+        origin_slug = require_origin_repo_slug(config)
+    except ValueError as exc:
+        return None, str(exc)
+    if f"{owner}/{repo}".lower() != origin_slug.lower():
+        return None, (
+            f"refusing to comment on {owner}/{repo}: not the configured "
+            f"origin ({origin_slug})"
+        )
+    try:
         from github import Github
 
         gh = Github(token)
-        ghrepo = gh.get_repo(f"{owner}/{repo}")
+        ghrepo = gh.get_repo(origin_slug)
         pr = ghrepo.get_pull(number)
-        # PR-level comments live on the issue endpoint (top-level
-        # comments, not inline review comments).
         ic = pr.create_issue_comment(body)
         return ic.html_url, None
     except Exception as exc:
@@ -2266,24 +1919,9 @@ def run_analyze_fails_pass(
     post_comment: bool | None,
     flaky_scan_extra: list[str] | None = None,
 ) -> tuple[list[PRRunResult], dict[str, list[str]], list[str], bool]:
-    """Drive analyze-fails over an explicit list of PR URLs.
+    """Run analyze-fails over ``pr_urls``; the caller owns lock, repo setup and state persistence.
 
-    Caller is responsible for: project lock, state load, ``_setup_repo``,
-    in-progress-op guard, and (later) state persistence + project sync.
-    Designed so :func:`refresh.refresh_tracked_prs` can fold an
-    analyze-fails phase into a single locked refresh invocation without
-    re-doing any of that bookkeeping.
-
-    Cost is accumulated onto the matching :class:`FeatureState`'s
-    ``ai_cost_usd`` in-place — the caller decides when to persist /
-    sync the project board (refresh already does this at the end of
-    its own pass).
-
-    ``flaky_scan_extra`` is used by single-PR callers (e.g. ``refresh
-    --pr <url> --analyze-fails``) to widen the flaky-elsewhere scan to
-    cover every other tracked PR rather than just the one being
-    analysed. Pass ``None`` to scan the primary list itself.
-
+    ``flaky_scan_extra`` replaces ``pr_urls`` as the flaky-elsewhere scan set.
     Returns ``(runs, flaky_map, flaky_warnings, cost_attributed_any)``.
     """
     effective_post_comment = (
@@ -2328,9 +1966,6 @@ def run_analyze_fails_pass(
         runs.append(run)
         if run.open_disputes and not dry_run:
             _apply_verify_label(config, run.pr_url)
-        # Accumulate cost on the matching FeatureState so the next
-        # state-save (whoever's driving us) reflects the spend. No-op
-        # for stateless / dry-run / unmatched PRs.
         if not dry_run and run.cost_usd:
             fid = _attribute_cost_to_feature(state, run.pr_url, run.cost_usd)
             if fid:
@@ -2342,10 +1977,10 @@ def run_analyze_fails_pass(
         if (
             effective_post_comment
             and not dry_run
-            and run.outcomes  # something was processed
+            and run.outcomes
         ):
             curl, cerr = _post_pr_comment(
-                run.pr_url, _format_pr_comment(run),
+                config, run.pr_url, _format_pr_comment(run),
             )
             if curl:
                 run.comment_url = curl
@@ -2378,17 +2013,7 @@ def analyze_fails(
     post_comment: bool | None = None,
     only: OnlyFilter | None = None,
 ) -> AnalyzeFailsResult:
-    """Drive one ``releasy analyze-fails`` run end-to-end.
-
-    ``only`` (optional) restricts the multi-PR walk to a single tracked
-    feature (matched by URL or feature / group ID). Mutually exclusive
-    with ``pr_url`` at the CLI layer.
-
-    This is the top-level entry point used by the standalone
-    ``releasy analyze-fails`` command. ``refresh --analyze-fails`` calls
-    :func:`run_analyze_fails_pass` directly instead — it already holds
-    the project lock, has state loaded, and the repo prepared.
-    """
+    """Drive one standalone ``releasy analyze-fails`` run end-to-end."""
     if not get_origin_repo_slug(config):
         return AnalyzeFailsResult(
             success=False,
@@ -2421,10 +2046,6 @@ def analyze_fails(
     if pr_url:
         primary_pr_urls = [pr_url]
     else:
-        # Refresh local merge status from GitHub so the tracked_pr_urls
-        # prefilter doesn't queue a PR that's already been merged
-        # externally. Cheap (parallel GETs); skipped on dry-run / no
-        # state since there's nothing to update.
         if state is not None and not dry_run:
             from releasy.pipeline import _refresh_all_merge_status_from_github
             _refresh_all_merge_status_from_github(config, state)
@@ -2456,7 +2077,7 @@ def analyze_fails(
 
     initial_base = None
     if primary_pr_urls:
-        first_meta = _fetch_pr_meta(primary_pr_urls[0])
+        first_meta = fetch_pr_head(primary_pr_urls[0])
         if first_meta is None:
             return AnalyzeFailsResult(
                 success=False,
@@ -2482,7 +2103,7 @@ def analyze_fails(
             ),
         )
 
-    runs, flaky_map, _flaky_warnings, cost_attributed_any = (
+    runs, _flaky_map, _flaky_warnings, cost_attributed_any = (
         run_analyze_fails_pass(
             config, state, repo_path, primary_pr_urls,
             push=push, dry_run=dry_run,
@@ -2501,13 +2122,6 @@ def analyze_fails(
             console.print(
                 f"[yellow]![/yellow] failed to persist state: {exc}"
             )
-        # Push the freshly accumulated AI cost(s) to the GitHub Project
-        # board. Same trigger as ``releasy refresh``: only when ``push``
-        # is on (the project sync is otherwise off-policy) and at least
-        # one PR's cost actually landed in state. No-op gracefully if
-        # the project isn't configured / token lacks the scope — the
-        # state file already has the right value, so the next
-        # ``releasy project push`` will catch up.
         if cost_attributed_any and config.push:
             try:
                 from releasy.github_ops import sync_project
@@ -2523,16 +2137,7 @@ def analyze_fails(
                 )
 
     success = all(r.error is None for r in runs)
-    return AnalyzeFailsResult(
-        success=success,
-        runs=runs,
-        flaky_elsewhere_map=flaky_map,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Reporting
-# ---------------------------------------------------------------------------
+    return AnalyzeFailsResult(success=success, runs=runs)
 
 
 def print_summary(runs: list[PRRunResult]) -> None:

@@ -1,9 +1,6 @@
-"""Stateless batch backport driven by a GitHub Project.
+"""Stateless batch backport of upstream PRs tagged in a GitHub Project's ``Port Versions``.
 
-For each project item whose content is an upstream (ClickHouse/ClickHouse)
-PR tagged with ``--version`` in its ``Port Versions`` field, open a backport
-PR into ``--target`` on origin (Altinity/ClickHouse) and add the new PR back
-to the project. Stateless and idempotent; only ever opens PRs into origin.
+Opens one backport PR per item into ``--target`` on origin and adds it to the project.
 """
 
 from __future__ import annotations
@@ -26,8 +23,6 @@ from releasy.git_ops import (
     fetch_remote,
     force_push,
     is_operation_in_progress,
-    local_branch_exists,
-    run_git,
     stash_and_clean,
     update_submodules,
 )
@@ -50,28 +45,23 @@ from releasy.github_ops import (
     parse_pr_url,
     slug_to_https_url,
 )
-from releasy.stateless import _try_ai_resolve
+from releasy.stateless import (
+    _build_changelog_block_for_pr,
+    _ci_options_section,
+    _cleanup_failed,
+    _read_pr_template,
+    _try_ai_resolve,
+)
 
 
-# The only repos this command ever reads from / writes to.
 UPSTREAM_SLUG = "ClickHouse/ClickHouse"
 DEFAULT_ORIGIN = "git@github.com:Altinity/ClickHouse.git"
 
-# Project field the views filter on; also what we set on each new card.
 PORT_VERSIONS_FIELD = "Port Versions"
-# Heading in the ClickHouse PR template; everything from here down is
-# copied verbatim into the backport PR body ("CI/CD options and below").
-CI_CD_SECTION_HEADER = "CI/CD Options"
-
-
-# ---------------------------------------------------------------------------
-# Public dataclasses
-# ---------------------------------------------------------------------------
 
 
 @dataclass
 class ProjectBackportOptions:
-    """All inputs for ``releasy project-backport`` (built from CLI flags)."""
     project_url: str
     version: str
     target: str
@@ -100,9 +90,7 @@ class ItemOutcome:
 @dataclass
 class ProjectBackportResult:
     outcomes: list[ItemOutcome] = field(default_factory=list)
-    # Set when the whole run could not start (bad project URL, unresolved
-    # project, missing 'Port Versions' field, …). Distinct from per-item
-    # failures; the CLI surfaces it as a hard error.
+    # Whole-run failure, distinct from per-item failures.
     fatal: str | None = None
 
     @property
@@ -110,26 +98,16 @@ class ProjectBackportResult:
         return any(o.status == "failed" for o in self.outcomes)
 
 
-# ---------------------------------------------------------------------------
-# Pure helpers (unit-tested without network)
-# ---------------------------------------------------------------------------
-
-
 def _sanitize_ref_component(value: str) -> str:
-    """Make ``value`` safe to embed in a git ref."""
     return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-") or "x"
 
 
 def _backport_branch(version: str, upstream_number: int) -> str:
-    """Deterministic branch name so re-runs and PR lookups line up."""
     return f"backport/{_sanitize_ref_component(version)}/{upstream_number}"
 
 
 def _port_versions_includes(value: str | None, version: str) -> bool:
-    """True when a ``Port Versions`` value (TEXT or single-select) lists
-    ``version``. Word-boundary match so ``24.8`` matches ``"24.8, 25.3"``
-    but not ``"24.80"`` or ``"24.8.14"``.
-    """
+    """True when ``value`` lists ``version``: ``24.8`` matches ``"24.8, 25.3"``, not ``"24.80"``."""
     if not value:
         return False
     pattern = rf"(?<![\d.]){re.escape(version)}(?![\d.])"
@@ -137,7 +115,6 @@ def _port_versions_includes(value: str | None, version: str) -> bool:
 
 
 def _item_qualifies(item: dict, version: str, upstream_slug: str) -> bool:
-    """A project item we should back-port: an upstream PR tagged for ``version``."""
     if item.get("content_typename") != "PullRequest":
         return False
     if (item.get("repo_slug") or "").lower() != upstream_slug.lower():
@@ -150,47 +127,9 @@ def _pr_title(version: str, pr: PRInfo) -> str:
     return f"{version} Backport of #{pr.number} - {pr.title}"
 
 
-def _build_changelog_block_for_pr(pr: PRInfo) -> str | None:
-    """Upstream PR's changelog category + entry, with attribution appended."""
-    from releasy.pipeline import (
-        _extract_changelog_category,
-        _extract_changelog_entry,
-        render_changelog_block,
-    )
-
-    return render_changelog_block(
-        _extract_changelog_category(pr.body or ""),
-        _extract_changelog_entry(pr.body or ""),
-        [pr],
-    )
-
-
-def _ci_options_section(template_text: str | None) -> str:
-    """The ``CI/CD Options`` heading and everything below it, verbatim.
-
-    Falls back to ``pipeline._DEFAULT_CI_CD_OPTIONS_BLOCK`` when the
-    template is missing or has no such section.
-    """
-    from releasy.pipeline import _DEFAULT_CI_CD_OPTIONS_BLOCK
-
-    if template_text:
-        lines = template_text.splitlines()
-        target = CI_CD_SECTION_HEADER.strip().lower()
-        for i, line in enumerate(lines):
-            m = re.match(r"^#{1,6}\s+(.+?)\s*$", line)
-            if m and m.group(1).strip().lower() == target:
-                return "\n".join(lines[i:]).rstrip()
-    return _DEFAULT_CI_CD_OPTIONS_BLOCK.rstrip()
-
-
 def _build_pr_body(changelog_block: str | None, ci_block: str) -> str:
     parts = [p for p in (changelog_block, ci_block) if p]
     return ("\n\n".join(parts)).strip() + "\n"
-
-
-# ---------------------------------------------------------------------------
-# Port Versions field
-# ---------------------------------------------------------------------------
 
 
 def _find_field_node(project_id: str, name: str) -> dict | None:
@@ -212,12 +151,7 @@ def _find_option_id(field_node: dict, version: str) -> str | None:
 def _set_port_versions(
     project_id: str, field_node: dict, item_id: str, version: str,
 ) -> tuple[bool, str | None]:
-    """Set the new card's ``Port Versions`` to ``version``.
-
-    For a SINGLE_SELECT field the ``version`` option must already exist
-    (qualifying items are tagged with it, so it does). We deliberately do
-    NOT mutate a user-owned field's option list to create one.
-    """
+    """Set the card's ``Port Versions``; a single-select option must already exist."""
     field_id = field_node.get("id")
     dtype = field_node.get("dataType")
     if not field_id:
@@ -238,11 +172,6 @@ def _set_port_versions(
         return ok, None if ok else "GraphQL set-single-select failed"
 
     return False, f"'Port Versions' is {dtype!r}; expected TEXT or SINGLE_SELECT"
-
-
-# ---------------------------------------------------------------------------
-# Work dir + config
-# ---------------------------------------------------------------------------
 
 
 def _default_work_dir() -> Path:
@@ -267,16 +196,10 @@ def _build_config(opts: ProjectBackportOptions) -> Config:
         ai_max_iterations=opts.max_iterations,
         ai_backend=opts.ai_backend,
     )
-    # Upstream is fetch-only; declaring it lets the AI resolver detect
-    # missing prerequisites against ClickHouse/ClickHouse history.
+    # Lets the AI resolver detect missing prerequisites in upstream history.
     config.upstream = UpstreamConfig(remote=slug_to_https_url(UPSTREAM_SLUG))
     config.dry_run = opts.dry_run
     return config
-
-
-# ---------------------------------------------------------------------------
-# Per-item backport
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -288,11 +211,7 @@ class _RepoState:
 
 
 def _prepare_repo(config: Config, opts: ProjectBackportOptions) -> _RepoState | None:
-    """Clone/reuse the work repo, fetch origin, verify the target branch.
-
-    Returns ``None`` (with a console error) when the target branch is
-    missing on origin — there's nothing to base backports on.
-    """
+    """Clone/reuse the work repo and fetch origin; ``None`` if the target branch is missing."""
     wd = config.resolve_work_dir(opts.work_dir)
     console.print(f"[dim]Working directory: {wd}[/dim]")
     console.print(f"[dim]Origin: {opts.origin}[/dim]")
@@ -320,22 +239,6 @@ def _prepare_repo(config: Config, opts: ProjectBackportOptions) -> _RepoState | 
     return _RepoState(repo_path, remote, target_ref, template_text)
 
 
-def _read_pr_template(repo_path: Path, target_ref: str) -> str | None:
-    res = run_git(
-        ["show", f"{target_ref}:.github/PULL_REQUEST_TEMPLATE.md"],
-        repo_path, check=False,
-    )
-    return res.stdout if res.returncode == 0 else None
-
-
-def _cleanup_branch(repo_path: Path, branch: str, target_ref: str) -> None:
-    if is_operation_in_progress(repo_path):
-        abort_in_progress_op(repo_path)
-    if local_branch_exists(repo_path, branch):
-        run_git(["checkout", "--detach", target_ref], repo_path, check=False)
-        run_git(["branch", "-D", branch], repo_path, check=False)
-
-
 def _backport_one(
     config: Config,
     opts: ProjectBackportOptions,
@@ -345,15 +248,11 @@ def _backport_one(
     item: dict,
     upstream: PRInfo,
 ) -> ItemOutcome:
-    """Cherry-pick, push, open the PR, and register it on the project."""
     version = opts.version
     n = upstream.number
     branch = _backport_branch(version, n)
-    # Postcondition complaints the resolver kept the resolution despite;
-    # flagged on the PR below once it exists.
     resolve_warnings: list[str] = []
 
-    # Fresh branch off the target tip.
     if is_operation_in_progress(repo.repo_path):
         abort_in_progress_op(repo.repo_path)
     stash_and_clean(repo.repo_path)
@@ -361,10 +260,9 @@ def _backport_one(
     console.print("    [dim]initialising submodules...[/dim]")
     update_submodules(repo.repo_path)
 
-    # Cherry-pick the merge commit (-m 1).
     fetch_url = slug_to_https_url(UPSTREAM_SLUG)
     if not fetch_commit(repo.repo_path, fetch_url, upstream.merge_commit_sha):
-        _cleanup_branch(repo.repo_path, branch, repo.target_ref)
+        _cleanup_failed(repo.repo_path, branch, repo.target_ref)
         return ItemOutcome(n, "failed", reason="could not fetch merge commit")
 
     cp = cherry_pick_sha(
@@ -372,12 +270,12 @@ def _backport_one(
         mainline=1, abort_on_conflict=False,
     )
     if cp.already_applied:
-        _cleanup_branch(repo.repo_path, branch, repo.target_ref)
+        _cleanup_failed(repo.repo_path, branch, repo.target_ref)
         return ItemOutcome(n, "skipped", reason="already present in target")
 
     if not cp.success:
         if not cp.conflict_files:
-            _cleanup_branch(repo.repo_path, branch, repo.target_ref)
+            _cleanup_failed(repo.repo_path, branch, repo.target_ref)
             return ItemOutcome(
                 n, "failed", reason=cp.error_message or "cherry-pick failed",
             )
@@ -387,10 +285,10 @@ def _backport_one(
                 cp.conflict_files, "backport",
             )
             if not ok:
-                _cleanup_branch(repo.repo_path, branch, repo.target_ref)
+                _cleanup_failed(repo.repo_path, branch, repo.target_ref)
                 return ItemOutcome(n, "failed", reason=f"AI resolve failed: {err}")
         else:
-            _cleanup_branch(repo.repo_path, branch, repo.target_ref)
+            _cleanup_failed(repo.repo_path, branch, repo.target_ref)
             return ItemOutcome(
                 n, "failed",
                 reason=(
@@ -400,7 +298,6 @@ def _backport_one(
                 ),
             )
 
-    # Push + open the PR.
     force_push(repo.repo_path, branch, config)
 
     title = _pr_title(version, upstream)
@@ -429,7 +326,6 @@ def _register_on_project(
     config: Config, project_id: str, field_node: dict,
     item: dict, pr_url: str, version: str,
 ) -> None:
-    """Add the new PR to the project and set its Port Versions (best-effort)."""
     parsed = parse_pr_url(pr_url)
     if not parsed:
         console.print(f"    [yellow]![/yellow] could not parse new PR URL {pr_url}")
@@ -456,18 +352,7 @@ def _register_on_project(
         )
 
 
-# ---------------------------------------------------------------------------
-# Main entry
-# ---------------------------------------------------------------------------
-
-
 def run_project_backport(opts: ProjectBackportOptions) -> ProjectBackportResult:
-    """Execute the batch backport described by ``opts``.
-
-    Never raises for per-item failures (they're collected into the result);
-    only returns early for whole-run problems (bad project URL, missing
-    field, missing target branch).
-    """
     result = ProjectBackportResult()
 
     parsed = _parse_project_url(opts.project_url)
@@ -504,7 +389,6 @@ def run_project_backport(opts: ProjectBackportOptions) -> ProjectBackportResult:
 
     items = list_project_items_for_backport(project_id)
     qualifying = [it for it in items if _item_qualifies(it, opts.version, UPSTREAM_SLUG)]
-    # Newest upstream PR first, then apply --limit.
     qualifying.sort(key=lambda it: it.get("pr_number") or 0, reverse=True)
     if opts.limit is not None:
         qualifying = qualifying[: opts.limit]
@@ -516,8 +400,6 @@ def run_project_backport(opts: ProjectBackportOptions) -> ProjectBackportResult:
         + (" [yellow](dry-run)[/yellow]" if opts.dry_run else "")
     )
     if not qualifying and items:
-        # Don't leave the user guessing why a non-empty board produced no
-        # work — the filter is upstream-PR content + Port Versions.
         console.print(
             f"[dim]No items matched: need content = a {UPSTREAM_SLUG} PR with "
             f"{PORT_VERSIONS_FIELD} including {opts.version!r}.[/dim]"
@@ -528,14 +410,11 @@ def run_project_backport(opts: ProjectBackportOptions) -> ProjectBackportResult:
         n = it.get("pr_number")
         console.print(f"\n[bold]#{n}[/bold] (upstream {UPSTREAM_SLUG}#{n})")
         try:
-            # Read-only resolution first: terminal outcome (skip / would-
-            # create / fetch failure) or an upstream PR that needs porting.
             terminal, upstream = _resolve_item(config, opts, it)
             if terminal is not None:
                 oc = terminal
             else:
-                # Clone/verify the repo lazily on the first real backport,
-                # then reuse it. A missing target branch aborts the run.
+                # Prepare the repo lazily on the first real backport.
                 if repo is None:
                     repo = _prepare_repo(config, opts)
                     if repo is None:
@@ -561,18 +440,11 @@ def _resolve_item(
     opts: ProjectBackportOptions,
     item: dict,
 ) -> tuple[ItemOutcome | None, PRInfo | None]:
-    """Read-only: decide skip / would-create, else hand back the upstream PR.
-
-    Returns ``(terminal_outcome, None)`` when the item needs no porting
-    (already backported, couldn't fetch, not merged, or dry-run), or
-    ``(None, upstream_pr)`` when the item should be backported.
-    """
+    """Return ``(terminal_outcome, None)`` or ``(None, upstream_pr)`` to backport."""
     n = item.get("pr_number")
     branch = _backport_branch(opts.version, n)
 
-    # Cheapest, immediately-consistent check first: any-state PR on our
-    # deterministic branch is unambiguously our backport (covers open,
-    # merged, and closed — so a re-run never duplicates it).
+    # Any-state PR on our deterministic branch is our backport.
     existing = find_latest_pr_for_branch(config, branch, base=opts.target)
     if existing is not None:
         return ItemOutcome(
@@ -587,7 +459,7 @@ def _resolve_item(
     if upstream.state != "merged" or not upstream.merge_commit_sha:
         return ItemOutcome(n, "skipped", reason="upstream PR not merged"), None
 
-    # Secondary: an open backport opened from a different branch.
+    # An open backport opened from a different branch.
     other = find_open_backport_pr(config, opts.target, n, upstream.url)
     if other:
         return ItemOutcome(
@@ -601,11 +473,6 @@ def _resolve_item(
         ), None
 
     return None, upstream
-
-
-# ---------------------------------------------------------------------------
-# Reporting
-# ---------------------------------------------------------------------------
 
 
 def _print_outcome(oc: ItemOutcome) -> None:

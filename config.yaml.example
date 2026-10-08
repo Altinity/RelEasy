@@ -1,394 +1,92 @@
-# RelEasy config.yaml — stable infrastructure for ONE project.
-#
-# Three files make up a project's on-disk footprint:
-#
-#   1. config.yaml            — this file. Origin, target branch, AI
-#                               settings, notifications, pr_policy. Rarely
-#                               edited once a project is set up.
-#   2. <target_branch>.session.yaml
-#                             — per-effort source data: the `features:`
-#                               list and `pr_sources:` selectors. Edit this
-#                               between runs as your target work changes.
-#                               Named after the target branch (falls back to
-#                               <name> when target_branch is unset) and lives
-#                               next to config.yaml by default; point
-#                               elsewhere with `session_file:` below or
-#                               `--session-file` on the CLI.
-#   3. <name>.state.yaml      — runtime progress. Managed by RelEasy; lives
-#                               in ${XDG_STATE_HOME:-~/.local/state}/releasy/.
-#
-# `--stateless` (e.g. `releasy refresh --address-review --stateless`) loads
-# THIS file (overridable with `--config`) but skips the session and state files.
+# RelEasy config.yaml — stable settings for one project.
+# What to port lives in the session file (see session.yaml.example).
+# Full reference: docs/configuration.md
 
-# ── Project identity (required) ─────────────────────────────────────
-# Unique slug for this project on this machine. Doubles as the filename
-# of the per-project state file (and the session file when target_branch
-# is unset):
-#   state:   ${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml
-#   session: <dir-of-this-config>/<target_branch>.session.yaml
-# Allowed characters: A-Z a-z 0-9 . _ - (1-64 chars). Pick something
-# stable like the target branch you are porting onto. Renaming this
-# orphans the old state file — use `releasy adopt` to rebind state to a
-# moved/renamed config.
-name: antalya-26.3
+# ── Identity (required) ─────────────────────────────────────────────
+name: antalya-26.3                  # slug [A-Za-z0-9._-]{1,64}; keys the state file + lock
+project: antalya                    # used in branch names and PR titles
 
-# ── Session file (optional override) ────────────────────────────────
-# By default the session file lives at
-# `<config-dir>/<target_branch>.session.yaml` (falling back to
-# `<name>.session.yaml` when target_branch is unset).
-# Set this to point somewhere else (absolute or relative to this file's
-# directory). The CLI `--session-file <path>` always takes precedence.
-# session_file: sessions/antalya-26.3.session.yaml
-
-# ── Push & PR control ───────────────────────────────────────────────
-# Push branches to origin and open PRs.
-# Default is false — everything stays local until you enable this.
-# push: true
-
-# ── Sequential mode ─────────────────────────────────────────────────
-# When true, RelEasy processes the merged-time-sorted PR queue one PR
-# per `releasy run` / `releasy continue` invocation:
-#   1. The first invocation ports the earliest-merged PR, pushes it,
-#      opens a rebase PR, and exits.
-#   2. You review the PR; once CI is green you approve & merge it
-#      manually into target_branch.
-#   3. The next `releasy continue` checks GitHub: if the previous
-#      rebase PR was merged, it ports the next PR (created from the
-#      now-updated target_branch). If not yet merged, it exits with a
-#      non-zero status and changes nothing.
-#
-# Default: false (batch mode — every discovered PR is ported in one go).
-# Incompatible with `pr_sources.groups` in the session file (session
-# load will fail).
-# sequential: false
-
-# ── Conflict handling ───────────────────────────────────────────────
-# When a cherry-pick conflicts and the AI resolver is disabled or gives
-# up resolving it, the pipeline:
-# (A resolution that lands but fails RelEasy's deterministic build/tests is
-# a separate, resumable `build_failed` state — see `ai_resolve` below — not
-# a conflict.)
-#   * Singleton PR or first-of-group: aborts the cherry-pick, deletes the
-#     local port branch (it has no useful commits), records the entry as
-#     "Conflict" in the GitHub Project. No push, no PR.
-#   * Group with N>=1 successful prior picks: aborts the failed pick,
-#     pushes the branch as-is, opens a DRAFT PR labelled
-#     `ai-needs-attention` with a banner explaining what failed, and
-#     records "Conflict" in the GitHub Project. Remaining PRs in
-#     the group are not attempted.
-# Either way the pipeline keeps going with the next unit.
-
-# ── Existing-PR behaviour ───────────────────────────────────────────
-# When a PR for the port branch already exists on GitHub:
-#   false (default) — leave it exactly as-is. Don't try to create a new
-#                     one (avoids GitHub 422s) and don't touch its
-#                     title/body/labels. You can still edit the PR
-#                     manually on GitHub.
-#   true            — reuse the same PR but overwrite its title and body
-#                     with what releasy would have set (source-PR refs,
-#                     combined group body, ai-resolved prefix, …). Handy
-#                     when source PR descriptions changed or you tweaked
-#                     the body format and want the rebase PR to reflect
-#                     it.
-# update_existing_prs: false
-
-# ── Merged-port label (optional) ────────────────────────────────────
-# When set, releasy applies this label to the rebase (port) PR once it
-# has been merged into target_branch, and strips the same label from
-# every source PR the port was cherry-picked from. Useful for marking
-# "this PR has been ported into release X" with a single label that
-# moves automatically as ports land.
-#
-# Source-PR cleanup is best-effort and only touches PRs hosted on the
-# configured origin — source PRs on a different repo are skipped (RelEasy
-# never writes outside origin). The label is auto-created on origin the
-# first time a merged port is observed.
-#
-# Each tracked unit is processed exactly once: a per-feature flag on
-# the state file (`merged_label_applied`) prevents re-hitting GitHub on
-# every subsequent `releasy run`. Renaming the label here does NOT
-# auto-relabel previously-processed units.
-#
-# Requires push: true to take effect. Unset / empty disables the feature.
-# merged_label: port-antalya
-# merged_label_color: "8B5CF6"   # 6-hex color used when releasy creates
-#                                #   the label on origin (default: purple).
-
-# ── Work directory ──────────────────────────────────────────────────
-# Where to clone/find the origin repo for git operations.
-# If it points to an existing git repo, it will be reused (no clone).
-# If omitted, uses the current working directory.
-# Can also be overridden with --work-dir on the CLI.
-# work_dir: /path/to/ClickHouse
-
-# ── Session log (optional) ───────────────────────────────────────
-# Append a full transcript of the process (stdout and stderr: Rich
-# output, ``click`` messages, tracebacks) to a file for post-run
-# analysis. Setting this also records timestamped INFO-and-above
-# ``logging`` output (GitHub API side-effects, project-board changes,
-# dry-run decisions) that never reaches the terminal. Relative paths
-# resolve against the directory that contains this config file.
-# log_file: .releasy/releasy.log
-
-# ── Origin (required) ──────────────────────────────────────────────
-# The repo you work against. This is the only repo RelEasy tracks
-# as a configured remote.
 origin:
   remote: https://github.com/Altinity/ClickHouse.git
   remote_name: origin
 
-# ── Optional upstream remote (AI prerequisite detection only) ───────
-# Fetch-only remote the AI resolver may `git log -S <symbol>` against to
-# identify which upstream PR introduced a missing foundation. RelEasy
-# NEVER pushes here and never reads code from it for resolution — only
-# commit references. Auto-added to the local clone on demand.
-# upstream:
+target_branch: antalya-26.3         # base branch (must exist on origin); unset = derive from --onto
+
+# session_file: sessions/antalya-26.3.session.yaml   # default <config-dir>/<target_branch>.session.yaml
+# work_dir: /path/to/ClickHouse     # default: cwd
+# log_file: .releasy/releasy.log    # append transcript + INFO logs
+
+# ── Behaviour ───────────────────────────────────────────────────────
+# push: true                        # push branches and open PRs (default false)
+# sequential: false                 # one PR per run, gated on the previous merging
+# update_existing_prs: false        # overwrite title/body of an existing rebase PR
+# merged_label: port-antalya        # add on merged rebase PR, strip from source PRs
+# merged_label_color: "8B5CF6"
+
+# upstream:                         # fetch-only; prerequisite detection
 #   remote: https://github.com/ClickHouse/ClickHouse.git
 #   remote_name: upstream
 #   branch: master
 
-# ── Project & target branch ────────────────────────────────────────
-# Short project identifier — used to name port branches as
-#   feature/<base>/<feature-id>
-project: antalya
-
-# The base/target branch PRs are opened into. Two ways to set it:
-#
-#   1. Explicit (recommended): set 'target_branch' here. --onto becomes
-#      optional and you don't need a tag-based name derivation.
-#
-#   2. Derived: leave 'target_branch' unset and pass --onto <ref> on
-#      the CLI. The base branch is then '<project>-<version>', where
-#      <version> is parsed from --onto (e.g. v26.3.4.234-lts → 26.3,
-#      yielding 'antalya-26.3').
-#
-# The base branch must already exist on origin before running.
-target_branch: antalya-26.3
-
-# ── PR policy ──────────────────────────────────────────────────────
-# Policy knobs that apply to EVERY discovered unit (by_labels entries,
-# explicit include_prs, groups, …). These live here — not in the
-# session file — because they're stable infrastructure: what to do
-# with branches, when to retry, whether to open PRs. Edit the session
-# file to change *what* to port; edit pr_policy to change *how*.
-#
-# All values shown below are defaults; omit pr_policy entirely to
-# accept them all.
-#
 # pr_policy:
-#   if_exists: skip
-#     # When the port branch already exists locally AND no rebase PR has
-#     # been opened for it yet:
-#     # "skip"     (default) — leave the local branch alone; don't re-process.
-#     #                        Also: refuse to start if a cherry-pick / merge
-#     #                        / rebase is still in progress in the work dir.
-#     # "recreate"           — delete the local branch and rebuild from base.
-#     #                        Also: if a cherry-pick / merge / rebase is in
-#     #                        progress at startup, abort it and start fresh.
-#     # "append"             — cherry-pick any declared PRs that aren't on the
-#     #                        existing branch onto its tip and update the
-#     #                        rebase PR body to match the declared group
-#     #                        order. Use when you've added a PR to a group
-#     #                        that already shipped through a prior run and
-#     #                        you want to top up the existing branch / PR
-#     #                        rather than rebuild from scratch.
-#     #                        Detection uses the ``Source-PR:`` commit
-#     #                        trailers releasy writes; falls back to ``skip``
-#     #                        with a warning if the existing commits don't
-#     #                        match a prefix of the declared group.
-#     #                        Mostly for groups (singletons have one PR, so
-#     #                        there's nothing to top up). The remote-already-
-#     #                        exists safety lock is bypassed in this mode
-#     #                        since appending is the explicit user opt-in.
-#     #
-#     # ONCE A REBASE PR IS OPEN: if_exists no longer controls whether the
-#     # branch is rebuilt — it never is. `releasy run` switches to
-#     # merging origin/<base> into the PR branch (the same flow
-#     # `releasy refresh` uses): clean merge → leave PR alone, conflict →
-#     # AI-resolve and plain push. Pass --merge-target on the CLI to
-#     # push a fresh merge commit even on clean merges. The only setting
-#     # that still touches an open PR's branch directly is `append`,
-#     # which cherry-picks newly declared PRs on top.
-#     #
-#     # Note: if the branch already exists on the REMOTE without a tracked
-#     # rebase PR, it is ALWAYS skipped in "skip"/"recreate" modes (resolve
-#     # those manually so you don't clobber someone else's work).
-#     # Individual session entries (pr_sources.by_labels[] /
-#     # pr_sources.groups[]) can override this default per-entry with
-#     # their own if_exists.
-#   auto_pr: true
-#     # When true (the default), every pushed port branch gets a PR opened
-#     # against the base. Set to false to push branches only and open PRs
-#     # manually. Requires push: true to have any effect.
-#   retry_failed: true
-#     # When a PR unit has a `conflict` entry in state from a previous run:
-#     #   true (default) — process the unit again on this run, per the
-#     #                    unit's `if_exists` value (see above). For units
-#     #                    WITHOUT an open rebase PR, retry can rebuild
-#     #                    from base (`recreate`), append, or skip per
-#     #                    if_exists. For units WITH an open rebase PR,
-#     #                    retry routes through merge-target instead —
-#     #                    an open PR's history is never blown away.
-#     #   false          — leave the conflicted entry exactly as-is; no
-#     #                    cherry-pick, no PR side-effects.
-#     # CLI flag `--retry-failed / --no-retry-failed` overrides per-invocation.
-#   recreate_closed_prs: false
-#     # When true, if state has a rebase_pr_url and that GitHub PR is closed
-#     # (not merged), allocate `<canonical>-1`, `-2`, … for the port branch
-#     # name and cherry-pick + open a fresh PR. Off by default: a closed
-#     # rebase PR just leaves the branch skipped on subsequent runs.
-#   recreate_reverted_prs: false
-#     # Same renumbered-branch re-port, for an entry marked `reverted` by
-#     # `releasy mark-reverted` (the port merged, then was reverted on the
-#     # target branch). Its own knob, and off by default, because a revert
-#     # is a stronger signal than a closed PR: somebody read the landed
-#     # code and took it back out. Turn it on only where reverts are
-#     # routine churn rather than a verdict.
-#   detect_superseded: true
-#     # When true (default), the refresh / run sweeps scan the target
-#     # branch's recent git history AND open PRs targeting the same base
-#     # for `(cherry picked from commit <sha>)` footers citing any of our
-#     # tracked entries' source PRs. Matches mark the local entry as
-#     # `status: superseded` — no further cherry-pick attempts, no
-#     # monitoring. Disable to keep the old behaviour (releasy keeps
-#     # refreshing its own port regardless of parallel work).
-#   honor_stall_reasons: true
-#     # Skip a unit parked on a stall that cannot clear by itself: one
-#     # waiting for another unit's PR to merge, or on a prerequisite
-#     # nobody ports. Re-resolving those reaches the same verdict at
-#     # full token price. The stall is dropped — and the unit retried —
-#     # as soon as what it waits on changes. `run --ignore-stalls`
-#     # overrides it for a single run.
-#   max_partial_continue_attempts: 2
-#     # How many times `run` auto-resumes a partially-applied group. When a
-#     # prior run cherry-picked some of a group's PRs and then a conflict
-#     # (often an AI token/budget exhaustion) left a draft PR labelled
-#     # `ai-needs-attention`, the next run (with retry_failed on) appends
-#     # the not-yet-applied PRs and re-resolves — no need to set
-#     # `if_exists: append` by hand. After this many attempts it stops and
-#     # leaves the draft PR for manual help. 0 disables (old behaviour).
+#   if_exists: skip                 # skip | recreate | append (branch without a rebase PR)
+#   auto_pr: true                   # open a PR for each pushed branch
+#   retry_failed: true              # re-process `conflict` entries
+#   recreate_closed_prs: false      # re-port closed PRs on a renumbered branch
+#   recreate_reverted_prs: false    # same, for `reverted` entries
+#   detect_superseded: true         # mark ports already cherry-picked elsewhere
+#   honor_stall_reasons: true       # skip units stalled on something external
+#   max_partial_continue_attempts: 2  # resumes of a partially applied group; 0 disables
 
-# ── PR sources and features ─────────────────────────────────────────
-# These live in the session file, not here. Look for
-# `<target_branch>.session.yaml` next to this config (or wherever `session_file:`
-# above points). The session file is where you edit:
-#
-#   * `features:` — the static list of feature branches to rebase.
-#   * `pr_sources:` — label-based discovery, explicit include/exclude,
-#                     author filters, groups, etc.
-#
-# See the bundled session template for the full reference.
-
-# ── GitHub Project board ────────────────────────────────────────────
-# Sync branch status to a GitHub Project v2 board (optional).
-# Only active when push: true.
-#
-# One-time setup:
-#   1. Create a GitHub Project (or run: releasy setup-project)
-#   2. Copy the project URL below
-#   3. Ensure RELEASY_GITHUB_TOKEN has repo + project scopes
-#
-# Or auto-setup (creates project + Status field):
-#   releasy setup-project
-#
-# Each rebase gets its own view (tab) in the project, named after
-# the base branch (e.g. antalya-26.3). Cards are managed automatically.
+# ── GitHub Project board (needs push: true) ─────────────────────────
 notifications:
   github_project: https://github.com/orgs/Altinity/projects/1
+  # assignee_dev_options: ["Octo Cat"]  # options when the field is first created
+  # assignee_qa_options: ["Verified by Dev"]
+  # assignee_dev_login_map:         # GitHub login → Assignee Dev option
+  #   octocat: "Octo Cat"
 
-# ── Global AI model / effort (optional) ─────────────────────────────
-# Applied to EVERY AI invocation (conflict resolve, changelog,
-# review response, analyze-fails, graph). Leave unset to use the claude
-# CLI defaults.
-#   ai_model:  model alias or full id (e.g. opus, sonnet, claude-opus-4-8)
-#   ai_effort: low | medium | high | xhigh | max
-# ai_model: opus
-# ai_effort: high
+# ── AI: shared ──────────────────────────────────────────────────────
+# ai_backend: cli                   # cli | codex | api
+# ai_model: opus                    # every AI call; ignored by codex
+# ai_effort: high                   # low | medium | high | xhigh | max
 
-# ── AI backend (optional) ───────────────────────────────────────────
-# How every AI invocation reaches the model:
-#   cli (default) — spawn the agent binary (`<section>.command`, i.e.
-#                   `claude -p …`) and use whatever it is logged in with.
-#   codex         — spawn `codex exec` and use whatever it is logged in
-#                   with (e.g. ChatGPT subscription). Ignores ai_model /
-#                   ai_effort and each section's command / extra_args.
-#   api           — talk to the Anthropic API directly with a token; no
-#                   subprocess, RelEasy runs the tool calls itself.
-#                   Needs: export ANTHROPIC_API_KEY=sk-ant-...
-# allowed_tools / timeout_seconds / api_retries / the session-exhaustion
-# wait all still apply in api mode; `command` and `extra_args` don't.
-# ai_backend: api
-# ai_api:
-#   api_key_env: ANTHROPIC_API_KEY   # env var holding the token
-#   # api_key: sk-ant-...            # inline (env var wins; prefer the env)
-#   # base_url: https://my-gateway    # gateway / proxy
-#   model: claude-opus-5             # overrides ai_model
-#   max_tokens: 64000                # output cap per response
-#   max_turns: 300                   # cap on model round-trips per run
-#   thinking: true                   # adaptive extended thinking
-#   max_retries: 5                   # SDK retries for 429 / 5xx
+# ai_api:                           # ai_backend: api
+#   api_key_env: ANTHROPIC_API_KEY
+#   # api_key: sk-ant-...           # used only if the env var is unset
+#   # base_url: https://my-gateway
+#   model: claude-opus-5            # overrides ai_model
+#   max_tokens: 64000
+#   max_turns: 300
+#   thinking: true
+#   max_retries: 5
 #   request_timeout_seconds: 1800
-#   bash_timeout_seconds: 3600       # per Bash tool call
-#   tool_output_max_chars: 30000     # tool results truncated past this
-#   # system_prompt_extra: "Project-specific guidance for the agent."
-#
-# ai_backend: codex
-# ai_codex:
-#   command: codex
-#   model: gpt-5.5                   # unset = codex's config default
-#   reasoning_effort: high           # -c model_reasoning_effort=...
-#   extra_args: []                   # extra `codex exec` flags
+#   bash_timeout_seconds: 3600
+#   tool_output_max_chars: 30000
+#   # system_prompt_extra: "Project-specific guidance."
 
-# ── AI conflict resolver (Claude) ───────────────────────────────────
-# Optional. When enabled, releasy invokes `claude` to resolve cherry-
-# pick conflicts and commit. By default (`deterministic_build: true`)
-# Claude resolves ONLY — releasy then builds the result itself and runs
-# the PR's tests, looping fresh-context build fixes (see the
-# deterministic-build knobs below). If Claude prints UNRESOLVED or fails
-# to resolve, releasy treats the unit as "Conflict"; if the resolution
-# builds/tests cleanly it opens the PR; otherwise it parks the local
-# branch as `build_failed` and retries on the next `releasy run`.
-#
+# ai_codex:                         # ai_backend: codex
+#   command: codex
+#   model: gpt-5.5
+#   reasoning_effort: high
+#   extra_args: []
+
+# ── AI conflict resolver ────────────────────────────────────────────
 # ai_resolve:
 #   enabled: false
 #   command: claude
-#   prompt_file: prompts/resolve_conflict.md
-#   # Prompt template used by `releasy refresh` when Claude has to
-#   # drive a `git merge` to completion (keeping an open rebase PR
-#   # current with its target branch). Same placeholder vocabulary as
-#   # prompt_file; the difference is the in-progress operation
-#   # (merge vs cherry-pick) and how to conclude it.
-#   merge_prompt_file: prompts/resolve_merge_conflict.md
-#   # Record the conflict and its resolution as TWO commits (raw
-#   # conflict state, then the fix) for clearer history, using a
-#   # dedicated prompt. Set false for a single squashed resolution.
-#   split_conflict_commit: true
-#   split_prompt_file: prompts/resolve_conflict_split.md
-#   # Legacy single-session cap on build attempts Claude makes per
-#   # conflict (only used when `deterministic_build: false`).
-#   max_iterations: 5
-#   # Consecutive runs that may re-resolve a unit whose last resolution
-#   # reached a dead end (resolver gave up, or the prereq dive ran out of
-#   # road); the unit is parked once they are spent. 0: no cap.
-#   max_dead_end_attempts: 2
+#   # allowed_tools: [Read, Edit, Write, Glob, Grep, "Bash(git:*)"]
+#   # extra_args: []
 #   timeout_seconds: 7200
 #   build_command: cd build && ninja
-#   # --- Deterministic build/test split (default) ---
-#   # true: Claude resolves only; RelEasy builds `build_command` itself and,
-#   # on failure, loops fresh-context build fixes (up to max_build_attempts),
-#   # then runs the PR's tests. Failures park on a local branch (build_failed,
-#   # no PR) and resume next `releasy run`. false: legacy resolve+build.
-#   deterministic_build: true
-#   max_build_attempts: 5             # consecutive build-fix attempts per run
-#   max_verify_resume_attempts: 2     # cross-run resumes of build_failed; 0 disables
-#   max_resume_base_drift: 50         # re-port instead of resuming a branch this
-#                                     # far behind base; 0 disables the check
-#   max_verify_iterations: 12         # cap on build↔test iterations per pass
-#   build_log_tail_lines: 500         # log tail fed to the fix-build prompt
-#   build_timeout_seconds: 7200       # cap for one build subprocess
-#   run_pr_tests: true                # run the PR's own tests after a green build
-#   # Globs marking a changed file as a runnable test (run-tests reuses
-#   # analyze_fails.allowed_tools). Defaults shown; override per project.
+#   deterministic_build: true       # AI resolves; RelEasy builds + runs tests
+#   max_build_attempts: 5
+#   max_verify_resume_attempts: 2   # 0 disables resuming build_failed branches
+#   max_resume_base_drift: 50       # 0 disables
+#   max_verify_iterations: 12
+#   build_log_tail_lines: 500
+#   build_timeout_seconds: 7200
+#   run_pr_tests: true
 #   test_file_globs:
 #     - "tests/queries/**"
 #     - "tests/integration/**"
@@ -396,204 +94,98 @@ notifications:
 #     - "**/gtest_*"
 #     - "**/*_test.cpp"
 #   test_timeout_seconds: 3600
-#   # Prompt templates for the split flow.
+#   max_iterations: 5               # only with deterministic_build: false
+#   max_dead_end_attempts: 2        # 0 = no cap
+#   split_conflict_commit: true
+#   prompt_file: prompts/resolve_conflict.md
+#   merge_prompt_file: prompts/resolve_merge_conflict.md
+#   split_prompt_file: prompts/resolve_conflict_split.md
 #   resolve_only_prompt_file: prompts/resolve_conflict_nobuild.md
 #   fix_build_prompt_file: prompts/fix_build.md
 #   run_tests_prompt_file: prompts/run_tests.md
-#   # Label automatically applied to PRs whose conflicts Claude
-#   # resolved cleanly.
-#   label: ai-resolved
-#   label_color: "8B5CF6"
-#   # Label applied to DRAFT PRs released by partial-group failures
-#   # (singleton failures don't get a PR — the local branch is dropped).
-#   needs_attention_label: ai-needs-attention
-#   needs_attention_label_color: "D93F0B"
-#   # How many times to re-invoke Claude when the Anthropic streaming
-#   # API drops the turn with a transient error (idle timeout, overload,
-#   # connection reset, …). Each retry is a fresh turn — independent of
-#   # `max_iterations`.
 #   api_retries: 3
 #   api_retry_backoff_seconds: 15
-#   # On an exhausted Claude session, poll + re-prompt instead of failing,
-#   # until the session resets or the wait cap elapses. Applies to every
-#   # Claude call; Ctrl-C aborts. (The CLI's "monthly spend limit · run
-#   # /usage-credits" wording is still a session reset, not a billing cap.)
-#   # false ⇒ fail fast.
 #   wait_on_session_exhaustion: true
 #   session_exhaustion_max_wait_hours: 60
 #   session_exhaustion_poll_minutes: 30
-#   # Extra regexes (OR-ed with the built-ins) for a limit wording not caught:
-#   # session_exhaustion_extra_patterns:
-#   #   - "your balance is too low"
-#   # When a resolution lands but trips a *content-correctable*
-#   # postcondition — today only the append-only
-#   # SettingsChangesHistory.cpp whitelist (extra setting rows swept in
-#   # from "ours") — hand the exact error back to Claude this many times
-#   # to trim the offending file in place (amend), instead of discarding
-#   # the whole resolution. 0 = old fail-and-reset behaviour.
+#   # session_exhaustion_extra_patterns: ["your balance is too low"]
 #   postcondition_retries: 2
-#   # What happens when those passes are spent and the check STILL fails.
-#   # true (default): keep the resolution, push it, and flag it on the PR
-#   # (warning comment + verify_label) — everything but that one registry
-#   # file is fine, so a human reviews a diff instead of redoing the
-#   # conflict. false: discard the resolution and reset (old behaviour).
 #   warn_on_unfixed_postconditions: true
-#   # When a conflict is identified as a MISSING PREREQUISITE (an
-#   # upstream PR the target lacks), optionally pull that prerequisite
-#   # PR in automatically before retrying. Accepts a bool (sugar) or
-#   # the mapping below. max_prereq_depth caps the recursive dive.
-#   auto_add_prerequisite_prs:
+#   auto_add_prerequisite_prs:      # or a bool
 #     enabled: false
 #     max_prereq_depth: 7
-#     # When a discovered prereq lives in the origin repo AND the PR that
-#     # needs it is also in origin, require the prereq to carry the
-#     # configured selection labels (match a pr_sources.by_labels entry,
-#     # no exclude_labels) — the same labels our own discovery selects on.
-#     # An in-origin prereq without them is out of scope: the dive aborts
-#     # (detection-only) and you must label it or list it in include_prs.
-#     # Only reached when no unit already carries the prereq — one brought
-#     # in by some unit's combined port waits for that unit instead.
-#     # Cross-repo prereqs (forward-port / backport sources) are never
-#     # gated. No-op when no by_labels selection is configured. Default true.
 #     require_origin_prereq_label: true
-#   # Post-resolve verifier: a read-only second AI pass auditing the
-#   # resolution. Findings → `verify_label` + PR comment. Never rolls
-#   # back. Roughly doubles AI cost on conflicted PRs.
-#   verify_resolution: false
+#   verify_resolution: false        # read-only audit of each resolution
 #   verify_prompt_file: prompts/verify_resolution.md
-#   verify_timeout_seconds: 1800        # read-only, no build
+#   verify_timeout_seconds: 1800
+#   label: ai-resolved
+#   label_color: "8B5CF6"
+#   needs_attention_label: ai-needs-attention
+#   needs_attention_label_color: "D93F0B"
+#   missing_prereqs_label: missing-prerequisites
+#   missing_prereqs_label_color: "E4E669"
+#   auto_prereq_label: auto-prereq-added
+#   auto_prereq_label_color: "0E8A16"
 #   verify_label: ai-needs-verify
 #   verify_label_color: "FBCA04"
 
-# ── AI changelog entry synthesis (Claude) ────────────────────────────
-# Optional. When enabled, multi-PR groups get a single user-facing
-# CHANGELOG entry composed by Claude based on the constituent PRs'
-# titles + bodies. Singletons (one PR per port branch) ALWAYS reuse
-# the source PR's `Changelog entry` verbatim — Claude is never invoked
-# in that case, so the singleton flow has zero API cost.
-#
-# The synthesizer is told to:
-#   - drop intermediate fix-ups inside the group (B fixes a bug A
-#     introduced earlier in the same group → the user never saw the
-#     bug, so it doesn't belong in the changelog),
-#   - drop refactors / internal cleanup with no user-visible effect,
-#   - keep the entry to one or two terse, imperative-present-tense
-#     sentences matching typical CHANGELOG.md tone.
-#
-# Failures are non-fatal: the per-PR fallback (first-PR-in-group's own
-# changelog entry) is used and a warning is logged.
-#
+# ── AI changelog for multi-PR groups ────────────────────────────────
 # ai_changelog:
 #   enabled: false
 #   command: claude
 #   prompt_file: prompts/synthesize_changelog.md
 #   timeout_seconds: 300
-#   # Per-PR body trimmed to this many characters before being inlined
-#   # into the prompt (keeps payloads bounded for chatty source PRs).
 #   max_pr_body_chars: 3000
 
-# ─────────────────────────────────────────────────────────────────────
-# REVIEW RESPONSE (`releasy refresh --address-review`)
-#
-# Reads review comments left on a PR and lets the AI make code
-# changes addressing the feedback. Triggered by `refresh
-# --address-review`. Off by default because it spends Anthropic tokens
-# and writes to your PR branch.
-#
-# Trust gate: comments are filtered to "trusted authors" BEFORE the AI
-# sees them — untrusted commenters cannot smuggle instructions into the
-# run. Two additive sources:
-#
-#   * `trusted_associations` (default OWNER, MEMBER, COLLABORATOR,
-#     CONTRIBUTOR) — GitHub's per-comment `author_association` field,
-#     set server-side when the comment is posted. Anyone with a real
-#     relationship to the repo (owner, org member, explicit
-#     collaborator, or a prior code contributor) passes automatically.
-#     Tighten or widen as you like.
-#   * `trusted_reviewers` — extra logins to trust regardless of their
-#     association (e.g. an external reviewer you want to whitelist).
-#
-# Both empty → the run refuses (no trust signal at all).
-#
-# Linear history is a hard rule: the AI only appends commits (it uses
-# `git revert` to retract anything, never amend / rebase / reset).
-# RelEasy pushes with plain `git push` at the end.
-#
+# ── Review response (refresh --address-review) ──────────────────────
 # review_response:
-#   trusted_associations:
-#     - OWNER
-#     - MEMBER
-#     - COLLABORATOR
-#     - CONTRIBUTOR
-#   trusted_reviewers:
-#     - alice
-#     - bob
-#   # Reply in-thread (with a bot footer) on every comment classified as
-#   # non-actionable. Set to false for a silent run that only reports
-#   # via the AI's terminal narration.
+#   trusted_associations: [OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR]
+#   trusted_reviewers: [alice]      # extra trusted logins
 #   reply_to_non_addressable: true
-#   # Optional: post one extra top-level summary comment on the PR
-#   # describing what was done (distinct from per-comment replies).
 #   post_summary_comment: false
-#   # Advanced overrides — the defaults below are already sensible.
-#   # command: claude
-#   # prompt_file: prompts/address_review.md
-#   # max_iterations: 15
-#   # timeout_seconds: 7200
+#   command: claude
+#   prompt_file: prompts/address_review.md
+#   max_iterations: 15
+#   timeout_seconds: 7200
+#   # allowed_tools: [Read, Edit, "Bash(git:*)"]
+#   # extra_args: []
 
-# ─────────────────────────────────────────────────────────────────────
-# DEPENDENCY GRAPH  (`releasy graph discover` / `graph update` / `graph sync`)
-#
-# All optional; defaults are sensible.
+# ── CI triage (analyze-fails / refresh --analyze-fails) ─────────────
+# analyze_fails:
+#   categories: []                  # empty = all failed checks
+#   job_level_failures: true
+#   baseline_check: true
+#   baseline_scan_commits: 25
+#   verify_outcome: true
+#   max_investigation_rounds: 2
+#   verify_prompt_file: prompts/verify_analysis.md
+#   verify_timeout_seconds: 1800
+#   verify_label: ai-needs-verify
+#   verify_label_color: "FBCA04"
+#   command: claude
+#   prompt_file: prompts/analyze_fails.md
+#   timeout_seconds: 7200
+#   max_iterations: 6
+#   max_prs_per_run: 0              # 0 = no cap
+#   flaky_elsewhere_threshold: 2    # 0 disables
+#   flaky_check_prs: 12
+#   post_comment_to_pr: true
+#   # allowed_tools:                # {work_dir} resolves to the repo path
+#   #   - Read
+#   #   - Bash(git:*)
+#   #   - Bash({work_dir}/build/programs/clickhouse:*)
+#   # extra_args: []
+
+# ── Dependency graph (graph discover / update / sync) ───────────────
 # graph:
-#   # author_association values whose comments graph update feeds to Claude
-#   # (GitHub-set, unforgeable). Tighten to ["MEMBER"] for org-only.
 #   trusted_associations: [OWNER, MEMBER, COLLABORATOR]
-#   # Extra trusted GitHub logins, additive.
 #   trusted_reviewers: [alice]
-#   issue_labels: [releasy]         # + the target-branch name; created if missing
-#   post_comment: true              # summary comment after each update
-#   sync_progress: true             # refresh issue checkboxes after run / refresh
-#   apply_exclusions: true          # enforce vetoes via exclude_prs
-#   minimize_addressed_comments: true  # collapse addressed comments as Outdated
-#   # command: claude
-#   # prompt_file: prompts/adjust_graph.md
-#   # timeout_seconds: 7200
-
-# ─────────────────────────────────────────────────────────────────────
-# WORKFLOW
-#
-# The base branch must already exist on origin. The pipeline then ports
-# each discovered PR / feature onto it:
-#
-#   releasy run --onto v26.3.4.234-lts   # (or just: releasy run, when
-#                                        #  target_branch is set above)
-#   → creates "feature/antalya-26.3/<id>" for each PR / feature
-#   → opens PRs into antalya-26.3 (if push + pr_policy.auto_pr)
-#
-# On unresolved conflict:
-#   * Singleton / first-of-group: nothing local survives — the entry is
-#     marked "Conflict" in the GitHub Project. Resolve manually
-#     in the source PR and re-run releasy.
-#   * Partial group: a draft PR is opened, labelled `ai-needs-attention`.
-#     Fix the conflict on that branch, push, mark the PR ready.
-#
-# The pipeline never stalls on a single bad unit anymore — it just
-# flags it and moves on.
-#
-# Once a batch of rebase PRs is open, the target branch keeps moving as
-# other work lands. Some PRs will eventually conflict with the new tip:
-#
-#   releasy refresh
-#   → strictly maintenance: never opens new PRs, never creates new
-#     branches, never discovers new sources. Only refreshes entries
-#     already in the per-project state file.
-#   → for each tracked PR with a branch + rebase PR URL:
-#       fetch latest tips, attempt `git merge --no-ff origin/<base>`
-#       into the PR branch. Clean merge: leave the PR alone. Conflict
-#       + AI resolves: push the resolved merge commit. Conflict + AI
-#       gives up: abort the merge, reset, mark the entry "Conflict".
-#   → uses `ai_resolve.merge_prompt_file` (same machinery as cherry-pick
-#     resolution; different in-progress operation and prompt framing).
-#   → exits 1 if any PR ended up in conflict — suitable for cron / CI.
-# ─────────────────────────────────────────────────────────────────────
+#   issue_labels: [releasy]         # target-branch name is always added
+#   post_comment: true
+#   sync_progress: true             # graph sync after run / refresh
+#   apply_exclusions: true          # vetoes → exclude_prs
+#   minimize_addressed_comments: true
+#   command: claude
+#   prompt_file: prompts/adjust_graph.md
+#   timeout_seconds: 7200
+#   # extra_args: []

@@ -1,13 +1,4 @@
-"""Port-cherry-pick pipeline.
-
-Assumes the base branch (e.g. ``antalya-26.3``) already exists on origin.
-For each source PR discovered via configured labels, the pipeline creates a
-port branch off ``origin/<base_branch>``, cherry-picks the PR merge commit,
-and on conflict either invokes the AI resolver or — if the resolver is
-disabled or fails — drops the local branch (singletons / first-of-group)
-or opens a draft PR labelled ``ai-needs-attention`` (partial groups), then
-records the entry as ``Conflict`` in the GitHub Project.
-"""
+"""Port pipeline: cherry-pick source PRs onto port branches off the base branch and open port PRs."""
 
 from __future__ import annotations
 
@@ -15,11 +6,12 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from releasy.termlog import console
 
 from releasy.config import (
-    Config, FeatureConfig, PortMode, PRGroupConfig, PRSourceConfig,
+    Config, FeatureConfig, PortMode, PRSourceConfig,
 )
 from releasy.git_ops import (
     OperationResult,
@@ -27,7 +19,6 @@ from releasy.git_ops import (
     append_commit_trailer,
     branch_exists,
     ensure_remote,
-    is_ancestor,
     local_branch_exists,
     remote_branch_exists,
     cherry_pick_merge_commit,
@@ -39,7 +30,6 @@ from releasy.git_ops import (
     fetch_remote,
     force_push,
     is_operation_in_progress,
-    ref_exists_locally,
     run_git,
     stash_and_clean,
     update_submodules,
@@ -63,6 +53,7 @@ from releasy.github_ops import (
     pr_ref_label,
     remove_label_from_pr,
     require_origin_repo_slug,
+    same_pr_url,
     search_prs_by_labels,
     slug_to_https_url,
     sync_project,
@@ -82,14 +73,12 @@ from releasy.state import (
     save_state,
 )
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+if TYPE_CHECKING:
+    from releasy.build_verify import VerifyResult
 
 
 def _persist_state(config: Config, state: PipelineState) -> None:
-    """Persist state to the per-project state file and (optionally) sync the project board."""
+    """Save state and, when pushing, sync the project board."""
     if config.dry_run:
         return
     save_state(state, config)
@@ -98,13 +87,7 @@ def _persist_state(config: Config, state: PipelineState) -> None:
 
 
 def _dry_record(state: PipelineState, action: str) -> None:
-    """Increment a dry-run action counter on ``state``.
-
-    Counts are populated only when ``run_pipeline`` is invoked with
-    ``config.dry_run`` (it seeds ``state._dry_run_actions``); otherwise
-    this is a no-op. ``run_pipeline`` reads them back at the end to
-    print a planned-actions summary.
-    """
+    """Count a planned dry-run action (no-op unless ``run_pipeline`` seeded ``state._dry_run_actions``)."""
     counts = getattr(state, "_dry_run_actions", None)
     if counts is not None:
         counts[action] = counts.get(action, 0) + 1
@@ -113,13 +96,7 @@ def _dry_record(state: PipelineState, action: str) -> None:
 def _setup_repo(
     config: Config, work_dir: Path | None, base_branch: str | None = None,
 ) -> Path:
-    """Set up work repo and fetch origin. The ``onto`` argument is used
-    only for branch naming.
-
-    If the repo was just cloned and ``base_branch`` is provided, check it
-    out from origin and initialise submodules — saves the user (and Claude)
-    from doing it manually before the first build.
-    """
+    """Set up the work repo and fetch origin; on a fresh clone, check out ``base_branch`` and init submodules."""
     wd = config.resolve_work_dir(work_dir)
     console.print(f"[dim]Working directory: {wd}[/dim]")
 
@@ -152,92 +129,44 @@ def _setup_repo(
 
 
 def _push(config: Config, repo_path: Path, branch: str) -> None:
-    """Push a branch to the origin remote (the only push path we use)."""
     force_push(repo_path, branch, config)
-
-
-# ---------------------------------------------------------------------------
-# Feature units (singletons + sequential PR groups)
-# ---------------------------------------------------------------------------
 
 
 @dataclass
 class FeatureUnit:
-    """A logical unit of porting work — one PR or a sequential group.
-
-    For singletons, ``prs`` contains exactly one ``PRInfo``. For groups,
-    ``prs`` are listed in cherry-pick order.
-    """
+    """One PR or a sequential group of PRs (in cherry-pick order) ported together."""
     feature_id: str
     prs: list[PRInfo]
     if_exists: str
-    title_prefix: str = ""        # used for both single-PR and group titles
+    title_prefix: str = ""
     is_group: bool = False
-    group_id: str | None = None   # filled when is_group
-    # True when this group came from the deps_file overlay (``graph
-    # discover`` owns the entry) rather than a hand-curated
-    # ``pr_sources.groups`` entry. Kept distinct so re-reading the overlay
-    # doesn't promote an auto group to user-declared — see
-    # ``dag_discovery._CandidateUnit.is_user_group``.
+    group_id: str | None = None
+    # Group comes from the deps_file overlay rather than ``pr_sources.groups``.
     auto_discovered: bool = False
-    # Free-form note appended to the AI conflict-resolver prompt for
-    # every cherry-pick step in this unit. Populated from the matching
-    # ``pr_sources.by_labels[].ai_context`` (singletons) or
-    # ``pr_sources.groups[].ai_context`` (groups). Empty string when the
-    # user supplied none.
+    # Extra note for the AI conflict-resolver prompt (from by_labels/groups ``ai_context``).
     ai_context: str = ""
-    # Per-PR ai_context for entries inside ``include_prs`` /
-    # ``pr_sources.groups[].prs`` that used the dict form. Keyed by PR
-    # URL. Combined with ``ai_context`` above when a step's source PR
-    # has a matching entry.
+    # PR URL → per-PR ai_context, combined with ``ai_context``.
     per_pr_ai_context: dict[str, str] = field(default_factory=dict)
-    # Why this unit is parked by ``pr_sources.on_hold`` — the recorded
-    # reason, or ``""`` when the hold carries none. ``None`` means the unit
-    # is not held. ``releasy run`` skips a held unit; discovery still
-    # analyses it so it keeps its place (and its edges) in the graph.
+    # ``pr_sources.on_hold`` reason (``""`` if none); ``None`` = not held.
     hold_reason: str | None = None
-    # Mutable per-run bookkeeping (set by _process_feature_unit):
+    # Per-run bookkeeping set by _process_feature_unit.
     ai_resolved_count: int = 0
     ai_iterations_total: int = 0
-    # Sum of USD cost reported by Claude across every cherry-pick step
-    # in this unit (groups accumulate; singletons hit at most one step).
-    # Also includes the changelog-synthesis cost when ``ai_changelog``
-    # is enabled. ``None`` until Claude reports a cost at least once —
-    # keeps downstream code able to distinguish "AI ran but produced no
-    # cost data" (None) from "AI ran and the bill was 0.0".
+    # Summed Claude cost (incl. changelog synthesis); ``None`` until a cost is reported.
     ai_cost_usd_total: float | None = None
-    # Post-resolve verifier outcome (only set when verify_resolution is on).
     verify_needs_attention: bool = False
     verify_findings: list[str] = field(default_factory=list)
     # Detected from the primary PR; groups are assumed homogeneous.
     mode: PortMode = "forward_port"
-    # Cached AI-synthesized CHANGELOG entry for multi-PR groups. Filled
-    # by :func:`_maybe_synthesize_changelog` once per run and read by
-    # :func:`_build_changelog_block`. ``None`` means "use the source
-    # PRs' own entries" (singletons, ai_changelog disabled, or a
-    # synthesis failure).
+    # AI-synthesized CHANGELOG entry; ``None`` = use the source PRs' own entries.
     synthesized_changelog: str | None = None
-    # Set of source-PR URLs already present on the existing port branch
-    # (read from ``Source-PR:`` commit trailers) when running with
-    # ``if_exists: append``. The cherry-pick loop skips PRs whose URL
-    # appears here, while ``_unit_body`` still iterates the full
-    # ``prs`` list — so the rebase PR description reflects the declared
-    # group order regardless of whether a given PR was applied on this
-    # run or a prior one.
+    # Source-PR URLs already on the existing port branch (``if_exists: append``).
     applied_pr_urls: set[str] = field(default_factory=set)
-    # When ``releasy run`` auto-resumes a partially-applied group, the
-    # number of auto-continue attempts INCLUDING this run. Carried into the
-    # next ``conflict`` state by :func:`_handle_unresolved_conflict` so the
-    # ``pr_policy.max_partial_continue_attempts`` cap is enforced across runs.
+    # Auto-continue attempts including this run, for ``max_partial_continue_attempts``.
     partial_continue_attempts: int = 0
-    # Other unit IDs this unit depends on. Populated from
-    # :class:`PRGroupConfig.depends_on` for group units (singletons can
-    # only carry deps via single-PR groups in the deps_file overlay).
-    # Processing order is topologically sorted on this field; processing
-    # gates on every entry having ``status: merged`` in target.
+    # Unit IDs that must be merged in target before this unit is processed.
     depends_on: list[str] = field(default_factory=list)
-    # Port branch to use instead of the canonical one. Set by
-    # :func:`_reset_unit_for_redo` (``releasy run --redo``).
+    # Overrides the canonical port branch (``releasy run --redo``).
     port_branch: str | None = None
 
     @property
@@ -256,25 +185,7 @@ PRRef = tuple[str, str, int]
 
 @dataclass
 class OnlyFilter:
-    """``--only`` / ``--pr`` filter: scope an action to a single PR / group / feature.
-
-    Built from either ``--only <URL|id>`` or ``--pr <URL>``. The
-    name is matched against group IDs (``pr_sources.groups[].id``) and
-    singleton feature IDs (``pr-<N>``, ``<owner>-<repo>-pr-<N>``). URLs
-    are parsed into a ``(owner, repo, number)`` tuple so cross-repo
-    sources can't collide with same-numbered origin PRs.
-
-    ``soft`` distinguishes the two CLI sources:
-
-      * ``--only`` (soft=False) — user intent is "I know this exists,
-        run it"; if nothing matches, the command exits non-zero so a
-        typo doesn't fail silently.
-      * ``--pr``   (soft=True)  — user intent is "if this PR is in our
-        scope, act on it; otherwise do nothing"; designed for
-        webhook / cron callers that don't know in advance whether
-        the PR belongs to this project. A no-match exits cleanly with
-        a "not in scope" notice.
-    """
+    """``--only`` / ``--pr`` filter by PR ref or group/feature ID; ``soft`` (``--pr``) makes no-match a clean exit."""
     raw: str
     pr_ref: PRRef | None
     name: str | None
@@ -304,12 +215,7 @@ class OnlyFilter:
 
 
 def parse_only(only: str | None) -> OnlyFilter | None:
-    """Parse a ``--only`` argument into an :class:`OnlyFilter`.
-
-    Returns ``None`` when the flag was not given. A value that looks
-    like a GitHub PR URL is parsed to ``(owner, repo, number)``;
-    anything else is taken as a group / feature ID.
-    """
+    """Parse ``--only`` as a PR URL or a group / feature ID."""
     if not only:
         return None
     only = only.strip()
@@ -319,8 +225,6 @@ def parse_only(only: str | None) -> OnlyFilter | None:
     if parsed is not None:
         return OnlyFilter(raw=only, pr_ref=parsed, name=None)
     if only.startswith(("http://", "https://")):
-        # Looks like a URL but didn't parse as a PR URL — better to
-        # surface this clearly than silently treat it as a group name.
         raise ValueError(
             f"--only={only!r} looks like a URL but isn't a "
             "https://github.com/<owner>/<repo>/pull/<N> link."
@@ -329,14 +233,7 @@ def parse_only(only: str | None) -> OnlyFilter | None:
 
 
 def parse_pr_url_filter(pr: str | None) -> OnlyFilter | None:
-    """Parse a ``--pr <URL>`` argument into a soft :class:`OnlyFilter`.
-
-    URL-only counterpart to :func:`parse_only`: the user is filtering
-    by PR identity, so we require a real PR URL and never fall through
-    to the name path. ``soft=True`` so no-match exits cleanly — the
-    caller's intent is "act on this PR if you can, otherwise quietly
-    skip", not "fail if it's missing".
-    """
+    """Parse ``--pr <URL>`` into a soft :class:`OnlyFilter`."""
     if not pr:
         return None
     raw = pr.strip()
@@ -357,9 +254,7 @@ def _detect_port_mode(
     *,
     explicit_mode: str = "auto",
 ) -> PortMode:
-    """Detection ladder: explicit override → forward_port_labels →
-    cross-origin → upstream-configured → forward_port default.
-    """
+    """Explicit override → forward_port_labels → cross-origin → upstream configured → forward_port."""
     if explicit_mode in ("backport", "forward_port"):
         return explicit_mode
 
@@ -383,13 +278,7 @@ def _detect_port_mode(
 
 
 def _singleton_feature_id(pr: PRInfo, origin_slug: str | None) -> str:
-    """Branch / state ID for a single-PR port.
-
-    Origin PRs keep the historical short ``pr-<N>`` form so existing state
-    files and branches keep working. PRs from other repos get a slug-prefixed
-    ID (``<owner>-<repo>-pr-<N>``) so a same-numbered origin PR can't clash
-    with them.
-    """
+    """``pr-<N>`` for origin PRs, ``<owner>-<repo>-pr-<N>`` for other repos."""
     if origin_slug and pr.repo_slug == origin_slug:
         return f"pr-{pr.number}"
     owner, repo = pr.repo_slug.split("/", 1)
@@ -397,12 +286,7 @@ def _singleton_feature_id(pr: PRInfo, origin_slug: str | None) -> str:
 
 
 def hold_map(config: Config) -> dict[PRRef, str]:
-    """``pr_sources.on_hold`` as canonical PR ref → recorded reason.
-
-    Keyed by ``(owner, repo, number)`` so a URL written with a ``.git``
-    suffix or a trailing path still matches. Unparseable entries are
-    dropped. A held PR with no recorded reason maps to ``""``.
-    """
+    """``pr_sources.on_hold`` as PR ref → reason (``""`` if none); unparseable URLs dropped."""
     out: dict[PRRef, str] = {}
     reasons = config.pr_sources.on_hold_reasons
     for url in config.pr_sources.on_hold:
@@ -415,13 +299,7 @@ def hold_map(config: Config) -> dict[PRRef, str]:
 def _unit_hold_reason(
     unit: "FeatureUnit", holds: dict[PRRef, str],
 ) -> str | None:
-    """The hold parking ``unit``, or ``None``. Holding any PR of a group
-    holds the whole group: its members cherry-pick as one atomic unit, so
-    porting the rest without the held one would ship a broken subset.
-
-    Several held PRs in one group → the reasons are joined, so the graph
-    issue names every hold the unit is waiting on.
-    """
+    """Joined hold reasons of ``unit``'s PRs, or ``None``; one held PR holds the whole group."""
     reasons = [
         holds[ref] for pr in unit.prs
         if (ref := pr.ref()) in holds
@@ -436,13 +314,7 @@ def _author_filter_reason(
     included_authors: set[str],
     excluded_authors: set[str],
 ) -> str | None:
-    """Return a human-readable reason to drop a PR by author, or ``None``
-    if the PR survives the author filter.
-
-    ``included_authors`` and ``excluded_authors`` are lower-cased GitHub
-    logins. When ``included_authors`` is non-empty it's an allowlist:
-    PRs whose author is unknown or not on the list are dropped.
-    """
+    """Reason to drop a PR by author, or ``None``; a non-empty ``included_authors`` is an allowlist."""
     login = (author or "").lower()
     if excluded_authors and login and login in excluded_authors:
         return f"author @{author} is in pr_sources.exclude_authors"
@@ -466,11 +338,6 @@ def _build_singleton_units(
     origin_slug = get_origin_repo_slug(config)
     include_pr_contexts = config.pr_sources.include_pr_contexts
     for pr, src in collected.values():
-        # Singletons get the matching by_labels entry's ai_context as
-        # unit-level context. include_prs entries use the per-PR dict
-        # form, which is keyed by URL — promote it to unit-level for the
-        # singleton (only one cherry-pick step, so the distinction is
-        # cosmetic).
         unit_ai_context = src.ai_context or include_pr_contexts.get(pr.url, "")
         units.append(FeatureUnit(
             feature_id=_singleton_feature_id(pr, origin_slug),
@@ -490,14 +357,7 @@ def _build_group_units(
     included_authors: set[str],
     excluded_authors: set[str],
 ) -> tuple[list[FeatureUnit], set[PRRef]]:
-    """Materialise group units, fetching each PR. Returns (units, claimed_refs)
-    where ``claimed_refs`` are ``(owner, repo, number)`` tuples that should
-    NOT also appear as standalone units.
-
-    ``included_authors`` and ``excluded_authors`` are lower-cased GitHub
-    logins; they filter group members the same way they filter top-level
-    discovered PRs.
-    """
+    """Materialise group units; also returns the PR refs they claim (not to be ported as singletons)."""
     origin_slug = get_origin_repo_slug(config)
     units: list[FeatureUnit] = []
     claimed: set[PRRef] = set()
@@ -551,9 +411,6 @@ def _build_group_units(
             )
             continue
         if group.sort == "merged_at":
-            # Unmerged PRs sort to the end via the "9999" sentinel; PR
-            # number breaks ties between same-timestamp (or both-unmerged)
-            # entries deterministically.
             group_prs.sort(key=lambda p: (p.merged_at or "9999", p.number))
             console.print(
                 f"    [dim]Sorted by merged_at: "
@@ -578,21 +435,10 @@ def _build_group_units(
 
 
 def _prune_superseded_singletons(config: Config, state: PipelineState) -> bool:
-    """Drop singleton state entries for PRs now claimed by a ``pr_sources.group``.
+    """Drop singleton state entries for PRs now in a ``pr_sources.groups`` entry.
 
-    When a PR that used to be ported as its own feature (``pr-<N>``) is
-    moved into a group entry in ``pr_sources.groups``, the group becomes the
-    unit of work (``feature/<base>/<group-id>``) and the old singleton state
-    entry is stale. Left alone, ``continue`` would keep pushing it and opening
-    a duplicate PR alongside the group's combined PR.
-
-    This helper removes those stale singleton entries from state. An
-    in-flight singleton's open port PR is closed as superseded by the group,
-    so the group's combined PR is the only port of it — unless the group is
-    on hold, in which case the PR is left open for the user. Branches are
-    left on origin.
-
-    Returns True if any entry was removed (so the caller can persist state).
+    An in-flight singleton's open port PR is closed as superseded unless the
+    group is on hold. Branches are left on origin. Returns True if any entry was removed.
     """
     group_of: dict[PRRef, str] = {}
     group_feature_ids: set[str] = set()
@@ -653,28 +499,10 @@ def _prune_superseded_singletons(config: Config, state: PipelineState) -> bool:
     return bool(stale)
 
 
-# ---------------------------------------------------------------------------
-# PR discovery (shared by run_pipeline and import_state)
-# ---------------------------------------------------------------------------
-
-
 def discover_feature_units(config: Config) -> list["FeatureUnit"]:
-    """Discover the PR units defined by ``config.pr_sources``.
-
-    Pure discovery: hits GitHub but touches no git worktree. Returns the
-    fully-filtered, ordered list of :class:`FeatureUnit`s the pipeline
-    would attempt to port, so other commands (``releasy project pull``) can
-    rebuild state from the same source-of-truth definition.
-
-    Output (``console.print``) mirrors ``releasy run``'s "Phase: Porting"
-    discovery block — this helper is called in place of the inline block
-    that used to live in :func:`run_pipeline`.
-    """
+    """Filtered, dependency-ordered units defined by ``config.pr_sources`` (GitHub only, no git)."""
     origin_slug = get_origin_repo_slug(config)
 
-    # --- Collect PRs from all sources (union) ---
-    # Keyed by (owner, repo, number) so cross-repo PR references can never
-    # collide with same-numbered origin PRs.
     collected: dict[PRRef, tuple[PRInfo, PRSourceConfig]] = {}
     for pr_source in config.pr_sources.by_labels:
         labels_str = ", ".join(pr_source.labels)
@@ -778,13 +606,11 @@ def discover_feature_units(config: Config) -> list["FeatureUnit"]:
                 f"\n  [dim]Excluded PR {ref_label} ({pr_info.title})[/dim]"
             )
 
-    # --- Build sequential PR groups (each becomes one combined feature) ---
     excluded_label_set = set(prs_cfg.exclude_labels)
     group_units, claimed_pr_refs = _build_group_units(
         config, exclude_pr_refs, excluded_label_set,
         included_authors, excluded_authors,
     )
-    # Drop any singletons that the groups have claimed.
     for ref in claimed_pr_refs:
         if ref in collected:
             pr_info, _ = collected.pop(ref)
@@ -805,12 +631,7 @@ def discover_feature_units(config: Config) -> list["FeatureUnit"]:
 def _mark_held_units(
     config: Config, units: list[FeatureUnit], origin_slug: str | None,
 ) -> None:
-    """Stamp ``hold_reason`` on every unit parked by ``pr_sources.on_hold``.
-
-    Marks rather than filters: ``graph discover`` runs off the same unit
-    list and a held unit has to keep its node (and its edges) in the graph,
-    which is where the issue lists it. The ``run`` loops are what skip it.
-    """
+    """Stamp ``hold_reason`` on held units; they stay in the list so the graph keeps them."""
     holds = hold_map(config)
     if not holds:
         return
@@ -838,17 +659,9 @@ def _mark_held_units(
 
 
 def _topo_sort_units(units: list[FeatureUnit]) -> list[FeatureUnit]:
-    """Order units so every ``depends_on`` reference is processed before its
-    dependent, with merge-time as the tie-breaker.
+    """Topologically sort on ``depends_on`` (deps outside ``units`` ignored), ties by ``sort_key``.
 
-    Kahn's algorithm: at each step, pick the ready unit (no unprocessed deps
-    pointing into the ``units`` set) with the smallest ``sort_key``. Deps
-    pointing OUTSIDE the ``units`` set are ignored here — the runtime gate
-    in ``_deps_satisfied`` is what enforces "must be merged in target". The
-    sort only ensures that *within this run*, a parent unit gets a chance
-    before its dependents.
-
-    Cycles raise ValueError listing the offending feature_ids.
+    Raises ValueError on cycles.
     """
     by_id = {u.feature_id: u for u in units}
     indeg: dict[str, int] = {u.feature_id: 0 for u in units}
@@ -870,7 +683,6 @@ def _topo_sort_units(units: list[FeatureUnit]) -> list[FeatureUnit]:
         for child in children[fid]:
             indeg[child] -= 1
             if indeg[child] == 0:
-                # Insertion-sorted to keep deterministic merge-time order.
                 key = by_id[child].sort_key
                 lo, hi = 0, len(ready)
                 while lo < hi:
@@ -891,13 +703,7 @@ def _topo_sort_units(units: list[FeatureUnit]) -> list[FeatureUnit]:
 
 
 def _unmet_deps(unit: FeatureUnit, state: PipelineState) -> list[str]:
-    """Return the list of unit IDs in ``unit.depends_on`` whose state is not
-    yet ``merged``. Empty list means every dep is satisfied.
-
-    Pure lookup — does not touch the network. Call
-    :func:`_refresh_dep_states_from_github` once before the iteration
-    loop to promote ``branch_created`` deps that have merged upstream.
-    """
+    """IDs in ``unit.depends_on`` whose state is not ``merged`` (state lookup only)."""
     unmet: list[str] = []
     for dep_id in unit.depends_on:
         dep_fs = state.features.get(dep_id)
@@ -906,10 +712,7 @@ def _unmet_deps(unit: FeatureUnit, state: PipelineState) -> list[str]:
     return unmet
 
 
-# Terminal statuses a ``pr_policy.recreate_*`` flag can opt back in, and
-# what to tell the user when it does. Both re-attempt the port on a
-# renumbered branch (``<canonical>-1`` / ``-2`` / …) because the canonical
-# one already carries a dead PR.
+# Terminal status → (message, ``pr_policy`` flag that opts it back in on a renumbered branch).
 _RECREATABLE: dict[str, tuple[str, str]] = {
     "closed": ("Rebase PR closed without merge", "recreate_closed_prs"),
     "reverted": ("Port was reverted on target", "recreate_reverted_prs"),
@@ -939,14 +742,7 @@ def _skip_ported_elsewhere(
 
 
 def terminal_statuses(config: Config) -> set[str]:
-    """Statuses ``releasy run`` will not re-enter, given the opt-ins.
-
-    ``merged`` / ``skipped`` / ``superseded`` are always terminal.
-    ``closed`` and ``reverted`` are terminal until their flag in
-    :class:`~releasy.config.PRPolicyConfig` says otherwise — without it
-    we'd waste a cherry-pick on a port somebody already decided against
-    (closed) or deliberately took back out of the branch (reverted).
-    """
+    """Statuses ``releasy run`` will not re-enter, given the ``recreate_*`` opt-ins."""
     terminal = {"merged", "skipped", "superseded"}
     for status, (_, flag) in _RECREATABLE.items():
         if not getattr(config.pr_policy, flag):
@@ -965,28 +761,7 @@ def _recreate_opt_in(config: Config, status: str | None) -> tuple[str, str] | No
 def _refresh_all_merge_status_from_github(
     config: Config, state: PipelineState,
 ) -> int:
-    """Promote / demote tracked features based on what GitHub says.
-
-    For every feature whose status is still in-flight and that has a
-    ``rebase_pr_url``, do one PR fetch and apply the terminal state:
-
-    * GitHub reports merged → ``status = "merged"``.
-    * GitHub reports closed-unmerged → ``status = "closed"`` with a
-      ``skip_reason`` so ``releasy status`` explains WHY the entry is
-      terminal. Closed entries are then ignored by the refresh loop and
-      by ``releasy run``; only ``pr_policy.recreate_closed_prs`` re-enters
-      them — via a renumbered port branch in ``_process_feature_unit``.
-    * Still open → no change.
-
-    Broader than :func:`_refresh_dep_states_from_github`: that one only
-    refreshes deps referenced by units in the current run; this one
-    walks every tracked feature so post-merge bookkeeping (the
-    ``merged_label`` sweep) doesn't miss merges that landed on PRs
-    nobody depends on.
-
-    Returns the number of features whose status changed in this pass
-    (merged + newly-closed combined).
-    """
+    """Mark in-flight features whose port PR merged / closed on GitHub; returns the number changed."""
     refreshable = {"branch_created", "conflict", "needs_review"}
     changed = 0
     for fid, fs in state.features.items():
@@ -1010,13 +785,7 @@ def _refresh_all_merge_status_from_github(
 def _scan_target_for_cherry_picks(
     repo_path: Path, base_ref: str, source_shas: set[str],
 ) -> dict[str, str]:
-    """Map ``{source_sha: citing_commit_sha}`` for cherry-pick footers on target.
-
-    Walks the last 2 000 commits on ``base_ref`` (cheap after a fetch) and
-    parses ``(cherry picked from commit <sha>)`` footers — `git cherry-pick
-    -x` always cites the full 40-char SHA, so set membership is exact.
-    First match wins (commits are in reverse-chrono order).
-    """
+    """Map ``{source_sha: citing_commit_sha}`` from cherry-pick footers in the last 2000 commits of ``base_ref``."""
     if not source_shas:
         return {}
     result = run_git(
@@ -1044,13 +813,7 @@ def _scan_open_prs_for_cherry_picks(
     config: Config, base_branch: str,
     source_shas: set[str], exclude_pr_urls: set[str],
 ) -> dict[str, str]:
-    """Map ``{source_sha: superseding_pr_url}`` for open PRs on ``base_branch``.
-
-    Single batched GraphQL fetch of every open PR's commit messages
-    targeting the same base (paginated 50 PRs at a time, 250 commits per
-    PR). PRs in ``exclude_pr_urls`` (typically our own rebase PRs) are
-    skipped so we don't self-supersede.
-    """
+    """Map ``{source_sha: superseding_pr_url}`` from commits of open PRs on ``base_branch``."""
     if not source_shas:
         return {}
     out: dict[str, str] = {}
@@ -1073,33 +836,10 @@ def _refresh_all_superseded_status_from_github(
     config: Config, state: PipelineState,
     repo_path: Path, base_branch: str,
 ) -> int:
-    """Mark entries whose source PRs were cherry-picked elsewhere.
+    """Mark entries ``superseded`` when target or another open PR cherry-picked their sources or port commits.
 
-    Two flavours of evidence, both surfaced via the same scans of
-    target-branch git history and open PRs targeting the same base:
-
-    * **Cherry-picks the same source** — another PR's commit cites the
-      upstream source PR's ``merge_commit_sha``. For groups, every
-      source URL must have its merge SHA cited.
-
-    * **Cherry-picks FROM our port** — another PR's commit cites one of
-      OUR port branch's new commit SHAs (the ones we added via
-      ``cherry-pick -x``). Any single port-commit match is enough to
-      mark the feature superseded; this case typically arises when
-      someone took our branch as a starting point. Cheap to fingerprint
-      via ``git rev-list <remote>/<branch> ^<remote>/<base>``.
-
-    ``closed`` entries are included on purpose: a closed rebase PR is
-    often closed *because* a parallel port landed. Promoting closed →
-    superseded gives a more informative terminal state AND blocks the
-    ``recreate_closed_prs`` opt-back-in (superseded is unconditionally
-    terminal).
-
-    Our own rebase PRs are excluded from the open-PR scan so they
-    don't mark themselves.
-
-    Gated by ``pr_policy.detect_superseded`` (default on). Returns the
-    number of features promoted to ``superseded`` on this pass.
+    A group needs every source cited; any one cited port commit suffices.
+    ``closed`` entries are included. Returns the number promoted.
     """
     if not config.pr_policy.detect_superseded:
         return 0
@@ -1111,18 +851,14 @@ def _refresh_all_superseded_status_from_github(
     for fid, fs in state.features.items():
         if fs.status not in refreshable:
             continue
-        urls = list(fs.pr_urls) if fs.pr_urls else (
-            [fs.pr_url] if fs.pr_url else []
-        )
+        urls = _source_pr_urls(fs)
         if urls:
             feature_sources[fid] = urls
 
     if not feature_sources:
         return 0
 
-    # Resolve each source URL to its merge_commit_sha. Sources that
-    # aren't merged on origin can't be matched against cherry-pick
-    # footers (those cite the merged commit), so we simply drop them.
+    # Unmerged sources have no merge SHA to match and are dropped.
     all_source_urls: set[str] = set()
     for urls in feature_sources.values():
         all_source_urls.update(urls)
@@ -1135,9 +871,6 @@ def _refresh_all_superseded_status_from_github(
     remote = config.origin.remote_name
     base_ref = f"{remote}/{base_branch}"
 
-    # Fingerprint our port branches' new commits — anything someone
-    # could cherry-pick FROM us. ``rev-list <branch> ^<base> -n 100``
-    # is bounded and post-fetch cheap; missing branches just skip.
     port_shas_by_feature: dict[str, list[str]] = {}
     all_port_shas: set[str] = set()
     for fid in feature_sources:
@@ -1184,8 +917,6 @@ def _refresh_all_superseded_status_from_github(
 
     changed = 0
     for fid, urls in feature_sources.items():
-        # First check: any of OUR port commits cited elsewhere.
-        # A single hit is enough — "they cherry-picked from us".
         port_evidence: tuple[str, str] | None = None
         for sha in port_shas_by_feature.get(fid, []):
             port_evidence = _evidence_for(sha)
@@ -1201,8 +932,6 @@ def _refresh_all_superseded_status_from_github(
             changed += 1
             continue
 
-        # Fallback: every source merge SHA must be cited elsewhere.
-        # Groups need all sources covered before the group is retired.
         evidence: list[tuple[str, str]] = []
         all_cited = True
         for url in urls:
@@ -1233,11 +962,7 @@ def _refresh_all_superseded_status_from_github(
 
 
 def _source_pr_urls(fs: FeatureState) -> list[str]:
-    """Source PR URLs the port was cherry-picked from.
-
-    Prefers ``pr_urls`` (populated for multi-PR groups) and falls back to
-    ``pr_url`` for singletons. Returns an empty list when neither is set.
-    """
+    """``pr_urls`` if set, else ``[pr_url]``, else ``[]``."""
     if fs.pr_urls:
         return list(fs.pr_urls)
     if fs.pr_url:
@@ -1246,17 +971,7 @@ def _source_pr_urls(fs: FeatureState) -> list[str]:
 
 
 def _apply_merged_labels(config: Config, state: PipelineState) -> None:
-    """Apply ``config.merged_label`` to merged port PRs, strip from sources.
-
-    Idempotent across runs via the per-feature ``merged_label_applied``
-    flag: each merged unit is processed exactly once. No-op when
-    ``config.merged_label`` is unset, when ``push`` is off (we never write
-    to GitHub then), or when there are no newly-merged units to process.
-
-    Source-PR cleanup is best-effort and only touches PRs hosted on the
-    configured origin — source PRs on a different repo are skipped (we
-    never write outside origin).
-    """
+    """Apply ``config.merged_label`` to merged port PRs once, and strip it from origin-hosted source PRs."""
     label = config.merged_label
     if not label or not config.push:
         return
@@ -1290,8 +1005,6 @@ def _apply_merged_labels(config: Config, state: PipelineState) -> None:
         if rebase_number is None:
             continue
         if not add_label_to_pr(config, rebase_number, label):
-            # Logged inside add_label_to_pr; skip the source-side work
-            # so we retry the whole unit on the next run.
             continue
         console.print(
             f"  [green]✓[/green] Labelled merged port "
@@ -1322,21 +1035,12 @@ def _apply_merged_labels(config: Config, state: PipelineState) -> None:
 def _refresh_dep_states_from_github(
     config: Config, state: PipelineState, units: list[FeatureUnit],
 ) -> None:
-    """Promote ``branch_created`` deps to ``merged`` if their rebase PR
-    has merged on GitHub since the state file was written.
-
-    Called once before the unit-iteration loop so ``_unmet_deps`` can run
-    purely off the state dict. Touches at most one GitHub call per unique
-    dep ID with an outstanding rebase PR.
-    """
+    """Refresh merged / closed status of in-flight deps referenced by ``units`` from GitHub."""
     referenced: set[str] = set()
     for u in units:
         referenced.update(u.depends_on)
     if not referenced:
         return
-    # Any dep that has an open rebase PR could have merged upstream since
-    # the last run — including ones that previously hit a conflict and
-    # were later fixed by hand. Don't over-narrow to ``branch_created``.
     refreshable = {"branch_created", "conflict", "needs_review"}
     for dep_id in referenced:
         dep_fs = state.features.get(dep_id)
@@ -1358,74 +1062,37 @@ def _refresh_dep_states_from_github(
             dep_fs.skip_reason = "rebase PR closed without merging"
 
 
-# ---------------------------------------------------------------------------
-# Main pipeline
-# ---------------------------------------------------------------------------
-
-
-def run_pipeline(
-    config: Config,
-    onto: str,
-    work_dir: Path | None = None,
-    resolve_conflicts: bool = True,
-    retry_failed: bool = True,
-    only: OnlyFilter | None = None,
-    force_merge: bool = False,
-    redo: bool = False,
-) -> PipelineState:
-    """Port PRs onto ``origin/<base_branch>``.
-
-    ``resolve_conflicts`` is a CLI-level kill-switch. The AI resolver only
-    runs when both this flag and ``config.ai_resolve.enabled`` are true.
-
-    ``retry_failed`` controls what happens when a discovered unit already
-    has a ``conflict`` entry in state from a previous run: when true, the
-    existing local / remote port branch is discarded and the cherry-pick
-    is re-attempted from base; when false, the entry is skipped entirely
-    (no cherry-pick, no PR side-effects). Defaults to true to match the
-    config-level default.
-
-    ``only`` (optional) restricts processing to a single PR (matched by
-    URL) or a single group / feature ID. Other discovered units are
-    dropped before any side-effects.
-
-    ``redo`` re-ports every kept unit from scratch — see
-    :func:`_reset_unit_for_redo`. The CLI only allows it with ``only``.
-    """
-    state = load_state(config)
-    _prune_superseded_singletons(config, state)
-    repo_path = _setup_repo(config, work_dir, config.base_branch_name(onto))
-
-    if is_operation_in_progress(repo_path):
-        if config.pr_policy.if_exists == "recreate":
-            if config.dry_run:
-                console.print(
-                    f"\n[magenta]dry-run:[/magenta] would abort in-progress "
-                    f"git op in [cyan]{repo_path}[/cyan] "
-                    "(pr_policy.if_exists: recreate)"
-                )
-            else:
-                kind = abort_in_progress_op(repo_path)
-                console.print(
-                    f"\n[yellow]↻ Aborted in-progress {kind} in [cyan]{repo_path}[/cyan][/yellow] "
-                    f"(pr_policy.if_exists: recreate)"
-                )
+def _handle_in_progress_op(config: Config, repo_path: Path) -> None:
+    """Abort a leftover git op under ``if_exists: recreate``, otherwise exit 2."""
+    if not is_operation_in_progress(repo_path):
+        return
+    if config.pr_policy.if_exists == "recreate":
+        if config.dry_run:
+            console.print(
+                f"\n[magenta]dry-run:[/magenta] would abort in-progress "
+                f"git op in [cyan]{repo_path}[/cyan] "
+                "(pr_policy.if_exists: recreate)"
+            )
         else:
+            kind = abort_in_progress_op(repo_path)
             console.print(
-                f"\n[red]✗[/red] A cherry-pick/merge/rebase is already in progress "
-                f"in [cyan]{repo_path}[/cyan]."
+                f"\n[yellow]↻ Aborted in-progress {kind} in [cyan]{repo_path}[/cyan][/yellow] "
+                f"(pr_policy.if_exists: recreate)"
             )
-            console.print(
-                "  Resolve it first (or run `git cherry-pick --abort`), then re-run.\n"
-                "  Or set [cyan]pr_policy.if_exists: recreate[/cyan] in config to "
-                "auto-abort it."
-            )
-            raise SystemExit(2)
+    else:
+        console.print(
+            f"\n[red]✗[/red] A cherry-pick/merge/rebase is already in progress "
+            f"in [cyan]{repo_path}[/cyan]."
+        )
+        console.print(
+            "  Resolve it first (or run `git cherry-pick --abort`), then re-run.\n"
+            "  Or set [cyan]pr_policy.if_exists: recreate[/cyan] in config to "
+            "auto-abort it."
+        )
+        raise SystemExit(2)
 
-    base_branch = config.base_branch_name(onto)
-    remote = config.origin.remote_name
 
-    # Verify the base branch already exists on origin.
+def _require_base_branch(repo_path: Path, base_branch: str, remote: str) -> None:
     if not branch_exists(repo_path, base_branch, remote):
         console.print(
             f"\n[red]✗[/red] Base branch [cyan]{base_branch}[/cyan] does not exist "
@@ -1434,24 +1101,9 @@ def run_pipeline(
         )
         raise SystemExit(2)
 
-    base_ref = f"{remote}/{base_branch}"
-    console.print(f"Base: [cyan]{base_ref}[/cyan]")
-    console.print(
-        f"PRs will be opened against [bold cyan]{require_origin_repo_slug(config)}[/bold cyan] "
-        "(origin) — RelEasy never opens PRs against any other repo."
-    )
-    if config.dry_run:
-        state._dry_run_actions = {}  # type: ignore[attr-defined]
-        console.print(
-            "\n[bold magenta]DRY RUN[/bold magenta]: no state, repo, or "
-            "GitHub writes will happen. Output shows intended actions only."
-        )
 
-    state.set_started(onto)
-    state.base_branch = base_branch
-    state.phase = "init"
-    _persist_state(config, state)
-
+def _ensure_run_labels(config: Config, resolve_conflicts: bool) -> bool:
+    """Ensure run labels exist and report the AI resolver; returns whether it is active."""
     if config.push:
         ensure_label(
             config, RELEASY_LABEL, RELEASY_LABEL_COLOR, RELEASY_LABEL_DESCRIPTION,
@@ -1480,16 +1132,89 @@ def run_pipeline(
                 "Port conflict auto-resolved by Claude",
             )
     else:
-        why = "disabled via --no-resolve-conflicts" if not resolve_conflicts else "disabled in config"
+        why = (
+            "disabled via --no-resolve-conflicts" if not resolve_conflicts
+            else "disabled in config"
+        )
         console.print(f"[dim]AI conflict resolver: {why}[/dim]")
 
-    # The needs-attention label is used for partial-group draft PRs whenever
-    # an unresolved conflict surfaces, regardless of whether the AI resolver
-    # was enabled — pre-create it so the PR-creation path doesn't fail on a
-    # missing label. Same goes for the missing-prereqs and auto-prereq
-    # labels: cheaper to ensure them once up-front than on every conflict.
     if config.push:
         _ensure_conflict_labels(config)
+
+    return ai_active
+
+
+def _apply_only_filter(
+    units: list[FeatureUnit], only: OnlyFilter,
+) -> list[FeatureUnit] | None:
+    """Units matching ``only``; ``None`` for a soft no-match, exit 2 for a hard one."""
+    before = len(units)
+    units = [u for u in units if only.matches_unit(u)]
+    flag = "--pr" if only.soft else "--only"
+    console.print(
+        f"\n  [dim]{flag}={only.label}: "
+        f"kept {len(units)}/{before} discovered unit(s)[/dim]"
+    )
+    if not units:
+        if only.soft:
+            console.print(
+                f"\n  [dim]--pr={only.label!r} is not in this "
+                "session's scope — nothing to do.[/dim]"
+            )
+            return None
+        console.print(
+            f"\n[red]✗[/red] --only={only.label!r} matched no "
+            "discovered units. Check the URL / group id and re-run."
+        )
+        raise SystemExit(2)
+    return units
+
+
+def run_pipeline(
+    config: Config,
+    onto: str,
+    work_dir: Path | None = None,
+    resolve_conflicts: bool = True,
+    retry_failed: bool = True,
+    only: OnlyFilter | None = None,
+    force_merge: bool = False,
+    redo: bool = False,
+) -> PipelineState:
+    """Port PRs onto ``origin/<base_branch>``.
+
+    ``retry_failed``: re-attempt units with a prior ``conflict`` from base
+    instead of skipping them. ``redo``: re-port every kept unit from scratch.
+    """
+    state = load_state(config)
+    _prune_superseded_singletons(config, state)
+    repo_path = _setup_repo(config, work_dir, config.base_branch_name(onto))
+
+    _handle_in_progress_op(config, repo_path)
+
+    base_branch = config.base_branch_name(onto)
+    remote = config.origin.remote_name
+
+    _require_base_branch(repo_path, base_branch, remote)
+
+    base_ref = f"{remote}/{base_branch}"
+    console.print(f"Base: [cyan]{base_ref}[/cyan]")
+    console.print(
+        f"PRs will be opened against [bold cyan]{require_origin_repo_slug(config)}[/bold cyan] "
+        "(origin) — RelEasy never opens PRs against any other repo."
+    )
+    if config.dry_run:
+        state._dry_run_actions = {}  # type: ignore[attr-defined]
+        console.print(
+            "\n[bold magenta]DRY RUN[/bold magenta]: no state, repo, or "
+            "GitHub writes will happen. Output shows intended actions only."
+        )
+
+    state.set_started(onto)
+    state.base_branch = base_branch
+    state.phase = "init"
+    _persist_state(config, state)
+
+    ai_active = _ensure_run_labels(config, resolve_conflicts)
 
     console.print(
         f"\n[bold]Phase:[/bold] Porting PRs onto [cyan]{base_branch}[/cyan]"
@@ -1498,45 +1223,14 @@ def run_pipeline(
     units = discover_feature_units(config)
 
     if only is not None:
-        before = len(units)
-        units = [u for u in units if only.matches_unit(u)]
-        flag = "--pr" if only.soft else "--only"
-        console.print(
-            f"\n  [dim]{flag}={only.label}: "
-            f"kept {len(units)}/{before} discovered unit(s)[/dim]"
-        )
-        if not units:
-            if only.soft:
-                # ``--pr`` is the "act-if-in-scope" form — a no-match
-                # is the expected outcome for PRs that don't belong to
-                # this session. Exit cleanly so cron / webhook callers
-                # don't have to special-case it.
-                console.print(
-                    f"\n  [dim]--pr={only.label!r} is not in this "
-                    "session's scope — nothing to do.[/dim]"
-                )
-                return load_state(config)
-            console.print(
-                f"\n[red]✗[/red] --only={only.label!r} matched no "
-                "discovered units. Check the URL / group id and re-run."
-            )
-            raise SystemExit(2)
+        units = _apply_only_filter(units, only)
+        if units is None:
+            return load_state(config)
 
     if not units:
         console.print("\n  [dim]No PRs or groups to process after filtering[/dim]")
 
-    # Refresh dep state once so any depends_on entry that has merged
-    # upstream since the last run gets promoted before the per-unit gate.
-    # Persist immediately: the promotion is the result of a real GitHub
-    # call, and if the iteration below crashes (Ctrl-C, OOM, exception in
-    # an early unit) the merge status would otherwise be re-fetched on
-    # the next run — wasting tokens and risking a transient False that
-    # leaves a now-mergeable dep stuck blocked.
     _refresh_dep_states_from_github(config, state, units)
-    # Catch ports merged externally since the previous run so the
-    # ``merged_label`` sweep below can apply / strip the configured label.
-    # Cheap when ``merged_label`` is unset (the call is still useful to
-    # keep the state file's ``status`` accurate for ``releasy status``).
     _refresh_all_merge_status_from_github(config, state)
     _refresh_all_superseded_status_from_github(
         config, state, repo_path, base_branch,
@@ -1563,15 +1257,7 @@ def run_pipeline(
             )
         ):
             continue
-        # Skip units already in a terminal state on the local state file —
-        # ``merged`` (port already shipped, no work left to do) or ``skipped``
-        # (user opted out). Without this, a re-run after `releasy project pull`
-        # or after the merged-status sweep promoted a unit would re-cherry-
-        # pick source PRs whose port is already merged.
-        #
-        # ``closed`` and ``reverted`` are terminal too unless their
-        # ``pr_policy.recreate_*`` flag opts back in — see
-        # :func:`terminal_statuses`.
+        # Re-read: _reset_unit_for_redo may have dropped the entry.
         prev_fs = state.features.get(unit.feature_id)
         terminal = terminal_statuses(config)
         if prev_fs is not None and prev_fs.status in terminal:
@@ -1610,10 +1296,6 @@ def run_pipeline(
         if unit.hold_reason is not None:
             _report_hold(config, state, unit)
             continue
-        # _process_feature_unit always returns "continue" — unresolved
-        # conflicts are now handled in-place (drop the branch or open a
-        # draft PR), and the pipeline keeps moving so a single bad PR
-        # can't strand the whole queue.
         _process_feature_unit(
             config, repo_path, state, unit, base_branch, base_ref, onto,
             remote, ai_active, retry_failed=retry_failed,
@@ -1623,7 +1305,6 @@ def run_pipeline(
     state.phase = "ports_done"
     _persist_state(config, state)
 
-    # --- Summary ---
     if config.dry_run:
         counts = getattr(state, "_dry_run_actions", {}) or {}
         total = sum(counts.values())
@@ -1657,8 +1338,6 @@ def run_pipeline(
             for code, label in order:
                 if counts.get(code):
                     console.print(f"  [magenta]·[/magenta] {label}: {counts[code]}")
-            # Catch any unmapped action codes so the summary stays honest
-            # if a new one is added but not registered above.
             mapped = {code for code, _ in order}
             for code, n in counts.items():
                 if code not in mapped:
@@ -1694,11 +1373,6 @@ def run_pipeline(
     return state
 
 
-# ---------------------------------------------------------------------------
-# Sequential mode
-# ---------------------------------------------------------------------------
-
-
 def run_sequential(
     config: Config,
     onto: str,
@@ -1708,76 +1382,20 @@ def run_sequential(
     only: OnlyFilter | None = None,
     force_merge: bool = False,
 ) -> PipelineState:
-    """Process the merged-time-sorted PR queue one PR per invocation.
+    """Sequential mode: port the next queued unit, or exit 1 until the in-flight port PR merges.
 
-    Loop semantics — for each unit in ``discover_feature_units(config)``
-    order (already sorted by ``merged_at``):
-
-      * state ``merged`` / ``skipped``     → already done, skip.
-      * state ``needs_review`` /
-        ``branch_created`` with rebase PR  → ask GitHub if the PR is
-                                            merged. Yes → mark
-                                            ``merged`` in state and
-                                            continue. No → exit 1 with
-                                            the in-flight PR URL.
-                                            Lookup failure → exit 1.
-      * state ``branch_created`` with no
-        rebase PR                           → exit 1 (something went
-                                            wrong opening the PR — fix
-                                            it and retry).
-      * state ``conflict``                  → exit 1 with the conflict
-                                            files (sequential mode never
-                                            auto-retries).
-      * no state at all                    → port it (cherry-pick onto
-                                            the freshly-fetched
-                                            ``origin/<base>``, push, open
-                                            PR), then return so the
-                                            caller exits cleanly.
-
-    ``releasy run`` and ``releasy continue`` (no ``--branch``) both
-    dispatch here when ``config.sequential`` is true; the function
-    is the single source of truth for sequential-mode behaviour.
+    A ``conflict`` entry exits 1 unless ``retry_failed``.
     """
     state = load_state(config)
     _prune_superseded_singletons(config, state)
     repo_path = _setup_repo(config, work_dir, config.base_branch_name(onto))
 
-    if is_operation_in_progress(repo_path):
-        if config.pr_policy.if_exists == "recreate":
-            if config.dry_run:
-                console.print(
-                    f"\n[magenta]dry-run:[/magenta] would abort in-progress "
-                    f"git op in [cyan]{repo_path}[/cyan] "
-                    "(pr_policy.if_exists: recreate)"
-                )
-            else:
-                kind = abort_in_progress_op(repo_path)
-                console.print(
-                    f"\n[yellow]↻ Aborted in-progress {kind} in [cyan]{repo_path}[/cyan][/yellow] "
-                    f"(pr_policy.if_exists: recreate)"
-                )
-        else:
-            console.print(
-                f"\n[red]✗[/red] A cherry-pick/merge/rebase is already in progress "
-                f"in [cyan]{repo_path}[/cyan]."
-            )
-            console.print(
-                "  Resolve it first (or run `git cherry-pick --abort`), then re-run.\n"
-                "  Or set [cyan]pr_policy.if_exists: recreate[/cyan] in config to "
-                "auto-abort it."
-            )
-            raise SystemExit(2)
+    _handle_in_progress_op(config, repo_path)
 
     base_branch = config.base_branch_name(onto)
     remote = config.origin.remote_name
 
-    if not branch_exists(repo_path, base_branch, remote):
-        console.print(
-            f"\n[red]✗[/red] Base branch [cyan]{base_branch}[/cyan] does not exist "
-            f"on remote [cyan]{remote}[/cyan].\n"
-            f"  Create and push it first, then re-run."
-        )
-        raise SystemExit(2)
+    _require_base_branch(repo_path, base_branch, remote)
 
     base_ref = f"{remote}/{base_branch}"
     console.print(f"Base: [cyan]{base_ref}[/cyan]")
@@ -1795,42 +1413,7 @@ def run_sequential(
     state.phase = "init"
     _persist_state(config, state)
 
-    if config.push:
-        ensure_label(
-            config, RELEASY_LABEL, RELEASY_LABEL_COLOR, RELEASY_LABEL_DESCRIPTION,
-        )
-        for sess_label in _all_session_label_names(config):
-            ensure_label(
-                config, sess_label, RELEASY_LABEL_COLOR,
-                "Session label (releasy session config)",
-            )
-
-    ai_active = resolve_conflicts and config.ai_resolve.enabled
-    if ai_active:
-        from releasy.ai_resolve import _backend_label
-
-        console.print(
-            f"[dim]AI conflict resolver: enabled "
-            f"(backend='{_backend_label(config, config.ai_resolve.command)}', "
-            f"label='{config.ai_resolve.label}', "
-            f"max_iterations={config.ai_resolve.max_iterations})[/dim]"
-        )
-        if config.push:
-            ensure_label(
-                config,
-                config.ai_resolve.label,
-                config.ai_resolve.label_color,
-                "Port conflict auto-resolved by Claude",
-            )
-    else:
-        why = (
-            "disabled via --no-resolve-conflicts" if not resolve_conflicts
-            else "disabled in config"
-        )
-        console.print(f"[dim]AI conflict resolver: {why}[/dim]")
-
-    if config.push:
-        _ensure_conflict_labels(config)
+    ai_active = _ensure_run_labels(config, resolve_conflicts)
 
     console.print(
         f"\n[bold]Phase:[/bold] Sequential porting onto [cyan]{base_branch}[/cyan]"
@@ -1839,32 +1422,10 @@ def run_sequential(
     units = discover_feature_units(config)
 
     if only is not None:
-        before = len(units)
-        units = [u for u in units if only.matches_unit(u)]
-        flag = "--pr" if only.soft else "--only"
-        console.print(
-            f"\n  [dim]{flag}={only.label}: "
-            f"kept {len(units)}/{before} discovered unit(s)[/dim]"
-        )
-        if not units:
-            if only.soft:
-                # ``--pr`` is the "act-if-in-scope" form — a no-match
-                # is the expected outcome for PRs that don't belong to
-                # this session. Exit cleanly so cron / webhook callers
-                # don't have to special-case it.
-                console.print(
-                    f"\n  [dim]--pr={only.label!r} is not in this "
-                    "session's scope — nothing to do.[/dim]"
-                )
-                return load_state(config)
-            console.print(
-                f"\n[red]✗[/red] --only={only.label!r} matched no "
-                "discovered units. Check the URL / group id and re-run."
-            )
-            raise SystemExit(2)
+        units = _apply_only_filter(units, only)
+        if units is None:
+            return load_state(config)
 
-    # Pick up ports that merged externally since the last run so the
-    # ``merged_label`` sweep below has accurate state to work from.
     _refresh_all_merge_status_from_github(config, state)
     _refresh_all_superseded_status_from_github(
         config, state, repo_path, base_branch,
@@ -1920,8 +1481,6 @@ def run_sequential(
                 f"\n  [yellow]↻[/yellow] [cyan]{unit.feature_id}[/cyan] ({ref}) "
                 "was in [red]conflict[/red] — retrying (retry_failed: true)"
             )
-            # Fall through: _process_feature_unit will see the conflict
-            # state below, force-recreate the branch, and re-cherry-pick.
 
         if fs is not None and fs.status in ("needs_review", "branch_created"):
             if not fs.rebase_pr_url:
@@ -1977,15 +1536,12 @@ def run_sequential(
             fs.status = "merged"
             clear_conflict_markers(fs)
             console.print(
-                f"    [green]✓[/green] PR merged — advancing the queue"
+                "    [green]✓[/green] PR merged — advancing the queue"
             )
             _apply_merged_labels(config, state)
             _persist_state(config, state)
             continue
 
-        # No state yet — this is the next unit to port. Refresh remote so
-        # the new branch is created off the latest base (which now
-        # includes any previously-merged sequential ports).
         console.print(
             f"\n[bold]Porting next unit:[/bold] [cyan]{unit.feature_id}[/cyan] ({ref})"
         )
@@ -2001,9 +1557,6 @@ def run_sequential(
                 f"  [yellow]![/yellow] feature {unit.feature_id!r} already "
                 "in config.features — skipping config-list mutation"
             )
-            # _process_feature_unit appends to config.features; guard against
-            # a duplicate by short-circuiting if it would clash. This matches
-            # the run_pipeline behaviour (which also skips in this case).
             continue
 
         _process_feature_unit(
@@ -2012,10 +1565,6 @@ def run_sequential(
             force_merge=force_merge,
         )
 
-        # _process_feature_unit may have ended in either a clean port or
-        # an unresolved conflict. Either way, sequential mode stops here:
-        # the user reviews the PR (or fixes the conflict) before invoking
-        # again.
         new_fs = state.features.get(unit.feature_id)
         if new_fs is not None and new_fs.status == "conflict":
             console.print(
@@ -2029,7 +1578,6 @@ def run_sequential(
             )
         return state
 
-    # Queue exhausted — nothing left.
     state.phase = "ports_done"
     _persist_state(config, state)
     console.print(
@@ -2039,14 +1587,7 @@ def run_sequential(
 
 
 def _unit_pr_meta(unit: FeatureUnit) -> dict:
-    """Build state-meta dict for a unit (single PR or group).
-
-    ``pr_author`` is the GitHub login of the *primary* (first) PR — for
-    groups, that's the author of the first PR in cherry-pick order, per
-    the user's spec for the project board's default ``Assignee Dev``.
-    May be ``None`` when GitHub didn't expose the author (rare:
-    deleted accounts).
-    """
+    """State-meta dict for a unit; PR fields come from the primary (first) PR."""
     primary = unit.primary_pr()
     return {
         "pr_url": primary.url,
@@ -2061,13 +1602,7 @@ def _unit_pr_meta(unit: FeatureUnit) -> dict:
 
 
 def _contained_source_urls(unit: FeatureUnit) -> list[str]:
-    """Source PRs the unit's own PRs say they cherry-picked.
-
-    A combined port (``Cherry-picked from #1388, #1405, …``) carries code
-    from PRs listed nowhere in the unit itself. Recorded on state so the
-    queued-elsewhere guard can match a prereq against the unit that
-    actually brings it, instead of only against literal ``prs:`` entries.
-    """
+    """Source PRs the unit's own PRs say they cherry-picked (``Cherry-picked from #…``)."""
     out: list[str] = []
     seen: set[PRRef] = set()
     for pr in unit.prs:
@@ -2083,21 +1618,14 @@ def _contained_source_urls(unit: FeatureUnit) -> list[str]:
 _VERSION_TOKEN = r"v?\d+(?:\.\d+)+"
 _RELEASY_PREFIX_RE = re.compile(r"^\[releasy\b[^\]]*\]\s*", re.IGNORECASE)
 
-# Label automatically applied to every PR RelEasy opens or updates, so a
-# project's GitHub UI can filter "everything releasy created/touched" at a
-# glance — and so the title itself stays clean.
+# Applied to every PR RelEasy opens or updates.
 RELEASY_LABEL = "releasy"
-RELEASY_LABEL_COLOR = "1F6FEB"  # GitHub blue
+RELEASY_LABEL_COLOR = "1F6FEB"
 RELEASY_LABEL_DESCRIPTION = "Created/managed by RelEasy"
 
 
 def _ensure_conflict_labels(config: Config) -> None:
-    """Pre-create every label the conflict-handling paths might apply.
-
-    Cheaper than re-checking on each conflict and removes the chance that
-    a label-application call inside the hot path fails on a missing
-    label (which would degrade gracefully but spam warnings).
-    """
+    """Pre-create every label the conflict-handling paths might apply."""
     ensure_label(
         config,
         config.ai_resolve.needs_attention_label,
@@ -2126,12 +1654,7 @@ def _ensure_conflict_labels(config: Config) -> None:
 
 
 def _display_project(project: str | None) -> str:
-    """Render ``config.project`` for inclusion in PR titles.
-
-    Lower-case names get title-cased (``antalya`` → ``Antalya``,
-    ``stable-26`` → ``Stable-26``); names that already carry mixed case
-    are preserved verbatim (so e.g. ``ClickHouse`` stays ``ClickHouse``).
-    """
+    """``config.project`` for PR titles: all-lowercase names are title-cased, others kept."""
     if not project:
         return ""
     if project.islower():
@@ -2140,13 +1663,7 @@ def _display_project(project: str | None) -> str:
 
 
 def _version_label(project: str | None, base_branch: str | None) -> str:
-    """Pull the version suffix out of the base branch name when possible.
-
-    If ``base_branch`` follows the conventional ``<project>-<version>``
-    shape (``antalya-26.3``), the bit after ``<project>-`` is the version
-    label. Otherwise the whole branch name is used so the prefix still
-    points at the real target — never silently drops information.
-    """
+    """``26.3`` from ``<project>-26.3``; otherwise the whole base branch name."""
     if not base_branch:
         return ""
     if project:
@@ -2157,15 +1674,7 @@ def _version_label(project: str | None, base_branch: str | None) -> str:
 
 
 def _subject_prefix(project: str | None, base_branch: str | None) -> str:
-    """Build the ``"Antalya 26.3"``-style PR title prefix.
-
-    Falls back gracefully:
-
-      - both pieces present → ``"Antalya 26.3"``
-      - project only        → ``"Antalya"``
-      - base only           → ``"antalya-26.3"``
-      - neither             → ``""`` (caller handles)
-    """
+    """``"Antalya 26.3"``-style PR title prefix (either part may be missing)."""
     proj = _display_project(project)
     ver = _version_label(project, base_branch)
     if proj and ver:
@@ -2174,25 +1683,9 @@ def _subject_prefix(project: str | None, base_branch: str | None) -> str:
 
 
 def _strip_misleading_title_prefix(title: str, project: str | None) -> str:
-    """Strip a misleading version-prefix from a source PR title.
+    """Strip a ``[releasy …]`` tag and a leading ``"26.1 Antalya: "``-style version prefix from a title.
 
-    Source repos often title backport PRs with their own target version,
-    e.g. ``"26.1 Antalya: Token Authentication and Authorization"`` for a
-    PR landing on ``antalya-26.1``. When that PR is re-ported onto a
-    different base (say ``antalya-26.3``), the embedded ``"26.1"`` becomes
-    actively misleading in the rebase PR title.
-
-    This helper drops, in order of preference:
-
-      1. A leading ``[releasy …]`` tag from a previous run (so we never
-         double-tag when porting one of our own rebase PRs).
-      2. ``"<version> <project>[:|-] "`` (e.g. ``"26.1 Antalya: "``).
-      3. ``"<project> <version>[:|-] "`` (e.g. ``"Antalya 26.1: "``).
-      4. Bare ``"<version>[:|-] "`` (e.g. ``"v3.2 - "``).
-
-    A bare leading version with no separator (``"26.1 Foo"``) is left
-    alone — without a colon/dash we can't tell a target-version prefix
-    from a genuine title.
+    A version without a ``:``/``-`` separator is kept.
     """
     cleaned = _RELEASY_PREFIX_RE.sub("", title.strip(), count=1)
 
@@ -2217,18 +1710,7 @@ def _unit_title(
     project: str | None,
     base_branch: str | None,
 ) -> str:
-    """Synthesise the PR title for a unit.
-
-    Format: ``"<Project> <version>: <subject>"`` — e.g.
-    ``"Antalya 26.3: Token Authentication and Authorization"``. The
-    ``[releasy]`` text tag is gone; identification is done via the
-    ``releasy`` label on the PR (see :data:`RELEASY_LABEL`).
-
-    Source PR titles are sanitised via ``_strip_misleading_title_prefix``
-    so a leading ``"26.1 Antalya: …"`` (the source's own target version)
-    doesn't leak into a rebase PR that actually targets a different
-    version.
-    """
+    """PR title ``"<Project> <version>: <subject>"``."""
     prefix = _subject_prefix(project, base_branch)
 
     if unit.is_group:
@@ -2249,15 +1731,11 @@ def _unit_title(
     return f"{prefix}: {subject}" if prefix else subject
 
 
-# Matches any level markdown heading: "# title", "## title", … up to 6.
 _MD_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$", re.MULTILINE)
 
 
 def _extract_md_section(body: str, keyword: str) -> str | None:
-    """Return the text under the first markdown heading whose title
-    contains ``keyword`` (case-insensitive), up to the next heading or
-    end of document. ``None`` if not found or section is empty.
-    """
+    """Text under the first heading containing ``keyword`` up to the next heading, or ``None``."""
     if not body:
         return None
     key = keyword.lower()
@@ -2274,16 +1752,7 @@ def _extract_md_section(body: str, keyword: str) -> str | None:
 def _extract_md_section_with_subsections(
     body: str, keyword: str,
 ) -> str | None:
-    """Like :func:`_extract_md_section` but keeps the heading line and
-    any nested subheadings.
-
-    Boundary rule: the section runs from its heading line to the next
-    heading of *equal or higher* level (fewer or equal ``#``s), or to
-    end-of-document. So ``### CI/CD Options`` followed by
-    ``#### Exclude tests:`` + ``#### Regression jobs to run:`` is
-    returned as a single block instead of being cut off at the first
-    ``####``. Returns ``None`` when no matching heading exists.
-    """
+    """Like :func:`_extract_md_section` but keeps the heading and nested subheadings."""
     if not body:
         return None
     key = keyword.lower()
@@ -2305,17 +1774,7 @@ def _extract_md_section_with_subsections(
 
 
 def _strip_md_sections(body: str, keywords: list[str]) -> str:
-    """Remove every markdown section whose heading contains any of ``keywords``.
-
-    Section boundaries follow the same equal-or-higher-level rule used
-    by :func:`_extract_md_section_with_subsections`, so removing
-    ``CI/CD Options`` takes its ``####`` subheadings (Exclude tests /
-    Regression jobs to run) along with it instead of leaving orphans.
-
-    Used by :func:`_unit_body` to keep per-source-PR bodies from
-    re-inserting Changelog / CI/CD blocks the combined PR already
-    presents once at the top.
-    """
+    """Remove every markdown section (with its subheadings) whose heading contains any of ``keywords``."""
     if not body:
         return body
     headings = list(_MD_HEADING_RE.finditer(body))
@@ -2339,27 +1798,17 @@ def _strip_md_sections(body: str, keywords: list[str]) -> str:
     out = body
     for start, end in sorted(spans, reverse=True):
         out = out[:start] + out[end:]
-    # Collapse runs of blank lines created by the deletions so the
-    # remaining body doesn't end up with awkward 3-line gaps.
     out = re.sub(r"\n{3,}", "\n\n", out)
     return out.strip()
 
 
-# Per-PR body sections that the combined PR already presents once at
-# the top (changelog) or that we deliberately deduplicate / reset (CI
-# options). Stripping them from each per-PR body keeps the combined
-# rebase PR readable instead of repeating the same template scaffolding
-# N times.
+# Source-PR body sections the port PR body renders once on its own.
 _DEDUP_PR_BODY_SECTIONS = (
     "changelog category",
     "changelog entry",
     "ci/cd options",
 )
 
-# Canonical CI/CD Options block for rebase PR bodies when a source PR
-# uses the same template (heading match). Checkbox defaults are fixed
-# here so ports do not inherit ad-hoc source-PR toggles or an all-empty
-# reset.
 _DEFAULT_CI_CD_OPTIONS_BLOCK = """### CI/CD Options
 #### Exclude tests:
 - [ ] <!---ci_exclude_fast--> Fast test
@@ -2394,12 +1843,7 @@ _DEFAULT_CI_CD_OPTIONS_BLOCK = """### CI/CD Options
 
 
 def _extract_changelog_category(body: str) -> str | None:
-    """Pull the single chosen 'Changelog category' value from a PR body.
-
-    ClickHouse's template lists every category as a bullet and authors
-    usually delete all but one. We return the first non-empty bullet (or
-    plain line) we find under the heading; ``None`` if absent.
-    """
+    """First non-placeholder line under the 'Changelog category' heading."""
     section = _extract_md_section(body, "changelog category")
     if not section:
         return None
@@ -2416,16 +1860,10 @@ def _extract_changelog_category(body: str) -> str | None:
 
 
 def _extract_changelog_entry(body: str) -> str | None:
-    """Pull the 'Changelog entry' paragraph from a PR body, stripped.
-
-    Drops placeholder-only sections (e.g. the raw template hint line
-    left behind when the author wrote nothing).
-    """
+    """The 'Changelog entry' paragraph, or ``None`` if only a placeholder."""
     section = _extract_md_section(body, "changelog entry")
     if not section:
         return None
-    # Some PR bodies contain an HTML comment or the default hint inside
-    # the section when no entry was added. Remove obvious placeholders.
     cleaned = re.sub(r"<!--.*?-->", "", section, flags=re.DOTALL).strip()
     if not cleaned:
         return None
@@ -2436,27 +1874,7 @@ def _extract_changelog_entry(body: str) -> str | None:
 
 
 def _build_changelog_block(unit: FeatureUnit) -> str | None:
-    """Synthesise a 'Changelog category' + 'Changelog entry' block for
-    the combined PR body.
-
-    Rules:
-    - Category = first PR's category (fallback: any PR in the unit
-      that does specify one, in listed order).
-    - Entry source order:
-        1. ``unit.synthesized_changelog`` when set — the AI-composed
-           summary for groups (see :func:`_maybe_synthesize_changelog`).
-           Only ever populated for multi-PR groups when
-           ``ai_changelog.enabled`` is true.
-        2. Otherwise the first PR's own changelog entry, in listed
-           cherry-pick order. For singletons that's always the
-           authoritative wording (1:1 from source — no Claude call).
-    - Suffix = ``(<url1> by <author1>, …)`` listing every PR in the
-      unit, appended even for singletons so reviewers have one-click
-      access to the source PR and its author.
-
-    Returns ``None`` when no PR in the unit has either a category or
-    an entry, so we don't clutter the body with empty headings.
-    """
+    """Changelog block: first category found, synthesized entry or else the first PR's entry."""
     category: str | None = None
     for pr in unit.prs:
         cat = _extract_changelog_category(pr.body or "")
@@ -2478,12 +1896,7 @@ def _build_changelog_block(unit: FeatureUnit) -> str | None:
 def render_changelog_block(
     category: str | None, entry_text: str | None, prs: "list[PRInfo]",
 ) -> str | None:
-    """Render a 'Changelog category' + 'Changelog entry' block.
-
-    The entry gets a ``(<url> by @author, …)`` attribution suffix for
-    ``prs``. Returns ``None`` when both ``category`` and ``entry_text``
-    are empty. Shared by the pipeline and the project-backport flow.
-    """
+    """Render a changelog category + entry block with a ``(<url> by @author, …)`` suffix."""
     if not category and not entry_text:
         return None
 
@@ -2502,8 +1915,6 @@ def render_changelog_block(
         attribution = _format_pr_attribution(prs)
         final_entry = entry_text.strip()
         if attribution:
-            # Strip a trailing period before the paren so punctuation reads
-            # cleanly.
             if final_entry.endswith("."):
                 final_entry = final_entry[:-1]
             final_entry = f"{final_entry} ({attribution})."
@@ -2513,12 +1924,7 @@ def render_changelog_block(
 
 
 def _truncate_for_prompt(text: str, max_chars: int) -> str:
-    """Trim ``text`` to ``max_chars`` with a visible truncation marker.
-
-    Used when packing source-PR bodies into the changelog-synthesis
-    prompt so a single long-winded PR can't blow the prompt size out
-    for a group with many entries.
-    """
+    """Trim ``text`` to ``max_chars`` with a visible truncation marker."""
     if not text:
         return ""
     if max_chars <= 0 or len(text) <= max_chars:
@@ -2527,12 +1933,7 @@ def _truncate_for_prompt(text: str, max_chars: int) -> str:
 
 
 def _build_pr_blocks_for_synthesis(unit: FeatureUnit, max_pr_body_chars: int) -> str:
-    """Render each PR's title + author + body into a markdown block.
-
-    Output is fed directly into the ``{pr_blocks}`` placeholder in the
-    changelog-synthesis prompt. PRs appear in cherry-pick order so
-    Claude can reason about which fixes supersede which.
-    """
+    """``{pr_blocks}`` for the changelog-synthesis prompt, in cherry-pick order."""
     blocks: list[str] = []
     for idx, pr in enumerate(unit.prs, start=1):
         body = _truncate_for_prompt((pr.body or "").strip(), max_pr_body_chars)
@@ -2549,18 +1950,7 @@ def _build_pr_blocks_for_synthesis(unit: FeatureUnit, max_pr_body_chars: int) ->
 def _maybe_synthesize_changelog(
     config: Config, unit: FeatureUnit, base_branch: str,
 ) -> None:
-    """Populate ``unit.synthesized_changelog`` for multi-PR groups.
-
-    Idempotent: returns early when already populated, when
-    ``ai_changelog.enabled`` is false, or when the unit has fewer than
-    two PRs (singletons take the source PR's wording verbatim — no
-    Claude call, no token spend, no surprises).
-
-    Failures are non-fatal: a synthesis error logs a warning and
-    leaves ``unit.synthesized_changelog`` as ``None``, which means
-    :func:`_build_changelog_block` falls back to the first PR's own
-    changelog entry — the pre-AI behaviour.
-    """
+    """Populate ``unit.synthesized_changelog`` for multi-PR groups when ``ai_changelog`` is on; failures are non-fatal."""
     if unit.synthesized_changelog is not None:
         return
     if not config.ai_changelog.enabled:
@@ -2616,18 +2006,7 @@ def _maybe_synthesize_changelog(
 
 
 def _build_ci_options_block(unit: FeatureUnit) -> str | None:
-    """Return a single ``### CI/CD Options`` block for the combined PR body.
-
-    When any source PR body contains a ``### CI/CD Options`` heading, we
-    insert :data:`_DEFAULT_CI_CD_OPTIONS_BLOCK` — a fixed checklist with
-    intended default checkmarks — rather than copying the source text
-    (which would inherit arbitrary reviewer toggles) or clearing every
-    box (which lost the project's preferred defaults).
-
-    Returns ``None`` when no PR in the unit carries a CI options
-    section — in that case the combined body omits the block so repos
-    without this template are unaffected.
-    """
+    """The default CI/CD Options block if any source PR body has that section."""
     for pr in unit.prs:
         section = _extract_md_section_with_subsections(
             pr.body or "", "ci/cd options",
@@ -2638,10 +2017,7 @@ def _build_ci_options_block(unit: FeatureUnit) -> str | None:
 
 
 def _format_pr_attribution(prs: "list[PRInfo]") -> str:
-    """Build the ``<url> by <author>`` comma-separated attribution suffix.
-
-    Falls back to just the URL when the author is unknown.
-    """
+    """Comma-separated ``<url> by @<author>`` (just ``<url>`` when the author is unknown)."""
     parts: list[str] = []
     for pr in prs:
         if pr.author:
@@ -2664,8 +2040,7 @@ def _unit_body(
     dropped_items: list[str] | None = None,
     stall: StallReason | None = None,
 ) -> str:
-    """Build the PR body. Optional banners cover the partial-group
-    intervention case, auto-ported prerequisites, and dropped scope."""
+    """Build the PR body, with optional banners for intervention, auto-prereqs and dropped scope."""
     lines: list[str] = []
     if needs_intervention:
         applied = failed_index if failed_index is not None else 0
@@ -2699,7 +2074,7 @@ def _unit_body(
             "> Resolve the conflict locally, push the fix, and mark this "
             "PR ready for review."
         )
-        lines.append("")  # blank separator before the rest
+        lines.append("")
 
     if dropped_items:
         lines.append(
@@ -2728,17 +2103,17 @@ def _unit_body(
             )
             if chain:
                 lines.append(f"> _Detection trail:_ {chain}")
-        lines.append("")  # blank separator before the rest
+        lines.append("")
 
     changelog = _build_changelog_block(unit)
     if changelog:
         lines.append(changelog)
-        lines.append("")  # blank separator before the rest
+        lines.append("")
 
     ci_block = _build_ci_options_block(unit)
     if ci_block:
         lines.append(ci_block)
-        lines.append("")  # blank separator before the rest
+        lines.append("")
 
     refs = [pr_ref_label(pr.repo_slug, pr.number, origin_slug) for pr in unit.prs]
     source_refs = ", ".join(refs)
@@ -2750,7 +2125,7 @@ def _unit_body(
         )
         for pr, ref in zip(unit.prs, refs):
             lines.append(f"- {ref} — {pr.title}")
-        lines.append("")  # blank
+        lines.append("")
     else:
         pr = unit.prs[0]
         lines.append(f"Cherry-picked from {source_refs}.")
@@ -2765,12 +2140,7 @@ def _unit_body(
 def _tag_commit_with_source_pr(
     repo_path: Path, unit: FeatureUnit, pr: PRInfo, origin_slug: str | None,
 ) -> None:
-    """For grouped units, append a ``Source-PR`` trailer to the just-made
-    commit so the combined PR's commit list is self-attributing.
-
-    For singleton units this is skipped — the branch IS the source PR, so
-    a trailer would be redundant noise on the commit.
-    """
+    """Append a ``Source-PR`` trailer to the just-made commit (multi-PR groups only)."""
     if not unit.is_group or len(unit.prs) <= 1:
         return
     ref = pr_ref_label(pr.repo_slug, pr.number, origin_slug)
@@ -2782,15 +2152,7 @@ def _tag_commit_with_source_pr(
 def _cherry_pick_pr(
     repo_path: Path, config: Config, pr: PRInfo,
 ) -> OperationResult:
-    """Cherry-pick one PR into the current branch.
-
-    For PRs from the configured ``origin`` repo we use the origin remote
-    (already fetched) and rely on the merge commit being locally present.
-    For PRs from any other repo (cross-repo references in
-    ``pr_sources.include_prs`` / ``pr_sources.groups[].prs``) we fetch the
-    needed commit / PR ref directly from that repo's HTTPS URL — no extra
-    git remote is added.
-    """
+    """Cherry-pick one PR into the current branch; non-origin PRs are fetched by HTTPS URL."""
     origin_slug = get_origin_repo_slug(config)
     is_external = origin_slug is None or pr.repo_slug != origin_slug
     fetch_target = (
@@ -2823,17 +2185,13 @@ def _cherry_pick_pr(
     )
 
 
-# Pulls every URL out of the Source-PR trailers we ourselves wrote
-# (e.g. ``#42 (https://github.com/owner/repo/pull/42)``).
 _SOURCE_PR_URL_RE = re.compile(r"https?://\S+?/pull/\d+", re.IGNORECASE)
 
 
 def _read_commit_subjects(
     repo_path: Path, base_ref: str, branch: str,
 ) -> list[str]:
-    """Return the subject (first line) of every commit in
-    ``base_ref..branch``, oldest → newest. Empty list on error.
-    """
+    """Subjects of ``base_ref..branch`` commits, oldest first; empty on error."""
     out = run_git(
         ["log", "--reverse", "--format=%s", f"{base_ref}..{branch}"],
         repo_path, check=False,
@@ -2846,16 +2204,7 @@ def _read_commit_subjects(
 def _read_source_pr_trailers(
     repo_path: Path, base_ref: str, branch: str,
 ) -> tuple[list[str | None], int]:
-    """Walk every commit in ``base_ref..branch`` and pull its
-    ``Source-PR:`` trailer URL.
-
-    Returns a tuple ``(per_commit_urls, total_commits)``. ``per_commit_urls``
-    has one entry per commit (oldest → newest); the entry is the URL when
-    the commit carries a ``Source-PR:`` trailer (the format
-    :func:`_tag_commit_with_source_pr` writes), or ``None`` when no trailer
-    is present (e.g. commits made before the trailer convention, or AI
-    fix-up commits that didn't get re-tagged).
-    """
+    """Per-commit ``Source-PR:`` trailer URL (or ``None``) for ``base_ref..branch``, oldest first, and the commit count."""
     rev_list = run_git(
         ["rev-list", "--reverse", f"{base_ref}..{branch}"],
         repo_path, check=False,
@@ -2866,9 +2215,6 @@ def _read_source_pr_trailers(
 
     urls: list[str | None] = []
     for sha in shas:
-        # ``%(trailers:key=...,unfold=true,valueonly=true)`` only emits the
-        # value half of the matching trailer lines (one per line) — won't
-        # false-positive on a URL that happens to appear in the body.
         out = run_git(
             [
                 "log", "-1",
@@ -2924,13 +2270,10 @@ def _collect_dropped_trailers(
 
 @dataclass
 class _AppendDecision:
-    """Result of ``_decide_append`` — whether we can append to an existing
-    port branch and which declared PRs are still missing.
-    """
     feasible: bool
-    reason: str                            # human-readable explanation
-    applied_urls: set[str] = field(default_factory=set)  # PRs already present
-    missing_count: int = 0                 # declared PRs not yet on branch
+    reason: str
+    applied_urls: set[str] = field(default_factory=set)
+    missing_count: int = 0
 
 
 def _decide_append(
@@ -2942,31 +2285,14 @@ def _decide_append(
 ) -> _AppendDecision:
     """Decide whether ``if_exists: append`` can proceed for this unit.
 
-    Trailers are the primary signal: every URL in a ``Source-PR:`` trailer
-    must point at a declared PR (foreign trailers fail the check). For
-    declared PRs that don't appear in any trailer we scan the branch's
-    commit *subjects* for the merge subject line — when releasy cherry-
-    picks a merge commit (``-m 1 --no-edit``), the original
-    ``Merge pull request #<N> from …`` subject is preserved verbatim, so
-    a declared origin PR whose merge was cherry-picked but whose tagging
-    step was skipped (e.g. an older releasy version) still shows up.
-
-    Cross-repo PRs (declared with a non-origin URL) can collide on PR
-    number with origin PRs, so subject matching is gated on the PR's
-    repo_slug equalling ``origin_slug``. Cross-repo PRs without trailers
-    fall through to "missing" — the cherry-pick step will then either
-    succeed (creating a duplicate commit, harmless) or surface a no-op
-    empty cherry-pick which is easy to debug.
-
-    AI conflict-resolution fix-up commits and base-merged-in commits sit
-    on the branch with no trailers and no matching subject; they're
-    correctly ignored.
+    A ``Source-PR:`` trailer naming an undeclared PR makes it infeasible.
+    Untagged origin PRs are matched by their ``Merge pull request #<N> from``
+    subject (origin only: cross-repo PR numbers can collide).
     """
     per_commit, _total = _read_source_pr_trailers(repo_path, base_ref, branch)
     declared_urls = [pr.url for pr in unit.prs]
     declared_set = set(declared_urls)
 
-    # 1) Trailers: every URL we wrote must point at a declared PR.
     tagged_urls = [u for u in per_commit if u is not None]
     foreign = sorted({u for u in tagged_urls if u not in declared_set})
     if foreign:
@@ -2980,7 +2306,6 @@ def _decide_append(
 
     applied: set[str] = set(tagged_urls)
 
-    # 2) Subject scan for declared PRs not yet matched.
     unmatched_origin = [
         pr for pr in unit.prs
         if pr.url not in applied
@@ -3020,9 +2345,7 @@ def _next_free_renumbered_port_branch(
     remote: str,
     canonical_branch: str,
 ) -> str:
-    """Pick ``<canonical_branch>-N`` for the smallest ``N >= 1`` with no
-    matching local or remote ref.
-    """
+    """``<canonical_branch>-N`` for the smallest ``N >= 1`` with no local or remote ref."""
     n = 1
     while True:
         candidate = f"{canonical_branch}-{n}"
@@ -3036,11 +2359,7 @@ def _next_free_renumbered_port_branch(
 def _close_port_pr_if_open(
     config: Config, pr_url: str, comment: str,
 ) -> str | None:
-    """Close port PR ``pr_url`` with ``comment`` if it is still open.
-
-    Returns the PR's state before the call (``open`` / ``merged`` /
-    ``closed``), or ``None`` when it could not be read or closed.
-    """
+    """Close port PR ``pr_url`` if open; returns its prior state, or ``None`` if unreadable / not closed."""
     info = fetch_pr_by_url(config, pr_url, include_closed=True)
     if info is None:
         return None
@@ -3069,11 +2388,9 @@ def _reset_unit_for_redo(
 ) -> bool:
     """Discard ``unit``'s prior port so this run re-ports it from base.
 
-    A unit that had a port PR moves to a renumbered branch; a still-open
-    PR is closed first. Without a PR, the recorded branch is rebuilt in
-    place. The state entry is dropped either way. Used by ``run --redo``
-    and for a port marked ``outdated``. Returns False (unit left
-    untouched) for a merged port.
+    With a port PR (closed if open), the unit moves to a renumbered branch;
+    otherwise its branch is rebuilt in place. Drops the state entry.
+    Returns False (unit untouched) for a merged port.
     """
     fs = state.features.get(unit.feature_id)
     if fs is None:
@@ -3131,13 +2448,7 @@ def _reset_unit_for_redo(
 
 
 def _is_partial_group(fs: FeatureState | None) -> bool:
-    """True for a unit a prior run left mid-cherry-pick.
-
-    A partial group has ``status == "conflict"`` with at least one PR
-    already committed (``partial_pr_count > 0``) — i.e. the draft-PR /
-    ``ai-needs-attention`` flavour of :func:`_handle_unresolved_conflict`,
-    not the first-pick-failed flavour (which keeps nothing).
-    """
+    """True for a ``conflict`` unit a prior run left with some PRs already committed."""
     return (
         fs is not None
         and fs.status == "conflict"
@@ -3151,16 +2462,7 @@ def _partial_continue_allowed(
     if_exists: str,
     retry_failed: bool,
 ) -> bool:
-    """True when a prior run's partial group should be resumed this run.
-
-    Resuming beats redoing whenever real work survives on the branch — an
-    exhausted / timed-out resolver is not a reason to throw it away, so
-    this holds for ``if_exists: recreate`` too. The redo cases don't reach
-    here: a rebase PR closed without merging is promoted to ``closed``
-    (partial markers cleared) by the merge-status sweep, and a first-pick
-    conflict never was partial. ``if_exists: append`` has its own resume
-    path, and ``max_partial_continue_attempts: 0`` opts out entirely.
-    """
+    """True when a prior run's partial group should be resumed (also under ``if_exists: recreate``)."""
     return (
         retry_failed
         and config.pr_policy.max_partial_continue_attempts > 0
@@ -3169,8 +2471,6 @@ def _partial_continue_allowed(
     )
 
 
-# A unit whose port PR reached one of these carries no more work: anything
-# waiting on it can stop waiting.
 _LANDED_STATUSES = frozenset({"merged", "superseded"})
 
 
@@ -3181,18 +2481,7 @@ def _stall_still_blocks(
     *,
     exclude_feature_id: str | None = None,
 ) -> bool:
-    """True when nothing has changed that could get ``stall`` unstuck.
-
-    Only the kinds in ``BLOCKING_STALL_KINDS`` are ever gated — every other
-    stall is worth another shot (base has moved, the resolver may do better).
-    A blocking stall clears the moment what it waits on moves:
-
-    * ``waiting_for_merge`` — one of the units it waits on merged (or left
-      the session, so we can no longer tell).
-    * ``missing_prereq`` — the prereq's own port landed, so base carries it
-      now. Somebody merely queueing the prereq releases nothing: until that
-      port merges, a retry meets the very same conflict.
-    """
+    """True while nothing ``stall`` waits on has landed (a merely queued prereq does not count)."""
     if stall.kind == "waiting_for_merge":
         if not stall.waiting_on_units:
             return False
@@ -3220,14 +2509,7 @@ def _prereq_now_queued_stall(
     prev_state: FeatureState,
     feature_id: str,
 ) -> StallReason | None:
-    """A ``waiting_for_merge`` for a ``missing_prereq`` somebody now ports.
-
-    The unit stays parked either way — the port has not merged — but the
-    stall can name the unit to merge instead of reporting a prereq nobody
-    ports. ``None`` when nothing changed: only units tracked in state
-    qualify, since a prereq sitting in the config alone gives the gate no
-    merge to watch for.
-    """
+    """A ``waiting_for_merge`` replacing a ``missing_prereq`` stall whose prereq a tracked unit now ports."""
     stall = prev_state.stall
     if stall is None or stall.kind != "missing_prereq":
         return None
@@ -3248,16 +2530,7 @@ def _dead_end_budget_spent(
     canonical_branch: str,
     label: str,
 ) -> bool:
-    """True when a :data:`CAPPED_STALL_KINDS` stall has used up its budget.
-
-    Base moves between runs, so a resolution that reached a dead end is
-    worth another try or two — but not on every run forever, at full token
-    price for the same verdict. ``stall.runs`` is that attempt count (it
-    only grows on a run that actually re-resolved), so raising the cap takes
-    effect on the next run. A partial group is left to
-    ``pr_policy.max_partial_continue_attempts``, which bounds the very same
-    work with the knob the user configured for it.
-    """
+    """True when a :data:`CAPPED_STALL_KINDS` stall used up ``max_dead_end_attempts`` (partial groups excluded)."""
     from rich.markup import escape
 
     cap = config.ai_resolve.max_dead_end_attempts
@@ -3283,14 +2556,7 @@ def _skip_for_stall(
     canonical_branch: str,
     label: str,
 ) -> bool:
-    """Honour a recorded stall: skip the unit, or drop a stall that cleared.
-
-    Returns True when the caller should leave the unit untouched this run.
-    Re-resolving a unit that waits on somebody else's merge costs a full
-    resolution and reaches the same verdict, so the default is to wait; a
-    resolution that reached a dead end gets a bounded number of tries
-    before the same applies.
-    """
+    """Honour a recorded stall; True when the unit should be left untouched this run."""
     from rich.markup import escape
 
     stall = prev_state.stall if prev_state is not None else None
@@ -3310,7 +2576,6 @@ def _skip_for_stall(
     if not _stall_still_blocks(
         config, state, stall, exclude_feature_id=feature_id,
     ):
-        # What it waited on moved — let the unit back into the normal flow.
         prev_state.stall = None
         return False
 
@@ -3333,16 +2598,7 @@ def _skip_for_stall(
 def _report_hold(
     config: Config, state: PipelineState, unit: FeatureUnit,
 ) -> None:
-    """Announce that ``unit`` is parked by ``pr_sources.on_hold`` and leave
-    it alone — no branch, no PR, no state write.
-
-    Nothing is recorded because the hold lives in the session, not in
-    state: a unit already ported before the hold keeps the status (and the
-    PR) it had, and dropping the entry from ``on_hold`` puts it straight
-    back in the queue on the next run. Anything declaring the unit in
-    ``depends_on`` reports as blocked meanwhile — a held unit never reaches
-    ``merged``.
-    """
+    """Announce that ``unit`` is on hold; nothing is written to state."""
     from rich.markup import escape
 
     primary = unit.primary_pr()
@@ -3372,25 +2628,7 @@ def _process_feature_unit(
     retry_failed: bool = True,
     force_merge: bool = False,
 ) -> str:
-    """Process one feature unit (single PR or sequential group).
-
-    Always returns ``"continue"`` — unresolved conflicts are handled
-    in-place by :func:`_handle_unresolved_conflict` (drop the local branch
-    for singletons / first-of-group, or open a draft PR for partial
-    groups), and the pipeline keeps moving.
-
-    ``retry_failed`` controls behaviour for units whose previous run
-    ended in ``conflict`` status: when true, any existing local / remote
-    port branch is force-recreated from base and the cherry-pick is
-    re-attempted; when false, the unit is left exactly as-is (no
-    cherry-pick, no PR side-effects).
-
-    ``pr_policy.recreate_closed_prs`` allocates ``feature/.../<id>-1``,
-    ``-2``, … when the stored ``rebase_pr_url`` PR was closed without merging,
-    then runs the normal cherry-pick + push + open-PR path for that name.
-    ``pr_policy.recreate_reverted_prs`` does the same for a port that
-    merged and was then reverted on target.
-    """
+    """Process one feature unit (single PR or sequential group). Always returns ``"continue"``."""
     origin_slug = get_origin_repo_slug(config)
     canonical_branch = config.feature_branch_name(unit.feature_id, onto)
     label = (
@@ -3404,14 +2642,11 @@ def _process_feature_unit(
 
     prev_state = state.features.get(unit.feature_id)
     is_failed_prev = prev_state is not None and prev_state.status == "conflict"
-    # A branch parked by the deterministic build/test verifier — resolved
-    # locally but not yet green. Resumed (not re-resolved) below.
     is_build_failed_prev = (
         prev_state is not None and prev_state.status == "build_failed"
     )
     force_retry = is_failed_prev and retry_failed
 
-    # --- Sequential gate: every depends_on must be merged in target ---
     if unit.depends_on:
         unmet = _unmet_deps(unit, state)
         if unmet:
@@ -3424,19 +2659,7 @@ def _process_feature_unit(
             blocked_state = prev_state or FeatureState()
             blocked_state.status = "blocked"
             blocked_state.blocked_by = list(unmet)
-            # Preserve branch_name / pr_url / etc. from prior state if present
-            # — a unit can be temporarily blocked between runs without
-            # discarding the work it produced earlier. Conflict / partial-pick
-            # bookkeeping is no longer accurate (we never re-attempted the
-            # pick this run), so clear it so `releasy status` and the YAML
-            # dump don't show stale conflict files under a Blocked entry.
-            #
-            # ``ai_resolved`` / ``ai_iterations`` / ``ai_cost_usd`` are
-            # *intentionally* preserved here: they're historical facts
-            # about a previous successful (or partially-successful) AI
-            # run on this unit. A future re-attempt may add to them, but
-            # we don't want to lose audit / cost-accounting info just
-            # because the unit was temporarily blocked between runs.
+            # Keep prior branch / PR / AI-cost fields; clear stale conflict bookkeeping.
             blocked_state.conflict_files = []
             blocked_state.failed_step_index = None
             blocked_state.partial_pr_count = None
@@ -3451,18 +2674,12 @@ def _process_feature_unit(
             _persist_state(config, state)
             _dry_record(state, "blocked-by-deps")
             return "continue"
-        # Deps were just satisfied — clear stale blocked state so the
-        # unit re-enters the normal flow below.
         if prev_state and prev_state.status == "blocked":
             prev_state.status = "needs_review"
             prev_state.blocked_by = []
             prev_state.stall = None
 
     if (is_failed_prev or is_build_failed_prev) and not retry_failed:
-        # User opted out of retries — leave the conflicted / build-failed
-        # entry exactly as it is so manual fix-ups (or a later
-        # --retry-failed run) can take over without us touching the PR /
-        # branch / project board.
         kind = "build-failed" if is_build_failed_prev else "previously conflicted"
         console.print(
             f"\n    [dim]{canonical_branch} ({label}) — {kind}, "
@@ -3472,23 +2689,12 @@ def _process_feature_unit(
         _dry_record(state, "skip-conflict-retry-off")
         return "continue"
 
-    # --- Stall gate: don't pay for a retry that cannot get anywhere yet ---
-    # A unit parked waiting on somebody else's merge (or on a prereq nobody
-    # ports) reaches the same verdict for the same money until that changes.
     if _skip_for_stall(
         config, state, prev_state, unit.feature_id, canonical_branch, label,
     ):
         return "continue"
 
-    # --- Resume a build_failed branch ---
-    # Re-run the build/test loop on the existing resolution (no re-resolve),
-    # bounded by max_verify_resume_attempts; falls through to a fresh port if
-    # the local branch is gone or has drifted more than
-    # max_resume_base_drift commits behind base. A parked build_failed unit
-    # has no PR (see
-    # _park_build_failed), so there's nothing a reviewer could have closed:
-    # resuming is always the right call, ``if_exists: recreate`` included.
-    # Set max_verify_resume_attempts: 0 to rebuild from base instead.
+    # A parked build_failed unit has no PR, so it is resumed even under ``if_exists: recreate``.
     if (
         is_build_failed_prev and retry_failed
         and config.ai_resolve.deterministic_build
@@ -3501,25 +2707,6 @@ def _process_feature_unit(
         if resumed is not None:
             return resumed
 
-    # --- Auto-continue a partially-applied group ---
-    # A prior run cherry-picked part of a group, then a conflict (usually
-    # the resolver running out of iterations / budget / wall-clock) stopped
-    # it mid-way, leaving a draft PR labelled ai-needs-attention. With
-    # retry_failed on (the default), resume where it left off — re-route
-    # through the append flow so the not-yet-applied PRs are cherry-picked
-    # + re-resolved on top of the existing branch — instead of skipping
-    # ("rebase PR already open") or throwing the work away.
-    #
-    # Preserving that work wins over ``if_exists: recreate``: an exhausted
-    # resolver is not a signal to redo from base. The redo cases are
-    # terminal ones — a rebase PR closed without merging is promoted to
-    # ``status: closed`` (which also clears the partial markers) by the
-    # merge-status sweep, so it lands on the recreate_closed_prs path below
-    # and rebuilds on a renumbered branch. ``if_exists: append`` already
-    # resumes on its own. Bounded by
-    # pr_policy.max_partial_continue_attempts (0 disables the resume and
-    # restores plain if_exists handling) so an unwinnable conflict doesn't
-    # re-burn budget on every run.
     cap = config.pr_policy.max_partial_continue_attempts
     configured_if_exists = unit.if_exists
     auto_continued = False
@@ -3567,14 +2754,7 @@ def _process_feature_unit(
             "([cyan]if_exists: recreate[/cyan] + [cyan]retry_failed: true[/cyan])"
         )
 
-    # The merge-status sweep at the top of every run / refresh / continue
-    # has already promoted closed-on-GitHub PRs to ``status="closed"``,
-    # so the local status IS the source of truth here — no GitHub call.
-    # Terminal-but-opted-back-in (``closed`` / ``reverted``): the canonical
-    # port branch already carries a dead PR, so the retry needs a fresh
-    # name — and must not take the "rebase PR already open" exit below.
-    # The run gate only lets these through when the flag is on; the check
-    # here is belt-and-braces for other callers.
+    # Opted-back-in ``closed`` / ``reverted``: the canonical branch carries a dead PR, so use a fresh name.
     recreate = _recreate_opt_in(
         config, prev_state.status if prev_state is not None else None,
     )
@@ -3595,15 +2775,7 @@ def _process_feature_unit(
     on_remote = remote_branch_exists(repo_path, new_branch, remote)
     on_local = local_branch_exists(repo_path, new_branch)
 
-    # --- Existing rebase PR → leave it alone in ``releasy run`` ---
-    # ``run`` is the "port new PRs" command; once a unit has an open
-    # rebase PR on origin, the merge-target-into-branch dance belongs
-    # to ``releasy refresh`` (the maintenance command). Doing it here
-    # would touch a PR the user didn't ask us to revisit — even when
-    # there's nothing to do (PR is clean, target hasn't moved). The
-    # exceptions go through the append handler below: ``if_exists:
-    # append``, and a group whose branch lacks some of its declared PRs
-    # (a member added after the PR was opened).
+    # An open rebase PR is left to ``releasy refresh``, unless members must be appended.
     if (
         on_remote
         and prev_state is not None
@@ -3626,20 +2798,7 @@ def _process_feature_unit(
             _dry_record(state, "skip-existing-pr")
             return "continue"
 
-    # --- if_exists: append ---
-    # ``cherry_pick_base`` defaults to ``base_ref`` for the from-scratch
-    # path; in append mode it's the existing branch tip so each loop
-    # iteration resets to the prefix we want to keep.
-    #
-    # Branch preservation is the default. ``if_exists`` is the only
-    # signal that can drive a from-base rebuild — explicit user intent.
-    # ``force_retry`` (from prev-state == ``conflict`` + ``retry_failed:
-    # true``) does NOT override ``if_exists``: it only controls whether
-    # the unit is processed at all this run, not how. A user who set
-    # ``if_exists: append`` keeps the existing branch even when a prior
-    # run left a stale ``conflict`` state (common when the prior failure
-    # was unrelated to the cherry-pick itself — e.g. a missing prompt
-    # file, an OOM, an aborted run).
+    # ``if_exists`` alone decides branch disposition; ``force_retry`` does not override it.
     append_active = False
     cherry_pick_base = base_ref
     if (
@@ -3657,7 +2816,6 @@ def _process_feature_unit(
             )
             return "continue"
         else:
-            # Need a local branch to inspect commits on.
             if not on_local:
                 run_git(
                     ["branch", "-f", new_branch, f"{remote}/{new_branch}"],
@@ -3668,9 +2826,6 @@ def _process_feature_unit(
                 repo_path, base_ref, new_branch, unit, origin_slug,
             )
             if not decision.feasible and auto_continued:
-                # We only switched to append to salvage a partial group.
-                # Salvage is off the table, so honour what the unit was
-                # actually configured with rather than silently skipping it.
                 console.print(
                     f"\n    [yellow]![/yellow] [cyan]{new_branch}[/cyan] "
                     f"({label}) — cannot resume the partial group: "
@@ -3712,23 +2867,6 @@ def _process_feature_unit(
                     f"on top of {len(decision.applied_urls)} already applied"
                 )
 
-    # ---------------------------------------------------------------
-    # Branch-disposition decision matrix (no longer gated on force_retry):
-    #
-    #   if_exists == "skip"     → existing branch is left alone, period.
-    #                             retry_failed/force_retry do NOT override
-    #                             this. To retry a previously-conflicted
-    #                             unit, the user must explicitly switch to
-    #                             "recreate" or "append".
-    #   if_exists == "append"   → handled in the block above; either set
-    #                             append_active and proceed, or skip with
-    #                             a warning.
-    #   if_exists == "recreate" → rebuild from base. This is the only
-    #                             explicit "I want to re-do existing work"
-    #                             signal; it bypasses the on-remote-branch
-    #                             safety lock too (the user owns it).
-    # ---------------------------------------------------------------
-
     if on_remote and unit.if_exists != "recreate" and not append_active:
         console.print(
             f"\n    [cyan]{new_branch}[/cyan] ({label}) — already exists on "
@@ -3769,12 +2907,7 @@ def _process_feature_unit(
         source_branch="", enabled=True,
     ))
 
-    # Auto-recovery loop. Each iteration runs the full cherry-pick sequence
-    # for whatever ``unit.prs`` currently contains. On a clean finish or a
-    # plain conflict (no missing-prereq signal) the loop exits. On a
-    # missing-prereq report we either label-and-stop (detection-only mode)
-    # or prepend the discovered prereq(s) and restart with the expanded
-    # unit. ``max_prereq_depth`` and the cycle check bound the loop.
+    # Each pass cherry-picks ``unit.prs``; a missing-prereq report may prepend prereqs and restart.
     fs_dynamic_prereq_urls: list[str] = []
     fs_prereq_trail: list[dict] = []
     prereq_discovery_depth = 0
@@ -3818,10 +2951,6 @@ def _process_feature_unit(
 
         pr_meta = _unit_pr_meta(unit)
         stash_and_clean(repo_path)
-        # In append mode ``cherry_pick_base`` is the existing branch tip
-        # (the commits we keep); otherwise it's the rebase base. Each
-        # iteration of the auto-prereq loop resets to the same point so
-        # we never duplicate or lose the kept-prefix.
         create_branch_from_ref(repo_path, new_branch, cherry_pick_base)
 
         outcome = _attempt_cherry_picks(
@@ -3830,15 +2959,7 @@ def _process_feature_unit(
         )
 
         if outcome.kind == "success":
-            # --- All PRs cherry-picked cleanly (possibly via AI) ---
-            # Synthesise the combined-port CHANGELOG entry now (groups only,
-            # ai_changelog enabled). Done after the cherry-pick succeeded so
-            # we don't burn tokens on units that ended up in conflict —
-            # those already produced a draft PR with the per-PR fallback
-            # wording, and a successful retry will hit this same path.
             _maybe_synthesize_changelog(config, unit, base_branch)
-            # Deterministic build + tests before opening the PR; on failure
-            # park as build_failed (branch pushed, no PR) and resume next run.
             if _should_verify_build(config, unit):
                 vres = _run_verify_phase(
                     config, repo_path, unit, new_branch, base_branch, onto,
@@ -3860,9 +2981,6 @@ def _process_feature_unit(
             return "continue"
 
         if outcome.kind == "already_applied":
-            # Every PR in the unit was already in target — port branch
-            # ended up empty. Mark feature ``skipped`` with reason and
-            # drop the empty branch instead of pushing / opening a PR.
             _handle_already_in_target(
                 config, repo_path, state, unit, new_branch, base_ref,
                 outcome.already_in_target_urls, onto, pr_meta,
@@ -3870,7 +2988,6 @@ def _process_feature_unit(
             return "continue"
 
         if outcome.kind == "missing_prereqs":
-            # Either label-and-stop (detection-only) or dive deeper.
             should_dive, exit_reason = _decide_prereq_dive(
                 config, state, unit, outcome, fs_dynamic_prereq_urls,
                 prereq_discovery_depth,
@@ -3886,7 +3003,6 @@ def _process_feature_unit(
                 )
                 return "continue"
 
-            # --- Dive: prepend discovered prereq(s) and restart ---
             prereq_infos, fetch_failed = _fetch_prereq_prs(
                 config, exit_reason["dive_urls"],
             )
@@ -3909,10 +3025,6 @@ def _process_feature_unit(
                 )
                 return "continue"
 
-            # Origin-label gate: an in-origin prereq must carry the
-            # configured selection labels (or be listed explicitly).
-            # An unlabeled one is out of scope — abort the dive and fall
-            # back to detection-only labelling rather than auto-porting it.
             unlabeled = _reject_unlabeled_origin_prereqs(
                 config, outcome.failed_pr, prereq_infos,
             )
@@ -3961,21 +3073,16 @@ def _process_feature_unit(
                     f" {pi.url}"
                 )
 
-            # Persist the in-progress trail so a Ctrl-C / crash mid-dive
-            # leaves a paper trail in state for the next `releasy continue`.
             _persist_dive_progress(
                 config, state, unit, new_branch, onto, pr_meta,
                 fs_dynamic_prereq_urls=fs_dynamic_prereq_urls,
                 fs_prereq_trail=fs_prereq_trail,
                 prereq_discovery_depth=prereq_discovery_depth,
             )
-            continue  # restart the loop with the expanded unit
+            continue
 
-        # outcome.kind == "unresolved"
-        # Plain unresolved conflict — flag for manual review and stop.
+        # The resolver never judged the conflict, so the auto-continue attempt is refunded.
         if outcome.api_aborted and unit.partial_continue_attempts:
-            # The attempt was claimed before the resolver ran; it never
-            # judged the conflict, so don't spend it on an outage.
             unit.partial_continue_attempts -= 1
             console.print(
                 "    [dim]resolver never ran (API/backend failure) — "
@@ -3996,25 +3103,8 @@ def _process_feature_unit(
 
 @dataclass
 class _CherryPickOutcome:
-    """Outcome of a single full ``_attempt_cherry_picks`` pass over a unit.
-
-    ``kind`` is one of:
-      * ``"success"`` — every PR in ``unit.prs`` was cherry-picked cleanly
-        (possibly via AI). ``already_in_target_urls`` lists any PRs that
-        git reported as "now empty" mid-loop (already in target, ``--skip``'d
-        and not part of the resulting commit count) — informational only.
-      * ``"already_applied"`` — every PR in the unit was already in target,
-        the port branch ended up empty. ``already_in_target_urls`` lists
-        all of them. The caller drops the empty branch and marks the
-        feature ``skipped`` with a reason rather than opening a PR.
-      * ``"unresolved"`` — a conflict on PR ``failed_idx`` could not be
-        resolved by the AI (or AI is disabled). ``failed_pr`` and
-        ``conflict_files`` are populated.
-      * ``"missing_prereqs"`` — the AI identified the conflict as caused
-        by an unported prerequisite. ``missing_prereq_prs`` and
-        ``missing_prereq_note`` carry Claude's report; ``failed_pr``
-        is the source PR that triggered the conflict.
-    """
+    """Outcome of one ``_attempt_cherry_picks`` pass."""
+    # "success" | "already_applied" (every PR already in target) | "unresolved" | "missing_prereqs"
     kind: str
     failed_idx: int = 0
     failed_pr: PRInfo | None = None
@@ -4022,8 +3112,7 @@ class _CherryPickOutcome:
     missing_prereq_prs: list[str] = field(default_factory=list)
     missing_prereq_note: str | None = None
     already_in_target_urls: list[str] = field(default_factory=list)
-    # Set on ``"unresolved"`` when the AI step died before judging the
-    # conflict (see AIResolveResult.api_aborted).
+    # The AI step died before judging the conflict.
     api_aborted: bool = False
 
 
@@ -4036,16 +3125,7 @@ def _attempt_cherry_picks(
     ai_active: bool,
     origin_slug: str | None,
 ) -> _CherryPickOutcome:
-    """Cherry-pick every PR in ``unit.prs`` into the current branch.
-
-    Stops on the first conflict and returns the appropriate outcome
-    (``unresolved`` or ``missing_prereqs``). Returns ``success`` only
-    when every PR landed cleanly.
-
-    PRs whose URL is in ``unit.applied_pr_urls`` are skipped — this is
-    the ``if_exists: append`` path, where the existing port branch
-    already has those commits applied from a prior run.
-    """
+    """Cherry-pick ``unit.prs`` (minus ``applied_pr_urls``) into the current branch, stopping at the first unresolved conflict."""
     already_in_target: list[str] = []
     real_pick_count = 0
 
@@ -4063,10 +3143,7 @@ def _attempt_cherry_picks(
                 f"({idx + 1}/{len(unit.prs)})[/dim]"
             )
 
-        # Capture the port-branch tip BEFORE the cherry-pick so we can
-        # roll back cleanly on AI failure (and use it as a known-good
-        # reset target in split-commit mode where one or two commits
-        # may need to come off).
+        # Rollback target if AI resolution fails.
         head_before = run_git(
             ["rev-parse", "--verify", "HEAD"], repo_path, check=False,
         )
@@ -4079,11 +3156,7 @@ def _attempt_cherry_picks(
             real_pick_count += 1
             continue
 
-        # Already-in-target: git reported "previous cherry-pick is now
-        # empty" — the patch is reachable from target via some other path
-        # (sibling backport, prior port, squash). cherry_pick_sha already
-        # ran ``--skip`` to drop it, so the working tree is clean and we
-        # can move on. No AI call, no conflict markers.
+        # Empty cherry-pick, already ``--skip``'d by git_ops.
         if cp_result.already_applied:
             console.print(
                 f"    [dim]↳ {ref} already in target — skipped "
@@ -4092,7 +3165,6 @@ def _attempt_cherry_picks(
             already_in_target.append(pr.url)
             continue
 
-        # --- Conflict path on this PR ---
         msg = f"Conflict on {ref}!"
         if cp_result.error_message and not cp_result.conflict_files:
             msg = f"{msg} ({cp_result.error_message})"
@@ -4100,14 +3172,7 @@ def _attempt_cherry_picks(
         for cf in cp_result.conflict_files:
             console.print(f"      [red]•[/red] {cf}")
 
-        # Split-commit mode: before handing control to Claude, conclude
-        # the in-progress cherry-pick by committing the conflict markers
-        # as a stand-alone "with conflicts" commit. The AI then makes a
-        # second commit on top with the resolution, so the port branch's
-        # `git log` shows the conflict and its fix as separate diffs.
-        # Only triggered when both AI is active (otherwise there's no
-        # second commit to make and the legacy unresolved-conflict path
-        # below is the right behaviour) and the config knob is on.
+        # Split-commit mode: commit the conflict markers as-is; the AI's resolution goes on top.
         pre_resolve_sha: str | None = None
         if ai_active and config.ai_resolve.split_conflict_commit:
             committed, pre_resolve_sha = commit_cherry_pick_conflict_as_is(
@@ -4120,9 +3185,6 @@ def _attempt_cherry_picks(
                     f"resolution commit on top[/dim]"
                 )
             else:
-                # Failed to pre-commit (very unusual — empty stage,
-                # missing MERGE_MSG). Fall back to the legacy in-progress
-                # cherry-pick flow so the pipeline doesn't get stuck.
                 console.print(
                     "    [yellow]![/yellow] could not pre-commit conflict "
                     "markers — falling back to single-commit AI resolve"
@@ -4161,10 +3223,6 @@ def _attempt_cherry_picks(
             api_aborted=ai_outcome is not None and ai_outcome.api_aborted,
         )
 
-    # Loop completed without hitting a real conflict. If every PR landed
-    # as a no-op (empty cherry-pick → ``--skip``'d), the port branch is
-    # empty: signal this so the caller can mark the feature ``skipped``
-    # with reason rather than push and open a PR with zero commits.
     if real_pick_count == 0 and already_in_target:
         return _CherryPickOutcome(
             kind="already_applied",
@@ -4183,29 +3241,17 @@ def _decide_prereq_dive(
     fs_dynamic_prereq_urls: list[str],
     prereq_discovery_depth: int,
 ) -> tuple[bool, dict]:
-    """Decide whether to dive into auto-recovery on a missing-prereq report.
+    """Decide whether to auto-port reported missing prereqs.
 
-    Returns ``(should_dive, exit_reason)``. ``exit_reason`` is a dict
-    that always carries a ``"reason"`` key. When ``should_dive`` is True,
-    it also has ``"dive_urls"``: the URLs to actually port (after
-    queued-elsewhere / depth / cycle / ancestor pre-flight have winnowed
-    the list). When False, the reason explains what stopped us:
-
-      * ``"detection_only"`` — auto-recovery is disabled in config
-      * ``"queued_elsewhere"`` — at least one prereq is already known to
-        releasy in another unit / config entry; ``"queued"`` lists them
-      * ``"cycle"`` — a discovered prereq is already in the unit's PR list
-      * ``"depth_exhausted"`` — bumping depth would exceed
-        ``max_prereq_depth``
-      * ``"all_already_in_base"`` — every discovered prereq is already
-        merged into ``base_branch`` per the local ancestor pre-flight
+    Returns ``(should_dive, exit_reason)``; ``exit_reason["reason"]`` is
+    ``ok`` (with ``dive_urls``), ``detection_only``, ``queued_elsewhere``,
+    ``cycle`` or ``depth_exhausted``.
     """
     auto_cfg = config.ai_resolve.auto_add_prerequisite_prs
 
     if not auto_cfg.enabled:
         return False, {"reason": "detection_only"}
 
-    # 1) Queued-elsewhere check (cheapest, most informative).
     queued = _find_already_queued_prereqs(
         config, state, outcome.missing_prereq_prs,
         exclude_feature_id=unit.feature_id,
@@ -4213,15 +3259,12 @@ def _decide_prereq_dive(
     if queued:
         return False, {"reason": "queued_elsewhere", "queued": queued}
 
-    # 2) Cycle: any prereq already in the unit's PR list (original
-    # members or already-prepended dynamic ones)?
     unit_urls = {pr.url for pr in unit.prs}
     unit_urls.update(fs_dynamic_prereq_urls)
     cycle_hits = [u for u in outcome.missing_prereq_prs if u in unit_urls]
     if cycle_hits:
         return False, {"reason": "cycle", "cycle_urls": cycle_hits}
 
-    # 3) Depth cap.
     if prereq_discovery_depth >= auto_cfg.max_prereq_depth:
         return False, {
             "reason": "depth_exhausted",
@@ -4229,24 +3272,11 @@ def _decide_prereq_dive(
             "max_depth": auto_cfg.max_prereq_depth,
         }
 
-    # 4) Made it through the gates — return the candidates as
-    # ``dive_urls``. The actual ancestor pre-flight needs ``PRInfo``
-    # (we need ``merge_commit_sha``), so it happens in the caller after
-    # the fetch step. Returning the raw URLs here keeps this function
-    # cheap and pure (no GitHub fetches).
     return True, {"reason": "ok", "dive_urls": list(outcome.missing_prereq_prs)}
 
 
 def _success_status(rebase_pr_url: str | None) -> str:
-    """Status for a port branch that finished cleanly (no conflicts).
-
-    ``needs_review`` once a PR exists for the rebase branch — that's the
-    "ready for human review" state. ``branch_created`` when the branch is
-    around but no PR has been opened yet (e.g. ``pr_policy.auto_pr:
-    false``, or PR creation hit a transient failure). The latter shows up
-    on the project board with a branch link and a GitHub *compare* URL so
-    the user can open the PR manually with one click.
-    """
+    """``needs_review`` once a port PR exists, else ``branch_created``."""
     return "needs_review" if rebase_pr_url else "branch_created"
 
 
@@ -4257,20 +3287,7 @@ def _ensure_pr_for_existing_remote_branch(
     new_branch: str,
     base_branch: str,
 ) -> None:
-    """For a unit whose branch is already on origin: open (or find) the PR
-    and update state / labels accordingly.
-
-    Triggered on re-runs when the cherry-pick is skipped because the branch
-    is already pushed (typical case: a prior run that ran with
-    ``pr_policy.auto_pr: false`` and only pushed the branch). Idempotent:
-    if a PR is already on file, this just makes sure the labels and project
-    board reflect it.
-
-    No-op unless ``config.push`` is enabled. When ``pr_policy.auto_pr``
-    is off, the helper still ensures a state entry exists for the branch
-    (status ``branch_created``) so the project board can show it with a
-    compare-URL link.
-    """
+    """For a branch already on origin: open (or find) its PR and update state / labels. No-op without ``push``."""
     if not config.push:
         return
 
@@ -4294,18 +3311,7 @@ def _ensure_pr_for_existing_remote_branch(
 
     fs = state.features.get(unit.feature_id)
 
-    # Heal stale "needs human attention" state on already-pushed PRs.
-    # This catches the case where a previous retry succeeded at the
-    # cherry-pick / push step but didn't run the recovery treatment
-    # (e.g. ran with older code, or `_reconcile_recovered_pr` hadn't
-    # been added yet). Without this, re-running `releasy run` would
-    # skip the cherry-pick (branch is on remote) and never touch the
-    # body / labels / draft state — leaving the PR perpetually stuck
-    # with the "needs intervention" banner. We detect the stuck-ness
-    # by reading the live PR's labels: if `ai-needs-attention` is
-    # still attached, the PR clearly wasn't reconciled and we treat
-    # this re-run as a deferred recovery (force-update body + title,
-    # remove the label, add `ai-resolved`, flip draft → ready).
+    # A PR still labelled needs-attention was never reconciled; treat this as a deferred recovery.
     needs_recovery = False
     existing_pr_url = fs.rebase_pr_url if fs else None
     if existing_pr_url:
@@ -4333,10 +3339,6 @@ def _ensure_pr_for_existing_remote_branch(
         pr_url = None
 
     if fs is None:
-        # Branch on remote but no state entry — record a minimal one so the
-        # project board picks it up. Without prior context we can't tell
-        # whether AI was involved; ``ai_resolved`` stays at its default
-        # (False).
         fs = FeatureState(
             status=_success_status(pr_url), branch_name=new_branch,
             mode=unit.mode,
@@ -4358,15 +3360,8 @@ def _ensure_pr_for_existing_remote_branch(
     _persist_state(config, state)
 
 
-# ---------------------------------------------------------------------------
-# Deterministic build + test verification (the resolve-only flow)
-# ---------------------------------------------------------------------------
-
-
 def _should_verify_build(config: Config, unit: "FeatureUnit") -> bool:
-    """Verify only when deterministic-build is on and a conflict was
-    AI-resolved this run (resolve-only ⇒ branch was never built). Clean
-    picks are left to CI."""
+    """Verify only with deterministic_build on and an AI-resolved conflict this run."""
     return config.ai_resolve.deterministic_build and unit.ai_resolved_count > 0
 
 
@@ -4392,16 +3387,14 @@ def _park_build_failed(
     config: Config, repo_path: Path, state: PipelineState, unit: "FeatureUnit",
     branch: str, onto: str, result: "VerifyResult", *, resume_attempts: int,
 ) -> None:
-    """Park a unit whose build/tests didn't pass as ``build_failed`` — the
-    branch is pushed (no PR is opened), and it resumes next run.
-    ``resume_attempts`` is the cross-run counter (0 on the first park)."""
+    """Park the unit as ``build_failed``: push the branch, open no PR; resumed next run."""
     from releasy.ai_resolve import build_log_path
 
     fs = FeatureState(
         status="build_failed", branch_name=branch, base_commit=onto,
         **_unit_pr_meta(unit),
     )
-    fs.ai_resolved = True  # the resolution landed; only the build lags
+    fs.ai_resolved = True
     fs.mode = unit.mode
     fs.build_attempts = result.build_attempts
     fs.verify_resume_attempts = resume_attempts
@@ -4414,8 +3407,6 @@ def _park_build_failed(
     if unit.ai_cost_usd_total is not None:
         fs.ai_cost_usd = unit.ai_cost_usd_total
 
-    # A parked unit gets no PR, so the pushed branch is the only thing a
-    # reviewer can open — and the only way to see the failing code at all.
     if config.push:
         try:
             _push(config, repo_path, branch)
@@ -4460,10 +3451,7 @@ def _resume_build_failed_unit(
     prev_state: FeatureState, branch: str, base_branch: str, base_ref: str,
     label: str,
 ) -> str | None:
-    """Resume a parked ``build_failed`` branch: re-run build/tests without
-    re-resolving. Returns ``"continue"`` when handled, or ``None`` to fall
-    back to a fresh port (the local branch/base is gone, or the parked
-    resolution has drifted too far behind base to be worth building)."""
+    """Re-run build/tests on a parked ``build_failed`` branch; ``None`` means fall back to a fresh port."""
     cap = config.ai_resolve.max_verify_resume_attempts
     attempts = prev_state.verify_resume_attempts
     if cap <= 0 or attempts >= cap:
@@ -4488,11 +3476,8 @@ def _resume_build_failed_unit(
 
     onto = prev_state.base_commit
     if not onto or not local_branch_exists(repo_path, branch):
-        return None  # branch/base gone — re-port from scratch
+        return None
 
-    # Resuming preserves an expensive resolution, but only while it still
-    # sits near base. Far enough behind and the build compiles stale code
-    # and hands the fixer errors from a base that no longer exists.
     drift_cap = config.ai_resolve.max_resume_base_drift
     behind = _commits_behind(repo_path, branch, base_ref) if drift_cap else 0
     if drift_cap and behind > drift_cap:
@@ -4502,10 +3487,9 @@ def _resume_build_failed_unit(
             f"(cap {drift_cap}); re-porting from base instead of building "
             "stale code [dim](ai_resolve.max_resume_base_drift)[/dim]"
         )
-        return None  # the fresh-port path below records the dry-run action
+        return None
 
     if config.dry_run:
-        # Everything below mutates the worktree and starts a real build.
         console.print(
             f"\n    [magenta]·[/magenta] [cyan]{branch}[/cyan] ({label}) — "
             f"would resume build/test on the existing resolution "
@@ -4528,7 +3512,6 @@ def _resume_build_failed_unit(
         f"build/test on the existing resolution "
         f"(resume attempt {attempts + 1}/{cap})"
     )
-    # Carry forward AI-resolved provenance + prior cost (no resolve ran now).
     if prev_state.ai_resolved and unit.ai_resolved_count == 0:
         unit.ai_resolved_count = 1
     if prev_state.ai_cost_usd is not None and unit.ai_cost_usd_total is None:
@@ -4544,9 +3527,6 @@ def _resume_build_failed_unit(
         return "continue"
 
     if vres.outcome == "error":
-        # The build never reached the compiler, or the tests never ran, so
-        # the resolution was never judged — don't spend a resume on a broken
-        # environment (same rule as the auto-continue counter above).
         console.print(
             "    [dim]build/tests never ran (environment fault) — resume "
             "attempt not counted[/dim]"
@@ -4573,24 +3553,9 @@ def _finish_clean_unit(
     prereq_trail: list[dict] | None = None,
     prereq_discovery_depth: int = 0,
 ) -> None:
-    """Push and (optionally) open a single combined PR for the unit.
+    """Push the branch, open / update the unit's PR, and record state and labels.
 
-    If any PR in the unit was AI-resolved, the resulting PR is tagged with
-    ``ai_resolve.label`` and the feature state is marked accordingly.
-
-    ``was_failed_prev`` is set by ``_process_feature_unit`` when this
-    unit's previous run ended in ``conflict`` status (and we just retried
-    it). When true, the existing PR is treated as stale: title + body
-    are force-rewritten regardless of ``update_existing_prs``, the
-    ``ai-needs-attention`` label (if any) is removed, and a draft PR is
-    flipped to ready-for-review — so reviewers don't see a "needs
-    intervention" banner on a port that is now actually clean.
-
-    ``dynamic_prereq_urls`` / ``prereq_trail`` / ``prereq_discovery_depth``
-    carry the auto-recovery bookkeeping. When non-empty they:
-      * persist on the FeatureState so the project board card and
-        re-runs surface the trail,
-      * tag the merged PR with ``ai_resolve.auto_prereq_label``.
+    ``was_failed_prev`` force-rewrites a stale PR and reconciles it as recovered.
     """
     ai_used = unit.ai_resolved_count > 0
     has_auto_prereqs = bool(dynamic_prereq_urls)
@@ -4602,7 +3567,6 @@ def _finish_clean_unit(
     else:
         console.print("    [dim]Skipping push[/dim]")
 
-    # Provisional status — refined below once we know if a PR got opened.
     fs = FeatureState(
         status="branch_created" if config.push else "needs_review",
         branch_name=new_branch, base_commit=onto, **pr_meta,
@@ -4621,17 +3585,11 @@ def _finish_clean_unit(
         fs.prereq_discovery_depth = prereq_discovery_depth
     state.features[unit.feature_id] = fs
 
-    # In append mode (PRs were added to an already-ported group) the body
-    # is stale by definition — it lists fewer PRs than the unit now
-    # carries. Force the rewrite even when ``update_existing_prs: false``
-    # so reviewers see the full declared group, not the prior subset.
     appended_to_existing = bool(unit.applied_pr_urls)
 
     dropped_items = _collect_dropped_trailers(repo_path, onto, new_branch)
 
     if config.push and config.pr_policy.auto_pr:
-        # Title format is identical regardless of AI involvement; the
-        # `ai-resolved` label (applied below) is what marks it.
         title = _unit_title(unit, config.project, base_branch)
         rebase_pr_url, outcome = _ensure_pr_for_branch(
             config, new_branch, base_branch, title,
@@ -4669,15 +3627,9 @@ def _finish_clean_unit(
                         fs_for_unit.verify_comment_posted = True
             if was_failed_prev:
                 relabelled = _reconcile_recovered_pr(config, rebase_pr_url)
-                # The previous failed run flagged this PR for human
-                # attention — mirror the first-run-resolved appearance
-                # so reviewers can't tell it apart: status `ai_resolved`
-                # in state, and the `ai-resolved` label on the PR.
                 if relabelled and not state.features[unit.feature_id].ai_resolved:
                     state.features[unit.feature_id].ai_resolved = True
     elif config.push and (ai_used or has_auto_prereqs or verify_flagged):
-        # Branch pushed but pr_policy.auto_pr disabled — try to label any
-        # pre-existing PR for this branch.
         existing = find_pr_for_branch(config, new_branch, base_branch)
         if existing:
             _apply_releasy_label_to_pr(
@@ -4719,28 +3671,9 @@ def _finish_clean_unit(
 def _reconcile_recovered_pr(
     config: Config, pr_url: str, pr_number: int | None = None,
 ) -> bool:
-    """Bring a previously-conflicted PR back into a clean reviewable shape.
+    """Swap needs-attention for the ai-resolved label and mark the PR ready (best-effort).
 
-    Called after a successful retry of a unit whose previous run had
-    landed in ``conflict`` status. Side effects:
-
-      * remove the ``ai_resolve.needs_attention_label`` (no-op if the
-        label was never attached — e.g. the partial-group draft path
-        wasn't taken),
-      * apply the ``ai_resolve.label`` (``ai-resolved``) so the
-        recovered PR is visually indistinguishable from one that
-        landed cleanly with AI on its very first run — the user
-        explicitly asked for this to keep dashboards consistent,
-      * mark the PR ready-for-review (no-op if it isn't draft).
-
-    Returns ``True`` when the PR carried the needs-attention label
-    (and thus genuinely went through the AI-failure path) so the
-    caller can promote ``FeatureState.ai_resolved`` to ``True``;
-    returns ``False`` when the label wasn't there (nothing to mirror).
-
-    All GitHub calls are best-effort: failures are logged but never
-    raised, so a transient GitHub blip can't undo an otherwise-
-    successful retry.
+    Returns True when the PR carried the needs-attention label.
     """
     if pr_number is None:
         pr_number = _pr_number_from_url(pr_url)
@@ -4759,10 +3692,6 @@ def _reconcile_recovered_pr(
                 f"{needs_attention_label}[/cyan] label "
                 "from previously-conflicted PR"
             )
-        # Mirror first-run-resolved appearance: tag with the
-        # ``ai-resolved`` label so dashboards / filters that key off
-        # it can't tell a recovered PR apart from one that cleared on
-        # its very first attempt.
         _apply_ai_label_to_pr(config, pr_url, pr_number=pr_number)
 
     ready = mark_pr_ready_for_review(config, pr_number)
@@ -4789,24 +3718,9 @@ def _ensure_pr_for_branch(
     *,
     force_update: bool = False,
 ) -> tuple[str | None, str]:
-    """Create a PR for ``branch`` or reuse / update an existing one.
+    """Create a PR for ``branch`` or reuse an open one (rewritten if ``update_existing_prs`` or ``force_update``).
 
-    Behaviour:
-      - If GitHub already has an open PR from ``branch`` → ``base_branch``:
-          * with ``update_existing_prs: true`` in config OR
-            ``force_update=True``, edit its title and body to match what
-            releasy would have set, then return ``(url, "updated")``.
-          * otherwise return ``(url, "reused")`` without touching the PR.
-      - If no matching PR is open, create a new one and return
-        ``(url, "created")``. On creation failure returns ``(None, "failed")``.
-
-    ``force_update`` is the per-call override the pipeline uses when it
-    *knows* the existing PR is stale (e.g. carries a "needs intervention"
-    banner from a previous failed run that we just successfully retried) —
-    in that case we always rewrite title + body, regardless of the global
-    ``update_existing_prs`` switch, because leaving misleading copy on a
-    PR that's now actually clean would be worse than the configured
-    "leave PRs alone" default.
+    Returns ``(url, "created" | "updated" | "reused" | "failed")``.
     """
     existing = find_pr_for_branch(config, branch, base_branch)
     if existing:
@@ -4874,12 +3788,7 @@ def _apply_ai_label_to_pr(
 def _apply_releasy_label_to_pr(
     config: Config, pr_url: str, pr_number: int | None = None,
 ) -> None:
-    """Best-effort: tag the PR with the ``releasy`` label.
-
-    This is the replacement for the old ``[releasy]`` text prefix in the
-    title — the label conveys the same identification, while keeping the
-    title clean (``"Antalya 26.3: <subject>"``).
-    """
+    """Best-effort: tag the PR with the ``releasy`` label."""
     if pr_number is None:
         pr_number = _pr_number_from_url(pr_url)
     if pr_number is None:
@@ -4890,12 +3799,7 @@ def _apply_releasy_label_to_pr(
 def _session_pr_labels(
     config: Config, mode: PortMode | None = None,
 ) -> list[str]:
-    """Session labels for a rebase PR of port mode ``mode`` (may be empty).
-
-    ``session.pr_labels`` unconditionally, plus the
-    ``session.pr_labels_by_mode[mode]`` bucket. ``mode=None`` (unknown
-    mode) gets the unconditional labels only.
-    """
+    """``session.pr_labels`` plus the ``pr_labels_by_mode[mode]`` bucket."""
     if config.session is None:
         return []
     labels = list(config.session.pr_labels)
@@ -4907,11 +3811,7 @@ def _session_pr_labels(
 
 
 def _all_session_label_names(config: Config) -> list[str]:
-    """Every session label name, mode-conditional ones included.
-
-    Used for the up-front ``ensure_label`` pass: a label has to exist on
-    origin before any unit that might carry it is ported.
-    """
+    """Every session label name, mode-conditional ones included."""
     if config.session is None:
         return []
     names = list(config.session.pr_labels)
@@ -4926,12 +3826,7 @@ def _apply_session_labels_to_pr(
     config: Config, pr_url: str, pr_number: int | None = None,
     mode: PortMode | None = None,
 ) -> None:
-    """Best-effort: attach this PR's session labels (see
-    :func:`_session_pr_labels`).
-
-    Idempotent — ``add_label_to_pr`` is a no-op for labels the PR
-    already carries.
-    """
+    """Best-effort: attach this PR's session labels."""
     labels = _session_pr_labels(config, mode)
     if not labels:
         return
@@ -4947,16 +3842,7 @@ def reconcile_session_labels_on_prs(
     config: Config,
     pr_refs: list[tuple[str, int, PortMode | None]],
 ) -> list[tuple[str, list[str]]]:
-    """Ensure every PR in ``pr_refs`` carries its session labels.
-
-    ``pr_refs`` is ``[(pr_url, pr_number, port_mode), …]`` — the mode
-    selects the ``pr_labels_by_mode`` bucket, ``None`` means unknown (see
-    :func:`_session_pr_labels`). Reads each PR's current labels via
-    ``fetch_pr_by_url`` (one GET per PR) and only adds the missing ones —
-    so a fully-labelled set costs N GETs and zero writes. Returns
-    ``[(pr_url, [added_labels])]`` for every PR where at least one label
-    was added — so the caller can render per-PR detail.
-    """
+    """Add missing session labels to ``(pr_url, pr_number, mode)`` PRs; returns ``[(pr_url, added_labels)]``."""
     from releasy.github_ops import fetch_pr_by_url
 
     result: list[tuple[str, list[str]]] = []
@@ -4982,30 +3868,10 @@ def reconcile_session_labels_on_prs(
     return result
 
 
-def _apply_missing_prereqs_label_to_pr(
-    config: Config, pr_url: str, pr_number: int | None = None,
-) -> None:
-    """Best-effort: tag a draft / placeholder PR with the
-    ``missing_prereqs_label``.
-
-    Called whenever a unit's conflict was identified as caused by a
-    missing prerequisite (detection-only mode), an exhausted
-    auto-recovery dive, or a prereq that's already queued elsewhere.
-    """
-    if pr_number is None:
-        pr_number = _pr_number_from_url(pr_url)
-    if pr_number is None:
-        return
-    add_label_to_pr(config, pr_number, config.ai_resolve.missing_prereqs_label)
-
-
 def _apply_auto_prereq_label_to_pr(
     config: Config, pr_url: str, pr_number: int | None = None,
 ) -> None:
-    """Best-effort: tag a successfully merged-up combined PR with the
-    ``auto_prereq_label`` so reviewers know the PR's scope was expanded
-    by auto-recovery (one or more prereq PRs were prepended).
-    """
+    """Best-effort: apply ``auto_prereq_label`` to a PR whose scope auto-recovery expanded."""
     if pr_number is None:
         pr_number = _pr_number_from_url(pr_url)
     if pr_number is None:
@@ -5033,8 +3899,7 @@ def _apply_verify_label_to_pr(
 def _post_verify_findings_comment(
     config: Config, pr_url: str, findings: list[str],
 ) -> bool:
-    """Post verifier findings as a top-level PR comment. Returns True on
-    successful post — caller persists that to suppress duplicates."""
+    """Post verifier findings as a top-level PR comment; True on success."""
     if not findings:
         return False
 
@@ -5088,13 +3953,7 @@ def _post_verify_findings_comment(
 
 
 def _ensure_upstream_remote(config: Config, repo_path: Path) -> None:
-    """Register the configured upstream remote on the local clone.
-
-    Idempotent: a no-op when ``config.upstream`` is ``None`` or when the
-    alias already points at the configured URL. Called lazily, just before
-    invoking the AI resolver, so users who never enable AI never pay the
-    cost (and never have a stray remote sitting in their clone).
-    """
+    """Register the configured upstream remote on the local clone (idempotent)."""
     if config.upstream is None:
         return
     changed = ensure_remote(
@@ -5115,90 +3974,50 @@ def _find_already_queued_prereqs(
     *,
     exclude_feature_id: str | None = None,
 ) -> list[dict]:
-    """For each URL in ``candidate_urls``, find where releasy already
-    tracks it (config or state), if anywhere.
+    """Where state or config already tracks each of ``candidate_urls`` (matched by PR ref).
 
-    Returns a list of dicts, one per matching candidate, in input order
-    and with no duplicates. Each dict has::
-
-        {
-            "prereq_url": "<the candidate URL>",
-            "queued_in": "<feature_id | 'config:include_prs' | 'config:groups[<id>]'>",
-            "queued_in_pr_url": "<rebase PR URL or None>",
-            "carried": <True when matched via combined-port provenance>,
-            "queued_status": "<porting unit's status, None when only the
-                              config lists the prereq>",
-        }
-
-    Empty list when no candidate is already queued — the caller falls
-    through to the auto-recovery dive (or detection-only labelling).
-
-    ``exclude_feature_id`` skips state entries with that id, used so we
-    don't flag a unit's own prior dynamic prereqs (which we already
-    know about) as "queued elsewhere".
-
-    Matching runs in two tiers. A unit that lists the prereq outright
-    wins; failing that, a unit whose PRs say they cherry-picked it (see
-    ``contained_pr_urls``) claims it. The second tier is what recognises
-    a combined port: #1832's prereqs #1388 / #1618 are listed by no unit,
-    but the 26.3 combined port #1718 — which some unit does list — states
-    in its body that it carries both, so the prereq is queued after all.
-
-    URL normalisation: candidates are matched against config / state by
-    their parsed ``(owner, repo, number)`` tuple, so query strings,
-    trailing slashes, and ``http`` vs ``https`` differences don't cause
-    false negatives.
+    Returns one dict per hit, in input order: ``prereq_url``, ``queued_in``
+    (feature id / ``config:include_prs`` / ``config:groups[<id>]``),
+    ``queued_in_pr_url``, ``carried`` and ``queued_status`` (``None`` for
+    config-only hits). A unit listing the prereq wins over one that only
+    carries it via ``contained_pr_urls`` (``carried=True``).
     """
-    def _normalize(url: str) -> tuple[str, str, int] | None:
-        return parse_pr_url(url)
-
-    # Build the lookup table from state and config.
-    # value = (queued_in_label, queued_in_pr_url_or_None, status_or_None)
+    # ref → (queued_in, queued_in_pr_url, status)
     index: dict[
         tuple[str, str, int], tuple[str, str | None, str | None]
     ] = {}
 
-    # State before config: a unit that already ports the prereq names the
-    # merge to wait for and the status to watch; the config line that
-    # queued it names neither.
+    # State before config: only a tracked unit has a merge to wait for.
     for fid, fs in state.features.items():
         if fid == exclude_feature_id:
             continue
-        # All PRs being processed by this feature, original + dynamic.
-        for url in (fs.pr_urls or ([fs.pr_url] if fs.pr_url else [])):
+        for url in _source_pr_urls(fs):
             if not url:
                 continue
-            ref = _normalize(url)
+            ref = parse_pr_url(url)
             if ref and ref not in index:
                 index[ref] = (fid, fs.rebase_pr_url, fs.status)
         for url in fs.dynamic_prereq_urls:
-            ref = _normalize(url)
+            ref = parse_pr_url(url)
             if ref and ref not in index:
                 index[ref] = (fid, fs.rebase_pr_url, fs.status)
-        # Also key on releasy's OWN port PR for this feature. A missing-
-        # prereq report can name the in-flight port PR (the branch where
-        # the prereq's code currently lives on the target) instead of the
-        # upstream source PR. Without this key the dive re-ports that
-        # branch into a combined PR, duplicating an already-open port PR.
+        # A missing-prereq report may name our own in-flight port PR instead of its source PR.
         if fs.rebase_pr_url:
-            ref = _normalize(fs.rebase_pr_url)
+            ref = parse_pr_url(fs.rebase_pr_url)
             if ref and ref not in index:
                 index[ref] = (fid, fs.rebase_pr_url, fs.status)
 
     for url in config.pr_sources.include_prs:
-        ref = _normalize(url)
+        ref = parse_pr_url(url)
         if ref and ref not in index:
             index[ref] = ("config:include_prs", None, None)
 
     for group in config.pr_sources.groups:
         for url in group.prs:
-            ref = _normalize(url)
+            ref = parse_pr_url(url)
             if ref and ref not in index:
                 index[ref] = (f"config:groups[{group.id}]", None, None)
 
-    # Second tier, built after every direct claim is in: PRs a unit's own
-    # PRs say they cherry-picked. Kept separate so a unit that lists the
-    # prereq outright always wins over one that merely carries it.
     carried: dict[
         tuple[str, str, int], tuple[str, str | None, str | None]
     ] = {}
@@ -5207,11 +4026,9 @@ def _find_already_queued_prereqs(
             continue
         contained = list(fs.contained_pr_urls)
         if not contained:
-            # State written before ``contained_pr_urls`` existed still has
-            # the primary PR's body — parse it so the fix applies without
-            # waiting for the unit to be re-processed.
+            # Older state lacks ``contained_pr_urls``; parse the primary PR body instead.
             primary_slug = None
-            primary_ref = _normalize(fs.pr_url or "")
+            primary_ref = parse_pr_url(fs.pr_url or "")
             if primary_ref:
                 primary_slug = f"{primary_ref[0]}/{primary_ref[1]}"
             contained = [
@@ -5221,14 +4038,14 @@ def _find_already_queued_prereqs(
                 )
             ]
         for url in contained:
-            ref = _normalize(url)
+            ref = parse_pr_url(url)
             if ref and ref not in index and ref not in carried:
                 carried[ref] = (fid, fs.rebase_pr_url, fs.status)
 
     out: list[dict] = []
     seen: set[tuple[str, str, int]] = set()
     for url in candidate_urls:
-        ref = _normalize(url)
+        ref = parse_pr_url(url)
         if ref is None or ref in seen:
             continue
         hit = index.get(ref)
@@ -5247,33 +4064,8 @@ def _find_already_queued_prereqs(
     return out
 
 
-def _is_prereq_already_in_base(
-    repo_path: Path, base_branch: str, pr: PRInfo,
-) -> bool:
-    """Pre-flight: is ``pr`` already merged into the local ``base_branch``?
-
-    Returns True when ``pr.merge_commit_sha`` is set AND is reachable from
-    ``base_branch`` per ``git merge-base --is-ancestor``. Returns False
-    in every other case (no merge SHA, ancestor check failed / errored,
-    not reachable) — falsing-out is the safe default because dive logic
-    will then proceed and any double-application will surface as an
-    empty cherry-pick downstream.
-    """
-    if not pr.merge_commit_sha:
-        return False
-    answer = is_ancestor(repo_path, pr.merge_commit_sha, base_branch)
-    return answer is True
-
-
 def _matches_config_labels(config: Config, pr: PRInfo) -> bool:
-    """True if ``pr`` carries the configured selection labels.
-
-    Mirrors ``search_prs_by_labels`` selection semantics: the PR matches
-    when it holds ALL labels of at least one ``pr_sources.by_labels``
-    entry and none of ``pr_sources.exclude_labels`` (case-insensitive).
-    In other words, it's True iff our own label-based discovery would
-    have picked this PR up.
-    """
+    """True iff label-based discovery would select ``pr`` (all labels of some ``by_labels`` entry, no excluded label)."""
     pr_labels = {(lbl or "").lower() for lbl in (pr.labels or [])}
     exclude = {lbl.lower() for lbl in config.pr_sources.exclude_labels}
     if pr_labels & exclude:
@@ -5290,21 +4082,7 @@ def _reject_unlabeled_origin_prereqs(
     triggering_pr: PRInfo | None,
     prereq_infos: list[PRInfo],
 ) -> list[PRInfo]:
-    """Return discovered prereqs that are in origin but lack the config labels.
-
-    Implements ``auto_add_prerequisite_prs.require_origin_prereq_label``:
-    when a discovered prereq lives in the origin repo AND the PR that
-    needs it also lives in origin, the prereq must carry the configured
-    selection labels (see :func:`_matches_config_labels`) — otherwise it
-    is out of scope and must be listed explicitly (``include_prs`` /
-    ``groups``, which the queued-elsewhere guard catches before we ever
-    dive). Prereqs on a different repo than origin (forward-port /
-    backport sources) are never gated.
-
-    No-op (returns ``[]``) when the gate is disabled, no ``by_labels``
-    selection is configured, the origin slug is undeterminable, or the
-    triggering PR is itself cross-repo.
-    """
+    """Origin prereqs of an origin PR that lack the selection labels (``require_origin_prereq_label``)."""
     auto_cfg = config.ai_resolve.auto_add_prerequisite_prs
     if not auto_cfg.require_origin_prereq_label:
         return []
@@ -5313,13 +4091,12 @@ def _reject_unlabeled_origin_prereqs(
     origin_slug = get_origin_repo_slug(config)
     if not origin_slug:
         return []
-    # Gate only fires when the PR that needs the prereq is itself in origin.
     if triggering_pr is not None and triggering_pr.repo_slug != origin_slug:
         return []
     rejected: list[PRInfo] = []
     for pr in prereq_infos:
         if pr.repo_slug != origin_slug:
-            continue  # cross-repo prereq — not gated
+            continue
         if not _matches_config_labels(config, pr):
             rejected.append(pr)
     return rejected
@@ -5328,15 +4105,7 @@ def _reject_unlabeled_origin_prereqs(
 def _fetch_prereq_prs(
     config: Config, urls: list[str],
 ) -> tuple[list[PRInfo], list[str]]:
-    """Fetch ``PRInfo`` for each prereq URL.
-
-    Returns ``(fetched, failed)``: ``fetched`` is the list of successful
-    fetches in input order, ``failed`` is the list of URLs that couldn't
-    be resolved (parse error, GitHub fetch failed, etc.). Callers treat
-    a non-empty ``failed`` list as a soft failure of the dive — log it
-    and fall through to the detection-only path so the user can sort
-    out the unfetchable URLs manually.
-    """
+    """Fetch each prereq URL; returns ``(fetched, failed_urls)``."""
     fetched: list[PRInfo] = []
     failed: list[str] = []
     for url in urls:
@@ -5360,13 +4129,7 @@ def _persist_dive_progress(
     fs_prereq_trail: list[dict],
     prereq_discovery_depth: int,
 ) -> None:
-    """Persist the unit's in-progress dive state.
-
-    Called between dives so a Ctrl-C / crash mid-recovery leaves a
-    paper trail that ``releasy continue`` can read. Status stays at
-    ``branch_created`` (a non-terminal "we're working on it" marker)
-    until the loop exits with success or a final failure outcome.
-    """
+    """Persist the in-progress dive trail (status ``branch_created``) between dives."""
     fs = state.features.get(unit.feature_id) or FeatureState()
     fs.status = "branch_created"
     fs.branch_name = new_branch
@@ -5384,18 +4147,11 @@ def _persist_dive_progress(
 
 def _print_prereq_dive_failure(
     fs_prereq_trail: list[dict],
-    prereq_discovery_depth: int,
     exit_reason: dict,
     auto_cfg,
-    triggering_pr: PRInfo | None,
     final_discovered: list[str],
 ) -> None:
-    """Pretty-print the auto-recovery dependency trail to the console.
-
-    Shared by every "dive aborted" path (depth exhausted, cycle, prereq
-    already queued elsewhere, fetch failed). Layout matches the project
-    board card body so the user sees the same trail in both places.
-    """
+    """Print why the auto-prereq dive stopped and its dependency trail."""
     reason = exit_reason.get("reason")
     headline_map = {
         "depth_exhausted": (
@@ -5487,12 +4243,7 @@ def _print_prereq_dive_failure(
 def _queued_stall(
     queued: list[dict], *, prior: FeatureState | None,
 ) -> StallReason:
-    """``waiting_for_merge`` naming the units that already port the prereq.
-
-    Units are deduped: one combined port routinely carries several of the
-    discovered prereqs, and repeating its id would read as "waiting for
-    `X`, `X` to merge".
-    """
+    """``waiting_for_merge`` naming the (deduped) units that already port the prereq."""
     units = dict.fromkeys(
         str(q.get("queued_in")) for q in queued if q.get("queued_in")
     )
@@ -5517,13 +4268,7 @@ def _prereq_stall(
     *,
     prior: FeatureState | None,
 ) -> StallReason:
-    """Map a ``_decide_prereq_dive`` exit reason onto a stall.
-
-    ``waiting_for_merge`` is the one that pays for itself: the prereq is
-    already being ported by another unit, so the next run skips this one
-    until that unit's PR merges instead of re-running the resolver to be
-    told the same thing.
-    """
+    """Map a ``_decide_prereq_dive`` exit reason onto a stall."""
     reason = exit_reason.get("reason")
     if reason == "queued_elsewhere":
         return _queued_stall(exit_reason.get("queued") or [], prior=prior)
@@ -5564,10 +4309,7 @@ def _prereq_stall(
             ),
             prior=prior,
         )
-    # "detection_only" and anything new. The dive never ran, so the
-    # queued-elsewhere check never ran either: do it now, so a prereq some
-    # other unit already carries parks this one as waiting-for-merge rather
-    # than as a prereq nobody ports.
+    # The dive never ran, so neither did the queued-elsewhere check.
     queued = _find_already_queued_prereqs(
         config, state, discovered, exclude_feature_id=unit.feature_id,
     )
@@ -5581,6 +4323,19 @@ def _prereq_stall(
         waiting_on_prs=list(discovered),
         prior=prior,
     )
+
+
+def _abort_git_op(repo_path: Path) -> None:
+    if is_operation_in_progress(repo_path):
+        run_git(["cherry-pick", "--abort"], repo_path, check=False)
+        run_git(["merge", "--abort"], repo_path, check=False)
+        run_git(["rebase", "--abort"], repo_path, check=False)
+
+
+def _drop_local_branch(repo_path: Path, branch: str, base_ref: str) -> None:
+    if local_branch_exists(repo_path, branch):
+        run_git(["checkout", "--detach", base_ref], repo_path, check=False)
+        run_git(["branch", "-D", branch], repo_path, check=False)
 
 
 def _handle_missing_prereqs_no_dive(
@@ -5600,36 +4355,10 @@ def _handle_missing_prereqs_no_dive(
     prereq_discovery_depth: int,
     exit_reason: dict,
 ) -> None:
-    """Roll back the unit, persist the prereq trail, label, and report.
-
-    Shared exit path for every "we know what's missing but we are not
-    going to dive" outcome:
-      * detection-only mode (auto-recovery disabled)
-      * prereq queued elsewhere
-      * depth exhausted
-      * cycle detected
-      * dive's prereq fetch failed
-      * every dive candidate is already in base_branch (rare; surfaces
-        when Claude misidentified a prereq we *just* merged)
-
-    Always:
-      * aborts any in-progress git op
-      * resets the port branch state (drops local branch when no
-        successful picks were committed; keeps partial-group commits
-        otherwise — same rule as ``_handle_unresolved_conflict``)
-      * persists the prereq trail + ``missing_prereq_prs`` /
-        ``missing_prereq_note`` on FeatureState
-      * applies the ``missing-prerequisites`` label to any opened PR
-      * emits the dependency trail to stdout
-    """
+    """Missing prereqs without a dive: report, drop the local branch, record ``conflict`` state."""
     auto_cfg = config.ai_resolve.auto_add_prerequisite_prs
 
-    # First: clean up any in-progress git op so the working tree is
-    # safe to operate on.
-    if is_operation_in_progress(repo_path):
-        run_git(["cherry-pick", "--abort"], repo_path, check=False)
-        run_git(["merge", "--abort"], repo_path, check=False)
-        run_git(["rebase", "--abort"], repo_path, check=False)
+    _abort_git_op(repo_path)
 
     final_discovered = list(outcome.missing_prereq_prs)
     exhausted = exit_reason.get("reason") in (
@@ -5637,23 +4366,10 @@ def _handle_missing_prereqs_no_dive(
     )
 
     _print_prereq_dive_failure(
-        fs_prereq_trail, prereq_discovery_depth, exit_reason,
-        auto_cfg, outcome.failed_pr, final_discovered,
+        fs_prereq_trail, exit_reason, auto_cfg, final_discovered,
     )
-    if exit_reason.get("reason") == "queued_elsewhere":
-        # Print the prereq cross-references in the standard "queued"
-        # variant of the trail printer. (Already done above in
-        # ``_print_prereq_dive_failure``; leave a marker so the next
-        # step doesn't rewrite the line.)
-        pass
 
-    # Discard any local branch we built up. Failed at idx 0 means no
-    # commit landed; idx > 0 means partial-group commits exist. Drop
-    # everything either way — when auto-recovery is in play we don't
-    # publish a half-built branch with confusing prereqs.
-    if local_branch_exists(repo_path, new_branch):
-        run_git(["checkout", "--detach", base_ref], repo_path, check=False)
-        run_git(["branch", "-D", new_branch], repo_path, check=False)
+    _drop_local_branch(repo_path, new_branch, base_ref)
     console.print(
         f"    [yellow]Dropped local branch[/yellow] [cyan]{new_branch}[/cyan]"
         " (auto-prereq dive aborted; nothing kept)."
@@ -5683,11 +4399,6 @@ def _handle_missing_prereqs_no_dive(
     )
     state.features[unit.feature_id] = fs
     _persist_state(config, state)
-    # Sync above already labelled the project card body. There is no
-    # rebase PR to label here (we dropped the branch and didn't push) —
-    # the missing-prereqs label only attaches to PRs in the partial-
-    # group draft path inside ``_handle_unresolved_conflict``, which is
-    # not the auto-recovery roll-back path.
 
 
 def _handle_already_in_target(
@@ -5701,26 +4412,12 @@ def _handle_already_in_target(
     onto: str,
     pr_meta: dict,
 ) -> None:
-    """Cleanup for a unit whose every PR was already in target.
-
-    The port branch was created off ``base_ref`` and ended up empty after
-    every cherry-pick was ``--skip``'d as "now empty". Drop the empty
-    branch and record the feature as ``skipped`` with a reason — so
-    ``releasy status`` makes clear no port was needed and ``releasy
-    continue`` won't try to re-pick it.
-    """
+    """Drop the empty port branch of a unit already fully in target and mark it ``skipped``."""
     origin_slug = get_origin_repo_slug(config)
 
-    # Defensive: if anything is somehow still in-progress (shouldn't be,
-    # since cherry_pick_sha already --skip'd), wind it down.
-    if is_operation_in_progress(repo_path):
-        run_git(["cherry-pick", "--abort"], repo_path, check=False)
-        run_git(["merge", "--abort"], repo_path, check=False)
-        run_git(["rebase", "--abort"], repo_path, check=False)
+    _abort_git_op(repo_path)
 
-    if local_branch_exists(repo_path, new_branch):
-        run_git(["checkout", "--detach", base_ref], repo_path, check=False)
-        run_git(["branch", "-D", new_branch], repo_path, check=False)
+    _drop_local_branch(repo_path, new_branch, base_ref)
 
     refs = ", ".join(
         pr_ref_label(pr.repo_slug, pr.number, origin_slug)
@@ -5764,35 +4461,15 @@ def _handle_unresolved_conflict(
     prereq_trail: list[dict] | None = None,
     prereq_discovery_depth: int = 0,
 ) -> None:
-    """Centralised cleanup for an unresolved cherry-pick conflict.
+    """Record an unresolved conflict as ``conflict`` state.
 
-    Drops in two flavours, depending on whether earlier picks in the unit
-    landed cleanly:
-
-    * ``idx == 0`` (singleton, or the very first pick of a group): the
-      branch has no commits worth keeping — abort the in-progress git op,
-      detach from the branch, delete it locally, and record a
-      ``conflict`` state entry with no PR / no push.
-
-    * ``idx > 0`` (a partial group): the prior ``idx`` picks are valid
-      commits — abort the current pick, push the branch as-is, open a
-      DRAFT PR labelled ``ai-needs-attention`` with a banner explaining
-      what failed, and record a ``conflict`` state entry pointing at the
-      new draft PR. Remaining PRs in the group are NOT attempted.
-
-    Either way the state is persisted (and synced to the GitHub Project
-    when ``push`` is enabled) before returning, so the caller can simply
-    move on to the next unit.
+    At ``idx == 0`` the local branch is dropped; for a partial group the
+    applied picks are pushed as a draft PR labelled needs-attention.
     """
     origin_slug = get_origin_repo_slug(config)
     ref = pr_ref_label(failed_pr.repo_slug, failed_pr.number, origin_slug)
 
-    # 1. Make sure no git op is mid-flight. Idempotent: if the resolver
-    # already aborted/reset (the AI path does this), these are no-ops.
-    if is_operation_in_progress(repo_path):
-        run_git(["cherry-pick", "--abort"], repo_path, check=False)
-        run_git(["merge", "--abort"], repo_path, check=False)
-        run_git(["rebase", "--abort"], repo_path, check=False)
+    _abort_git_op(repo_path)
 
     why = (
         "AI resolver gave up" if ai_attempted
@@ -5819,10 +4496,7 @@ def _handle_unresolved_conflict(
         )
 
     if idx == 0:
-        # Nothing to keep — drop the branch entirely.
-        if local_branch_exists(repo_path, new_branch):
-            run_git(["checkout", "--detach", base_ref], repo_path, check=False)
-            run_git(["branch", "-D", new_branch], repo_path, check=False)
+        _drop_local_branch(repo_path, new_branch, base_ref)
         console.print(
             f"    [yellow]Dropped local branch[/yellow] [cyan]{new_branch}[/cyan] "
             f"({why}; nothing to keep)."
@@ -5850,7 +4524,6 @@ def _handle_unresolved_conflict(
         _persist_state(config, state)
         return
 
-    # Partial group: keep the n-1 successful commits, push, draft PR.
     applied = idx
     remaining = max(0, len(unit.prs) - applied - 1)
     console.print(
@@ -5880,10 +4553,7 @@ def _handle_unresolved_conflict(
             dropped_items=dropped_items,
             stall=stall,
         )
-        # On a retry of a previously-failed unit a draft PR may already
-        # exist for this branch — `create_pull_request` would 422 in that
-        # case. Look it up first and refresh title/body/labels in place;
-        # only call `create_pull_request` when no PR is open.
+        # A retry may already have a draft PR open; creating another would 422.
         existing = find_pr_for_branch(config, new_branch, base_branch)
         if existing is not None:
             rebase_pr_url = existing.url
@@ -5939,8 +4609,6 @@ def _handle_unresolved_conflict(
                     f"[cyan]{new_branch}[/cyan] (see warnings above)"
                 )
 
-    # Carry the prior verify_comment_posted across the FeatureState
-    # rebuild below so re-runs don't stack duplicate comments.
     verify_comment_posted = bool(
         prior_state and prior_state.verify_comment_posted
     )
@@ -5961,10 +4629,6 @@ def _handle_unresolved_conflict(
         conflict_files=conflict_files,
         failed_step_index=applied,
         partial_pr_count=applied,
-        # Carry the auto-continue attempt count forward so the cap in
-        # pr_policy.max_partial_continue_attempts is enforced across runs.
-        # 0 on the original failure; >0 once `run` has been re-routed
-        # through the auto-continue path.
         partial_continue_attempts=unit.partial_continue_attempts,
         ai_cost_usd=unit.ai_cost_usd_total,
         verify_needs_attention=unit.verify_needs_attention,
@@ -5983,14 +4647,7 @@ def _handle_unresolved_conflict(
 
 
 def _combine_user_context(unit: FeatureUnit, pr: PRInfo) -> str:
-    """Build the ``user_context`` string for a single cherry-pick step.
-
-    Combines the unit-level ``ai_context`` (set during discovery from
-    ``pr_sources.by_labels[].ai_context`` / ``pr_sources.groups[].ai_context``
-    / ``pr_sources.include_prs[].ai_context``) with the per-PR override
-    for this step's source PR (``pr_sources.groups[].prs[].ai_context``).
-    Returns ``""`` when the user supplied no context.
-    """
+    """Unit-level ``ai_context`` plus the per-PR one for ``pr``."""
     parts: list[str] = []
     if unit.ai_context:
         parts.append(unit.ai_context)
@@ -6012,28 +4669,9 @@ def _try_ai_resolve_step(
     start_sha: str | None = None,
     pre_resolve_sha: str | None = None,
 ) -> "_AIStepOutcome":
-    """Invoke Claude to resolve ONE conflicted cherry-pick step in place.
-
-    Step-mode contract: on success Claude has resolved, built, and committed
-    locally — the cherry-pick is concluded, the working tree is clean, and
-    HEAD has advanced. RelEasy stays in charge of pushing the branch and
-    opening the (possibly combined) PR. This contract is the same for
-    singletons and for any step inside a sequential group.
-
-    Returns an :class:`_AIStepOutcome`. ``handled`` is True iff the step
-    succeeded and the caller should continue with the next pick. When
-    Claude reported ``MISSING_PREREQS`` the outcome carries the discovered
-    URLs / reason, even though ``handled`` is False — callers branch on
-    this to enter the auto-recovery dive (or detection-only labelling)
-    instead of routing to :func:`_handle_unresolved_conflict`.
-
-    On non-success the working tree is reset to a clean state at
-    ``start_sha`` (handled inside ``attempt_ai_resolve``).
-    """
+    """Have Claude resolve and commit one conflicted cherry-pick step in place."""
     from releasy.ai_resolve import AIResolveContext, attempt_ai_resolve
 
-    # Lazy: register the upstream remote so Claude's prereq-detection
-    # `git fetch` / `git log` queries can resolve it.
     _ensure_upstream_remote(config, repo_path)
 
     ctx = AIResolveContext(
@@ -6043,24 +4681,15 @@ def _try_ai_resolve_step(
         conflict_files=conflict_files,
         operation="cherry-pick",
         user_context=_combine_user_context(unit, pr),
-        # Split-commit mode: ``pre_resolve_sha`` is set iff RelEasy already
-        # concluded the cherry-pick as a "with conflicts" commit before
-        # this call (see ``_attempt_cherry_picks``). The AI prompt and
-        # post-condition checks both branch on this. ``start_sha`` is the
-        # branch tip BEFORE the cherry-pick so cleanup-on-failure rolls
-        # back both the pre-commit and any partial resolution.
         split_mode=pre_resolve_sha is not None,
         pre_resolve_sha=pre_resolve_sha,
         start_sha=start_sha,
         mode=unit.mode,
-        # Resolve only; RelEasy builds + tests afterwards (see _run_verify_phase).
         skip_build=config.ai_resolve.deterministic_build,
     )
 
     result = attempt_ai_resolve(config, repo_path, ctx)
 
-    # Cost is billed even when Claude failed — record it before deciding
-    # what to do about the failure.
     if result.cost_usd is not None:
         unit.ai_cost_usd_total = (
             (unit.ai_cost_usd_total or 0.0) + result.cost_usd
@@ -6098,9 +4727,7 @@ def _try_ai_resolve_step(
         f"    [green]✓[/green] AI resolved #{pr.number}{iters}{cost}"
     )
 
-    # A resolution kept despite a failing postcondition rides the verifier's
-    # channel: the unit's PR doesn't exist yet, and ``_finalise_unit``
-    # already turns these into the label + PR comment once it does.
+    # A resolution kept despite a failing postcondition is reported via the verifier findings.
     if result.warnings:
         from releasy.ai_resolve import flatten_resolve_warnings
 
@@ -6179,7 +4806,6 @@ def _run_verify_pass(
             console.print(f"      [dim]{vr.summary}[/dim]")
         return
 
-    # needs_attention
     unit.verify_needs_attention = True
     header = f"#{pr.number}"
     if vr.summary:
@@ -6188,7 +4814,6 @@ def _run_verify_pass(
         unit.verify_findings.append(f"**{header}**")
     for finding in vr.findings:
         unit.verify_findings.append(f"- {finding}")
-    # blank-line separator between PR blocks in the eventual PR comment
     unit.verify_findings.append("")
 
     console.print(
@@ -6201,23 +4826,12 @@ def _run_verify_pass(
 
 @dataclass
 class _AIStepOutcome:
-    """Result of one ``_try_ai_resolve_step`` call.
-
-    ``handled`` is True iff the AI committed the cherry-pick locally.
-    When False, ``missing_prereq_prs`` may be non-empty (Claude reported
-    a missing-prereq situation) — callers route on that distinction
-    instead of falling straight through to ``_handle_unresolved_conflict``.
-    """
+    # True iff the AI committed the cherry-pick locally.
     handled: bool
     missing_prereq_prs: list[str] = field(default_factory=list)
     missing_prereq_note: str | None = None
-    # The resolver never reached a verdict (see AIResolveResult.api_aborted).
+    # The resolver never reached a verdict.
     api_aborted: bool = False
-
-
-# ---------------------------------------------------------------------------
-# Continue / Skip / Abort / Status
-# ---------------------------------------------------------------------------
 
 
 def _resolve_branch_target(
@@ -6288,11 +4902,9 @@ def continue_branch(config: Config, branch_name: str) -> bool:
 def _branch_resolution_state(
     repo_path: Path, branch: str, base_ref: str,
 ) -> tuple[bool, str | None]:
-    """Inspect a port branch and decide whether it has been resolved.
+    """Check out ``branch``; resolved = clean tree, no op in progress, commits beyond ``base_ref``.
 
-    Returns ``(resolved, reason_if_not)``. Resolved means: branch is
-    checked out cleanly, no unmerged files, no in-progress cherry-pick,
-    and HEAD has at least one commit beyond ``base_ref``.
+    Returns ``(resolved, reason_if_not)``.
     """
     co = run_git(["checkout", branch], repo_path, check=False)
     if co.returncode != 0:
@@ -6336,7 +4948,7 @@ def _open_pr_for_resolved(
 
     if remote_branch_exists(repo_path, branch, config.origin.remote_name):
         console.print(
-            f"    [dim]already on origin, not force-pushing[/dim]"
+            "    [dim]already on origin, not force-pushing[/dim]"
         )
     else:
         _push(config, repo_path, branch)
@@ -6351,7 +4963,7 @@ def _open_pr_for_resolved(
 
     body_parts: list[str] = []
     origin_slug = get_origin_repo_slug(config)
-    pr_urls = fs.pr_urls or ([fs.pr_url] if fs.pr_url else [])
+    pr_urls = _source_pr_urls(fs)
     refs: list[str] = []
     for url in pr_urls:
         parsed = parse_pr_url(url) if url else None
@@ -6386,8 +4998,6 @@ def _open_pr_for_resolved(
                 f"(set [cyan]update_existing_prs: true[/cyan] to overwrite "
                 f"title/body)[/dim]"
             )
-        # Make sure the `releasy` label is present even on PRs from older
-        # runs that predated label-based identification.
         _apply_releasy_label_to_pr(config, fs.rebase_pr_url, pr_number=pr_num)
         _apply_session_labels_to_pr(
             config, fs.rebase_pr_url, pr_number=pr_num, mode=fs.mode,
@@ -6449,28 +5059,9 @@ def _feature_id_from_branch(state: PipelineState, branch: str) -> str:
 
 
 def continue_all(config: Config, work_dir: Path | None = None) -> bool:
-    """Re-check every feature in state and finish whatever can be finished.
+    """Re-check every feature in state: open PRs for resolved / ``branch_created`` ports, report the rest.
 
-    This is the catch-all "reconcile everything" command. Per feature:
-
-      - ``skipped`` → log and skip.
-      - ``conflict`` from an AI-gave-up partial group / dropped singleton
-        (any of ``failed_step_index`` / ``partial_pr_count`` /
-        ``rebase_pr_url`` set) → highlight; user must act on the draft
-        PR or source PR, then re-run.
-      - ``conflict``, branch now clean → push, open PR (if ``auto_pr``),
-        flip to ``needs_review`` or ``branch_created``.
-      - ``conflict``, still unresolved → highlight, leave alone.
-      - ``branch_created`` (branch on origin, no PR yet) → try to open
-        the PR. Covers the case where the previous run had
-        ``pr_policy.auto_pr: false`` and only pushed the branch, or
-        where an earlier failure prevented PR creation. Stays as
-        ``branch_created`` if PR creation is still disabled / failing.
-      - ``needs_review`` already linked to a PR → leave alone.
-
-    Always finishes with a project-board reconciliation pass so the GitHub
-    Project reflects the current state (and stale draft stubs get replaced
-    by the real PR cards).
+    Ends with a project-board reconciliation pass.
     """
     state = load_state(config)
     if not state.features:
@@ -6516,9 +5107,6 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
             "GitHub writes will happen."
         )
 
-    # Pick up ports merged externally since the last run; ``continue``
-    # is the natural place to reconcile, so apply the merged_label sweep
-    # here as well.
     _refresh_all_merge_status_from_github(config, state)
     _refresh_all_superseded_status_from_github(
         config, state, repo_path, base_branch,
@@ -6550,10 +5138,6 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
             console.print(f"{header} — [dim]reverted: {reason}[/dim]")
             continue
 
-        # AI-gave-up flavour of conflict (partial group / dropped
-        # singleton) — these have an explicit human-action checkpoint
-        # (the draft PR or the source PR), so we never auto-flip them
-        # below; the user re-runs ``continue`` after the manual fix.
         if fs.status == "conflict" and (
             fs.failed_step_index is not None
             or fs.partial_pr_count is not None
@@ -6565,7 +5149,6 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
             )
             continue
 
-        # Resolved locally but build/tests not green — resumed by `releasy run`.
         if fs.status == "build_failed":
             err = fs.last_verify_error or "build/tests not green"
             console.print(
@@ -6574,9 +5157,6 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
             )
             continue
 
-        # Already-finished states. ``needs_review`` is terminal (PR exists);
-        # ``branch_created`` is the "branch pushed but no PR" case, where
-        # ``releasy continue`` will try to open the PR.
         if fs.status == "needs_review":
             console.print(
                 f"{header} — [dim]needs-review, PR open[/dim]"
@@ -6605,7 +5185,6 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
             _persist_state(config, state)
             continue
 
-        # Conflict path needs the branch locally so we can inspect / continue.
         if not fs.branch_name or not local_branch_exists(repo_path, fs.branch_name):
             console.print(
                 f"{header} [yellow]branch missing locally, skipping[/yellow]"
@@ -6633,8 +5212,6 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
 
         console.print(f"{header} [green]✓ resolved[/green]")
         fs.conflict_files = []
-        # Provisional — flips to needs_review inside _open_pr_for_resolved
-        # if a PR is opened (or already exists for the branch).
         fs.status = _success_status(fs.rebase_pr_url)
         state.features[feat_id] = fs
         _open_pr_for_resolved(config, repo_path, state, fs, base_branch)
@@ -6654,19 +5231,7 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
 
 
 def sync_to_project(config: Config) -> bool:
-    """Standalone reconciliation: push current local state to the board.
-
-    Loads the per-project state file and calls the same reconciliation
-    used at the end of ``releasy continue``, so the user can refresh the
-    project board without running the whole pipeline (handy after editing
-    state by hand, after rotating tokens, or right after wiring up a new
-    project URL on an in-flight rebase).
-
-    Returns False — for non-zero CLI exit — only when the user asked for a
-    sync but nothing happened: no project configured, missing token,
-    unparseable URL, or sync errors. A clean "already up to date" is
-    success.
-    """
+    """Push local state to the project board (pruning orphans); False when the sync did not happen or errored."""
     if not config.notifications.github_project:
         console.print(
             "[yellow]No GitHub Project configured.[/yellow] Set "
@@ -6721,18 +5286,7 @@ def sync_to_project(config: Config) -> bool:
 
 
 def _reconcile_project_board(config: Config, state: PipelineState) -> None:
-    """Make sure every local port is reflected on the GitHub Project board.
-
-    Per-feature state changes during the run already trigger
-    ``sync_project`` from ``_persist_state`` (when ``push`` is
-    on). This is the belt-and-braces pass: even with ``push: false``, or
-    when the project URL was added to config after some ports were
-    already in state, we still want ``releasy continue`` to leave the
-    board in sync with what we have locally.
-
-    Output is a single, friendly line — quiet when there's nothing to do,
-    informative when there is.
-    """
+    """Sync the project board with local state (also when ``push`` is off)."""
     if not config.notifications.github_project:
         return
     console.print("\n[dim]Reconciling GitHub Project board...[/dim]")
@@ -6784,13 +5338,7 @@ def skip_branch(config: Config, branch_name: str) -> bool:
 def mark_reverted(
     config: Config, branch_name: str, reason: str | None = None,
 ) -> bool:
-    """Record that a merged port was reverted on the target branch.
-
-    State-only: git and the port PR are untouched — the revert itself is
-    the user's, already on target. The entry becomes unconditionally
-    terminal, so no later `run` / `refresh` re-ports it and no sweep
-    flips it back (they only look at in-flight statuses).
-    """
+    """Mark a port ``reverted`` (state only; terminal, never re-ported)."""
     state = load_state(config)
     feat = _resolve_branch_target(config, state, branch_name)
 
@@ -6833,21 +5381,14 @@ def abort_run(config: Config) -> None:
     _persist_state(config, state)
 
 
-# Statuses that represent purely-local damage (no rebase PR, never merged).
-# `clear` only touches features in these states.
+# Local-only damage that ``clear`` without an identifier cleans up.
 _CLEARABLE_STATUSES: tuple[str, ...] = ("conflict", "branch_created")
 
 
 def _resolve_clear_target(
     config: Config, state: PipelineState, ident: str,
 ) -> tuple[str, FeatureState] | None:
-    """Resolve any of: feature ID, branch name, source-PR number, source-PR URL.
-
-    Returns ``(feature_id, FeatureState)`` for an entry that exists in
-    state, or ``None`` if nothing matches. Unlike :func:`_resolve_branch_target`,
-    this only succeeds when state actually tracks the feature — `clear`
-    has nothing to do for features releasy has never touched.
-    """
+    """Find a state entry by feature ID, branch name, source-PR number or URL."""
     feat = _resolve_branch_target(config, state, ident)
     if feat is not None and feat.id in state.features:
         return feat.id, state.features[feat.id]
@@ -6859,11 +5400,8 @@ def _resolve_clear_target(
                 return fid, fs
 
     if parse_pr_url(ident) is not None:
-        norm = ident.rstrip("/")
         for fid, fs in state.features.items():
-            if fs.pr_url and fs.pr_url.rstrip("/") == norm:
-                return fid, fs
-            if any(u.rstrip("/") == norm for u in fs.pr_urls):
+            if any(same_pr_url(u, ident) for u in (fs.pr_url, *fs.pr_urls)):
                 return fid, fs
 
     return None
@@ -6877,12 +5415,7 @@ def _clear_one_feature(
     work_dir: Path | None,
     dry_run: bool,
 ) -> bool:
-    """Wipe one feature's local artifacts and drop its state entry.
-
-    Caller must have already vetted ``fs.rebase_pr_url`` is empty.
-    Mutates ``state.features`` (pops the entry) but does NOT persist —
-    callers persist once at the end (so multi-clear is one save).
-    """
+    """Delete one feature's local branch and drop its state entry (caller persists)."""
     branch = fs.branch_name
     work = config.resolve_work_dir(work_dir)
     repo_path = work if (work / ".git").exists() else work / "repo"
@@ -6919,7 +5452,6 @@ def _clear_one_feature(
             )
             on_branch = head.returncode == 0 and head.stdout.strip() == branch
             if on_branch:
-                # Detach so we can delete the branch we're sitting on.
                 base = state.base_branch or config.target_branch or "HEAD"
                 run_git(["checkout", "--detach", base], repo_path, check=False)
 
@@ -6936,7 +5468,7 @@ def _clear_one_feature(
                 return False
 
     state.features.pop(feat_id, None)
-    console.print(f"  [green]✓[/green] state entry removed")
+    console.print("  [green]✓[/green] state entry removed")
     return True
 
 
@@ -6946,11 +5478,7 @@ def clear_branch(
     work_dir: Path | None = None,
     dry_run: bool = False,
 ) -> bool:
-    """Clean up local artifacts for one feature that never made it to a PR.
-
-    Refuses to touch a feature whose ``rebase_pr_url`` is set — those are
-    user-visible on GitHub and outside the scope of `clear`.
-    """
+    """Clean up local artifacts for one feature that has no port PR."""
     state = load_state(config)
     resolved = _resolve_clear_target(config, state, identifier)
     if resolved is None:
@@ -6983,12 +5511,7 @@ def clear_all_dirty(
     dry_run: bool = False,
     assume_yes: bool = False,
 ) -> bool:
-    """Clean every feature in a local-only damaged state.
-
-    Selects features where ``rebase_pr_url`` is empty and status is in
-    :data:`_CLEARABLE_STATUSES`. Confirms interactively unless
-    ``assume_yes`` or ``dry_run``.
-    """
+    """Clear every PR-less feature in a :data:`_CLEARABLE_STATUSES` status (confirms unless ``assume_yes``)."""
     import click
 
     state = load_state(config)
@@ -7035,11 +5558,7 @@ def clear_all_dirty(
 
 
 def print_status(config: Config) -> None:
-    """Print the current pipeline state, grouped by status.
-
-    One sub-table per status section (in :data:`STATUS_DISPLAY_ORDER`),
-    so the most-attention-needing entries (conflicts) surface at the top.
-    """
+    """Print the current pipeline state, one table per status."""
     from rich.markup import escape
     from rich.table import Table
     from releasy.state import STATUS_DISPLAY_ORDER
@@ -7122,8 +5641,6 @@ def print_status(config: Config) -> None:
             table.add_column("Blocked By", style="yellow")
         if status == "skipped":
             table.add_column("Reason", style="yellow")
-        # Why the port stopped where it did — only for statuses that can
-        # carry one (a clean port has no stall).
         show_why = any(fs.stall is not None for _, fs in rows)
         if show_why:
             table.add_column("Why", style="yellow")

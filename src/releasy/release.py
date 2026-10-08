@@ -1,10 +1,4 @@
-"""Release branch construction — PR-per-feature workflow.
-
-Creates a base release branch directly from a tag (resolved against the
-origin remote, or the local repo if already present), then for each
-enabled feature creates a separate branch with a single squashed commit
-and opens a GitHub PR targeting the release branch.
-"""
+"""Release branch construction: base branch from a tag, then one squashed PR per feature."""
 
 from __future__ import annotations
 
@@ -30,7 +24,6 @@ from releasy.state import load_state
 
 
 def _feature_pr_branch(release_name: str, feature_id: str) -> str:
-    """Naming convention for per-feature PR branches."""
     return f"{release_name}/feat/{feature_id}"
 
 
@@ -40,7 +33,6 @@ def _build_pr_body(
     release_name: str,
     original_pr_body: str | None = None,
 ) -> str:
-    """Build the PR body for a feature."""
     lines = [
         f"## {feat.description}",
         "",
@@ -75,14 +67,6 @@ def build_release(
     include_skipped: bool = False,
     work_dir: Path | None = None,
 ) -> bool:
-    """Build a release with PR-per-feature workflow.
-
-    Steps:
-    1. Pre-flight checks on feature status
-    2. Create release base branch directly from the given tag/ref
-    3. Push the base branch
-    4. For each feature: create a branch with squashed commit, push, open PR
-    """
     state = load_state(config)
 
     existing_ids = {f.id for f in config.features}
@@ -183,8 +167,6 @@ def build_release(
         feat_remote_ref = f"{config.origin.remote_name}/{fs.branch_name}"
         feat_tip = get_branch_tip(repo_path, feat_remote_ref)
 
-        # Feature-only commits: everything on the feature branch after
-        # the recorded base_commit.
         n_feat = count_commits(repo_path, fs.base_commit, feat_tip)
         if n_feat == 0:
             console.print("    [dim]No unique commits — skipping[/dim]")

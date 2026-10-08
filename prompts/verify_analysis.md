@@ -1,1 +1,0 @@
-../src/releasy/prompts/verify_analysis.md

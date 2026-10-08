@@ -1,11 +1,4 @@
-"""Shared display constants for pipeline status output.
-
-Kept as a tiny module of its own so ``pipeline.print_status`` and any
-future status renderer (`releasy list`, project-board sync, …) can share
-the same icon / heading vocabulary without depending on the old
-STATUS.md generator (which was removed when state moved out of the
-user's repo).
-"""
+"""Shared display constants for pipeline status output."""
 
 from __future__ import annotations
 

@@ -346,7 +346,7 @@ class RoundLoop(unittest.TestCase):
         with mock.patch.multiple(
             analyze_fails,
             fetch_pr_by_url=mock.Mock(return_value=fake_pr),
-            _fetch_pr_meta=mock.Mock(
+            fetch_pr_head=mock.Mock(
                 return_value=("head", "o/r", "base", "sha0", 7),
             ),
             get_origin_repo_slug=mock.Mock(return_value="o/r"),

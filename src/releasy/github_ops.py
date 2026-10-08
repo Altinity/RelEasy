@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from pathlib import Path
 
 import requests
 from releasy.termlog import console
@@ -18,17 +17,8 @@ log = logging.getLogger(__name__)
 GRAPHQL_URL = "https://api.github.com/graphql"
 
 
-# ---------------------------------------------------------------------------
-# Remote URL parsing
-# ---------------------------------------------------------------------------
-
-
 def parse_remote_url(url: str) -> tuple[str, str] | None:
-    """Extract (owner, repo) from a GitHub remote URL.
-
-    Supports SSH (git@github.com:owner/repo.git) and
-    HTTPS (https://github.com/owner/repo.git).
-    """
+    """Extract (owner, repo) from an SSH or HTTPS GitHub remote URL."""
     m = re.match(r"git@github\.com:(.+)/(.+?)(?:\.git)?$", url)
     if m:
         return m.group(1), m.group(2)
@@ -47,13 +37,7 @@ def get_origin_repo_slug(config: Config) -> str | None:
 
 
 def require_origin_repo_slug(config: Config) -> str:
-    """Return the origin slug or raise — used by every write path.
-
-    RelEasy *only* writes (create/update/label PRs, push branches) to the
-    repo configured as ``origin``. If the origin URL can't be parsed, no
-    write should be attempted at all — this is the single chokepoint that
-    makes that guarantee enforceable.
-    """
+    """Return the origin slug or raise; all writes go through this."""
     slug = get_origin_repo_slug(config)
     if not slug:
         raise ValueError(
@@ -67,13 +51,7 @@ def require_origin_repo_slug(config: Config) -> str:
 def _assert_writes_target_origin(
     config: Config, target_slug: str, action: str,
 ) -> None:
-    """Defense-in-depth: refuse to write to anything other than origin.
-
-    All write paths derive their target slug from origin in the first
-    place, so this check is tautological in correct code. It's here to
-    catch refactor mistakes loudly instead of silently mutating an
-    unintended GitHub repo.
-    """
+    """Defense-in-depth: refuse to write to anything other than origin."""
     origin_slug = require_origin_repo_slug(config)
     if target_slug != origin_slug:
         raise ValueError(
@@ -82,11 +60,6 @@ def _assert_writes_target_origin(
             f"({origin_slug!r}). This should never happen — please "
             "report it as a bug."
         )
-
-
-# ---------------------------------------------------------------------------
-# Pull Request creation (PyGithub REST API)
-# ---------------------------------------------------------------------------
 
 
 def create_pull_request(
@@ -99,26 +72,7 @@ def create_pull_request(
     draft: bool = False,
     labels: list[str] | None = None,
 ) -> str | None:
-    """Create a pull request **on the origin repo**.
-
-    By construction this function only ever creates PRs in the configured
-    ``origin``. The slug is derived from origin on every call and
-    re-validated via ``_assert_writes_target_origin`` before any GitHub
-    write — there is deliberately no parameter for naming a different repo.
-
-    Args:
-        config: Config with origin remote URL.
-        head: Source branch name (in origin).
-        base: Target branch name (in origin).
-        title: PR title.
-        body: PR body (markdown).
-        draft: When True, open the PR in draft state.
-        labels: Optional labels to attach right after creation. Labels that
-            don't already exist on the repo are not auto-created here — call
-            ``ensure_label`` first if you need that.
-
-    Returns the PR URL, or None if creation failed.
-    """
+    """Create a PR on origin; return its URL or None. Labels must already exist."""
     if config.dry_run:
         log.info(
             "[dry-run] would open PR on origin: %s → %s — %r", head, base, title,
@@ -168,12 +122,7 @@ def update_pull_request(
     title: str | None = None,
     body: str | None = None,
 ) -> bool:
-    """Edit the title and/or body of an existing PR **on the origin repo**.
-
-    Returns True on success, False on failure. A ``None`` argument means
-    "leave that field alone". Like ``create_pull_request``, this only ever
-    targets the configured origin — no parameter to point elsewhere.
-    """
+    """Edit an origin PR's title/body; ``None`` leaves a field alone."""
     if config.dry_run:
         log.info("[dry-run] would update PR #%d", pr_number)
         return True
@@ -220,12 +169,7 @@ def close_pull_request(
     *,
     comment: str | None = None,
 ) -> bool:
-    """Close an open PR **on the origin repo**, optionally leaving a comment.
-
-    Returns True on success (the PR is closed after the call) or when the
-    PR was already closed, False on any GitHub failure. Like the other
-    write helpers this only ever targets the configured origin.
-    """
+    """Close an origin PR (optionally commenting first); True if it ends up closed."""
     if config.dry_run:
         log.info("[dry-run] would close PR #%d", pr_number)
         return True
@@ -268,11 +212,6 @@ def close_pull_request(
         return False
 
 
-# ---------------------------------------------------------------------------
-# Issue I/O (used by `releasy graph discover --open-issue` / `graph update`)
-# ---------------------------------------------------------------------------
-
-
 def create_issue(
     config: Config,
     title: str,
@@ -280,11 +219,7 @@ def create_issue(
     *,
     labels: list[str] | None = None,
 ) -> tuple[int, str] | None:
-    """Create an issue on origin; return (number, html_url) or None.
-
-    Only writes to the configured origin. Labels must already exist on the
-    repo (call ensure_label first). Returns None on failure / dry-run.
-    """
+    """Create an issue on origin; return (number, html_url) or None. Labels must already exist."""
     if config.dry_run:
         log.info("[dry-run] would open issue on origin: %r", title)
         return None
@@ -331,11 +266,7 @@ def update_issue(
     title: str | None = None,
     body: str | None = None,
 ) -> bool | None:
-    """Edit an issue's title/body on origin. None args are left alone.
-
-    Returns True on success, False on a transient/other failure, and None
-    when the issue no longer exists (HTTP 404) so the caller can recreate it.
-    """
+    """Edit an origin issue's title/body; None means the issue is gone (404)."""
     if config.dry_run:
         log.info("[dry-run] would update issue #%d", issue_number)
         return True
@@ -382,7 +313,6 @@ def update_issue(
 
 
 def add_issue_comment(config: Config, issue_number: int, body: str) -> bool:
-    """Post a comment on an origin issue. Returns True on success."""
     if config.dry_run:
         log.info("[dry-run] would comment on issue #%d", issue_number)
         return True
@@ -428,12 +358,7 @@ def create_draft_release(
     body: str,
     target_commitish: str | None = None,
 ) -> str | None:
-    """Create a draft GitHub release on the origin repo.
-
-    Returns the release HTML URL on success, ``None`` on failure. The
-    release is always created as a draft (``draft=True``); GitHub will
-    not create the tag until the draft is published.
-    """
+    """Create a draft release on origin; return its HTML URL or None."""
     token = get_github_token()
     if not token:
         log.warning("RELEASY_GITHUB_TOKEN not set — cannot create release")
@@ -467,11 +392,6 @@ def create_draft_release(
     return data.get("html_url")
 
 
-# ---------------------------------------------------------------------------
-# PR search by label
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class PRInfo:
     number: int
@@ -485,13 +405,7 @@ class PRInfo:
     merged_at: str | None = None  # ISO timestamp of merge
     labels: list[str] = None  # type: ignore[assignment]
     author: str | None = None  # GitHub login of the PR author
-    # GitHub's ``mergeable_state`` for OPEN PRs. Set on the lookups used
-    # by ``releasy project pull`` so we can decide whether a rebase PR is
-    # currently clean or conflicting without a trial merge. Values seen
-    # in the wild: "clean", "dirty" (= conflicting), "unstable" (CI red
-    # but no conflicts), "blocked" (branch-protection / review wait),
-    # "behind" (base moved — needs update), "draft", "unknown" (GitHub
-    # still computing). ``None`` when we didn't bother to look it up.
+    # Open PR's GitHub mergeable_state ("clean", "dirty" = conflicting, ...)
     mergeable_state: str | None = None
 
     def __post_init__(self) -> None:
@@ -505,7 +419,6 @@ class PRInfo:
 
 
 def _pr_author(pr) -> str | None:  # noqa: ANN001 — PyGithub PullRequest
-    """Best-effort extraction of the author's GitHub login."""
     try:
         user = pr.user
         if user is not None and getattr(user, "login", None):
@@ -516,11 +429,7 @@ def _pr_author(pr) -> str | None:  # noqa: ANN001 — PyGithub PullRequest
 
 
 def parse_pr_url(url: str) -> tuple[str, str, int] | None:
-    """Extract ``(owner, repo, number)`` from a GitHub PR URL.
-
-    Accepts URLs like https://github.com/owner/repo/pull/123 (with an
-    optional trailing ``.git`` on the repo segment).
-    """
+    """Extract ``(owner, repo, number)`` from a GitHub PR URL."""
     m = re.match(
         r"https://github\.com/([^/]+)/([^/]+?)(?:\.git)?/pull/(\d+)\b", url,
     )
@@ -529,20 +438,53 @@ def parse_pr_url(url: str) -> tuple[str, str, int] | None:
     return m.group(1), m.group(2), int(m.group(3))
 
 
-# RelEasy stamps the sources of every port PR into its body (see
-# ``pipeline._build_pr_body``) in one of two shapes:
-#
-#   Cherry-picked from #1832.
-#   Combined port of 12 PR(s) (group `apassos-3`). Cherry-picked from #1388, …
-#
-# The clause is therefore matched anywhere in a line, not anchored to its
-# start, and only up to the end of that line — the rest of the body carries
-# unrelated PR links (changelog attributions) we must not mistake for sources.
+def same_pr_url(a: str | None, b: str | None) -> bool:
+    """True when both URLs name the same ``owner/repo#number`` (case-insensitive)."""
+    if not a or not b:
+        return False
+    pa = parse_pr_url(a)
+    pb = parse_pr_url(b)
+    if pa is None or pb is None:
+        return False
+    return (pa[0].lower(), pa[1].lower(), pa[2]) == (
+        pb[0].lower(), pb[1].lower(), pb[2],
+    )
+
+
+def fetch_pr_head(pr_url: str) -> tuple[str, str, str, str, int] | None:
+    """``(head_ref, head_repo_slug, base_ref, head_sha, number)`` of a PR, or None."""
+    token = get_github_token()
+    if not token:
+        return None
+    parsed = parse_pr_url(pr_url)
+    if parsed is None:
+        return None
+    owner, repo, number = parsed
+    try:
+        from github import Github
+
+        gh = Github(token)
+        ghrepo = gh.get_repo(f"{owner}/{repo}")
+        pr = ghrepo.get_pull(number)
+        head_repo = None
+        if pr.head.repo is not None:
+            head_repo = pr.head.repo.full_name
+        return (
+            pr.head.ref,
+            head_repo or f"{owner}/{repo}",
+            pr.base.ref,
+            pr.head.sha,
+            pr.number,
+        )
+    except Exception:  # pragma: no cover — network / permissions
+        return None
+
+
+# Unanchored but line-bounded: later lines carry unrelated PR links.
 _CHERRY_PICKED_CLAUSE_RE = re.compile(
     r"Cherry-picked from\s+([^\n]+)", re.IGNORECASE,
 )
-# One PR reference: full URL, ``owner/repo#N``, or bare ``#N``. Ordered
-# alternation, so a URL never falls through to the bare-``#N`` branch.
+# Full URL, ``owner/repo#N``, or bare ``#N``; order matters.
 _PR_REF_RE = re.compile(
     r"https?://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s)]+?)"
     r"(?:\.git)?/pull/(?P<num>\d+)\b"
@@ -555,13 +497,9 @@ _PR_REF_RE = re.compile(
 def parse_cherry_picked_refs(
     body: str | None, default_slug: str | None,
 ) -> list[tuple[str, str, int]]:
-    """Source PRs named in a port PR body's ``Cherry-picked from`` clause.
+    """Deduped source PR refs from a port PR body's ``Cherry-picked from`` clause.
 
-    Returns canonical ``(owner, repo, number)`` refs, deduped, in body
-    order. ``default_slug`` (``"owner/repo"``) resolves bare ``#N`` refs;
-    without it those are skipped rather than guessed. Empty list when the
-    body has no such clause — this is best-effort provenance, so callers
-    must treat a miss as "unknown", never as "carries nothing".
+    ``default_slug`` resolves bare ``#N``; without it they are skipped.
     """
     if not body:
         return []
@@ -579,7 +517,6 @@ def parse_cherry_picked_refs(
 def _pr_ref_from_match(
     m: re.Match, default_slug: str | None,
 ) -> tuple[str, str, int] | None:
-    """Canonical ``(owner, repo, number)`` for a ``_PR_REF_RE`` match."""
     if m.group("num"):
         return m.group("owner"), m.group("repo"), int(m.group("num"))
     if m.group("slug_num"):
@@ -602,12 +539,7 @@ _FOLLOW_UP_SEP_RE = re.compile(r"\s*(?:,|&|\band\b)?\s*", re.IGNORECASE)
 def parse_follow_up_refs(
     body: str | None, default_slug: str | None,
 ) -> list[tuple[str, str, int]]:
-    """PRs a PR body declares itself a follow-up for.
-
-    Only the run of refs directly after the phrase counts, so prose later
-    in the sentence is never picked up. Same ref forms and ``default_slug``
-    handling as :func:`parse_cherry_picked_refs`.
-    """
+    """PRs a PR body declares itself a follow-up for (refs directly after the phrase)."""
     if not body:
         return []
     out: list[tuple[str, str, int]] = []
@@ -624,25 +556,9 @@ def parse_follow_up_refs(
 def parse_source_url(
     url: str,
 ) -> tuple[str, str, str, str] | None:
-    """Classify a GitHub URL as a PR, commit, or tag reference.
+    """Classify a GitHub URL as ``(kind, owner, repo, id)``, kind in pr/commit/tag.
 
-    Returns ``(kind, owner, repo, identifier)`` where:
-
-    - ``kind == "pr"``     → identifier is the PR number as a string
-    - ``kind == "commit"`` → identifier is the commit SHA (any length)
-    - ``kind == "tag"``    → identifier is the tag name
-
-    Recognised URL shapes (trailing ``.git`` on the repo segment is
-    tolerated, query strings / fragments are ignored):
-
-    - ``https://github.com/<owner>/<repo>/pull/<N>``
-    - ``https://github.com/<owner>/<repo>/commit/<sha>``
-    - ``https://github.com/<owner>/<repo>/releases/tag/<tag>``
-    - ``https://github.com/<owner>/<repo>/tree/<tag>``     (only when the
-      ref is a tag — caller resolves it via ``git ls-remote`` and
-      decides if it points at a commit)
-
-    Returns ``None`` if the URL doesn't match any of the above.
+    ``/tree/<ref>`` is reported as a tag; the caller resolves it.
     """
     cleaned = url.split("?", 1)[0].split("#", 1)[0]
 
@@ -678,7 +594,6 @@ def parse_source_url(
 
 
 def slug_to_https_url(slug: str) -> str:
-    """Build the canonical HTTPS git URL for a ``owner/repo`` slug."""
     return f"https://github.com/{slug}.git"
 
 
@@ -690,12 +605,7 @@ def fetch_pr_by_number(
     *,
     include_closed: bool = False,
 ) -> PRInfo | None:
-    """Fetch a single PR by number.
-
-    By default fetches from the origin repo. Pass ``slug`` (``"owner/repo"``)
-    to fetch a PR from any other public GitHub repo — used for cross-repo
-    PR references in ``pr_sources.include_prs`` and ``pr_sources.groups[].prs``.
-    """
+    """Fetch a PR by number from origin, or from ``slug`` if given."""
     token = get_github_token()
     if not token:
         log.warning("RELEASY_GITHUB_TOKEN not set — cannot fetch PR")
@@ -760,14 +670,9 @@ def fetch_prs_by_numbers(
     slug: str | None = None,
     include_closed: bool = False,
 ) -> dict[int, PRInfo | None]:
-    """Fetch many PRs by number, reusing one client + repo handle.
+    """Fetch many PRs by number with one client.
 
-    Per number the result is: a ``PRInfo`` (found — state-filtered like
-    :func:`fetch_pr_by_number`); ``None`` if the fetch failed transiently;
-    or **absent** if the number is a 404 / filtered-out (i.e. not a usable
-    PR). Callers distinguish "abort — incomplete" (value None) from "skip —
-    not a real PR" (key absent). Avoids the per-call ``Github(token)`` +
-    ``get_repo`` a loop over :func:`fetch_pr_by_number` would repeat.
+    Value ``None`` = transient failure; key absent = 404 or state filtered out.
     """
     out: dict[int, PRInfo | None] = {}
     if not numbers:
@@ -801,7 +706,6 @@ def fetch_prs_by_numbers(
                 repo.get_pull(n), slug, include_closed=include_closed,
             )
         except UnknownObjectException:
-            # 404 — the number isn't a PR on this repo (a bad subject parse).
             log.warning("PR %s#%d not found", slug, n)
             continue
         except GithubException as exc:
@@ -812,7 +716,6 @@ def fetch_prs_by_numbers(
             log.warning("Unexpected error fetching PR %s#%d: %s", slug, n, exc)
             out[n] = None
             continue
-        # Filtered-out (state excluded) → not a usable PR → leave absent.
         if info is not None:
             out[n] = info
     return out
@@ -825,7 +728,6 @@ def fetch_pr_by_url(
     *,
     include_closed: bool = False,
 ) -> PRInfo | None:
-    """Fetch a PR identified by its full GitHub URL (any public repo)."""
     parsed = parse_pr_url(url)
     if parsed is None:
         log.warning("Could not parse PR URL: %s", url)
@@ -842,28 +744,7 @@ def fetch_pr_by_url(
 
 @dataclass
 class PRComment:
-    """One comment on a pull request, flattened across GitHub's three APIs.
-
-    ``kind`` is one of:
-      - ``"issue"``  — top-level conversation comment (`/issues/<n>/comments`).
-      - ``"review"`` — the summary body of a review (`/pulls/<n>/reviews`).
-                        Approvals/change-requests with no body text are
-                        dropped at fetch time; only reviews with actual
-                        prose reach this list.
-      - ``"inline"`` — line-level comment on a diff
-                        (`/pulls/<n>/comments`), carrying ``path`` +
-                        ``line`` + ``diff_hunk``.
-
-    All timestamps are ISO-8601 UTC strings (matching what PyGithub
-    emits). ``author`` is the commenter's GitHub login — missing / bot
-    authors are represented as an empty string so the trusted-reviewer
-    filter simply drops them.
-
-    The last four fields are populated by a follow-up GraphQL fetch
-    (REST doesn't expose ``isResolved`` / ``isMinimized``). They default
-    to "unknown / visible / not part of a thread" so callers that skip
-    the enrichment step still get sensible behaviour.
-    """
+    """One PR comment; ``kind`` is "issue", "review" (body only) or "inline" (diff line)."""
     id: int
     kind: str
     author: str
@@ -871,12 +752,7 @@ class PRComment:
     updated_at: str
     url: str
     body: str
-    # GitHub's ``author_association`` for this comment, upper-case
-    # (``OWNER``, ``MEMBER``, ``COLLABORATOR``, ``CONTRIBUTOR``,
-    # ``FIRST_TIME_CONTRIBUTOR``, ``MANNEQUIN``, ``NONE``, ``""``).
-    # Set by GitHub at post time — commenters can't forge it — so it
-    # doubles as a trust signal: "is this person a maintainer of the
-    # repo / org or just a passer-by?"
+    # Upper-case GitHub author_association; set by GitHub, used as a trust signal
     author_association: str = ""
     path: str | None = None
     line: int | None = None
@@ -884,6 +760,7 @@ class PRComment:
     diff_hunk: str | None = None
     in_reply_to_id: int | None = None
     review_state: str | None = None
+    # Filled from GraphQL; REST doesn't expose these
     is_minimized: bool = False
     is_resolved: bool | None = None  # None when comment isn't on a thread
     is_outdated: bool = False
@@ -893,20 +770,12 @@ class PRComment:
 
 @dataclass
 class PRCommentsResult:
-    """Bundle returned by :func:`fetch_pr_comments`.
-
-    ``pr_author`` is the GitHub login of whoever opened the PR — needed
-    by the "no PR-author reply" gate when filtering top-level comments
-    (we drop a comment if the PR author has posted any later comment,
-    treating that as the response).
-    """
     comments: list[PRComment]
     pr_author: str
     error: str | None = None
 
 
 def _safe_iso(value) -> str:  # noqa: ANN001 — PyGithub returns datetime
-    """Format a PyGithub-returned datetime as ISO-8601, or ``""`` if missing."""
     if value is None:
         return ""
     try:
@@ -916,7 +785,6 @@ def _safe_iso(value) -> str:  # noqa: ANN001 — PyGithub returns datetime
 
 
 def _comment_author_login(obj) -> str:  # noqa: ANN001
-    """Best-effort extraction of a comment author's login (``""`` on miss)."""
     try:
         user = obj.user
         if user is not None and getattr(user, "login", None):
@@ -927,21 +795,7 @@ def _comment_author_login(obj) -> str:  # noqa: ANN001
 
 
 def _author_association(obj) -> str:  # noqa: ANN001
-    """Pull ``author_association`` off a PyGithub comment, upper-cased.
-
-    The value is set by GitHub when the comment is posted and reflects
-    the author's relationship to the repo at that moment — ``OWNER``,
-    ``MEMBER`` (of the repo's org), ``COLLABORATOR``, ``CONTRIBUTOR``,
-    ``FIRST_TIME_CONTRIBUTOR``, ``MANNEQUIN``, or ``NONE``. We
-    upper-case for safety (the docs list upper-case constants but the
-    API has historically returned a few mixed-case variants) and
-    return ``""`` if PyGithub didn't surface the field.
-
-    PyGithub does not expose ``author_association`` as an attribute on
-    :class:`PullRequestReview` even though the REST payload includes
-    it. Fall back to ``raw_data`` so reviews authored by org members
-    don't silently fail the trust gate.
-    """
+    """Upper-cased author_association; PyGithub reviews only have it in raw_data."""
     try:
         v = getattr(obj, "author_association", None)
         if isinstance(v, str) and v:
@@ -958,13 +812,6 @@ def _author_association(obj) -> str:  # noqa: ANN001
 
 @dataclass
 class _CommentMeta:
-    """GraphQL-derived metadata for one comment, keyed by REST databaseId.
-
-    Populated by :func:`_fetch_pr_comment_metadata_gql`. ``is_resolved``
-    is ``None`` for comments that aren't part of a review thread (issue
-    comments, review-body comments) since the concept doesn't apply to
-    them.
-    """
     is_minimized: bool = False
     is_resolved: bool | None = None
     is_outdated: bool = False
@@ -974,22 +821,7 @@ class _CommentMeta:
 def _fetch_pr_comment_metadata_gql(
     slug: str, number: int,
 ) -> tuple[dict[int, _CommentMeta], str]:
-    """Pull ``isMinimized`` / ``isResolved`` / ``isOutdated`` + PR author.
-
-    Returns ``({databaseId -> _CommentMeta}, pr_author_login)``. On any
-    GraphQL transport failure (no token, API down, missing repo) we
-    return ``({}, "")`` — callers degrade to "no metadata, no PR-author
-    cross-check", which means the new resolved/no-reply gate doesn't
-    apply but the run doesn't crash either.
-
-    We paginate review threads + issue comments; each thread's inner
-    comments are capped at 100, which is far above any real PR. If
-    you ever see a thread with more comments, GraphQL truncates
-    silently and those extra comments stay with default metadata
-    (``is_minimized=False``, ``is_resolved=None``) — the worst-case
-    failure mode is "consider too many comments", not "miss a
-    minimised one".
-    """
+    """Return ``({databaseId: _CommentMeta}, pr_author)``; ``({}, "")`` on failure."""
     out: dict[int, _CommentMeta] = {}
     pr_author = ""
     owner, _, repo = slug.partition("/")
@@ -1069,7 +901,6 @@ def _fetch_pr_comment_metadata_gql(
 
         thread_pi = (threads.get("pageInfo") or {})
         issue_pi = (issue_comments.get("pageInfo") or {})
-        # Advance whichever page still has more; stop when both are done.
         next_thread = (
             thread_pi.get("endCursor") if thread_pi.get("hasNextPage")
             else None
@@ -1089,29 +920,7 @@ def _fetch_pr_comment_metadata_gql(
 def fetch_pr_comments(
     config: Config, pr_url: str,
 ) -> PRCommentsResult:
-    """Fetch every comment on ``pr_url`` from the three GitHub APIs.
-
-    Returns a :class:`PRCommentsResult` whose ``error`` field is set on
-    any failure (missing token, unparseable URL, GitHub API error); the
-    ``comments`` list is empty in that case. The three sources are:
-
-      1. Issue comments (`/issues/<n>/comments`)  — general PR discussion.
-      2. Review comments (`/pulls/<n>/comments`)  — inline on diff.
-      3. Reviews (`/pulls/<n>/reviews`)           — only those with a
-         non-empty body (pure approvals contribute no text).
-
-    Comments are sorted by ``created_at`` (stable) so consumers always
-    see them in the order they were posted. After the REST pass we run
-    a GraphQL enrichment pass to attach ``is_minimized`` /
-    ``is_resolved`` / ``is_outdated`` / ``thread_id`` — REST simply
-    doesn't expose those fields, but the unresolved / hidden filters
-    in ``releasy refresh --address-review`` need them. GraphQL also
-    yields the PR author's login (returned alongside) used by the
-    "no PR-author reply" gate.
-
-    The function is read-only — no filtering by author / time / trust
-    applied here; that's the caller's responsibility.
-    """
+    """All comments on ``pr_url``, sorted by time, with GraphQL thread metadata."""
     token = get_github_token()
     if not token:
         return PRCommentsResult(
@@ -1152,9 +961,6 @@ def fetch_pr_comments(
             ))
 
         for rc in pr.get_review_comments():
-            # PyGithub exposes ``line`` (file line) and ``original_line``
-            # (line in the original diff). Prefer ``line`` when present
-            # so outdated threads still resolve to something useful.
             line_num = getattr(rc, "line", None) or getattr(rc, "original_line", None)
             out.append(PRComment(
                 id=rc.id,
@@ -1175,11 +981,8 @@ def fetch_pr_comments(
         for rv in pr.get_reviews():
             body = (rv.body or "").strip()
             if not body:
-                # Pure approval / change-request with no prose — nothing
-                # to feed the resolver.
                 continue
-            # PyGithub's Review exposes ``submitted_at`` rather than
-            # ``created_at``; fall back to whichever is present.
+            # PyGithub reviews expose submitted_at rather than created_at
             created = (
                 _safe_iso(getattr(rv, "submitted_at", None))
                 or _safe_iso(getattr(rv, "created_at", None))
@@ -1225,7 +1028,6 @@ def fetch_pr_comments(
 
 @dataclass
 class IssueCommentsResult:
-    """Result of :func:`fetch_issue_comments`. ``error`` set on failure."""
     comments: list[PRComment]
     error: str | None = None
 
@@ -1233,8 +1035,7 @@ class IssueCommentsResult:
 def fetch_issue_comments(
     config: Config, issue_number: int,
 ) -> IssueCommentsResult:
-    """Fetch an origin issue's comments, sorted by created_at. Read-only;
-    no trust/time filtering (the caller does that). Reuses PRComment."""
+    """Fetch an origin issue's comments, sorted by created_at."""
     token = get_github_token()
     if not token:
         return IssueCommentsResult(
@@ -1282,7 +1083,6 @@ def fetch_issue_comments(
 
 
 def pr_ref_label(pr_slug: str, number: int, origin_slug: str | None) -> str:
-    """Format a PR reference as ``#N`` for origin and ``owner/repo#N`` otherwise."""
     if origin_slug and pr_slug == origin_slug:
         return f"#{number}"
     return f"{pr_slug}#{number}"
@@ -1293,12 +1093,7 @@ def search_prs_by_labels(
     labels: list[str],
     merged_only: bool = False,
 ) -> list[PRInfo]:
-    """Search the origin repo for PRs that have ALL specified labels.
-
-    Returns PRs sorted by merge date (earliest first), with open PRs last.
-    Skips closed-but-not-merged PRs.
-    When merged_only is True, only merged PRs are returned.
-    """
+    """Origin PRs carrying ALL ``labels``: merged by merge date, then open; closed skipped."""
     token = get_github_token()
     if not token:
         log.warning("RELEASY_GITHUB_TOKEN not set — cannot search PRs")
@@ -1319,36 +1114,16 @@ def search_prs_by_labels(
         repo = gh.get_repo(slug)
         results: list[PRInfo] = []
 
-        # GitHub API filters by all labels when given a list, so this
-        # already implements AND semantics.
+        # A label list is AND-ed by the API
         for issue in repo.get_issues(labels=labels, state="all"):
             if issue.pull_request is None:
                 continue
-            pr = repo.get_pull(issue.number)
-            if pr.merged:
-                pr_state = "merged"
-            elif pr.state == "open":
-                if merged_only:
-                    continue
-                pr_state = "open"
-            else:
-                continue  # closed but not merged — skip
+            info = _pr_info_from_gh(
+                repo.get_pull(issue.number), slug, merged_only=merged_only,
+            )
+            if info is not None:
+                results.append(info)
 
-            results.append(PRInfo(
-                number=pr.number,
-                title=pr.title,
-                body=pr.body or "",
-                state=pr_state,
-                merge_commit_sha=pr.merge_commit_sha if pr.merged else None,
-                head_sha=pr.head.sha,
-                url=pr.html_url,
-                repo_slug=slug,
-                merged_at=pr.merged_at.isoformat() if pr.merged_at else None,
-                labels=[lbl.name for lbl in pr.labels],
-                author=_pr_author(pr),
-            ))
-
-        # Merged PRs first in merge order, then open PRs by number.
         results.sort(key=lambda p: (p.merged_at or "9999", p.number))
         return results
     except GithubException as exc:
@@ -1367,14 +1142,9 @@ def build_merged_base_query(
     merged_to: str | None = None,
     exclude_labels: list[str] | None = None,
 ) -> str:
-    """Build the Search-API query for merged PRs whose base is ``base_branch``.
-
-    ``merged_from`` / ``merged_to`` are ISO timestamps bounding ``merged:``
-    (inclusive). With both set we emit a single range qualifier ``merged:A..B``:
-    GitHub Search silently drops the date filter when two comparison
-    qualifiers share a field. ``exclude_labels`` adds ``-label:"<l>"`` terms.
-    """
+    """Search-API query for merged PRs into ``base_branch``, optionally date-bounded."""
     q = f"repo:{slug} is:pr is:merged base:{base_branch}"
+    # GitHub Search drops the filter if two comparisons share a field; use a range
     if merged_from and merged_to:
         q += f" merged:{merged_from}..{merged_to}"
     elif merged_from:
@@ -1382,7 +1152,6 @@ def build_merged_base_query(
     elif merged_to:
         q += f" merged:<={merged_to}"
     for lbl in exclude_labels or []:
-        # Strip embedded quotes so a label can't break out of the term.
         q += f' -label:"{lbl.replace(chr(34), "")}"'
     return q
 
@@ -1395,11 +1164,9 @@ def search_merged_prs_by_base(
     merged_to: str | None = None,
     exclude_labels: list[str] | None = None,
 ) -> list[PRInfo]:
-    """Merged PRs whose base branch is ``base_branch``, via one Search query.
+    """Merged PRs into ``base_branch`` via one Search query, by number.
 
-    Bodies come back inline (no per-PR fetch). ``merged_from`` /
-    ``merged_to`` are ISO timestamps bounding ``merged:``. Returns PRInfo
-    (``head_sha`` / ``merge_commit_sha`` unset) sorted by number ascending.
+    ``head_sha`` / ``merge_commit_sha`` / ``merged_at`` are left unset.
     """
     token = get_github_token()
     if not token:
@@ -1447,10 +1214,7 @@ def search_merged_prs_by_base(
 
 
 def search_pr_urls(query: str) -> list[str] | None:
-    """PR URLs matching a raw Search-API ``query``, by number ascending.
-
-    None on failure (no token, API error).
-    """
+    """PR URLs matching a raw Search-API ``query``, by number; None on failure."""
     token = get_github_token()
     if not token:
         log.warning("RELEASY_GITHUB_TOKEN not set — cannot search PRs")
@@ -1473,21 +1237,13 @@ def search_pr_urls(query: str) -> list[str] | None:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Labels + PR lookup helpers (REST)
-# ---------------------------------------------------------------------------
-
-
 def ensure_label(
     config: Config,
     name: str,
     color: str = "8B5CF6",
     description: str = "",
 ) -> bool:
-    """Ensure a label exists **on the origin repo**. Idempotent.
-
-    Returns True if the label exists (pre-existing or freshly created).
-    """
+    """Ensure a label exists on origin; True if it exists afterwards."""
     if config.dry_run:
         log.info("[dry-run] would ensure label %r on origin", name)
         return True
@@ -1520,7 +1276,7 @@ def ensure_label(
             repo.create_label(name=name, color=color, description=description)
             return True
         except GithubException as exc:
-            # 422 == already exists (race); treat as success.
+            # 422 = already exists (race)
             if exc.status == 422:
                 return True
             log.warning("Failed to create label %s: %s", name, exc)
@@ -1531,7 +1287,6 @@ def ensure_label(
 
 
 def add_label_to_pr(config: Config, pr_number: int, label: str) -> bool:
-    """Attach a label to a PR **on the origin repo**. Idempotent on repeated calls."""
     if config.dry_run:
         log.info("[dry-run] would add label %r to PR #%d", label, pr_number)
         return True
@@ -1569,19 +1324,7 @@ def add_label_to_pr(config: Config, pr_number: int, label: str) -> bool:
 
 
 def pr_has_label(config: Config, pr_number: int, label: str) -> bool:
-    """Return whether PR ``pr_number`` currently carries ``label`` on origin.
-
-    Returns ``False`` (silently) when we can't even talk to GitHub — a
-    missing token / unresolvable origin slug / API error all collapse
-    to ``False`` so callers can treat "label is definitely not there"
-    and "we don't know" the same way: don't take the
-    label-was-present-side-effect.
-
-    Used by the recovery path to decide whether a previously-conflicted
-    PR carried ``ai-needs-attention`` (and therefore deserves to be
-    promoted to ``ai-resolved`` after a successful retry, mirroring the
-    appearance of PRs that landed cleanly on their first run).
-    """
+    """Whether origin PR ``pr_number`` carries ``label``; False when unknown."""
     label_lc = label.lower()
     token = get_github_token()
     if not token:
@@ -1615,14 +1358,7 @@ def pr_has_label(config: Config, pr_number: int, label: str) -> bool:
 
 
 def remove_label_from_pr(config: Config, pr_number: int, label: str) -> bool:
-    """Strip a label from a PR **on the origin repo**.
-
-    Returns True when the label is gone after the call (whether we
-    removed it or it was already absent), False on any unexpected
-    GitHub error. Used to clean up state markers like
-    ``ai-needs-attention`` once a previously-conflicted port has been
-    re-resolved.
-    """
+    """Remove a label from an origin PR; True if it is absent afterwards."""
     if config.dry_run:
         log.info(
             "[dry-run] would remove label %r from PR #%d", label, pr_number,
@@ -1655,7 +1391,7 @@ def remove_label_from_pr(config: Config, pr_number: int, label: str) -> bool:
         try:
             issue.remove_from_labels(label)
         except GithubException as exc:
-            # 404 = the label wasn't on the PR; treat as success.
+            # 404 = label wasn't on the PR
             if exc.status == 404:
                 return True
             raise
@@ -1677,21 +1413,7 @@ def remove_label_from_pr(config: Config, pr_number: int, label: str) -> bool:
 def mark_pr_ready_for_review(
     config: Config, pr_number: int,
 ) -> bool | None:
-    """Flip a draft PR to ready-for-review **on the origin repo**.
-
-    Returns:
-      * ``True``  — the PR is ready-for-review after this call (we flipped
-        it, or it was already non-draft).
-      * ``False`` — GitHub rejected the change (label not gone? token
-        scope?) — caller may want to log it.
-      * ``None``  — couldn't even talk to GitHub (no token, slug
-        unresolvable). Distinguished from ``False`` so the caller can
-        stay quiet on transient setup gaps without misreporting failure.
-
-    PyGithub's ``PullRequest.mark_ready_for_review()`` wraps the
-    GraphQL ``markPullRequestReadyForReview`` mutation and is available
-    on the versions we already depend on.
-    """
+    """Un-draft an origin PR: True = ready, False = GitHub error, None = no token/slug."""
     token = get_github_token()
     if not token:
         return None
@@ -1780,15 +1502,7 @@ def find_open_backport_pr(
     upstream_number: int,
     upstream_url: str | None = None,
 ) -> str | None:
-    """URL of an open origin backport PR for an upstream PR, else None.
-
-    Secondary idempotency for ``project-backport`` (the deterministic
-    branch name is the primary, immediately-consistent check). Matches an
-    open PR into ``base_branch`` by the ``Backport of #<n>`` title
-    fingerprint, or by an ``upstream_url`` body reference whose title also
-    contains "backport" (the title guard rejects umbrella/tracking PRs
-    that merely list the URL). GitHub Search is eventually consistent.
-    """
+    """URL of an open origin backport PR for an upstream PR (via Search), else None."""
     token = get_github_token()
     if not token:
         return None
@@ -1809,9 +1523,7 @@ def find_open_backport_pr(
         from github import Github, GithubException
 
         gh = Github(token)
-        # Title fingerprint: trust any matching PR (it's the title we mint).
-        # Body match: require a "backport"-y title so a tracking PR that
-        # merely links the upstream URL doesn't suppress a real port.
+        # Body matches also need "backport" in the title, to skip tracking PRs
         for query, require_backport_title in (
             (title_query, False), (body_query, True),
         ):
@@ -1835,15 +1547,7 @@ def find_open_backport_pr(
 def find_latest_pr_for_branch(
     config: Config, head_branch: str, base: str | None = None,
 ) -> PRInfo | None:
-    """Return the most recent PR (any state) from ``head_branch`` → ``base``.
-
-    Unlike :func:`find_pr_for_branch` which is scoped to open PRs, this
-    looks across ``state="all"`` and returns whichever PR was updated
-    most recently. ``releasy project pull`` uses it so a rebase PR that's
-    already been merged (or closed in favour of a replacement) still
-    gets surfaced in reconstructed state — otherwise the feature would
-    silently reappear as "never ported" on a fresh checkout.
-    """
+    """Most recently updated PR in any state from ``head_branch`` (optionally → ``base``)."""
     token = get_github_token()
     if not token:
         return None
@@ -1893,12 +1597,7 @@ def find_latest_pr_for_branch(
         return None
 
 
-# ---------------------------------------------------------------------------
-# Supersede detection helpers
-# ---------------------------------------------------------------------------
-
-
-# Standard footer left by ``git cherry-pick -x`` — always a full 40-char SHA.
+# ``git cherry-pick -x`` footer
 CHERRY_PICK_FROM_RE = re.compile(
     r"\(cherry picked from commit ([0-9a-f]{40})\)",
     re.IGNORECASE,
@@ -1908,16 +1607,7 @@ CHERRY_PICK_FROM_RE = re.compile(
 def fetch_open_prs_with_commits_to_base(
     config: Config, base_branch: str,
 ) -> list[tuple[str, list[str]]]:
-    """Open PRs on origin targeting ``base_branch`` + each PR's commit messages.
-
-    Single GraphQL round-trip (paginated by 50 PRs / 250 commits per page)
-    instead of the N+1 of ``get_pulls`` + per-PR ``get_commits``. Used by
-    the supersede sweep, which scans commit messages for ``(cherry picked
-    from commit <sha>)`` footers.
-
-    Returns ``[(pr_html_url, [commit_msg, ...]), ...]``. Empty on missing
-    token / API failure — supersede detection is best-effort.
-    """
+    """``[(url, [commit_msg, ...])]`` for open origin PRs into ``base_branch``; best-effort."""
     slug = get_origin_repo_slug(config)
     if not slug:
         return []
@@ -1977,19 +1667,8 @@ def fetch_open_prs_with_commits_to_base(
             return out
 
 
-# ---------------------------------------------------------------------------
-# GitHub Projects v2 integration (GraphQL API)
-# ---------------------------------------------------------------------------
-
-
 def _gql(query: str, variables: dict | None = None) -> dict | None:
-    """Execute a GitHub GraphQL query.
-
-    Returns the ``data`` block on success, ``None`` on transport failure or
-    when the response carried any GraphQL errors. Returning ``None`` in the
-    error case prevents callers from silently treating partial / invalid
-    payloads as successes (e.g. a mutation that the API rejected).
-    """
+    """Run a GraphQL query; return ``data``, or None on transport or any GraphQL error."""
     token = get_github_token()
     if not token:
         return None
@@ -2019,12 +1698,7 @@ def _gql(query: str, variables: dict | None = None) -> dict | None:
 
 
 def minimize_comment(node_id: str, classifier: str = "OUTDATED") -> bool:
-    """Collapse a comment via GraphQL ``minimizeComment``. Returns success.
-
-    ``classifier`` is a ReportedContentClassifiers value (OUTDATED,
-    RESOLVED, OFF_TOPIC, DUPLICATE, …). No-op-safe: a comment already
-    minimized returns a GraphQL error → ``False`` (logged, not fatal).
-    """
+    """Collapse a comment via GraphQL ``minimizeComment``; True on success."""
     if not node_id:
         return False
     mutation = """
@@ -2037,14 +1711,11 @@ def minimize_comment(node_id: str, classifier: str = "OUTDATED") -> bool:
     data = _gql(mutation, {"id": node_id, "classifier": classifier})
     if not data:
         return False
-    # ``.get(k, {})`` returns None when the key is present with a null value,
-    # so chain through ``or {}`` to stay no-op-safe on a null payload.
     payload = (data.get("minimizeComment") or {}).get("minimizedComment") or {}
     return bool(payload.get("isMinimized"))
 
 
 def _parse_project_url(url: str) -> tuple[str, int, bool] | None:
-    """Parse a GitHub Project URL into (owner, number, is_org)."""
     m = re.match(r"https://github\.com/orgs/([^/]+)/projects/(\d+)", url)
     if m:
         return m.group(1), int(m.group(2)), True
@@ -2082,12 +1753,7 @@ def _get_project_id(owner: str, number: int, is_org: bool) -> str | None:
 
 
 def _list_project_fields(project_id: str) -> list[dict]:
-    """Return every field node on a project (any data type).
-
-    Single-select fields carry their ``options``; non-single-select fields
-    (NUMBER, TEXT, DATE, …) just have ``id``/``name``/``dataType``. Empty
-    list on lookup failure — callers fall back gracefully.
-    """
+    """All field nodes on a project; empty on failure."""
     query = """
     query($projectId: ID!) {
       node(id: $projectId) {
@@ -2115,28 +1781,9 @@ def _list_project_fields(project_id: str) -> list[dict]:
 
 
 def _get_status_field(project_id: str) -> tuple[str, dict[str, str], list[dict]] | None:
-    """Return (field_id, {lowercase_name: option_id}, [raw_options]) or None.
-
-    Looks for a single-select field named "Status" (case-insensitive). A
-    field with that name but a different data type (TEXT / NUMBER /
-    DATE) is ignored — RelEasy can only drive a single-select Status.
-    """
-    for field_node in _list_project_fields(project_id):
-        if field_node.get("name", "").lower() != "status":
-            continue
-        if field_node.get("dataType") and field_node["dataType"] != "SINGLE_SELECT":
-            continue
-        raw_options = field_node.get("options") or []
-        options = {
-            opt["name"].lower(): opt["id"]
-            for opt in raw_options
-        }
-        return field_node["id"], options, raw_options
-    return None
+    return _get_single_select_field(project_id, "Status")
 
 
-# Project field names RelEasy owns. Hard-coded to keep board layout stable
-# and to make the "find or create" lookups trivial.
 AI_COST_FIELD_NAME = "AI Cost"
 ASSIGNEE_DEV_FIELD_NAME = "Assignee Dev"
 ASSIGNEE_QA_FIELD_NAME = "Assignee QA"
@@ -2145,12 +1792,7 @@ ASSIGNEE_QA_FIELD_NAME = "Assignee QA"
 def _find_field_by_name(
     project_id: str, name: str, data_type: str | None = None,
 ) -> str | None:
-    """Return the field id for ``name`` on ``project_id`` (case-insensitive).
-
-    When ``data_type`` is given, also requires the field to be of that
-    type — protects against accidentally wiring up to a same-named field
-    of the wrong shape (e.g. a TEXT "AI Cost" left over from a hand-edit).
-    """
+    """Field id for ``name`` (case-insensitive), optionally requiring ``data_type``."""
     target = name.lower()
     for f in _list_project_fields(project_id):
         if (f.get("name") or "").lower() != target:
@@ -2162,7 +1804,6 @@ def _find_field_by_name(
 
 
 def _create_number_field(project_id: str, name: str) -> str | None:
-    """Create a NUMBER field on a project. Returns the field id."""
     mutation = """
     mutation($projectId: ID!, $name: String!) {
       createProjectV2Field(input: {
@@ -2186,14 +1827,7 @@ def _create_number_field(project_id: str, name: str) -> str | None:
 def _get_single_select_field(
     project_id: str, name: str,
 ) -> tuple[str, dict[str, str], list[dict]] | None:
-    """Look up a single-select field by name. Returns ``(field_id,
-    {lowercase_name: option_id}, raw_options)`` or ``None``.
-
-    Generalises ``_get_status_field`` for any single-select field (used
-    for ``Assignee Dev`` / ``Assignee QA``). A field with the right name
-    but a different ``dataType`` is rejected — protects against an
-    accidental TEXT field shadowing a SINGLE_SELECT one.
-    """
+    """``(field_id, {lowercase_name: option_id}, raw_options)`` for a single-select field."""
     target = name.lower()
     for field_node in _list_project_fields(project_id):
         if (field_node.get("name") or "").lower() != target:
@@ -2209,27 +1843,13 @@ def _get_single_select_field(
     return None
 
 
-# Color used for newly-provisioned Assignee Dev / Assignee QA options.
-# GRAY keeps the UI neutral (no implied semantics like "good"/"bad").
 _ASSIGNEE_OPTION_COLOR = "GRAY"
 
 
 def _ensure_assignee_field(
     project_id: str, field_name: str, configured_options: list[str],
 ) -> tuple[str, dict[str, str]] | None:
-    """Find or create a single-select assignee field on the project.
-
-    On first creation the field is provisioned with exactly the
-    ``configured_options`` list (each option coloured GRAY). On
-    subsequent runs the field is left untouched — RelEasy never
-    rewrites the option list, so any options the user added in the
-    GitHub UI (and any value assigned to a card on a since-removed
-    option) are preserved.
-
-    Returns ``(field_id, {lowercase_option_name: option_id})`` for the
-    live field, or ``None`` if the field could neither be found nor
-    created (e.g. the token can't write to the project).
-    """
+    """Find or create an assignee single-select field; existing options are never rewritten."""
     existing = _get_single_select_field(project_id, field_name)
     if existing:
         field_id, options_by_name, _ = existing
@@ -2255,7 +1875,7 @@ def _ensure_assignee_field(
     )
     if not field_id:
         return None
-    # Re-read so we get the option ids GitHub assigned.
+    # Re-read to get the assigned option ids
     refreshed = _get_single_select_field(project_id, field_name)
     if not refreshed:
         log.warning(
@@ -2267,13 +1887,6 @@ def _ensure_assignee_field(
 
 
 def _ensure_ai_cost_field(project_id: str) -> str | None:
-    """Find or create the ``AI Cost`` NUMBER field on a project.
-
-    Idempotent: returns the existing field id when one is already present
-    with the right type, creates one otherwise. Returns ``None`` only on
-    a hard GraphQL failure — callers degrade gracefully (skip the cost
-    sync rather than abort the whole project sync).
-    """
     existing = _find_field_by_name(project_id, AI_COST_FIELD_NAME, data_type="NUMBER")
     if existing:
         return existing
@@ -2282,40 +1895,18 @@ def _ensure_ai_cost_field(project_id: str) -> str | None:
 
 @dataclass
 class ProjectBoardCard:
-    """One card we read back from the GitHub Project board.
-
-    Produced by :func:`fetch_project_board_snapshot`. Used by ``releasy
-    import`` to promote the board to source-of-truth for the two fields
-    local state can't recover from PRs alone: the ``Skipped`` decision
-    (set by humans via ``releasy skip``) and the cumulative ``AI Cost``
-    (billed to Claude and mirrored to the board on every sync).
-    """
+    """One card read back from the GitHub Project board."""
     item_id: str
-    # When the card is a real PR attachment: ``url`` + ``number`` are
-    # populated. For DraftIssue fallback cards (features that have no PR
-    # yet — e.g. dropped-singleton conflicts) only ``draft_title`` is set.
+    # PR cards set pr_url/pr_number; DraftIssue cards set only draft_title
     pr_url: str | None
     pr_number: int | None
     draft_title: str | None
-    # Status option as configured on the board ("Needs Review", "Skipped",
-    # …). ``None`` if the card has no Status value or the field is missing.
     status: str | None
-    # ``AI Cost`` number field. ``None`` means "never billed" (distinct
-    # from 0.0 which RelEasy writes on sync for cards that ran the
-    # resolver but paid nothing, though GitHub itself reports unset as
-    # None — we preserve that distinction).
-    ai_cost_usd: float | None
+    ai_cost_usd: float | None  # None = never billed (distinct from 0.0)
 
 
 def _list_project_items_with_fields(project_id: str) -> list[dict]:
-    """Paginate every item on a project with its field values attached.
-
-    Companion to :func:`_list_project_items` — same shape, plus a
-    ``fieldValues`` node carrying each item's Status option and AI Cost
-    number. Broken out as a separate query so we don't slow down the hot
-    write-path in :func:`sync_project` (which doesn't need field values
-    to match items). ``releasy project pull`` is the sole caller today.
-    """
+    """Like :func:`_list_project_items`, plus Status and AI Cost field values."""
     query = """
     query($projectId: ID!, $cursor: String) {
       node(id: $projectId) {
@@ -2357,10 +1948,7 @@ def _list_project_items_with_fields(project_id: str) -> list[dict]:
 
 
 def _paginate_project_v2_items(project_id: str, query: str) -> list[dict]:
-    """Run a ProjectV2 ``items(first: 100, after: $cursor)`` query to
-    exhaustion and return the raw item nodes. ``query`` must shape its
-    ``items`` connection with ``pageInfo { hasNextPage endCursor }``.
-    """
+    """Run a paginated ProjectV2 ``items`` query to exhaustion; return raw nodes."""
     nodes: list[dict] = []
     cursor: str | None = None
     while True:
@@ -2381,17 +1969,8 @@ def _paginate_project_v2_items(project_id: str, query: str) -> list[dict]:
 
 
 def list_project_items_for_backport(project_id: str) -> list[dict]:
-    """Project items with content repo slug + named field values.
-
-    Like :func:`_list_project_items_with_fields` but also returns each
-    content item's repository slug (upstream vs origin) and reads TEXT
-    field values (``Port Versions`` may be TEXT). Each dict: ``item_id``,
-    ``content_typename``, ``pr_number``, ``pr_url``, ``repo_slug``,
-    ``field_values`` ({lowercased field name: value-as-str}).
-    """
-    # first: 50 matches the fields(first: 50) cap in _list_project_fields,
-    # so every field's value is reachable (no silent truncation of the
-    # Port Versions value the caller filters on).
+    """Project items with content repo slug and ``{lowercased field name: text/option}``."""
+    # fieldValues(first: 50) matches the fields(first: 50) cap in _list_project_fields
     query = """
     query($projectId: ID!, $cursor: String) {
       node(id: $projectId) {
@@ -2455,17 +2034,7 @@ def list_project_items_for_backport(project_id: str) -> list[dict]:
 def fetch_project_board_snapshot(
     config: Config,
 ) -> list[ProjectBoardCard] | None:
-    """Read every card off the configured GitHub Project.
-
-    Returns ``None`` when sync can't even start — no project configured,
-    no token, unparseable URL, or GraphQL couldn't resolve the project
-    id. Returns an empty list for an empty (but valid) board.
-
-    Consumers (``releasy project pull``) match returned cards against local
-    features by ``pr_url`` first and fall back to ``draft_title``
-    parsing — see :func:`_project_item_body`'s title convention
-    (``"<branch_name> (<feature_id>)"``).
-    """
+    """Read every PR/draft card off the configured Project; None if it can't be reached."""
     project_url = config.notifications.github_project
     if not project_url:
         return None
@@ -2493,9 +2062,6 @@ def fetch_project_board_snapshot(
         elif kind == "DraftIssue":
             draft_title = content.get("title")
         else:
-            # Issue or some other content — not something RelEasy
-            # itself creates. Skip (we won't be able to map it back to
-            # a feature anyway).
             continue
 
         status: str | None = None
@@ -2529,12 +2095,6 @@ def fetch_project_board_snapshot(
 
 
 def _list_project_items(project_id: str) -> list[dict]:
-    """Return every item in a project (paginated).
-
-    Each entry is the raw item node ``{id, content: {...}}``. ``content``
-    can be a ``DraftIssue``, ``Issue``, or ``PullRequest`` — callers
-    distinguish by the ``__typename`` field.
-    """
     query = """
     query($projectId: ID!, $cursor: String) {
       node(id: $projectId) {
@@ -2559,11 +2119,6 @@ def _list_project_items(project_id: str) -> list[dict]:
 
 
 def _is_closed_unmerged_pr(content: dict) -> bool:
-    """True iff ``content`` is a PullRequest closed without merge.
-
-    Merged PRs intentionally stay on the board — they're the record of
-    work that landed. Only closed-without-merge cards are pollution.
-    """
     if content.get("__typename") != "PullRequest":
         return False
     return content.get("state") == "CLOSED" and not content.get("merged")
@@ -2572,12 +2127,7 @@ def _is_closed_unmerged_pr(content: dict) -> bool:
 def _prune_closed_pr_items(
     project_id: str, items: list[dict],
 ) -> int:
-    """Delete project items whose PR was closed without merging.
-
-    Mutates ``items`` in place so subsequent lookups (e.g. via
-    :func:`_find_item_by_pr_url`) don't see the removed entries.
-    Returns the count actually deleted.
-    """
+    """Delete items whose PR closed unmerged (also from ``items``); return count."""
     removed = 0
     survivors: list[dict] = []
     for item in items:
@@ -2602,14 +2152,7 @@ def _prune_closed_pr_items(
 def _prune_orphan_items(
     project_id: str, items: list[dict], kept_ids: set[str],
 ) -> int:
-    """Delete DraftIssue / PullRequest items not in ``kept_ids``.
-
-    ``kept_ids`` holds the project item IDs the current sync claims as
-    still backed by local state. Anything else of those two kinds is
-    removed. Bare ``Issue`` items are left alone — releasy doesn't
-    create them, so they're assumed user-added. Mutates ``items`` in
-    place. Returns the count actually deleted.
-    """
+    """Delete DraftIssue/PR items not in ``kept_ids`` (also from ``items``); return count."""
     removed = 0
     survivors: list[dict] = []
     for item in items:
@@ -2642,10 +2185,7 @@ def _prune_orphan_items(
 def _find_draft_item_by_title(
     items: list[dict], title: str,
 ) -> tuple[str, str] | None:
-    """Find a draft-issue item by title in a pre-fetched item list.
-
-    Returns ``(item_id, draft_issue_id)`` or ``None``.
-    """
+    """``(item_id, draft_issue_id)`` of the draft item titled ``title``."""
     for item in items:
         content = item.get("content") or {}
         if content.get("__typename") != "DraftIssue":
@@ -2656,7 +2196,6 @@ def _find_draft_item_by_title(
 
 
 def _find_item_by_pr_url(items: list[dict], pr_url: str) -> str | None:
-    """Find a PR-content item by URL in a pre-fetched item list."""
     for item in items:
         content = item.get("content") or {}
         if content.get("__typename") != "PullRequest":
@@ -2684,13 +2223,7 @@ def _add_draft_issue(project_id: str, title: str, body: str) -> str | None:
 
 
 def _get_pr_node_id(slug: str, number: int) -> tuple[str, str, bool] | None:
-    """Return ``(node_id, state, merged)`` for a PR.
-
-    ``state`` is GitHub's PR state (``OPEN`` / ``CLOSED`` / ``MERGED``),
-    ``merged`` is the explicit boolean — together they let callers
-    distinguish *closed without merge* (pollution) from *merged*
-    (kept on the board as a record).
-    """
+    """``(node_id, state, merged)`` for a PR."""
     owner, name = slug.split("/", 1)
     query = """
     query($owner: String!, $name: String!, $number: Int!) {
@@ -2710,11 +2243,7 @@ def _get_pr_node_id(slug: str, number: int) -> tuple[str, str, bool] | None:
 
 
 def _add_item_by_content_id(project_id: str, content_id: str) -> str | None:
-    """Add an Issue or PullRequest to a project by its node id.
-
-    Idempotent: GitHub returns the existing project-item id if the content
-    was already added to this project.
-    """
+    """Add an Issue/PR to a project by node id; idempotent."""
     mutation = """
     mutation($projectId: ID!, $contentId: ID!) {
       addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
@@ -2736,12 +2265,7 @@ def _update_draft_issue(
     title: str | None = None,
     body: str | None = None,
 ) -> bool:
-    """Update an existing draft issue's title and/or body.
-
-    Note: the ``UpdateProjectV2DraftIssueInput`` type takes ``draftIssueId``
-    only — there is no ``projectId`` field on it. Passing one makes the
-    GraphQL endpoint reject the whole mutation.
-    """
+    # UpdateProjectV2DraftIssueInput has no projectId; passing one fails the mutation
     mutation = """
     mutation($draftIssueId: ID!, $title: String, $body: String) {
       updateProjectV2DraftIssue(input: {
@@ -2786,19 +2310,7 @@ def _set_item_field(project_id: str, item_id: str, field_id: str, option_id: str
 def _set_item_number_field(
     project_id: str, item_id: str, field_id: str, value: float,
 ) -> bool:
-    """Set a NUMBER field on a project item to ``value``.
-
-    GitHub's GraphQL API takes a ``Float`` for ``value.number``; passing
-    a Python float is fine — the JSON encoder serialises it correctly
-    and integers are accepted too.
-
-    GitHub rejects values with more than 8 decimal places (``VALIDATION``
-    error). Accumulated AI costs (``$4.5365`` becoming
-    ``4.536499999999999`` after summing several Claude usage entries)
-    routinely trip this, so the value is rounded to 8 fractional digits
-    before being sent. Eight is the API ceiling — well above the
-    cents-level precision we actually care about.
-    """
+    # GitHub rejects numbers with more than 8 decimal places
     safe_value = round(float(value), 8)
     mutation = """
     mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: Float!) {
@@ -2824,12 +2336,6 @@ def _set_item_number_field(
 def _set_item_text_field(
     project_id: str, item_id: str, field_id: str, value: str,
 ) -> bool:
-    """Set a TEXT field on a project item to ``value``.
-
-    Companion to :func:`_set_item_number_field` / :func:`_set_item_field`
-    for the one field type those don't cover. Used by ``project-backport``
-    when ``Port Versions`` is a free-text field.
-    """
     mutation = """
     mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: String!) {
       updateProjectV2ItemFieldValue(input: {
@@ -2904,7 +2410,6 @@ def _get_owner_id(owner: str, is_org: bool) -> str | None:
 
 
 def _create_project(owner_id: str, title: str) -> tuple[str, int] | None:
-    """Create a new GitHub Project v2. Returns (project_id, project_number)."""
     mutation = """
     mutation($ownerId: ID!, $title: String!) {
       createProjectV2(input: {ownerId: $ownerId, title: $title}) {
@@ -2925,7 +2430,6 @@ def _create_project(owner_id: str, title: str) -> tuple[str, int] | None:
 def _create_single_select_field(
     project_id: str, name: str, options: list[dict],
 ) -> str | None:
-    """Create a single-select field on a project. Returns field ID."""
     mutation = """
     mutation($projectId: ID!, $name: String!, $options: [ProjectV2SingleSelectFieldOptionInput!]!) {
       createProjectV2Field(input: {
@@ -2954,13 +2458,7 @@ def _create_single_select_field(
 def _update_single_select_options(
     field_id: str, options: list[dict],
 ) -> tuple[bool, str | None]:
-    """Replace all options on an existing single-select field.
-
-    Returns ``(success, error_message_or_None)`` so the caller can
-    surface the GitHub-side reason for a failure (commonly: missing
-    ``project`` token scope, or per-API-version constraints on which
-    fields ``updateProjectV2Field`` permits editing).
-    """
+    """Replace all options on a single-select field; return ``(ok, error_message)``."""
     mutation = """
     mutation($fieldId: ID!, $options: [ProjectV2SingleSelectFieldOptionInput!]!) {
       updateProjectV2Field(input: {
@@ -3004,11 +2502,7 @@ def _update_single_select_options(
 
 
 def setup_project(config: Config) -> str | None:
-    """Create a GitHub Project with the Status field, or verify an existing one.
-
-    If notifications.github_project is set, verifies the Status field exists.
-    If not set, creates a new project and returns the URL.
-    """
+    """Create the configured Project (if unset) and reconcile its fields; return its URL."""
     token = get_github_token()
     if not token:
         log.warning("RELEASY_GITHUB_TOKEN not set")
@@ -3052,6 +2546,14 @@ def setup_project(config: Config) -> str | None:
         else:
             project_url = f"https://github.com/users/{owner}/projects/{p_number}"
 
+    status_options = [
+        {
+            "name": opt,
+            "color": STATUS_COLORS.get(opt, "GRAY"),
+            "description": "",
+        }
+        for opt in STATUS_OPTIONS
+    ]
     status_info = _get_status_field(project_id)
     if status_info:
         field_id, existing_options, raw_options = status_info
@@ -3077,23 +2579,8 @@ def setup_project(config: Config) -> str | None:
                 f"  [yellow]→[/yellow] reconciling: "
                 f"add={missing or '—'}, remove={extra or '—'}"
             )
-            # Replace, don't merge: the Status field is fully owned by
-            # RelEasy. Orphan options (e.g. legacy ``Ok`` / ``Resolved``
-            # from older RelEasy versions, or anything else hand-added to
-            # the field) get dropped. Items that were sitting on a
-            # dropped option lose their Status value momentarily — the
-            # next ``sync_project`` call re-assigns them based on
-            # ``fs.status``, which the load-time migration has already
-            # collapsed to the new vocabulary.
-            canonical = [
-                {
-                    "name": opt,
-                    "color": STATUS_COLORS.get(opt, "GRAY"),
-                    "description": "",
-                }
-                for opt in STATUS_OPTIONS
-            ]
-            ok, err = _update_single_select_options(field_id, canonical)
+            # Replace, not merge: RelEasy owns the Status options
+            ok, err = _update_single_select_options(field_id, status_options)
             if ok:
                 console.print(
                     "  [green]✓[/green] Status field options reconciled"
@@ -3121,15 +2608,7 @@ def setup_project(config: Config) -> str | None:
             "  [dim]No Status field found on the project, creating "
             "one...[/dim]"
         )
-        options = [
-            {
-                "name": opt,
-                "color": STATUS_COLORS.get(opt, "GRAY"),
-                "description": "",
-            }
-            for opt in STATUS_OPTIONS
-        ]
-        field_id = _create_single_select_field(project_id, "Status", options)
+        field_id = _create_single_select_field(project_id, "Status", status_options)
         if field_id:
             console.print("  [green]✓[/green] Status field created")
         else:
@@ -3138,10 +2617,6 @@ def setup_project(config: Config) -> str | None:
                 "(see warnings above)"
             )
 
-    # Ensure the AI Cost (NUMBER) field exists. Created lazily here so an
-    # already-running project picks it up the next time the user runs
-    # ``releasy setup-project``; ``sync_project`` also creates it on the
-    # fly so cards always carry the value.
     ai_cost_field_id = _ensure_ai_cost_field(project_id)
     if ai_cost_field_id:
         console.print(
@@ -3154,11 +2629,6 @@ def setup_project(config: Config) -> str | None:
             "synced to the board."
         )
 
-    # Provision the Assignee Dev / Assignee QA single-select fields. On
-    # first creation each is populated with the option list from
-    # ``notifications.assignee_*_options``. On subsequent runs we leave
-    # the options alone — adding/removing options would risk wiping
-    # values the user manually set on the board.
     for field_name, options in (
         (ASSIGNEE_DEV_FIELD_NAME, config.notifications.assignee_dev_options),
         (ASSIGNEE_QA_FIELD_NAME, config.notifications.assignee_qa_options),
@@ -3182,7 +2652,7 @@ def setup_project(config: Config) -> str | None:
         else:
             console.print(
                 f"  [green]\u2713[/green] {field_name} field created "
-                f"with {len(options)} option(s): {', '.join(options) or '\u2014'}"
+                f"with {len(options)} option(s): {', '.join(options) or '—'}"
             )
 
     return project_url
@@ -3208,11 +2678,7 @@ def _rest_api(
     *, expected_statuses: tuple[int, ...] = (200, 201),
     log_on_error: bool = True,
 ) -> tuple[int, dict | list | None]:
-    """Make a GitHub REST API call.
-
-    Returns ``(status_code, json_body_or_None)``. Emits a warning on
-    unexpected status codes unless ``log_on_error`` is False.
-    """
+    """GitHub REST call; return ``(status_code, json_or_None)``. Status 0 = no token."""
     token = get_github_token()
     if not token:
         return 0, None
@@ -3238,9 +2704,7 @@ def _rest_api(
         return resp.status_code, None
 
 
-# Projects Classic uses the REST `/projects/{n}/views` endpoint; Projects V2
-# (the only kind still being created) serves that URL as 404. We probe once
-# per run, cache the result, and stop spamming the log for V2 projects.
+# Projects whose REST views endpoint returned 404 (Projects V2)
 _PROJECT_IS_V2: set[tuple[str, int]] = set()
 
 
@@ -3249,7 +2713,7 @@ def _project_v2_marker(owner: str, project_number: int) -> tuple[str, int]:
 
 
 def _get_project_views(owner: str, project_number: int, is_org: bool) -> list[dict]:
-    """List existing views on a Projects Classic project. Empty list for V2."""
+    """Views of a Projects Classic project; empty for V2."""
     marker = _project_v2_marker(owner, project_number)
     if marker in _PROJECT_IS_V2:
         return []
@@ -3282,10 +2746,7 @@ def _create_project_view(
     owner: str, project_number: int, is_org: bool,
     name: str, layout: str = "table",
 ) -> dict | None:
-    """Create a new view (tab) on a Projects Classic project.
-
-    No-op for Projects V2 (already detected by _get_project_views).
-    """
+    """Create a view on a Projects Classic project; no-op for V2."""
     marker = _project_v2_marker(owner, project_number)
     if marker in _PROJECT_IS_V2:
         return None
@@ -3311,7 +2772,6 @@ def _create_project_view(
 def _ensure_project_view(
     owner: str, project_number: int, is_org: bool, view_name: str,
 ) -> bool:
-    """Create a view for this rebase if it doesn't exist yet."""
     marker = _project_v2_marker(owner, project_number)
     if marker in _PROJECT_IS_V2:
         return False
@@ -3327,17 +2787,7 @@ def _ensure_project_view(
 
 @dataclass
 class ProjectSyncSummary:
-    """Outcome of a single ``sync_project`` call.
-
-    ``added`` counts cards that didn't exist on the board before this call
-    (newly attached PRs + newly created draft issues). ``updated`` counts
-    pre-existing cards we refreshed (body / Status field). ``errors`` is
-    the number of features we wanted to sync but couldn't.
-
-    ``skipped`` is True when sync didn't run at all (no project URL
-    configured, missing token, unparseable URL, …) — that's not an error,
-    just a no-op.
-    """
+    """Outcome of one ``sync_project`` call; ``skipped`` = sync didn't run (not an error)."""
     added: int = 0
     updated: int = 0
     removed: int = 0
@@ -3349,56 +2799,15 @@ class ProjectSyncSummary:
     def changed(self) -> int:
         return self.added + self.updated + self.removed
 
-    def summary_line(self) -> str:
-        if self.skipped:
-            return f"skipped ({self.skipped_reason or 'no project configured'})"
-        parts: list[str] = []
-        if self.added:
-            parts.append(f"{self.added} added")
-        if self.updated:
-            parts.append(f"{self.updated} updated")
-        if self.removed:
-            parts.append(f"{self.removed} removed")
-        if self.errors:
-            parts.append(f"{self.errors} error(s)")
-        if not parts:
-            return "already up to date"
-        return ", ".join(parts)
-
 
 def sync_project(
     config: Config, state: PipelineState,
     *,
     prune_orphans: bool = False,
 ) -> ProjectSyncSummary:
-    """Sync pipeline state to a GitHub Project board.
+    """Sync each state feature to a Project card: its PR if any, else a draft issue.
 
-    Iterates every feature actually present in ``state.features`` (ports
-    discovered via ``pr_sources`` are only known here, never in
-    ``config.features``) and any static feature from ``config.features``
-    that has not produced state yet (so unstarted/disabled features still
-    show up as cards).
-
-    Each feature becomes one item on the project:
-
-    * If a PR exists for it (``fs.rebase_pr_url``), the *real* PR is
-      attached to the project via ``addProjectV2ItemById`` — that's the
-      whole point of the Projects v2 API. The mutation is idempotent so
-      re-running is safe.
-    * Otherwise (pending / disabled / dropped singleton) we fall back to a
-      DraftIssue carrying the same status info, so the board still
-      reflects the run.
-
-    When ``prune_orphans`` is set, DraftIssue / PullRequest items on the
-    board that aren't backed by a state entry in this run are deleted.
-    Off by default so per-run incremental sync calls (after every state
-    save) don't reap items mid-mutation; only the standalone
-    ``releasy project push`` opts in.
-
-    The returned ``ProjectSyncSummary`` reports how many cards were added
-    vs. refreshed, so reconciliation passes (e.g. at the end of ``releasy
-    continue``) can tell the user "added 3 missing items" without parsing
-    log output.
+    ``prune_orphans`` deletes PR/draft cards not backed by state.
     """
     if config.dry_run:
         return ProjectSyncSummary(
@@ -3452,22 +2861,14 @@ def sync_project(
     if status_info:
         status_field_id, status_options, _ = status_info
 
-    # Auto-provision the AI Cost field. Best-effort: if the token can't
-    # create it, we just skip the cost sync — every other part of the
-    # board still updates.
     ai_cost_field_id = _ensure_ai_cost_field(project_id)
 
-    # Look up (do NOT auto-create here — that's setup_project's job) the
-    # Assignee Dev field. We only set its default value on freshly created
-    # cards; missing field => default-seeding is silently skipped.
+    # Not auto-created here; setup_project does that
     assignee_dev_field_id: str | None = None
     assignee_dev_options: dict[str, str] = {}
     dev_field = _get_single_select_field(project_id, ASSIGNEE_DEV_FIELD_NAME)
     if dev_field:
         assignee_dev_field_id, assignee_dev_options, _ = dev_field
-    # Lower-case the configured login → option-label map at the call
-    # site so we can compare PR-author logins case-insensitively without
-    # mutating the live config.
     login_map_lc = {
         k.lower(): v
         for k, v in config.notifications.assignee_dev_login_map.items()
@@ -3475,10 +2876,7 @@ def sync_project(
 
     origin_slug = get_origin_repo_slug(config)
 
-    # Collect every feature we know about. State wins; static config
-    # features merely provide a row for things that haven't run yet.
     rows: list[tuple[str, str, str, list[str], FeatureState | None]] = []
-    seen: set[str] = set()
 
     for feat_id, fs in state.features.items():
         feat = config.get_feature(feat_id)
@@ -3489,11 +2887,6 @@ def sync_project(
         )
         title = f"{label} ({feat_id})"
         rows.append((feat_id, title, fs.status, fs.conflict_files, fs))
-        seen.add(feat_id)
-
-    # Static config.features that haven't run yet are deliberately
-    # skipped: they have no real status, no branch, and nothing to track.
-    # They appear on the board only after a run produces a state entry.
 
     summary = ProjectSyncSummary()
     if not rows:
@@ -3512,7 +2905,6 @@ def sync_project(
         item_id: str | None = None
         was_existing = False
         attached_real_pr = False
-        # Prefer attaching the real PR — that's what Projects v2 is for.
         pr_url = fs.rebase_pr_url if fs else None
         if pr_url:
             item_id = _find_item_by_pr_url(existing_items, pr_url)
@@ -3567,9 +2959,7 @@ def sync_project(
                     summary.errors += 1
                     continue
         elif attached_real_pr:
-            # Real PR is now the project item. Remove any leftover draft stub
-            # created on a prior run when no PR existed yet — otherwise the
-            # board ends up with two cards for the same feature.
+            # Drop the draft stub from a run before the PR existed
             stale_draft = _find_draft_item_by_title(existing_items, title)
             if stale_draft:
                 stale_item_id, _ = stale_draft
@@ -3593,20 +2983,13 @@ def sync_project(
             if option_id:
                 _set_item_field(project_id, item_id, status_field_id, option_id)
 
-        # AI Cost: always write a number so the column is never blank
-        # (cards that never invoked the resolver land at 0.0). Skipped
-        # only when the field couldn't be provisioned at all.
         if ai_cost_field_id:
             cost_value = float(fs.ai_cost_usd) if (fs and fs.ai_cost_usd is not None) else 0.0
             _set_item_number_field(
                 project_id, item_id, ai_cost_field_id, cost_value,
             )
 
-        # Assignee Dev: seed once per card, on first creation only. We
-        # never overwrite an existing card's value so anything a human
-        # set manually (or any later reassignment) is preserved across
-        # re-runs. Assignee QA is left strictly untouched — it has no
-        # automatic default.
+        # Assignee Dev is seeded only on new cards, never overwritten
         if (
             not was_existing
             and assignee_dev_field_id
@@ -3650,11 +3033,7 @@ def sync_project(
 
 
 def _format_pr_url_as_link(url: str) -> str:
-    """Render a GitHub PR URL as a markdown link ``[owner/repo#N](url)``.
-
-    Falls back to the bare URL when parsing fails — keeps the body
-    readable without ever throwing on a malformed string.
-    """
+    """``[owner/repo#N](url)``, or the bare URL if it isn't a PR URL."""
     m = re.match(
         r"https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/pull/(\d+)",
         url,
@@ -3675,8 +3054,6 @@ def _project_item_body(
     """Render the body for a draft-issue project card."""
     body_parts = [f"**Status:** {status}"]
     if fs is not None and fs.stall is not None:
-        # The status says what the card is; the stall says why it is stuck
-        # and whether the next run will even try again.
         stuck = f"**Why:** {fs.stall.summary()}"
         if fs.stall.runs > 1:
             stuck += f" _(unchanged for {fs.stall.runs} runs)_"
@@ -3691,9 +3068,7 @@ def _project_item_body(
     ):
         repo_url = f"https://github.com/{origin_slug}"
         branch_url = f"{repo_url}/tree/{fs.branch_name}"
-        # GitHub /compare/<base>...<head>?expand=1 lands on the
-        # "Open a pull request" form pre-populated with the diff, so the
-        # user can create the PR manually with one click.
+        # ?expand=1 opens the "Open a pull request" form
         compare_url = (
             f"{repo_url}/compare/{state.base_branch or 'main'}..."
             f"{fs.branch_name}?expand=1"
@@ -3703,12 +3078,7 @@ def _project_item_body(
             f"- Branch: [`{fs.branch_name}`]({branch_url})\n"
             f"- [Open a pull request manually]({compare_url})"
         )
-    # An "AI gave up" conflict (legacy ``needs_resolution``) is now just
-    # a regular ``conflict`` — but the ``failed_step_index`` /
-    # ``partial_pr_count`` / ``rebase_pr_url`` fields, when set, identify
-    # this flavour and let the body explain what happened. Plain
-    # cherry-pick conflicts (no AI involvement) just fall through to the
-    # ``conflict_files`` block below.
+    # These fields mark a conflict the AI resolver gave up on
     if (
         status == "conflict" and fs is not None and (
             fs.partial_pr_count is not None
@@ -3739,9 +3109,6 @@ def _project_item_body(
             note_lines.append(f"Draft PR: {fs.rebase_pr_url}")
         body_parts.append("\n".join(note_lines))
 
-    # Prereq-detection blocks. These are independent of the conflict-files
-    # block above — a unit can both have unresolved conflict files AND a
-    # missing-prereq trail (e.g. detection-only mode left both populated).
     if fs is not None:
         prereq_block = _render_prereq_body_block(fs)
         if prereq_block:
@@ -3754,17 +3121,7 @@ def _project_item_body(
 
 
 def _render_prereq_body_block(fs: FeatureState) -> str | None:
-    """Render the prereq-detection / auto-recovery block(s) for ``fs``.
-
-    Selects the right variant based on which fields are populated:
-    * ``queued_prereq_units`` set → "already queued elsewhere"
-    * ``prereq_recovery_exhausted`` set → "depth limit / cycle"
-    * ``dynamic_prereq_urls`` set with no exhaust + status != conflict
-      → "auto-ported prerequisites" (success)
-    * ``missing_prereq_prs`` set otherwise → detection-only block
-
-    Returns ``None`` when no prereq-related state is present.
-    """
+    """Markdown block for ``fs``'s prereq state, or None if there is none."""
     if fs.queued_prereq_units:
         lines = ["**Prerequisite already queued.**"]
         lines.append(
@@ -3788,8 +3145,7 @@ def _render_prereq_body_block(fs: FeatureState) -> str | None:
             (entry.get("at_depth", 0) for entry in fs.prereq_trail),
             default=0,
         )
-        # Last trail entry's `discovered` is the prereq we *would* have
-        # dived into when we hit the cap (or the cycle).
+        # The last entry's ``discovered`` is where the cap/cycle stopped
         last = fs.prereq_trail[-1]
         next_prereqs = last.get("discovered", []) or []
         next_link_str = ", ".join(

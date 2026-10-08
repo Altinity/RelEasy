@@ -1,142 +1,109 @@
 # Concepts
 
-The mental model behind RelEasy. For the schema, see
-[configuration.md](configuration.md); for commands, see
-[commands.md](commands.md).
+Schema: [configuration.md](configuration.md). Commands: [commands.md](commands.md).
 
 ## The model
 
 ```
-origin/antalya-26.3:          * (stable base branch on origin — you maintain it)
+origin/antalya-26.3:          * (base branch — you maintain it)
                               |
 feature/antalya-26.3/pr-42:   * --- fix   (PR → antalya-26.3)
 feature/antalya-26.3/pr-99:   * --- feat  (PR → antalya-26.3)
 ```
 
-You maintain the **base branch**. Each PR you want to port becomes its own
-**port branch** carrying the cherry-picked commits, opened as a rebase PR
-back into the base. RelEasy never creates or rewrites the base.
+Each PR (or group of PRs) to port becomes a **unit**: its own port branch off
+the base, carrying the cherry-picked commits, opened as a rebase PR into the
+base. RelEasy never creates or rewrites the base branch.
 
 ## Pipeline
 
-`releasy run` does:
+`releasy run`:
 
-1. Discover PRs from `pr_sources` in the session file.
-2. For each PR / group, create `feature/<base>/<id>` from the base.
-3. Cherry-pick the PR merge commit(s).
-4. Push and open a PR into the base (when `push: true` and
-   `pr_policy.auto_pr: true`).
+1. Discovers PRs from the session's `pr_sources`.
+2. Creates `feature/<base>/<id>` from `origin/<base>` per unit.
+3. Cherry-picks the merge commit(s), AI-resolving conflicts if enabled.
+4. Pushes and opens a PR into the base (`push: true` + `pr_policy.auto_pr`).
 
-On conflict: pipeline stops with instructions. Resolve, then
-[`releasy continue`](commands.md#releasy-continue), then
-[`releasy run`](commands.md#releasy-run) again.
-
-The other commands fit around this loop — see the
-[at-a-glance matrix](commands.md#at-a-glance-which-command-does-what).
+Units already having an open rebase PR are not rebuilt; `run` merges the base
+into them instead (as [`refresh --merge-target`](commands.md#releasy-refresh)
+does).
 
 ## Branch naming
 
-Base branch = `target_branch` from config, or derived
-`<project>-<version>` (with `<version>` parsed from `--onto`).
-`--onto` is a **naming label** — never resolved as a git ref.
+Base = `target_branch`, or `<project>-<version>` with `<version>` parsed from
+`--onto` (a naming label, never resolved as a git ref).
 
 | Type | Pattern | Example |
 |------|---------|---------|
 | Base | `target_branch` or `<project>-<version>` | `antalya-26.3` |
-| Feature | `feature/<base>/<id>` | `feature/antalya-26.3/s3-disk` |
+| Feature / group | `feature/<base>/<id>` | `feature/antalya-26.3/s3-disk` |
 | Origin PR | `feature/<base>/pr-<N>` | `feature/antalya-26.3/pr-42` |
-| External PR | `feature/<base>/<owner>-<repo>-pr-<N>` | `feature/antalya-26.3/ClickHouse-ClickHouse-pr-12345` |
+| Cross-repo PR | `feature/<base>/<owner>-<repo>-pr-<N>` | `feature/antalya-26.3/ClickHouse-ClickHouse-pr-12345` |
 
-## Multiple projects in parallel
+## Files
 
-Each `config.yaml` has a required `name:`. That name keys a state file +
-lock under `${XDG_STATE_HOME:-~/.local/state}/releasy/` (override with
-`$RELEASY_STATE_DIR`). Different-named projects run truly concurrently;
-same-named projects serialize on the lock.
+| Path | Purpose |
+|------|---------|
+| `config.yaml` | Stable per-project settings. Scaffolded by `releasy new`. |
+| `<config-dir>/<target_branch>.session.yaml` | What to port (`features:`, `pr_sources:`). Named after `name` when `target_branch` is unset; override with `session_file:` / `--session-file`. |
+| `<session-stem>.deps.yaml` | Deps overlay written by `graph discover`, read by `run`. |
+| `${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml` | Pipeline state. Managed by RelEasy. |
+| `${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.lock` | Per-project lock. |
 
-```bash
-(cd ~/work/antalya-26.3 && releasy run) &
-(cd ~/work/antalya-25.8 && releasy run) &
-releasy list   # see every project on this machine
-```
+`$RELEASY_STATE_DIR` overrides the state directory.
 
-> One `work_dir` per project — git itself isn't safe with two processes
-> mutating the same checkout.
+## Multiple projects
 
-Moving a `config.yaml` trips an ownership check. Fix with
-[`releasy adopt`](commands.md#releasy-adopt) from the new location.
+`name:` keys the state file and lock, so differently-named projects run
+concurrently; same-named ones serialize. Use one `work_dir` per project.
+[`releasy list`](commands.md#releasy-list) shows all projects. The state file
+records its owning config path; after moving a config, run
+[`releasy adopt`](commands.md#releasy-adopt).
 
-## Files RelEasy reads & writes
+## Statuses
 
-| Path | Purpose | Edited by |
-|------|---------|-----------|
-| `config.yaml` | Stable per-project config — origin, target branch, AI, notifications. [Schema](configuration.md#configyaml-stable-infrastructure). | You; scaffolded by `releasy new`. |
-| `<config-dir>/<target_branch>.session.yaml` | `features:` + `pr_sources:` (falls back to `<name>` when `target_branch` is unset). [Schema](configuration.md#target_branchsessionyaml-per-effort-source-data). Override path with `session_file:` or `--session-file`. | You; mutated by [`releasy feature *`](commands.md#feature-management). |
-| `${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml` | Pipeline state (phase, branches, statuses, AI cost). | Auto. Not user-editable. |
-| `${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.lock` | POSIX advisory lock. | Auto. Crash leftovers self-reclaim. |
+| Status | Meaning |
+|--------|---------|
+| `needs_review` | Rebase PR open. |
+| `branch_created` | Branch pushed, no PR yet. |
+| `build_failed` | Resolution landed but build/tests failed; branch kept, retried next `run`. |
+| `conflict` | Needs a human. |
+| `blocked` | Waiting on `depends_on` units to merge. |
+| `skipped` | Dropped by `releasy skip` or an empty cherry-pick. |
+| `merged` | Rebase PR merged. |
+| `closed` | Rebase PR closed unmerged. Terminal unless `pr_policy.recreate_closed_prs`. |
+| `superseded` | Another commit/PR on the base already cherry-picks the source. Terminal; see `pr_policy.detect_superseded`. |
+| `reverted` | Merged, then reverted on target (`releasy mark-reverted`). Terminal unless `pr_policy.recreate_reverted_prs`. |
 
-The state file remembers the owning `config.yaml`'s absolute path, so
-[`releasy list`](commands.md#releasy-list) can show the back-link and a
-moved/copied config trips a clear ownership error.
+AI-resolved ports also carry `ai_resolved` and the `ai-resolved` PR label.
+Units in `pr_sources.on_hold` keep whatever status they had and are skipped by
+`run` (see [on hold vs. excluded](configuration.md#on-hold-vs-excluded)).
 
-## Conflict resolution
+## Conflicts
 
-When AI resolve is disabled or gives up, RelEasy flags the unit for manual
-review and keeps the pipeline moving. Two flavours:
+When AI resolution is off or gives up, the unit is marked `conflict` and the
+pipeline moves on:
 
-**Singleton (or first PR of a group)** — no useful commits yet, so:
-abort cherry-pick, delete local port branch, mark `Conflict` on the board,
-do not push, do not open a PR.
+- **Singleton or first PR of a group** — cherry-pick aborted, local branch
+  deleted, nothing pushed.
+- **Later PR of a group** — earlier picks kept; branch pushed as a draft PR
+  labelled `ai-needs-attention`. The next `run` resumes it, up to
+  `pr_policy.max_partial_continue_attempts`.
 
-**Partial group (later PR in a group fails)** — earlier picks are valid, so:
-abort failed pick, push the branch, open a draft PR labelled
-`ai-needs-attention` with a banner explaining the failure, mark `Conflict`.
+| To… | Run |
+|-----|-----|
+| Re-attempt a unit after fixing its source | [`releasy run`](commands.md#releasy-run) |
+| Mark a manually resolved port branch done | [`releasy continue`](commands.md#releasy-continue) |
+| Resolve target drift on an open rebase PR | [`releasy refresh --merge-target`](commands.md#releasy-refresh) |
+| Drop the unit | [`releasy skip`](commands.md#releasy-skip) |
 
-After conflicts:
-
-| You want to… | Run |
-|--------------|-----|
-| Re-attempt a source PR you just fixed manually | [`releasy run`](commands.md#releasy-run) |
-| Mark a manually-resolved port branch as done | [`releasy continue`](commands.md#releasy-continue) |
-| Resolve target-drift conflicts on an open rebase PR | [`releasy refresh`](commands.md#releasy-refresh) |
-| Drop a port from this run | [`releasy skip`](commands.md#releasy-skip) |
-| Record that a merged port was reverted on target | [`releasy mark-reverted`](commands.md#releasy-mark-reverted) |
-| Resync the GitHub Project board | [`releasy project push`](commands.md#releasy-project-push) |
-
-**Status semantics:** clean or AI-resolved port with rebase PR open →
-`needs_review`. Pushed branch without PR → `branch_created`. Needs human →
-`conflict`. Rebase PR landed → `merged`. Rebase PR closed without merging
-→ `closed` (terminal — `pr_policy.recreate_closed_prs` lets a fresh
-`<canonical>-1` / `-2` / … attempt opt back in). Another PR on the same
-base already cherry-picks the source(s) → `superseded` (terminal — gated
-by `pr_policy.detect_superseded`). Merged and then reverted on target →
-`reverted` (terminal, set only by
-[`releasy mark-reverted`](commands.md#releasy-mark-reverted); re-porting
-would undo a human decision, so it takes its own opt-in,
-`pr_policy.recreate_reverted_prs`). AI involvement is signalled by
-`ai_resolved` + the `ai-resolved` PR label.
-
-A unit listed in `pr_sources.on_hold` has no status of its own: the hold
-lives in the session, not in state, so `run` walks past the unit without
-touching whatever it already had. It keeps its node and its edges in the
-graph (units that depend on it report `blocked`, since a held unit never
-reaches `merged`), the graph issue lists it under **On hold**, and dropping
-the entry puts it straight back in the queue. See
-[on hold vs. excluded](configuration.md#on-hold-vs-excluded).
-
-For per-PR hints to the resolver, see
+Per-PR hints for the resolver:
 [`ai_context`](configuration.md#per-pr--per-group-ai_context).
 
 ## Stall reasons
 
-`status` says *what* a parked unit is; a **stall** says *why* it stopped and
-whether re-running could change that. It is recorded on the state entry
-(`stall:`) on every non-clean exit, and cleared the moment the unit lands,
-merges, is skipped, or has its conflict resolved.
-
-A stall is a generic `kind` plus the specifics — a short `detail`, the units
-and PRs it waits on, when it was first seen, and how many consecutive runs
-have ended in it:
+A **stall** records *why* a unit stopped (on its state entry, `stall:`), and is
+cleared when the unit lands, merges, is skipped, or is resolved.
 
 ```yaml
 stall:
@@ -147,70 +114,33 @@ stall:
   runs: 3
 ```
 
-| Kind | Meaning | Blocks a retry? |
-|------|---------|-----------------|
-| `waiting_for_merge` | A prerequisite is queued in another unit — listed there, or carried inside a combined port that unit brings — or a `depends_on` gate is unmet. Nothing to try until that PR merges. | yes |
-| `missing_prereq` | A prerequisite PR was identified but nobody ports it: add it to the session, or merge it upstream. | yes |
-| `retries_exhausted` | An attempt cap was spent (`max_partial_continue_attempts`, `max_verify_resume_attempts`). | the cap does |
-| `unresolvable` | The resolver judged the conflict and could not fix it. | once `ai_resolve.max_dead_end_attempts` are spent |
-| `prereq_search_exhausted` | The auto-prereq dive hit its depth cap, a cycle, or a fetch failure. | once `ai_resolve.max_dead_end_attempts` are spent |
-| `resolver_unavailable` | AI resolution is off, or the backend died before reaching a verdict. | no |
-| `build_unfixed` | The resolution landed but the build/tests never went green. | no |
+| Kind | Meaning | Skipped by `run`? |
+|------|---------|-------------------|
+| `waiting_for_merge` | A prerequisite is queued in another unit, or a `depends_on` gate is unmet. | yes, until that unit merges |
+| `missing_prereq` | A prerequisite PR was found but nobody ports it. | yes, until the prereq's port merges |
+| `retries_exhausted` | An attempt cap was spent. | the cap decides |
+| `unresolvable` | The resolver could not fix the conflict. | after `ai_resolve.max_dead_end_attempts` runs |
+| `prereq_search_exhausted` | The auto-prereq dive hit its depth cap, a cycle, or a fetch failure. | after `ai_resolve.max_dead_end_attempts` runs |
+| `resolver_unavailable` | AI resolution off, or the backend died. | no |
+| `build_unfixed` | Build/tests never went green. | no |
 
-**Blocking stalls skip the unit** on the next [`run`](commands.md#releasy-run)
-instead of paying for a resolution that can only reach the same verdict. The
-skip is not permanent — it lasts exactly as long as the thing being waited on:
-a `waiting_for_merge` clears when one of its units reaches `merged` /
-`superseded` (or leaves the session), a `missing_prereq` clears once the
-prereq's own port merges. Queueing the prereq is not enough on its own: a
-unit that ports it but hasn't merged leaves the conflict exactly where it
-was, so the unit stays parked and the stall is re-stated as
-`waiting_for_merge` on that unit. `retries_exhausted` isn't
-gated here because the caps are re-read from config every run, so raising one
-takes effect immediately.
-
-`unresolvable` and `prereq_search_exhausted` are gated by a cap of their own
-rather than by what they wait on: base moves between runs, so a resolution
-that reached a dead end is worth another try or two — but not at full token
-price on every run forever. The stall's `runs` counter is that attempt count
-(it only grows on a run that actually re-resolved), and once it reaches
-`ai_resolve.max_dead_end_attempts` (default 2; `0` never parks) the unit is
-skipped until the cap is raised, the conflict is fixed by hand, or
-`--ignore-stalls` forces a try. The count restarts when the dive reports a
-different set of prereqs — that is new information, worth a run. A partially
-applied group is left to `pr_policy.max_partial_continue_attempts`, which
-bounds the same work.
-
-Set [`pr_policy.honor_stall_reasons:
-false`](configuration.md#configyaml-stable-infrastructure) to always
-re-attempt, or pass `run --ignore-stalls` for a single run.
-
-Stalls surface in `releasy status` (a **Why** column), on the graph issue
-([`graph sync`](commands.md#releasy-graph-sync)), on the project board card,
-and in the draft PR's "needs manual intervention" banner.
+Force a retry with `run --ignore-stalls`, or disable skipping with
+`pr_policy.honor_stall_reasons: false`. Stalls show in `releasy status`
+(**Why** column), on the graph issue, on the board, and in draft PR banners.
 
 ## PR title & labels
 
-Rebase PR title: `"<Project> <version>: <subject>"` — e.g.
-`"Antalya 26.3: Token Authentication and Authorization"`. Version comes
-from the base branch; project is title-cased only if all-lowercase
-(`ClickHouse` preserved). A leading `<version>[<project>]:` prefix on the
-source title is stripped first.
+Title: `"<Project> <version>: <subject>"`, e.g.
+`"Antalya 26.3: Token Authentication and Authorization"`. The project is
+title-cased only if all-lowercase; a leading `<version>[<project>]:` prefix on
+the source title is stripped.
 
-Labels: every PR gets `releasy` (auto-created on first run with
-`push: true`). AI-resolved PRs also get `ai_resolve.label` (default
-`ai-resolved`). Optional `merged_label` is stamped on the rebase PR when it
-merges and stripped from the source PRs — see
-[`merged_label`](configuration.md#configyaml-stable-infrastructure).
+Every rebase PR gets the `releasy` label; AI-resolved ones also get
+`ai_resolve.label`. See also `merged_label`, `pr_labels` and
+`pr_labels_by_mode` in [configuration.md](configuration.md#key-options).
 
 ## Safety: PRs always target origin
 
-Cross-repo PR URLs are read-only sources for cherry-picks. RelEasy only
-ever **creates, updates, labels** PRs in the `origin` repo and only ever
-**pushes branches** to that same remote. Enforced at the API helper layer
-(`create_pull_request`, `update_pull_request`, `add_label_to_pr`,
-`ensure_label`, `force_push`) — there's no parameter to point elsewhere.
-
-`releasy run` prints `PRs will be opened against <owner>/<repo> (origin)`
-on startup so the target is visible. If you see writes to anywhere else,
-it's a bug — please report.
+Cross-repo PR URLs are read-only cherry-pick sources. RelEasy only creates,
+updates or labels PRs in the `origin` repo and only pushes to that remote;
+`run` prints the target repo on startup.

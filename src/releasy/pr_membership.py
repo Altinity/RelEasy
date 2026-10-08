@@ -1,11 +1,4 @@
-"""PR membership management: add, remove, list.
-
-PRs live in the session file (``<target_branch>.session.yaml`` by default) under
-``pr_sources.include_prs`` (top-level) and ``pr_sources.groups[].prs``
-(grouped). State entries (``FeatureState``) live in the project state
-file. Every mutation here writes back via :func:`save_session` and
-:func:`save_state` so the user never edits YAML by hand.
-"""
+"""PR membership management (session ``pr_sources``): add, remove, hold, list."""
 
 from __future__ import annotations
 
@@ -25,7 +18,6 @@ from releasy.state import (
 
 
 def _require_session(config: Config):
-    """Return the live session, or raise — same contract as feature.py."""
     if config.session is None:
         raise RuntimeError(
             "pr subcommands need the session file loaded — this is a "
@@ -35,7 +27,6 @@ def _require_session(config: Config):
 
 
 def _url_in_list(url: str, urls: list[str]) -> bool:
-    """``url`` matches any entry in ``urls`` after canonicalisation."""
     target = parse_pr_url(url)
     if target is None:
         return False
@@ -43,7 +34,7 @@ def _url_in_list(url: str, urls: list[str]) -> bool:
 
 
 def _remove_url_from_list(url: str, urls: list[str]) -> bool:
-    """Drop ``url`` from ``urls`` (in place) by canonical match. True if removed."""
+    """Drop ``url`` from ``urls`` in place by canonical match; True if removed."""
     target = parse_pr_url(url)
     if target is None:
         return False
@@ -86,17 +77,7 @@ def add_pr(
     group_id: str | None = None,
     context: str | None = None,
 ) -> bool:
-    """Add a PR to the session.
-
-    Top-level (no ``group_id``) → ``pr_sources.include_prs``.
-    Grouped → the named group's ``prs``.
-
-    Validates the URL syntax, then fetches the PR via the GitHub API to
-    confirm it's reachable (closed PRs accepted). If the URL is already
-    in the target list with the same context, returns ``True`` without
-    mutating. If it's in ``exclude_prs``, it's removed (re-add overrides
-    a prior exclusion).
-    """
+    """Add a reachable PR to ``include_prs`` or group ``group_id``; clears a prior exclusion."""
     session = _require_session(config)
 
     if parse_pr_url(url) is None:
@@ -105,7 +86,6 @@ def add_pr(
 
     ps = session.pr_sources
 
-    # Locate target list + context dict.
     if group_id is not None:
         group = next((g for g in ps.groups if g.id == group_id), None)
         if group is None:
@@ -123,11 +103,7 @@ def add_pr(
         target_ctx = ps.include_pr_contexts
         loc_label = "[cyan]include_prs[/cyan]"
 
-    # A PR belongs in exactly one place: top-level include_prs, OR one
-    # group. The session loader warns about cross-list duplicates; at
-    # add-time we refuse so the user moves explicitly. They can re-add
-    # the same URL into the same group to update its ai_context — that
-    # falls through to the idempotency / context-update branch below.
+    # A PR belongs to include_prs or exactly one group.
     for g in ps.groups:
         if g.id == group_id:
             continue
@@ -163,23 +139,19 @@ def add_pr(
         )
         return True
 
-    # Apply mutations.
     if not already_present:
         target_list.append(url)
 
-    # Refresh ai_context: drop any prior canonical-matched entry, then
-    # set the new one if non-empty.
     _drop_context(url, target_ctx)
     if incoming_ctx:
         target_ctx[url] = incoming_ctx
 
-    # Re-adding a previously excluded PR clears the exclusion.
     removed_from_exclude = _remove_url_from_list(url, ps.exclude_prs)
 
     save_session(session)
 
     note = (
-        f" (updated ai_context)"
+        " (updated ai_context)"
         if already_present
         else f" — {pr_info.repo_slug}#{pr_info.number}: {pr_info.title}"
     )
@@ -200,17 +172,9 @@ def remove_pr(
     *,
     keep_discovery: bool = False,
 ) -> bool:
-    """Remove a PR from session + state.
+    """Remove a PR from session + state; unless ``keep_discovery``, add it to ``exclude_prs``.
 
-    Drops the URL from every session-level location (top-level
-    ``include_prs``, every group's ``prs``, both ai_context dicts).
-    Unless ``keep_discovery``, appends to ``exclude_prs`` so the next
-    refresh's label-driven discovery doesn't re-add it.
-
-    Locates the corresponding ``FeatureState`` and deletes it for
-    singleton features. A multi-PR group's entry is kept; an in-flight
-    port of it is marked outdated, so ``releasy run`` re-ports the group
-    without the PR.
+    Singleton state entries are deleted; a group's in-flight port is marked outdated.
     """
     session = _require_session(config)
 
@@ -234,8 +198,7 @@ def remove_pr(
     removed_from_top = _remove_url_from_list(url, ps.include_prs)
     _drop_context(url, ps.include_pr_contexts)
 
-    # A veto outranks a hold — leaving the entry would only trip the
-    # load-time "has no effect" warning.
+    # A veto outranks a hold.
     removed_from_hold = _remove_url_from_list(url, ps.on_hold)
     _drop_context(url, ps.on_hold_reasons)
 
@@ -243,10 +206,7 @@ def remove_pr(
     overlay_groups: list[str] = []
     for g in ps.groups:
         if _remove_url_from_list(url, g.prs):
-            # save_session() only writes hand-curated groups; an overlay
-            # entry is regenerated by `graph discover`, so say so instead
-            # of claiming a durable edit. exclude_prs (below) is what
-            # actually keeps the PR out of the group at discovery time.
+            # save_session() doesn't write overlay groups; `graph discover` regenerates them.
             (overlay_groups if g.auto_discovered else removed_from_groups).append(g.id)
         _drop_context(url, g.pr_ai_contexts)
 
@@ -309,13 +269,7 @@ def remove_pr(
 
 
 def hold_pr(config: Config, url: str, reason: str = "") -> bool:
-    """Park a PR in ``pr_sources.on_hold`` — waiting, not vetoed.
-
-    Re-holding an already-held PR just refreshes its reason. A held PR
-    stays in the dependency graph and keeps whatever port branch / PR it
-    already has; ``releasy run`` skips the unit carrying it until the entry
-    is dropped by :func:`unhold_pr`, by a graph-issue comment, or by hand.
-    """
+    """Park a PR in ``pr_sources.on_hold`` (waiting, not vetoed); re-holding updates the reason."""
     session = _require_session(config)
 
     if parse_pr_url(url) is None:

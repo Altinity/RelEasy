@@ -1,15 +1,4 @@
-"""Optional capture of the full process terminal stream to a log file.
-
-When :func:`configure` is called with a path (typically from config
-``log_file:``), ``sys.stdout`` and ``sys.stderr`` are wrapped so that
-everything the Rich console, Click, the logging module, and tracebacks
-emit is appended to that file in addition to the real terminal. When
-``configure(None)`` runs, wrappers are removed and the file is closed.
-
-:func:`configure` also attaches the ``releasy`` logger's handlers, so
-``log.info`` / ``log.debug`` calls reach the log file — without them the
-stdlib drops every record below WARNING.
-"""
+"""Optional tee of stdout/stderr and the ``releasy`` logger to a log file."""
 
 from __future__ import annotations
 
@@ -24,8 +13,6 @@ from typing import Any, TextIO
 
 from rich.console import Console
 
-# Captured on import — the real TTY (or whatever ``sys`` pointed at) before
-# we install tees.
 _real_stdout: TextIO = sys.stdout
 _real_stderr: TextIO = sys.stderr
 
@@ -34,8 +21,6 @@ _patched: bool = False
 _console: Console | None = None
 _log_handlers: list[logging.Handler] = []
 
-# Every module logs through ``logging.getLogger(__name__)``, so this is the
-# common ancestor of all of them.
 _LOGGER_NAME = "releasy"
 
 
@@ -78,15 +63,8 @@ def _reset_console() -> None:
 def _install_log_handlers(fp: TextIO) -> None:
     """Route the ``releasy`` logger to ``fp`` (INFO+) and the terminal (WARNING+).
 
-    Nothing configures ``logging``, so the root logger sits at WARNING with
-    no handlers: every ``log.info`` is discarded and only
-    ``logging.lastResort`` puts warnings on stderr. Two handlers replace
-    that, on the ``releasy`` logger rather than the root one so enabling
-    INFO doesn't also unleash urllib3's per-request chatter.
-
-    The file handler writes to ``fp`` directly instead of the tee'd
-    ``sys.stderr``, and the terminal handler to the pre-tee stderr, so a
-    warning is written to the log file exactly once.
+    Handlers write to ``fp`` and the pre-tee stderr so a warning lands in
+    the log file exactly once.
     """
     to_file = logging.StreamHandler(fp)
     to_file.setLevel(logging.INFO)
@@ -97,8 +75,7 @@ def _install_log_handlers(fp: TextIO) -> None:
     file_fmt.converter = time.gmtime  # match the UTC session header
     to_file.setFormatter(file_fmt)
 
-    # Bare message, as lastResort rendered it — the terminal output users
-    # already know stays byte-for-byte the same.
+    # Bare message, matching logging.lastResort's terminal output.
     to_term = logging.StreamHandler(_real_stderr)
     to_term.setLevel(logging.WARNING)
     to_term.setFormatter(logging.Formatter("%(message)s"))
@@ -126,7 +103,7 @@ def _teardown() -> None:
         sys.stdout = _real_stdout
         sys.stderr = _real_stderr
         _patched = False
-    # Before closing the file the handler writes to.
+    # Must precede closing the file the handler writes to.
     _remove_log_handlers()
     if _log_fp is not None:
         _log_fp.close()
@@ -138,15 +115,7 @@ atexit.register(_teardown)
 
 
 def configure(log_file: Path | str | None) -> None:
-    """Enable or disable file mirroring. Safe to call repeatedly.
-
-    * ``log_file is None`` — remove tees + log handlers, close the log file.
-    * Otherwise — open the file in append mode, tee stdout/stderr, write a
-      short session header, and attach the ``releasy`` logger's handlers
-      (see :func:`_install_log_handlers`). The path should already be
-      absolute (as after :func:`~releasy.config.load_config` resolves
-      ``log_file:`` in YAML).
-    """
+    """Enable (path) or disable (None) file mirroring. Safe to call repeatedly."""
     _teardown()
     if not log_file:
         return
@@ -167,12 +136,7 @@ def configure(log_file: Path | str | None) -> None:
 
 
 def get_console() -> Console:
-    """Return the shared :class:`rich.console.Console`, creating it lazily.
-
-    The console always targets the current ``sys.stdout`` (after any tee
-    installed by :func:`configure`). Call :func:`configure` before the
-    first :meth:`~rich.console.Console.print` if you use ``log_file``.
-    """
+    """Return the shared lazily-created Console bound to the current ``sys.stdout``."""
     global _console
     if _console is None:
         _console = Console()
@@ -184,6 +148,5 @@ class _ConsoleProxy:
         return getattr(get_console(), name)
 
 
-# Backwards-compatible ``from releasy.termlog import console`` — every
-# attribute is resolved on the lazily created ``Console`` instance.
+# Resolves every attribute on the lazily created Console.
 console = _ConsoleProxy()

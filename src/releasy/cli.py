@@ -18,19 +18,7 @@ from releasy.config import (
     validate_project_name,
 )
 
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-
-# Per-process dedupe set for session-load warnings. ``_attach_session``
-# may run multiple times in one CLI process (test harnesses, internal
-# helpers that re-load), and the warnings produced by ``load_session``
-# are deterministic functions of file contents — so re-printing them on
-# every load just creates stderr noise. Keyed on the warning text plus
-# the session path so simultaneous projects in one process still get
-# their own first-emission.
+# (session path, warning) pairs already printed in this process.
 _PRINTED_LOAD_WARNINGS: set[tuple[str, str]] = set()
 
 
@@ -52,16 +40,10 @@ def _attach_session(
     *,
     required: bool,
 ) -> None:
-    """Populate ``config.session`` by loading the session file.
+    """Load the session into ``config.session``.
 
-    ``required=True`` is for commands that can't do anything useful
-    without features / pr_sources (``run``, ``feature *``). Missing
-    session file → ``click.ClickException``.
-
-    ``required=False`` leaves ``config.session`` as ``None`` if the file
-    is missing — except when the user explicitly pointed at a specific
-    path via ``--session-file``, which is always an error if absent
-    (never silently fall back; the user asked for *that file*).
+    A missing file is an error when ``required`` or when ``--session-file``
+    named it explicitly; otherwise ``config.session`` is left ``None``.
     """
     from releasy.config import load_session
 
@@ -77,12 +59,6 @@ def _attach_session(
     except Exception as e:
         raise click.ClickException(f"Failed to load session: {e}")
 
-    # Surface non-fatal load issues (deps_file overlay collisions,
-    # redundant include_prs / exclude_prs / group entries, etc.) to the
-    # user. They aren't fatal — the run can still proceed — but silently
-    # accumulating them in the SessionConfig defeats the point.
-    # Dedupe per process so a CLI run that re-loads the session doesn't
-    # spam stderr with the same warnings on every load.
     if config.session is not None:
         session_key = (
             str(config.session.session_path)
@@ -99,13 +75,9 @@ def _attach_session(
 def _load_and_verify(
     ctx: click.Context, *, session: str = "optional",
 ) -> Config:
-    """Load config, verify state ownership, optionally attach session.
+    """Load config, verify state ownership, attach session.
 
-    ``session``: ``"required"`` (error if missing), ``"optional"``
-    (leave ``config.session=None`` on missing), ``"skip"`` (don't look).
-
-    Use this for commands that need a config but don't take the project
-    lock (read-only operations, or commands that explicitly rebind state).
+    ``session``: ``"required"``, ``"optional"`` or ``"skip"``.
     """
     from releasy.state import OwnershipCollisionError, verify_ownership
 
@@ -126,14 +98,7 @@ def _load_and_verify(
 def _locked_config(
     ctx: click.Context, *, session: str = "optional",
 ) -> Iterator[Config]:
-    """Load + verify + lock a project's config; yield the Config.
-
-    Wrap every mutating subcommand in this so concurrent invocations on
-    the SAME project (same ``name:``) serialize, while invocations on
-    different projects run in parallel.
-
-    ``session`` controls session-file handling; see :func:`_load_and_verify`.
-    """
+    """Like :func:`_load_and_verify`, but holds the project lock while in use."""
     from releasy.locks import project_lock
 
     config = _load_and_verify(ctx, session=session)
@@ -141,13 +106,58 @@ def _locked_config(
         yield config
 
 
+def _parse_walk_only(only: str | None, pr_url: str | None, stateless: bool):
+    """Validate and parse ``--only`` for commands that walk tracked PRs."""
+    from releasy.pipeline import parse_only
+
+    if only is None:
+        return None
+    if pr_url is not None:
+        raise click.UsageError(
+            "--only and --pr are mutually exclusive: --only filters "
+            "the multi-PR walk; --pr already names a single PR."
+        )
+    if stateless:
+        raise click.UsageError(
+            "--only is incompatible with --stateless: stateless mode "
+            "always operates on a single PR (--pr) without a state "
+            "file to filter against."
+        )
+    try:
+        return parse_only(only)
+    except ValueError as e:
+        raise click.UsageError(str(e))
+
+
+def _load_config_if_present(ctx: click.Context) -> Config | None:
+    from releasy.config import load_config
+
+    config_path = ctx.obj.get("config_path")
+    try:
+        return load_config(Path(config_path) if config_path else None)
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        raise click.ClickException(f"Failed to load config: {e}")
+
+
+def _origin_from_pr_url(pr_url: str) -> str:
+    """https URL of the repo hosting ``pr_url``."""
+    from releasy.github_ops import parse_pr_url, slug_to_https_url
+
+    parsed = parse_pr_url(pr_url)
+    if parsed is None:
+        raise click.ClickException(f"Could not parse --pr URL: {pr_url!r}")
+    owner, repo, _ = parsed
+    return slug_to_https_url(f"{owner}/{repo}")
+
+
 def _short_id() -> str:
-    """6 hex chars from a CSPRNG — used to disambiguate auto-generated names."""
     return secrets.token_hex(3)
 
 
 def _render_template(text: str, **vars: str) -> str:
-    """Tiny ``{{ key }}`` substitution. Whitespace around the key is tolerated."""
+    """Substitute ``{{ key }}`` / ``{{key}}`` placeholders."""
     out = text
     for key, value in vars.items():
         for placeholder in (f"{{{{ {key} }}}}", f"{{{{{key}}}}}"):
@@ -155,16 +165,7 @@ def _render_template(text: str, **vars: str) -> str:
     return out
 
 
-# ---------------------------------------------------------------------------
-# CLI group
-# ---------------------------------------------------------------------------
-
-
-# Click defaults `max_content_width` to 80 even on wider terminals, which
-# truncates our one-line command summaries with "..." in `releasy --help`.
-# Bumping it lets the help output use the full terminal width (Click takes
-# `min(max_content_width, terminal_width)`), so descriptions stay readable
-# at modern terminal sizes without us having to artificially shorten them.
+# Click caps help width at 80 by default, truncating short_help in `releasy --help`.
 _CLI_CONTEXT_SETTINGS = {"max_content_width": 120}
 
 
@@ -194,11 +195,6 @@ def cli(
     ctx.ensure_object(dict)
     ctx.obj["config_path"] = config_path
     ctx.obj["session_file"] = session_file
-
-
-# ---------------------------------------------------------------------------
-# Maintenance pipeline
-# ---------------------------------------------------------------------------
 
 
 @cli.command(short_help="Discover + port new PRs (cherry-pick + open PR).")
@@ -368,9 +364,7 @@ def run(
         )
         _maybe_sync_graph_progress(config, onto)
 
-        # Scope the conflict-exit check to whatever the user filtered on
-        # — otherwise --only / --pr on a single unit could exit non-zero
-        # because of an unrelated stale conflict in state.
+        # Only conflicts within the --only / --pr scope affect the exit code.
         if only_filter is not None:
             has_conflicts = any(
                 fs.status == "conflict"
@@ -528,13 +522,9 @@ def cherry_pick_cmd(
     """One-off cross-repo cherry-pick — no config file, no state file.
 
     Cherry-picks a PR / commit / tag from any public GitHub repo onto a
-    fresh branch off ``--target`` in ``--origin``, optionally lets
-    Claude resolve any conflicts, optionally pushes the branch and
-    opens a PR back against ``--target``.
-
-    Nothing is persisted: this command does not read or write any
-    releasy config / state / lock / project board. Re-running it makes
-    a brand-new branch every time (use ``--branch-name`` to control it).
+    fresh branch off ``--target`` in ``--origin``, optionally resolving
+    conflicts with Claude, pushing, and opening a PR against ``--target``.
+    Nothing is persisted; each run makes a new branch.
     """
     if resolve_conflicts and not build_command.strip():
         raise click.UsageError(
@@ -680,15 +670,12 @@ def project_backport_cmd(
 ) -> None:
     """Batch-backport upstream PRs queued in a GitHub Project — no state file.
 
-    Walks the project, and for every item whose content is an upstream
-    (ClickHouse/ClickHouse) PR whose 'Port Versions' field includes
-    ``--version``, opens a Backport PR into ``--target`` on origin
-    (Altinity/ClickHouse), then adds the new PR back to the project with
-    its 'Port Versions' set so it shows in that version's view.
+    For every upstream (ClickHouse/ClickHouse) PR item whose 'Port Versions'
+    includes ``--version``, opens a Backport PR into ``--target`` on origin
+    and adds it to the project with 'Port Versions' set.
 
-    Stateless and idempotent: the GitHub Project + open origin PRs are the
-    only source of truth. Re-running skips any item that already has a
-    backport PR. Only ever opens PRs into origin — never upstream.
+    Idempotent: items that already have a backport PR are skipped. Only
+    ever opens PRs into origin — never upstream.
     """
     if not version.strip():
         raise click.UsageError("--version must not be empty.")
@@ -813,14 +800,12 @@ def skip(ctx: click.Context, branch: str) -> None:
 def mark_reverted_cmd(
     ctx: click.Context, branch: str, reason: str | None,
 ) -> None:
-    """Mark a port as reverted on the target branch (state-only).
+    """Mark a merged port as reverted on the target branch (state-only).
 
-    For a port that merged and was then reverted on purpose. The entry
-    becomes terminal: `run` and `refresh` leave it alone, and `graph sync`
-    states the revert in its own section of the graph issue. Only
-    `pr_policy.recreate_reverted_prs` (off by default) re-ports it — the
-    `closed` opt-in does not reach it. Nothing in git or on the PR is
-    touched — the revert is already yours.
+    The entry becomes terminal: `run` and `refresh` leave it alone and
+    `graph sync` lists it as reverted. Only
+    `pr_policy.recreate_reverted_prs` (off by default) re-ports it.
+    Git and the PR are not touched.
     """
     from releasy.pipeline import mark_reverted
 
@@ -840,15 +825,10 @@ def mark_reverted_cmd(
 def hold(ctx: click.Context, url: str, reason: str | None) -> None:
     """Put a PR on hold — appends it to ``pr_sources.on_hold``.
 
-    A hold is not a veto. The PR keeps its place (and its dependency
-    edges) in the graph and whatever port branch / PR it already has;
-    `run` just walks past the unit carrying it, and anything declaring
-    that unit in ``depends_on`` reports as blocked. The graph issue lists
-    it under **On hold** from the next write onward.
-
-    Holding any PR of a group holds the whole group — its members
-    cherry-pick as one atomic unit. Use `releasy unhold` to put it back in
-    work. Refused for a PR already vetoed in ``exclude_prs``.
+    Not a veto: the PR keeps its graph place and any port branch / PR;
+    `run` skips its unit, and units depending on it report as blocked.
+    Holding any PR of a group holds the whole group. Use `releasy unhold`
+    to resume. Refused for a PR in ``exclude_prs``.
     """
     from releasy.pr_membership import hold_pr
 
@@ -863,8 +843,7 @@ def hold(ctx: click.Context, url: str, reason: str | None) -> None:
 def unhold(ctx: click.Context, url: str) -> None:
     """Take a PR off hold — drops it from ``pr_sources.on_hold``.
 
-    The unit ports on the next `releasy run`. A no-op (exit 0) when the
-    PR was not on hold.
+    The unit ports on the next `releasy run`. No-op if not on hold.
     """
     from releasy.pr_membership import unhold_pr
 
@@ -910,18 +889,13 @@ def clear(
 ) -> None:
     """Wipe local-only port artifacts that never made it to a PR.
 
-    With IDENTIFIER (feature ID, branch name, source-PR number, or
-    source-PR URL), clears that one feature. Without it, scans state for
-    every feature in a damaged local-only state (``conflict`` or
-    ``branch_created`` with no rebase PR), shows the list, and clears
-    them after a confirmation prompt.
+    With IDENTIFIER (feature ID, branch name, source-PR number or URL),
+    clears that feature. Without it, clears every ``conflict`` /
+    ``branch_created`` feature with no rebase PR, after confirmation.
 
-    For each cleared feature: aborts any in-progress cherry-pick / merge /
-    rebase in the work-dir repo, force-deletes the local port branch,
-    and drops the state entry so the next ``releasy run`` starts fresh.
-
-    Refuses to touch a feature whose rebase PR is already open — those
-    are user-visible on GitHub and out of scope for ``clear``.
+    Clearing aborts any in-progress cherry-pick / merge / rebase, deletes
+    the local port branch, and drops the state entry. Features with an
+    open rebase PR are refused.
     """
     from releasy.pipeline import clear_all_dirty, clear_branch
 
@@ -951,11 +925,9 @@ def status(ctx: click.Context) -> None:
 def graph_cmd() -> None:
     """Discover the PR dependency graph and track it as a GitHub issue.
 
-    ``discover`` runs the git-based trial-pick discovery and can open an
-    issue carrying the graph (``--open-issue``). ``update`` then refines
-    that graph from trusted org-member comments on the issue — no git, no
-    trial-picks — and reconciles the session so the changes take effect on
-    the next ``run``.
+    ``discover`` trial-picks PRs to build the graph (``--open-issue`` opens
+    an issue for it); ``update`` refines it from trusted member comments on
+    the issue; ``sync`` refreshes the issue's progress checkboxes.
     """
 
 
@@ -1040,19 +1012,14 @@ def graph_discover_cmd(
 ) -> None:
     """Auto-discover PR groups from trial cherry-picks.
 
-    Walks ``pr_sources`` candidates oldest-merged first, trial-cherry-picking
-    each onto the target tip in a scratch worktree. A real (non-cosmetic)
-    conflict groups the PR with its prerequisite; connected PRs collapse into
-    one combined unit, cherry-picked in apply order. Always emits a diagnostic
-    YAML report, checkpointed as each unit finishes so an interrupted run
-    resumes from where it stopped instead of re-picking + re-resolving.
+    Trial-cherry-picks ``pr_sources`` candidates (oldest-merged first) onto
+    the target tip in a scratch worktree. A real conflict groups a PR with
+    its prerequisite; connected PRs collapse into one unit. Writes a
+    diagnostic YAML report (checkpointed per unit, so interrupted runs
+    resume) and a deps overlay to ``pr_sources.deps_file`` for the next
+    ``releasy run`` (``--no-write`` skips, ``--deps-file`` redirects).
 
-    By default also writes a deps overlay (multi-PR ``auto_discovered`` groups)
-    to ``pr_sources.deps_file`` so the next ``releasy run`` honors it. Pass
-    ``--no-write`` to skip, or ``--deps-file <path>`` to redirect.
-
-    Read-only with respect to ``state.yaml`` and the main worktree. Acquires
-    the project lock so it doesn't race with concurrent ``run`` invocations.
+    Does not touch ``state.yaml`` or the main worktree.
     """
     if no_write and deps_file_override:
         raise click.UsageError(
@@ -1071,22 +1038,13 @@ def graph_discover_cmd(
     from releasy.config import resolve_deps_file_path
 
     with _locked_config(ctx, session="required") as config:
-        # Resolve the deps overlay output path (or None to skip):
-        #   --no-write              → None
-        #   --deps-file <path>      → that path (CLI override; relative to cwd)
-        #   else                    → resolve_deps_file_path(...) which
-        #                             returns the configured pr_sources
-        #                             .deps_file or the convention
-        #                             default <session-stem>.deps.yaml.
         deps_overlay_path: Path | None
         if no_write:
             deps_overlay_path = None
         elif deps_file_override:
             override = Path(deps_file_override)
             if not override.is_absolute():
-                # Resolve relative to cwd (NOT session dir) so a one-off
-                # `--deps-file /tmp/preview.yaml` or relative path on the
-                # command line does what the user typed.
+                # Relative to cwd, not the session dir.
                 override = override.resolve()
             deps_overlay_path = override
         else:
@@ -1096,10 +1054,6 @@ def graph_discover_cmd(
                 else None
             )
             if session_path is None:
-                # No session file on disk — nothing to derive a default
-                # path from. Skip silently (only the diagnostic report
-                # lands). Pretty rare in practice; the in-memory
-                # stateless config flow is the only producer.
                 deps_overlay_path = None
             else:
                 deps_file_value = (
@@ -1132,13 +1086,7 @@ def graph_discover_cmd(
 
 
 def _print_discovery_summary(report) -> None:  # noqa: ANN001 — DiscoveryReport
-    """Render a compact human-readable summary of a DiscoveryReport."""
-    # Breakdown: how the candidate units split between user-declared
-    # groups and singletons, and what the trial-pick loop did with them.
     group_units = sum(1 for n in report.nodes if n.is_user_group)
-    # Note: ``report.nodes`` excludes already-in-target units (unless
-    # ``--include-already-merged`` was passed). We re-derive group/single
-    # counts conservatively from what's recorded.
     method_counts: dict[str, int] = {}
     for n in report.nodes:
         method_counts[n.discovery_method] = method_counts.get(n.discovery_method, 0) + 1
@@ -1159,11 +1107,6 @@ def _print_discovery_summary(report) -> None:  # noqa: ANN001 — DiscoveryRepor
         f"  status: {in_target} already in target · {to_pick} to trial-pick"
     )
     if method_counts:
-        # Show what came out of the trial-pick loop. ``trial-clean`` =
-        # standalone unit; ``git-graph`` / ``git-graph+claude`` = had
-        # conflicts that got mapped to deps; ``ai-resolve(-clean)`` =
-        # AI fallback resolved the conflict; ``depth-cutoff`` =
-        # recursion bound hit (deps incomplete).
         ordered_keys = [
             "trial-clean", "git-graph", "git-graph+claude",
             "ai-resolve", "ai-resolve-clean", "depth-cutoff",
@@ -1213,8 +1156,6 @@ def _print_discovery_summary(report) -> None:  # noqa: ANN001 — DiscoveryRepor
         for g in groups:
             click.echo(f"    {g.unit_id}: {len(g.pr_urls)} PR(s)")
     if report.components:
-        # Kept components: a user-declared group sharing deps with autos,
-        # emitted as depends_on edges rather than merged.
         click.echo(f"  dependency components: {len(report.components)}")
         for comp in report.components:
             arrows = " → ".join(comp.unit_ids)
@@ -1269,12 +1210,11 @@ def graph_update_cmd(
 ) -> None:
     """Refine the saved graph from trusted member comments on its issue.
 
-    Loads the graph written by ``graph discover --open-issue``, feeds Claude
-    the prior graph plus new comments from trusted org members (per
-    ``graph.trusted_associations``), and rebuilds the graph from Claude's
-    reply. No git, no trial-picks. Adds/vetoes are reconciled into the
-    session (``include_prs`` / ``exclude_prs``) so the next ``run`` honors
-    them; the issue body is refreshed in place.
+    Feeds Claude the graph from ``graph discover --open-issue`` plus new
+    comments from trusted members (``graph.trusted_associations``) and
+    rebuilds the graph from its reply. No git, no trial-picks. Adds /
+    vetoes go into the session (``include_prs`` / ``exclude_prs``); the
+    issue body is refreshed in place.
     """
     from releasy.dag_discovery import run_graph_update
 
@@ -1321,15 +1261,10 @@ def graph_sync_cmd(
 ) -> None:
     """Refresh the graph issue's progress checkboxes from pipeline state.
 
-    Re-renders the issue opened by ``graph discover --open-issue``: each
-    unit's box is ticked once releasy has opened its port PR (a
-    partially-applied group counts — its draft PR is linked), annotated
-    with the unit's status and a link to the PR. No git, no AI, no
-    comment ingest — cheap enough to run any time.
-
-    Pass ``--open-issue`` to open the issue from the saved graph when the
-    ``discover`` run that produced it didn't; re-running discovery just to
-    get an issue is never necessary.
+    Each unit's box is ticked once its port PR is open (a partially-applied
+    group's draft PR counts), annotated with status and a PR link. No git,
+    no AI. ``--open-issue`` opens the issue from the saved graph if
+    ``discover`` didn't.
 
     ``releasy run`` and ``releasy refresh`` do this automatically unless
     ``graph.sync_progress: false``.
@@ -1347,12 +1282,7 @@ def graph_sync_cmd(
 def _maybe_sync_graph_progress(
     config: Config, onto: str | None = None,
 ) -> None:
-    """Post-``run`` / post-``refresh`` hook: refresh the graph issue.
-
-    Best-effort and non-fatal — a missing graph report, a missing issue
-    or a GitHub hiccup must never fail the command that just did the
-    real work.
-    """
+    """Best-effort graph issue refresh after ``run`` / ``refresh``; never fails."""
     if not config.graph.sync_progress:
         return
     from releasy.dag_discovery import sync_graph_progress
@@ -1581,12 +1511,9 @@ def refresh(
                                    is read if present, otherwise a synthetic
                                    config is built from the stateless flags.
 
-    Strictly a maintenance pass — never opens new PRs, never creates
-    new branches, never discovers new PR sources. Status sync (catch
-    PRs merged externally, supersede sweep, merged-label apply,
-    session-label reconciliation) ALWAYS runs.
-
-    The three branch-mutating passes are opt-in:
+    Never opens new PRs, creates branches, or discovers PR sources.
+    Status sync (externally merged PRs, supersede sweep, labels) always
+    runs. The three branch-mutating passes are opt-in:
 
     \b
     - ``--merge-target``    — merge ``origin/<base>`` into each PR
@@ -1596,43 +1523,20 @@ def refresh(
     - ``--address-review``  — fetch trusted review feedback, drop
       hidden / addressed comments, and let the AI add fix commits.
 
-    When more than one is set the phases run in a fixed order:
-    ``merge-target → analyze-fails → address-review``. PRs left in
-    conflict by ``--merge-target`` skip both subsequent passes.
-    Rationale: ``analyze-fails`` reads commit statuses tied to the
-    *current* head SHA, so any push that lands first (merge-target,
-    address-review) would invalidate the CI report it needs.
+    Phases run in the order ``merge-target → analyze-fails →
+    address-review``; PRs left in conflict by ``--merge-target`` skip the
+    rest.
 
     Exit code is 1 if any PR ended up in conflict, any address-review
     run failed, or any analyze-fails per-PR run errored — 0 otherwise.
-    Suitable for cron / CI loops.
     """
-    from releasy.pipeline import parse_only
     from releasy.refresh import (
         refresh_tracked_prs,
         resolve_conflicts_for_pr,
     )
 
     wd = Path(work_dir) if work_dir else None
-
-    if only is not None:
-        if pr_url is not None:
-            raise click.UsageError(
-                "--only and --pr are mutually exclusive: --only filters "
-                "the multi-PR walk; --pr already names a single PR."
-            )
-        if stateless:
-            raise click.UsageError(
-                "--only is incompatible with --stateless: stateless mode "
-                "always operates on a single PR (--pr) without a state "
-                "file to filter against."
-            )
-        try:
-            only_filter = parse_only(only)
-        except ValueError as e:
-            raise click.UsageError(str(e))
-    else:
-        only_filter = None
+    only_filter = _parse_walk_only(only, pr_url, stateless)
 
     stateless_only_set: list[str] = []
     if origin_url is not None:
@@ -1661,37 +1565,12 @@ def refresh(
                 "--stateless requires --pr <url>: there is no state "
                 "file to enumerate tracked PRs from."
             )
-        from releasy.config import (
-            make_stateless_config,
-            load_config,
-        )
-        from releasy.github_ops import parse_pr_url, slug_to_https_url
+        from releasy.config import make_stateless_config
 
-        config_path = ctx.obj.get("config_path")
-        config: Config | None = None
-        try:
-            config = load_config(
-                Path(config_path) if config_path else None,
-            )
-        except FileNotFoundError:
-            config = None
-        except Exception as e:
-            raise click.ClickException(f"Failed to load config: {e}")
-
+        config = _load_config_if_present(ctx)
         if config is None:
-            effective_origin = origin_url
-            if not effective_origin:
-                parsed = parse_pr_url(pr_url)
-                if parsed is None:
-                    raise click.ClickException(
-                        f"Could not parse --pr URL: {pr_url!r}"
-                    )
-                owner, repo, _ = parsed
-                effective_origin = slug_to_https_url(f"{owner}/{repo}")
-            # ``ai_resolve.prompt_file`` defaults to the cherry-pick
-            # prompt; the merge prompt slot is set explicitly below.
             config = make_stateless_config(
-                effective_origin,
+                origin_url or _origin_from_pr_url(pr_url),
                 work_dir=wd,
                 push=True,
                 auto_pr=False,
@@ -1708,8 +1587,6 @@ def refresh(
                     if max_iterations_cli is not None else 5
                 ),
             )
-            # Bundled merge prompt so a user with no project config can
-            # still run the resolver.
             if prompt_file_cli is not None:
                 config.ai_resolve.merge_prompt_file = prompt_file_cli
             else:
@@ -1733,8 +1610,6 @@ def refresh(
                 config.ai_resolve.timeout_seconds = timeout_seconds
             if max_iterations_cli is not None:
                 config.ai_resolve.max_iterations = max_iterations_cli
-            # AI must be enabled for the merge prompt to fire — flip it
-            # on when the user kept the default --resolve-conflicts.
             if ai_resolve_flag:
                 config.ai_resolve.enabled = True
 
@@ -1754,13 +1629,12 @@ def refresh(
             raise SystemExit(1)
         return
 
-    # Non-stateless paths: load + lock the project's config. Session is
-    # loaded "optional" (not "skip") so session.pr_labels is visible and
-    # `refresh` can reconcile labels onto tracked PRs. A missing session
-    # file is still fine — the label pass is a no-op when not configured.
+    # Session is "optional" (not "skip") so session.pr_labels can be reconciled.
     if pr_url is None:
         with _locked_config(ctx, session="optional") as config:
             config.dry_run = dry_run
+            if ai_backend_cli is not None:
+                config.ai_backend = ai_backend_cli
             if no_baseline_check:
                 config.analyze_fails.baseline_check = False
             ok = refresh_tracked_prs(
@@ -1771,8 +1645,7 @@ def refresh(
                 no_flaky_check=no_flaky_check,
                 post_comment=post_comment_flag,
             )
-            # Sync before the exit check: a partly-failed refresh still
-            # moved ports forward, and the issue should say so.
+            # Sync even on partial failure: some ports still moved forward.
             _maybe_sync_graph_progress(config)
             if not ok:
                 raise SystemExit(1)
@@ -1780,6 +1653,8 @@ def refresh(
 
     with _locked_config(ctx, session="optional") as config:
         config.dry_run = dry_run
+        if ai_backend_cli is not None:
+            config.ai_backend = ai_backend_cli
         if no_baseline_check:
             config.analyze_fails.baseline_check = False
         if not resolve_conflicts_for_pr(
@@ -1954,9 +1829,8 @@ def analyze_fails_cmd(
 ) -> None:
     """Walk failed CI on a PR (or every tracked PR), debug + fix per test.
 
-    Every failed commit status is read: praktika JSON reports (Fast
-    test, Stateless, Integration, …) and the TestFlows regression
-    suites alike. For each failed test that surfaces, Claude:
+    Reads every failed commit status (praktika reports and TestFlows
+    suites). For each failed test, Claude:
 
     \b
     1. Reads the failure excerpt and the PR's diff.
@@ -1964,40 +1838,16 @@ def analyze_fails_cmd(
     3. If related, reproduces the failure locally, fixes the test or
        the code under test, and commits.
 
-    A "flaky-elsewhere" assessment is built from the OTHER tracked
-    PRs' reports — when a test is failing in N >= threshold other PRs,
-    Claude is told so and is encouraged to exit with UNRELATED. The
-    final classification is always Claude's call (the heuristic is a
-    hint, not a hard cutoff), so disable it with --no-flaky-check if
-    you want every test investigated regardless.
+    Tests failing in enough other tracked PRs are flagged to Claude as
+    likely flaky (a hint, not a cutoff); --no-flaky-check disables this.
 
-    Exit code is 1 on any per-PR failure (couldn't fetch metadata,
-    push race, non-linear history, …); 0 on success even if every
+    Exit code is 1 on any per-PR failure; 0 on success even if every
     test was UNRELATED.
     """
     from releasy.analyze_fails import analyze_fails
-    from releasy.pipeline import parse_only
 
     wd = Path(work_dir) if work_dir else None
-
-    if only is not None:
-        if pr_url is not None:
-            raise click.UsageError(
-                "--only and --pr are mutually exclusive: --only filters "
-                "the multi-PR walk; --pr already names a single PR."
-            )
-        if stateless:
-            raise click.UsageError(
-                "--only is incompatible with --stateless: stateless mode "
-                "always operates on a single PR (--pr) without a state "
-                "file to filter against."
-            )
-        try:
-            only_filter = parse_only(only)
-        except ValueError as e:
-            raise click.UsageError(str(e))
-    else:
-        only_filter = None
+    only_filter = _parse_walk_only(only, pr_url, stateless)
 
     stateless_only_set: list[str] = []
     if origin_url is not None:
@@ -2025,22 +1875,10 @@ def analyze_fails_cmd(
     if stateless:
         from releasy.config import (
             build_stateless_analyze_fails_config,
-            load_config,
             overlay_analyze_fails_overrides,
         )
-        from releasy.github_ops import parse_pr_url, slug_to_https_url
 
-        config_path = ctx.obj.get("config_path")
-        config: Config | None = None
-        try:
-            config = load_config(
-                Path(config_path) if config_path else None,
-            )
-        except FileNotFoundError:
-            config = None
-        except Exception as e:
-            raise click.ClickException(f"Failed to load config: {e}")
-
+        config = _load_config_if_present(ctx)
         if config is None:
             effective_origin = origin_url
             if not effective_origin:
@@ -2050,13 +1888,7 @@ def analyze_fails_cmd(
                         "either --origin or --pr (so the origin can be "
                         "derived from the PR URL)."
                     )
-                parsed = parse_pr_url(pr_url)
-                if parsed is None:
-                    raise click.ClickException(
-                        f"Could not parse --pr URL: {pr_url!r}"
-                    )
-                owner, repo, _ = parsed
-                effective_origin = slug_to_https_url(f"{owner}/{repo}")
+                effective_origin = _origin_from_pr_url(pr_url)
             config = build_stateless_analyze_fails_config(
                 origin_url=effective_origin,
                 work_dir=wd,
@@ -2109,15 +1941,16 @@ def analyze_fails_cmd(
         return
 
     if pr_url is None:
-        # Multi-PR mode needs the state file to enumerate tracked PRs.
         with _locked_config(ctx, session="optional") as config:
             config.dry_run = dry_run
+            if ai_backend_cli is not None:
+                config.ai_backend = ai_backend_cli
             if no_baseline_check:
                 config.analyze_fails.baseline_check = False
             result = analyze_fails(
                 config, pr_url=None, work_dir=wd, dry_run=dry_run,
                 push=push, no_flaky_check=no_flaky_check,
-                only=only_filter,
+                post_comment=post_comment, only=only_filter,
             )
             if not result.success:
                 if result.error:
@@ -2127,6 +1960,8 @@ def analyze_fails_cmd(
 
     with _locked_config(ctx, session="skip") as config:
         config.dry_run = dry_run
+        if ai_backend_cli is not None:
+            config.ai_backend = ai_backend_cli
         if no_baseline_check:
             config.analyze_fails.baseline_check = False
         result = analyze_fails(
@@ -2208,28 +2043,13 @@ def rebase_cmd(
        prefixed with a ``Port of <old PR> onto <target>`` reference).
     4. Close the original PR with a ``superseded by <new PR>`` comment.
 
-    With ``--pr <url>`` only that PR is processed. Without ``--pr`` the
-    project state file is read and every tracked rebase PR is rebased
-    in turn.
-
-    The state file is never mutated — rebased PRs belong to a different
-    project (whose target branch is ``--target``); this command is only
-    a one-way porter, not a state migration.
+    Without ``--pr`` every tracked rebase PR in state is processed. The
+    state file is never mutated.
     """
-    from releasy.pipeline import parse_only
     from releasy.rebase import rebase_all_tracked, rebase_single
 
     wd = Path(work_dir) if work_dir else None
-
-    if only is not None and pr_url is not None:
-        raise click.UsageError(
-            "--only and --pr are mutually exclusive: --only filters the "
-            "multi-PR walk; --pr already names a single PR."
-        )
-    try:
-        only_filter = parse_only(only)
-    except ValueError as e:
-        raise click.UsageError(str(e))
+    only_filter = _parse_walk_only(only, pr_url, stateless=False)
 
     with _locked_config(ctx, session="skip") as config:
         config.dry_run = dry_run
@@ -2246,11 +2066,6 @@ def rebase_cmd(
             )
         if not summary.all_succeeded:
             raise SystemExit(1)
-
-
-# ---------------------------------------------------------------------------
-# Release
-# ---------------------------------------------------------------------------
 
 
 @cli.command(short_help="Build a release branch from a tag.")
@@ -2384,24 +2199,16 @@ def draft_release_cmd(
 ) -> None:
     """Build a categorised release changelog from merged PRs.
 
-    Queries origin (one Search call) for PRs whose base is ``--base``
-    (the target branch) and that merged in the ``--from``..``--to``
-    window, drops anything labelled / titled as a forward-port,
-    classifies each by its Changelog category, and renders the markdown
-    body in Altinity's release-notes format. ``--prs`` / ``--prs-file``
-    supply an explicit PR set instead, bypassing discovery.
+    Collects PRs merged into ``--base`` in the ``--from``..``--to`` window
+    (or the explicit ``--prs`` / ``--prs-file`` set), drops forward-ports,
+    groups them by Changelog category, and renders Altinity release notes.
 
-    With ``-o`` the markdown is written to disk and nothing is published.
-    Without ``-o`` a DRAFT GitHub release is created on origin (tag =
-    ``--name``, target commitish = ``--to``); the draft URL is printed
-    on stdout. When ``--name`` is omitted and ``--to`` is not an actual
-    tag, the draft's tag field is left blank instead of being defaulted
-    to the commit / branch in ``--to``.
+    With ``-o`` the markdown is written to disk. Otherwise a DRAFT GitHub
+    release is created on origin (tag = ``--name``, commitish = ``--to``)
+    and its URL printed.
 
-    Needs no project: with ``--work-dir`` the origin (and upstream)
-    remote comes from that clone and no ``config.yaml`` is read. Without
-    it, ``config.yaml`` supplies both. An explicit ``--config`` wins over
-    ``--work-dir``.
+    With ``--work-dir`` (and no ``--config``) remotes come from that clone
+    and no ``config.yaml`` is read.
     """
     from releasy.changelog import emit_changelog
     from releasy.config import make_stateless_config_for_repo
@@ -2439,11 +2246,6 @@ def draft_release_cmd(
         raise SystemExit(1)
 
 
-# ---------------------------------------------------------------------------
-# Project setup
-# ---------------------------------------------------------------------------
-
-
 @cli.command(
     name="setup-project",
     short_help="Create or verify the GitHub Project board.",
@@ -2452,16 +2254,10 @@ def draft_release_cmd(
 def setup_project_cmd(ctx: click.Context) -> None:
     """Create or verify a GitHub Project for status tracking.
 
-    If notifications.github_project is set in config, verifies the project
-    and its Status field. Otherwise, creates a new project and prints the URL
+    If notifications.github_project is set, verifies the project and its
+    Status field, drops non-canonical Status options, and re-syncs cards
+    from local state. Otherwise creates a new project and prints the URL
     to add to config.
-
-    The Status field is fully owned by RelEasy: any options that aren't
-    in the canonical set (Needs Review, Branch Created, Conflict,
-    Skipped) get dropped on every run. After dropping orphan options,
-    this command also triggers a project sync so any cards that were
-    sitting on a now-removed option get re-assigned to the right Status
-    based on local state.
     """
     from releasy.github_ops import setup_project
     from releasy.pipeline import sync_to_project
@@ -2502,10 +2298,8 @@ def project_cmd() -> None:
 def project_push_cmd(ctx: click.Context) -> None:
     """Push the current local state to the GitHub Project board.
 
-    Reads the per-project state file and reconciles every known feature
-    with the configured project: attaches any missing PR cards, refreshes
-    existing ones, updates Status, and deletes cards no longer backed by
-    local state. No git operations, no PRs — just the project board.
+    Adds missing PR cards, refreshes existing ones and their Status, and
+    deletes cards not backed by local state. No git, no PRs.
     """
     from releasy.pipeline import sync_to_project
 
@@ -2522,33 +2316,18 @@ def project_push_cmd(ctx: click.Context) -> None:
 def project_pull_cmd(ctx: click.Context) -> None:
     """Rebuild the per-project state file from GitHub + the project board.
 
-    Use this when the local state is missing or out of date (fresh
-    machine, teammate takeover, throwaway CI runner) but the rest of the
-    world is unchanged — source PRs still live on GitHub, rebase PRs are
-    still open on origin, and the configured project board still carries
-    the Skipped / AI Cost history.
+    For when local state is missing or stale (fresh machine, CI runner).
+    GitHub API only — no git. Merges into any existing state file:
+    local-only fields are kept, the board wins for `Skipped` and
+    `AI Cost`, everything else is refreshed from GitHub.
 
-    Read-only on git: no checkouts, no clones, no pushes, no new PRs.
-    The command only hits the GitHub REST / GraphQL APIs. It merges into
-    any existing state file — local-only fields (ai_iterations,
-    failed_step_index, partial_pr_count) are preserved verbatim; the
-    board wins for `Skipped` decisions and `AI Cost`; every other field
-    is refreshed from the authoritative source.
-
-    Requires notifications.github_project in config — without a project
-    board there's no durable source for the Skipped / cost values that
-    can't be re-derived from PRs alone.
+    Requires notifications.github_project in config.
     """
     from releasy.import_state import import_from_github
 
     with _locked_config(ctx, session="optional") as config:
         if not import_from_github(config):
             raise SystemExit(1)
-
-
-# ---------------------------------------------------------------------------
-# Multi-project ergonomics
-# ---------------------------------------------------------------------------
 
 
 @cli.command(name="new", short_help="Scaffold a fresh config from the bundled template.")
@@ -2623,10 +2402,6 @@ def new_cmd(
             "packaging bug — please report it."
         )
 
-    # Session file goes next to config.yaml, named after the target branch
-    # (the most distinguishing identifier when one dir holds several
-    # efforts) and falling back to the project name. Keep it co-located so
-    # users editing config see the session file right there.
     session_stem = default_session_stem(name_opt, target_branch)
     session_path = out_path.parent / f"{session_stem}.session.yaml"
     if session_path.exists():
@@ -2647,9 +2422,7 @@ def new_cmd(
     out_path.write_text(rendered_config)
     session_path.write_text(rendered_session)
 
-    # stdout is the absolute path of config.yaml and nothing else; user-
-    # facing chatter goes to stderr so shell composition
-    # (cd $(releasy new …)) works.
+    # stdout carries only the path, for `cd $(dirname $(releasy new …))`.
     click.echo(str(out_path))
     click.echo(
         f"Created config for project {name_opt!r}.\n"
@@ -2670,7 +2443,7 @@ def list_cmd() -> None:
 
     from releasy.termlog import console
 
-    from releasy.state import _read_raw_state  # internal helper, see state.py
+    from releasy.state import _read_raw_state
 
     root = state_root()
     state_files = sorted(root.glob("*.state.yaml"))
@@ -2721,9 +2494,6 @@ def list_cmd() -> None:
     console.print(table)
 
 
-# Register `releasy ls` as an alias for `releasy list`. We add it as a
-# separate Click command (rather than `aliases=`, which Click doesn't
-# support natively) so help output shows both names.
 @cli.command(name="ls", short_help="Alias for `releasy list`.")
 def ls_cmd() -> None:
     """Alias for `releasy list`."""
@@ -2743,10 +2513,8 @@ def where(ctx: click.Context) -> None:
 def adopt(ctx: click.Context) -> None:
     """Rewrite the state file's stored config_path to the current config.
 
-    Use after moving / renaming your config.yaml so subsequent commands
-    don't trip the ownership-collision check. Creates an empty state
-    file if none exists yet (so `releasy adopt` doubles as "register
-    this config without doing anything").
+    Use after moving / renaming config.yaml to avoid the
+    ownership-collision check. Creates an empty state file if none exists.
     """
     from releasy.locks import project_lock
     from releasy.state import adopt_ownership
@@ -2764,11 +2532,6 @@ def adopt(ctx: click.Context) -> None:
             f"Rebound project {config.name!r} from {previous} to "
             f"{config.config_path}.\nState file: {state_path}"
         )
-
-
-# ---------------------------------------------------------------------------
-# Feature management
-# ---------------------------------------------------------------------------
 
 
 @cli.group()
@@ -2838,11 +2601,6 @@ def feature_list(ctx: click.Context) -> None:
     list_features(config)
 
 
-# ---------------------------------------------------------------------------
-# PR membership: session-level add/remove without hand-edited YAML.
-# ---------------------------------------------------------------------------
-
-
 @cli.group()
 def pr() -> None:
     """Add, remove, and list PR membership in the session."""
@@ -2866,10 +2624,9 @@ def pr_add(
 ) -> None:
     """Add a PR URL to the session.
 
-    Top-level by default (``pr_sources.include_prs``); ``--group <id>``
-    appends to that group's ``prs`` instead. Validates the URL exists via
-    the GitHub API, idempotent on re-add, removes the URL from
-    ``exclude_prs`` if previously excluded.
+    Adds to ``pr_sources.include_prs``, or to a group's ``prs`` with
+    ``--group``. Validates the URL via GitHub, is idempotent, and removes
+    it from ``exclude_prs``.
     """
     from releasy.pr_membership import add_pr
 
@@ -2892,9 +2649,8 @@ def pr_remove(
 ) -> None:
     """Remove a PR URL from session and state.
 
-    Drops the URL from ``include_prs``, every group's ``prs``, and the
-    matching ``FeatureState``. Refuses if the URL is part of a multi-PR
-    group in state (groups are atomic — clear the whole group instead).
+    Drops the URL from ``include_prs``, every group's ``prs``, and its
+    state entry. Refused for a PR in a multi-PR group in state.
     """
     from releasy.pr_membership import remove_pr
 

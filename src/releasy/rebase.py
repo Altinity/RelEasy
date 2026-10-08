@@ -1,23 +1,7 @@
-"""``releasy rebase`` — port an existing rebase PR onto a different target.
+"""``releasy rebase``: re-open existing rebase PRs against a different target branch.
 
-Single-PR mode (``--pr <url> --target <branch>``) or bulk mode
-(``--target <branch>`` only). Bulk reads the per-project state file to
-enumerate every rebase PR currently tracked. Each PR is rebased
-independently:
-
-1. Skip when the PR already targets ``<branch>``.
-2. Make a fresh branch off ``origin/<target>``.
-3. Cherry-pick the PR's commits one-by-one, AI-resolving conflicts as
-   they appear. If the cherry-pick path can't be made to apply, fall
-   back to a single squashed ``git merge --squash`` of the PR's head
-   onto the new target and AI-resolve from there.
-4. Push the new branch and open a new PR (same title / body, prefixed
-   with a ``Port of <old PR> onto <target>`` reference).
-5. Close the original PR with a ``superseded by <new PR>`` comment.
-
-Stateless by design — the state file is per-project (target branch),
-and rebased PRs belong to a different project. We never mutate the
-loaded state file; we only read it in bulk mode to enumerate PRs.
+Cherry-picks each PR's commits (falling back to a squashed merge), opens a new PR
+and closes the original. Never writes the state file.
 """
 
 from __future__ import annotations
@@ -37,7 +21,7 @@ from releasy.ai_resolve import (
     attempt_ai_resolve,
     flag_resolution_warnings_on_pr,
 )
-from releasy.config import Config, get_github_token, lookup_pr_ai_context
+from releasy.config import Config, lookup_pr_ai_context
 from releasy.git_ops import (
     abort_in_progress_op,
     fetch_commit,
@@ -54,6 +38,7 @@ from releasy.github_ops import (
     close_pull_request,
     create_pull_request,
     fetch_pr_by_url,
+    fetch_pr_head,
     get_origin_repo_slug,
     parse_pr_url,
     slug_to_https_url,
@@ -61,14 +46,8 @@ from releasy.github_ops import (
 from releasy.state import load_state
 
 
-# ---------------------------------------------------------------------------
-# Public dataclasses
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class RebaseOutcome:
-    """Per-PR result reported back to the CLI for summarisation."""
     pr_url: str
     skipped: bool = False
     skip_reason: str | None = None
@@ -84,7 +63,6 @@ class RebaseOutcome:
 
 @dataclass
 class RebaseSummary:
-    """Aggregate result for the CLI's exit-code shaping."""
     outcomes: list[RebaseOutcome] = field(default_factory=list)
 
     @property
@@ -92,73 +70,20 @@ class RebaseSummary:
         return all(o.success for o in self.outcomes)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _short_id() -> str:
     return secrets.token_hex(3)
 
 
-def _new_branch_name(old_head_ref: str, pr_number: int, target: str) -> str:
-    """Build a fresh branch name for the rebased PR.
-
-    Carries enough provenance (old PR number + target) for humans
-    inspecting ``git branch -a`` to figure out where it came from, and a
-    6-hex suffix so re-runs don't collide with a previous attempt.
-    """
+def _new_branch_name(pr_number: int, target: str) -> str:
+    """Branch name with PR number, target and a random suffix to avoid collisions."""
     sanitized_target = "".join(
         c if (c.isalnum() or c in "._-") else "-" for c in target
     )
     return f"releasy/rebase/pr-{pr_number}-onto-{sanitized_target}-{_short_id()}"
 
 
-def _fetch_pr_refs(
-    pr_url: str,
-) -> tuple[str, str, str, str, int] | None:
-    """Look up the PR's head ref / head repo / base ref / head sha / number.
-
-    Local copy of refresh._fetch_pr_refs to avoid dragging the refresh
-    module's import surface into the rebase flow.
-    """
-    token = get_github_token()
-    if not token:
-        return None
-    parsed = parse_pr_url(pr_url)
-    if parsed is None:
-        return None
-    owner, repo, number = parsed
-    try:
-        from github import Github
-
-        gh = Github(token)
-        ghrepo = gh.get_repo(f"{owner}/{repo}")
-        pr = ghrepo.get_pull(number)
-        head_repo = None
-        if pr.head.repo is not None:
-            head_repo = pr.head.repo.full_name
-        return (
-            pr.head.ref,
-            head_repo or f"{owner}/{repo}",
-            pr.base.ref,
-            pr.head.sha,
-            pr.number,
-        )
-    except Exception:  # pragma: no cover — network / permissions
-        return None
-
-
 def _commits_in_range(repo_path: Path, base_ref: str, tip_ref: str) -> list[str]:
-    """Commits in ``base_ref..tip_ref`` (oldest first), excluding merges.
-
-    Octopus / merge commits can't be cherry-picked without an explicit
-    ``-m <parent>`` choice; in a PR head branch they're virtually always
-    "merged base into branch" noise that we don't want anyway — the
-    target-side equivalent will get re-introduced by branching off the
-    new target. Drop them here so the per-commit pick loop never has to
-    guess a mainline.
-    """
+    """Non-merge commits in ``base_ref..tip_ref``, oldest first."""
     result = run_git(
         ["rev-list", "--reverse", "--no-merges", f"{base_ref}..{tip_ref}"],
         repo_path, check=False,
@@ -189,9 +114,35 @@ def _ai_active(config: Config, resolve_conflicts: bool) -> bool:
     return resolve_conflicts and config.ai_resolve.enabled
 
 
-# ---------------------------------------------------------------------------
-# Cherry-pick attempt
-# ---------------------------------------------------------------------------
+def _ai_resolve(
+    config: Config,
+    repo_path: Path,
+    new_branch: str,
+    target_branch: str,
+    source_pr: PRInfo,
+    conflict_files: list[str],
+):
+    head = run_git(
+        ["rev-parse", "--verify", "HEAD"], repo_path, check=False,
+    )
+    start_sha = head.stdout.strip() if head.returncode == 0 else None
+    ctx = AIResolveContext(
+        port_branch=new_branch,
+        base_branch=target_branch,
+        source_pr=source_pr,
+        conflict_files=conflict_files,
+        start_sha=start_sha,
+        operation="cherry-pick",
+        user_context=lookup_pr_ai_context(
+            config.pr_sources, source_pr.url,
+        ),
+    )
+    ai_result = attempt_ai_resolve(config, repo_path, ctx)
+    if ai_result.cost_usd is not None:
+        console.print(
+            f"      [dim](claude cost: ${ai_result.cost_usd:.4f})[/dim]"
+        )
+    return ai_result
 
 
 def _try_cherry_pick_path(
@@ -203,17 +154,9 @@ def _try_cherry_pick_path(
     commits: list[str],
     ai_active: bool,
 ) -> tuple[bool, str | None, list[str]]:
-    """Cherry-pick each commit; AI-resolve any conflicts.
+    """Cherry-pick each commit onto the checked-out ``new_branch``, AI-resolving conflicts.
 
-    Returns ``(ok, err, warnings)``; ``warnings`` are postcondition
-    complaints the resolver kept a resolution despite, for the caller to
-    flag on the PR it opens.
-
-    Caller is responsible for putting HEAD on ``new_branch`` (already
-    checked out off ``origin/<target_branch>``) before invoking this and
-    for resetting / branching elsewhere on a False return — we leave the
-    branch in whatever shape the failure produced so the caller can pick
-    a recovery strategy (try the diff fallback, etc.).
+    Returns ``(ok, err, warnings)``; on failure the branch is left as-is for the caller.
     """
     warnings: list[str] = []
     for idx, sha in enumerate(commits, start=1):
@@ -222,9 +165,7 @@ def _try_cherry_pick_path(
             f"    [dim]({idx}/{len(commits)})[/dim] cherry-pick "
             f"[cyan]{sha[:12]}[/cyan]  {subject}"
         )
-        # ``--keep-redundant-commits`` so commits that became no-ops on
-        # the new target don't halt the loop; ``--allow-empty[-message]``
-        # rescues the rare PR with an empty source commit.
+        # Don't halt on commits that became no-ops or were empty to begin with.
         result = run_git(
             [
                 "cherry-pick", "--no-edit",
@@ -258,27 +199,9 @@ def _try_cherry_pick_path(
             _abort_any(repo_path)
             return False, "cherry-pick conflicted and AI resolver disabled", warnings
 
-        head = run_git(
-            ["rev-parse", "--verify", "HEAD"], repo_path, check=False,
+        ai_result = _ai_resolve(
+            config, repo_path, new_branch, target_branch, source_pr, conflict_files,
         )
-        start_sha = head.stdout.strip() if head.returncode == 0 else None
-
-        ctx = AIResolveContext(
-            port_branch=new_branch,
-            base_branch=target_branch,
-            source_pr=source_pr,
-            conflict_files=conflict_files,
-            start_sha=start_sha,
-            operation="cherry-pick",
-            user_context=lookup_pr_ai_context(
-                config.pr_sources, source_pr.url,
-            ),
-        )
-        ai_result = attempt_ai_resolve(config, repo_path, ctx)
-        if ai_result.cost_usd is not None:
-            console.print(
-                f"      [dim](claude cost: ${ai_result.cost_usd:.4f})[/dim]"
-            )
         if not ai_result.success:
             reason = ai_result.error or (
                 "timed out" if ai_result.timed_out else "unknown failure"
@@ -296,11 +219,6 @@ def _try_cherry_pick_path(
     return True, None, warnings
 
 
-# ---------------------------------------------------------------------------
-# Squashed-diff fallback
-# ---------------------------------------------------------------------------
-
-
 def _try_diff_fallback(
     config: Config,
     repo_path: Path,
@@ -311,13 +229,7 @@ def _try_diff_fallback(
     head_sha: str,
     ai_active: bool,
 ) -> tuple[bool, str | None, list[str]]:
-    """Replay the PR as a single squashed merge of ``head_sha`` onto target.
-
-    Used as a last resort when the per-commit cherry-pick path can't be
-    made to apply (e.g. moved files, history rewrites, AI gave up
-    mid-stream). Resets the branch to target, runs ``git merge --squash
-    <head_sha>``, lets the AI resolve any conflicts, then commits.
-    """
+    """Fallback: reset to target and replay ``head_sha`` as one squashed merge."""
     _abort_any(repo_path)
     _hard_reset(repo_path, target_ref)
 
@@ -356,39 +268,18 @@ def _try_diff_fallback(
                 "squashed merge conflicted and AI resolver disabled"
             ), []
 
-        head = run_git(
-            ["rev-parse", "--verify", "HEAD"], repo_path, check=False,
+        ai_result = _ai_resolve(
+            config, repo_path, new_branch, target_branch, source_pr, conflict_files,
         )
-        start_sha = head.stdout.strip() if head.returncode == 0 else None
-        ctx = AIResolveContext(
-            port_branch=new_branch,
-            base_branch=target_branch,
-            source_pr=source_pr,
-            conflict_files=conflict_files,
-            start_sha=start_sha,
-            operation="cherry-pick",
-            user_context=lookup_pr_ai_context(
-                config.pr_sources, source_pr.url,
-            ),
-        )
-        ai_result = attempt_ai_resolve(config, repo_path, ctx)
-        if ai_result.cost_usd is not None:
-            console.print(
-                f"      [dim](claude cost: ${ai_result.cost_usd:.4f})[/dim]"
-            )
         if not ai_result.success:
             reason = ai_result.error or (
                 "timed out" if ai_result.timed_out else "unknown failure"
             )
             _hard_reset(repo_path, target_ref)
             return False, f"AI resolve failed on squashed merge: {reason}", []
-        # AI committed the resolution itself (the prompt instructs it to
-        # `git commit` after fixing). Nothing else to do here.
+        # The AI commits the resolution itself.
         return True, None, list(ai_result.warnings)
 
-    # Clean squashed merge — index has the changes staged but no commit
-    # was made (we passed --no-commit). Make one now so we have something
-    # to push.
     title = source_pr.title or f"Rebase PR #{source_pr.number}"
     commit_msg = f"{title}\n\nSquashed port of {source_pr.url}"
     commit = run_git(
@@ -399,11 +290,6 @@ def _try_diff_fallback(
         _hard_reset(repo_path, target_ref)
         return False, f"failed to commit squashed merge: {err}", []
     return True, None, []
-
-
-# ---------------------------------------------------------------------------
-# Per-PR driver
-# ---------------------------------------------------------------------------
 
 
 def _ported_body(old_pr_url: str, target_branch: str, original_body: str) -> str:
@@ -419,7 +305,6 @@ def rebase_one_pr(
     *,
     resolve_conflicts: bool = True,
 ) -> RebaseOutcome:
-    """Rebase one PR onto ``target_branch``. Stateless beyond GitHub I/O."""
     parsed = parse_pr_url(pr_url)
     if parsed is None:
         return RebaseOutcome(
@@ -446,7 +331,7 @@ def rebase_one_pr(
             error=f"could not fetch PR {pr_url} (token scope? URL?)",
         )
 
-    refs = _fetch_pr_refs(pr_url)
+    refs = fetch_pr_head(pr_url)
     if refs is None:
         return RebaseOutcome(
             pr_url=pr_url,
@@ -454,8 +339,6 @@ def rebase_one_pr(
         )
     head_ref, head_repo, base_ref_branch, head_sha, pr_number = refs
 
-    # Skip when the PR already targets the requested branch — the user's
-    # explicit "no-op" case.
     if base_ref_branch == target_branch:
         console.print(
             f"  [dim]{pr_url} already targets [cyan]{target_branch}[/cyan] "
@@ -488,9 +371,7 @@ def rebase_one_pr(
             ),
         )
 
-    # Make sure the PR's head sha is locally available — the PR's head
-    # branch may have been deleted on origin (e.g. the PR is closed); we
-    # fall back to fetching the SHA directly from the origin URL.
+    # The head branch may be gone on origin (closed PR); fetch the SHA directly.
     if not remote_branch_exists(repo_path, head_ref, remote):
         if not fetch_commit(repo_path, slug_to_https_url(pr_slug), head_sha):
             return RebaseOutcome(
@@ -501,9 +382,6 @@ def rebase_one_pr(
                 ),
             )
 
-    # Determine the commit list from merge-base(target, head) so we don't
-    # replay any commit that's already on the new target — common when
-    # both branches share an ancestor in master.
     merge_base = run_git(
         ["merge-base", target_ref, head_sha], repo_path, check=False,
     )
@@ -518,7 +396,7 @@ def rebase_one_pr(
     base_for_range = merge_base.stdout.strip()
     commits = _commits_in_range(repo_path, base_for_range, head_sha)
 
-    new_branch = _new_branch_name(head_ref, pr_number, target_branch)
+    new_branch = _new_branch_name(pr_number, target_branch)
     console.print(
         f"\n  [bold]Rebasing PR #{pr_number}[/bold] ({pr_info.title or '?'})"
     )
@@ -535,7 +413,7 @@ def rebase_one_pr(
             "fresh PR (closing the original as superseded). Conflict "
             "outcome unknown — not simulated."
         )
-        return RebaseOutcome(pr_url=pr_url, success=True)
+        return RebaseOutcome(pr_url=pr_url, new_branch=new_branch)
 
     stash_and_clean(repo_path)
     _abort_any(repo_path)
@@ -552,8 +430,6 @@ def rebase_one_pr(
 
     ai_active = _ai_active(config, resolve_conflicts)
     fallback_used = False
-    # Postcondition complaints a kept resolution carries; flagged on the
-    # new PR below.
     resolve_warnings: list[str] = []
 
     if commits:
@@ -581,8 +457,6 @@ def rebase_one_pr(
                 )
             fallback_used = True
     else:
-        # Edge case: no commits in the range (PR head already in target).
-        # Skip rather than push an empty branch.
         console.print(
             "    [dim]no commits in range — PR is already on top of "
             f"{target_branch}[/dim]"
@@ -642,13 +516,7 @@ def rebase_one_pr(
     )
 
 
-# ---------------------------------------------------------------------------
-# Top-level entry points
-# ---------------------------------------------------------------------------
-
-
 def _setup(config: Config, work_dir: Path | None, target_branch: str) -> Path:
-    """Set up the work repo and fetch origin so the target ref is present."""
     from releasy.pipeline import _setup_repo  # late import to avoid a cycle
 
     repo_path = _setup_repo(config, work_dir, target_branch)
@@ -664,7 +532,6 @@ def rebase_single(
     work_dir: Path | None = None,
     resolve_conflicts: bool = True,
 ) -> RebaseSummary:
-    """Drive ``releasy rebase --pr <url> --target <branch>``."""
     repo_path = _setup(config, work_dir, target_branch)
     if config.dry_run:
         console.print(
@@ -690,11 +557,7 @@ def rebase_all_tracked(
     resolve_conflicts: bool = True,
     only: OnlyFilter | None = None,
 ) -> RebaseSummary:
-    """Drive ``releasy rebase --target <branch>`` (every tracked rebase PR).
-
-    ``only`` (optional) restricts the walk to a single tracked PR
-    (matched by URL — source or rebase) or a single feature / group ID.
-    """
+    """Rebase every tracked rebase PR (or just ``only``) onto ``target_branch``."""
     state = load_state(config)
     candidates: list[tuple[str, str]] = []  # (feature_id, rebase_pr_url)
     for fid, fs in state.features.items():
@@ -756,8 +619,9 @@ def _print_summary(summary: RebaseSummary) -> None:
             )
         elif o.success:
             tag = " [dim](diff fallback)[/dim]" if o.fallback_used else ""
+            dest = o.new_pr_url or f"{o.new_branch} [dim](dry-run)[/dim]"
             console.print(
-                f"  [green]✓[/green] {o.pr_url} → {o.new_pr_url}{tag}"
+                f"  [green]✓[/green] {o.pr_url} → {dest}{tag}"
             )
         else:
             console.print(

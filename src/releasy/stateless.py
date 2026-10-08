@@ -1,14 +1,6 @@
-"""One-off, stateless cross-repo cherry-pick.
+"""One-off cross-repo cherry-pick of a PR / commit / tag onto an origin branch.
 
-No config file, no state file, no lock, no project board. The user hands
-us an origin remote, a target branch, and a GitHub URL pointing at a PR /
-commit / tag in any public repo; we clone, pick, optionally have Claude
-resolve conflicts, push, and optionally open a PR back against origin.
-
-This module deliberately does NOT touch any of the persistence layers
-that the rest of releasy uses (``state.py``, ``locks.py``, project
-sync). Anything calling those would couple the one-off flow to the
-multi-project bookkeeping it's meant to side-step.
+Uses no config, state file, lock, or project board.
 """
 
 from __future__ import annotations
@@ -55,18 +47,8 @@ FORMATTING_SECTION_HEADER = "CI/CD Options"
 SourceKind = Literal["pr", "commit", "tag"]
 
 
-# ---------------------------------------------------------------------------
-# Public dataclasses
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class StatelessOptions:
-    """All inputs the stateless cherry-pick command needs.
-
-    Constructed by the CLI from flags; passed through unchanged so the
-    pipeline below has a single, easy-to-test entry point.
-    """
     origin: str           # origin remote URL (ssh / https / slug-form)
     target: str           # base branch on origin
     source_url: str       # PR / commit / tag URL
@@ -75,11 +57,8 @@ class StatelessOptions:
     push: bool = True
     open_pr: bool = False
     resolve_conflicts: bool = False
-    # Port direction for the AI resolver. ``backport`` unlocks the
-    # adapt/drop latitude (bucket 0 + bucket 2) so the resolver adjusts
-    # code rather than pulling prereqs; ``forward_port`` keeps the strict
-    # "report MISSING_PREREQS" behavior. Cross-repo one-offs are usually
-    # backports, hence the default.
+    # Port direction for the AI resolver; ``backport`` lets it adapt code instead of
+    # reporting missing prereqs.
     mode: PortMode = "backport"
     build_command: str = ""
     claude_command: str = "claude"
@@ -94,7 +73,6 @@ class StatelessOptions:
 
 @dataclass
 class StatelessResult:
-    """Outcome reported back to the CLI for exit-code shaping."""
     success: bool
     branch_name: str | None = None
     pr_url: str | None = None
@@ -102,22 +80,12 @@ class StatelessResult:
     error: str | None = None
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _short_id() -> str:
     return secrets.token_hex(3)
 
 
 def _short_ref(kind: SourceKind, ident: str) -> str:
-    """A filesystem-friendly token derived from the source identifier.
-
-    Used as the human-readable middle slug of the auto-generated branch
-    name (``releasy/port/<short>-<6hex>``). Tags can contain ``/`` and
-    other shell-unfriendly characters, so we sanitise.
-    """
+    """Ref-safe slug for the source, used in the default branch name."""
     if kind == "pr":
         return f"pr-{ident}"
     if kind == "commit":
@@ -131,12 +99,7 @@ def _default_branch_name(kind: SourceKind, ident: str) -> str:
 
 
 def _git_show_subject_body(repo_path: Path, sha: str) -> tuple[str, str]:
-    """Return ``(subject, body)`` of the commit at ``sha`` (best effort).
-
-    Falls back to ``("", "")`` when the commit isn't reachable yet (the
-    caller fetches it before invoking us, but we don't want this helper
-    to crash the flow if something weird happens).
-    """
+    """``(subject, body)`` of the commit at ``sha``; empty strings on failure."""
     subj = run_git(
         ["log", "-1", "--format=%s", sha], repo_path, check=False,
     )
@@ -158,14 +121,7 @@ def _synthesize_pr_info(
     body: str,
     is_merge_commit: bool,
 ) -> PRInfo:
-    """Build a PRInfo for non-PR sources so AI resolve / PR-body code reuses
-    the existing :class:`PRInfo` plumbing without a parallel type.
-
-    ``number`` is set to 0 for non-PR sources — it never gets used as an
-    actual PR number (no GitHub call accepts a synthesized one) and is
-    only echoed back in log lines / prompt placeholders, where the ``url``
-    is what reviewers actually click.
-    """
+    """A :class:`PRInfo` (``number=0``) standing in for a commit / tag source."""
     return PRInfo(
         number=0,
         title=title or sha[:12],
@@ -184,13 +140,7 @@ def _fetch_and_pick_pr(
     slug: str,
     pr_number: int,
 ) -> tuple[OperationResult, PRInfo | None]:
-    """Resolve a PR URL → merge commit (or PR ref) → cherry-pick with -m 1.
-
-    Returns ``(result, pr_info)`` where ``pr_info`` is the GitHub-side
-    PRInfo (or ``None`` if we couldn't fetch it). The result's
-    ``conflict_files`` populates only when ``success is False`` and
-    git left the working tree mid-conflict.
-    """
+    """Cherry-pick a PR's merge commit (or PR merge ref) with ``-m 1``; return ``(result, pr)``."""
     pr = fetch_pr_by_number(config, pr_number, slug=slug)
     if pr is None:
         return (
@@ -245,13 +195,7 @@ def _fetch_and_pick_commit(
     slug: str,
     sha: str,
 ) -> OperationResult:
-    """Fetch a single commit by SHA from the source repo and cherry-pick it.
-
-    Always uses plain ``cherry-pick <sha>`` (no ``-m``); a merge commit
-    passed via the ``/commit/<sha>`` URL would fail here, which is the
-    intended signal for "use the PR URL instead — git can't tell which
-    parent you want without ``-m``".
-    """
+    """Fetch and cherry-pick a commit without ``-m`` (merge commits need the PR URL)."""
     fetch_url = slug_to_https_url(slug)
     if not fetch_commit(repo_path, fetch_url, sha):
         return OperationResult(
@@ -268,11 +212,7 @@ def _fetch_and_pick_tag(
     slug: str,
     tag: str,
 ) -> tuple[OperationResult, str | None]:
-    """Resolve ``tag`` on the source repo → commit SHA → cherry-pick.
-
-    Returns ``(result, sha)`` so the caller can synthesize a PRInfo
-    referencing the actual commit (the tag itself is just a label).
-    """
+    """Resolve ``tag`` on the source repo and cherry-pick its commit; return ``(result, sha)``."""
     fetch_url = slug_to_https_url(slug)
     sha = resolve_remote_tag(repo_path, fetch_url, tag)
     if not sha:
@@ -308,12 +248,7 @@ def _try_ai_resolve(
     conflict_files: list[str],
     mode: PortMode = "backport",
 ) -> tuple[bool, str | None, list[str]]:
-    """Invoke Claude on a conflicted cherry-pick.
-
-    Returns ``(ok, error, warnings)`` — ``warnings`` are postcondition
-    complaints the resolver kept the resolution despite, for the caller to
-    surface on the PR it opens.
-    """
+    """Invoke Claude on a conflicted cherry-pick; return ``(ok, error, warnings)``."""
     from releasy.ai_resolve import AIResolveContext, attempt_ai_resolve
 
     ctx = AIResolveContext(
@@ -344,19 +279,12 @@ def _try_ai_resolve(
     return False, reason, []
 
 
-# ---------------------------------------------------------------------------
-# PR title / body
-# ---------------------------------------------------------------------------
-
-
 _HEADER_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _CHECKBOX_RE = re.compile(r"^\s*[-*+]\s*\[[ xX]\]")
 
 
 def _extract_markdown_section(body: str, header_text: str) -> str | None:
-    """Return the section from ``header_text`` to EOF, trimmed after the
-    last ``- [ ]`` / ``- [x]`` checkbox if any exist. ``None`` if the
-    header isn't found. Header match is case-insensitive."""
+    """Section from ``header_text`` to EOF, cut after the last checkbox; ``None`` if absent."""
     target = header_text.strip().lower()
     lines = body.splitlines()
     start: int | None = None
@@ -381,8 +309,7 @@ def _extract_markdown_section(body: str, header_text: str) -> str | None:
 def _fetch_formatting_section(
     config: Config, url: str,
 ) -> tuple[str | None, str | None]:
-    """Fetch a same-origin PR and return ``(section, error)`` — exactly
-    one is non-None. The PR slug must match origin."""
+    """``(section, error)`` from a same-origin PR's body; exactly one is non-None."""
     parsed = parse_source_url(url)
     if parsed is None or parsed[0] != "pr":
         return None, (
@@ -430,7 +357,6 @@ def _pr_title(
 
 
 def _read_pr_template(repo_path: Path, target_ref: str) -> str | None:
-    """The target branch's ``.github/PULL_REQUEST_TEMPLATE.md`` (or ``None``)."""
     res = run_git(
         ["show", f"{target_ref}:.github/PULL_REQUEST_TEMPLATE.md"],
         repo_path, check=False,
@@ -439,9 +365,7 @@ def _read_pr_template(repo_path: Path, target_ref: str) -> str | None:
 
 
 def _ci_options_section(template_text: str | None) -> str:
-    """The target template's ``CI/CD Options`` heading + everything below it,
-    verbatim. Falls back to the bundled default block when the template is
-    missing or has no such section."""
+    """The template's ``CI/CD Options`` section to EOF, else the bundled default block."""
     from releasy.pipeline import _DEFAULT_CI_CD_OPTIONS_BLOCK
 
     if template_text:
@@ -455,9 +379,7 @@ def _ci_options_section(template_text: str | None) -> str:
 
 
 def _build_changelog_block_for_pr(pr_info: PRInfo | None) -> str | None:
-    """Source PR's Changelog category + entry with a ``(<url> by @author)``
-    attribution suffix. ``None`` for sources without changelog metadata
-    (plain commits / tags)."""
+    """Source PR's changelog category + entry with attribution, or ``None``."""
     if pr_info is None:
         return None
     from releasy.pipeline import (
@@ -477,14 +399,7 @@ def _build_changelog_block_for_pr(pr_info: PRInfo | None) -> str | None:
 def _pr_body(
     source_url: str, pr_info: PRInfo | None, ci_section: str,
 ) -> str:
-    """Compose the rebase PR body, respecting the target's PR template.
-
-    Provenance line, then the source PR's Changelog category + entry with
-    a ``(<url> by @author)`` attribution suffix, then the ``CI/CD Options``
-    section verbatim. The raw upstream body is deliberately not pasted in —
-    it carries upstream's own template/CI section, which ``ci_section``
-    replaces.
-    """
+    """Provenance line, changelog block, then ``ci_section`` (upstream body is not copied)."""
     lines: list[str] = [f"Cherry-picked from {source_url}."]
     changelog = _build_changelog_block_for_pr(pr_info)
     if changelog:
@@ -496,15 +411,9 @@ def _pr_body(
     return "\n".join(lines).rstrip() + "\n"
 
 
-# ---------------------------------------------------------------------------
-# Cleanup
-# ---------------------------------------------------------------------------
-
-
 def _cleanup_failed(
     repo_path: Path, branch: str, target_ref: str,
 ) -> None:
-    """Abort any in-progress git op and delete ``branch`` locally."""
     if is_operation_in_progress(repo_path):
         abort_in_progress_op(repo_path)
     if local_branch_exists(repo_path, branch):
@@ -512,18 +421,7 @@ def _cleanup_failed(
         run_git(["branch", "-D", branch], repo_path, check=False)
 
 
-# ---------------------------------------------------------------------------
-# Main entry
-# ---------------------------------------------------------------------------
-
-
 def run_stateless_cherry_pick(opts: StatelessOptions) -> StatelessResult:
-    """Execute the one-off cherry-pick described by ``opts``.
-
-    Returns a ``StatelessResult`` so the CLI can pick the exit code; this
-    function never calls ``sys.exit`` itself, which keeps it trivially
-    testable end-to-end (with a fake remote / GH token).
-    """
     parsed = parse_source_url(opts.source_url)
     if parsed is None:
         return StatelessResult(
@@ -594,8 +492,6 @@ def run_stateless_cherry_pick(opts: StatelessOptions) -> StatelessResult:
     pr_info: PRInfo | None = None
     picked_sha: str | None = None
     cp_result: OperationResult
-    # Postcondition complaints the resolver kept the resolution despite;
-    # flagged on the PR below once it exists.
     resolve_warnings: list[str] = []
 
     if kind == "pr":
@@ -630,8 +526,6 @@ def run_stateless_cherry_pick(opts: StatelessOptions) -> StatelessResult:
             console.print(f"    [red]•[/red] {cf}")
 
         if not cp_result.conflict_files:
-            # Hard failure (couldn't fetch / commit not found / etc.) —
-            # nothing to attempt-resolve, just clean up and bail.
             _cleanup_failed(repo_path, branch, target_ref)
             return StatelessResult(
                 success=False, branch_name=branch,
@@ -650,7 +544,6 @@ def run_stateless_cherry_pick(opts: StatelessOptions) -> StatelessResult:
                     conflict_files=cp_result.conflict_files,
                     error=f"AI resolve failed: {err}",
                 )
-            # AI succeeded — fall through to push / PR.
         else:
             _cleanup_failed(repo_path, branch, target_ref)
             return StatelessResult(
@@ -678,9 +571,6 @@ def run_stateless_cherry_pick(opts: StatelessOptions) -> StatelessResult:
                 "[yellow]![/yellow] --with-pr requires push; skipping PR creation."
             )
         else:
-            # CI/CD Options: --formatting-example PR overrides; otherwise the
-            # target branch's own PR template (falling back to the bundled
-            # default block when the template lacks the section).
             ci_section = _ci_options_section(template_text)
             if opts.formatting_example_url:
                 override, err = _fetch_formatting_section(

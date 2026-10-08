@@ -1,9 +1,4 @@
-"""Claude-driven autonomous conflict resolution.
-
-Renders a prompt template, spawns ``claude -p``, streams its output to the
-console, enforces a timeout, and verifies the post-conditions (branch pushed,
-PR opened, AI label attached) using the existing GitHub helpers.
-"""
+"""Claude-driven conflict resolution: render the prompt, run the agent, verify the result."""
 
 from __future__ import annotations
 
@@ -18,6 +13,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Literal
 
 from rich.markup import escape
@@ -41,10 +37,6 @@ if TYPE_CHECKING:
     from releasy.api_agent import ApiAgentSpec
 
 
-# What kind of conflicted git operation Claude is being asked to drive to
-# completion. Picks the prompt template (``ai_resolve.prompt_file`` for
-# cherry-picks, ``ai_resolve.merge_prompt_file`` for merges) and shapes
-# the placeholders rendered into it.
 OperationKind = Literal["cherry-pick", "merge"]
 
 
@@ -52,48 +44,20 @@ OperationKind = Literal["cherry-pick", "merge"]
 class AIResolveContext:
     port_branch: str
     base_branch: str
-    # The PR most relevant to interpreting the conflict:
-    # - cherry-pick: the upstream PR being ported (source of the commits).
-    # - merge:       the upstream source PR the rebase branch ports — the
-    #                conflict is between its changes and the moved-on
-    #                base branch, so its intent is what Claude must
-    #                preserve.
+    # cherry-pick: the PR being ported; merge: the source PR the rebase branch ports.
     source_pr: PRInfo
     conflict_files: list[str] = field(default_factory=list)
-    # SHA of the port branch tip BEFORE the conflicting operation was
-    # attempted. Used to verify Claude actually committed something, and
-    # to reset to a known-good state on failure.
+    # Port branch tip before the conflicting operation; reset target on failure.
     start_sha: str | None = None
-    # Which kind of conflict Claude is resolving. Selects the prompt
-    # template and tweaks the postcondition narrative.
     operation: OperationKind = "cherry-pick"
-    # Merge-only context: the URL of the rebase PR whose branch is being
-    # kept current. Rendered into the merge prompt so Claude can name it
-    # in commit messages / log lines if it wants. Ignored for cherry-pick.
-    rebase_pr_url: str | None = None
-    # Free-form note the user attached to this PR / group / feature in
-    # the session file via ``ai_context:``. Surfaced verbatim in a
-    # dedicated section of the rendered prompt. Empty string ⇒ no
-    # section is rendered.
+    rebase_pr_url: str | None = None  # merge only
+    # ``ai_context:`` note from the session file; empty ⇒ no prompt section.
     user_context: str = ""
-    # Cherry-pick split-commit mode (see ``ai_resolve.split_conflict_commit``):
-    # when True, RelEasy has already concluded the cherry-pick by committing
-    # the conflict markers as a stand-alone "with conflicts" commit, and
-    # Claude's job is to make a SECOND commit on top with the resolution.
-    # Selects ``ai_resolve.split_prompt_file`` instead of ``prompt_file``
-    # and tightens postcondition checks (HEAD must have advanced past
-    # ``pre_resolve_sha``, not just ``start_sha``). Ignored for merge.
+    # Cherry-pick already committed with conflict markers; Claude adds a resolution commit on top.
     split_mode: bool = False
-    # SHA of HEAD AFTER the "with conflicts" commit but BEFORE Claude
-    # ran. Used in split-mode postcondition checks: a successful resolve
-    # must add at least one new commit on top of this SHA.
-    pre_resolve_sha: str | None = None
-    # Backport unlocks bucket-0 (drop optional missing-prereq surfaces);
-    # forward-port keeps the MISSING_PREREQS-only flow.
+    pre_resolve_sha: str | None = None  # HEAD after the "with conflicts" commit
     mode: PortMode = "forward_port"
-    # Resolve + commit but do NOT build (no-build prompt); RelEasy builds +
-    # tests afterwards via ``build_verify``. Set by the cherry-pick port path
-    # when ``deterministic_build`` is on; merge/rebase leave it False (legacy).
+    # Resolve + commit only; RelEasy builds afterwards via ``build_verify``.
     skip_build: bool = False
 
 
@@ -103,58 +67,27 @@ class AIResolveResult:
     iterations: int | None = None
     error: str | None = None
     timed_out: bool = False
-    new_head: str | None = None  # branch tip after Claude's commit
-    # Total USD cost reported by Claude across every attempt of this
-    # resolve invocation (sum of ``total_cost_usd`` from each
-    # ``result``-typed event in the stream-json transcript, including
-    # transient-API-error retries). ``None`` when Claude reported no cost
-    # at all (e.g. failed before producing a result event).
+    new_head: str | None = None
+    # Summed across every attempt; None when no result event reported a cost.
     cost_usd: float | None = None
-    # When Claude reported ``MISSING_PREREQS: <url1> <url2>`` in its
-    # output (followed by ``UNRESOLVED``), these are the discovered PR
-    # URLs and the one-line REASON. Empty list / None when the run was
-    # not classified as a missing-prereq situation. Always paired with
-    # ``success=False`` and a non-None ``error`` ("claude reported
-    # MISSING_PREREQS"); the pipeline reads ``missing_prereq_prs`` to
-    # branch into detection-only labelling or auto-recovery.
+    # Set from a ``MISSING_PREREQS:`` / ``REASON:`` report (always with success=False).
     missing_prereq_prs: list[str] = field(default_factory=list)
     missing_prereq_note: str | None = None
-    # True when the run died before the model could work on the conflict —
-    # a transient API error that outlived the retries, an unusable backend,
-    # a missing prompt file. The resolver reached no verdict, so callers
-    # must not spend a retry budget (``max_partial_continue_attempts``) on
-    # it. A timeout is NOT this: that one burned the whole wall-clock.
+    # Died before the model could work (API error, unusable backend, missing
+    # prompt); callers must not spend a retry on it. Timeouts are not this.
     api_aborted: bool = False
-    # Postcondition failures downgraded to warnings instead of sinking an
-    # otherwise-complete resolution (see ``_DOWNGRADABLE_POSTCONDITIONS``).
-    # Paired with ``success=True``: the work is kept and pushed, and
-    # callers that own a PR flag it there for a human.
+    # Downgraded postcondition failures (success=True); callers flag them on the PR.
     warnings: list[str] = field(default_factory=list)
 
 
-# ---------------------------------------------------------------------------
-# Build wrapper script
-# ---------------------------------------------------------------------------
-#
-# Claude Code's Bash tool matcher refuses compound commands (subshells,
-# `&&`, `;`, `bash -c '…'`). The user's build_command is intrinsically
-# multi-step (`cd build` + `cmake …` + `ninja`) and its output is too
-# large to fit in a single Bash tool result. We solve both problems at
-# once by writing the build commands to a wrapper script inside the repo
-# (`.releasy/build.sh`) that internally tees full output to a per-branch
-# log under `.releasy/`. Claude then only needs to run the single
-# command  `bash .releasy/build.sh`, and can `Read` the log on failure.
-
+# Claude Code's Bash matcher refuses compound commands and build output is too
+# large for one tool result, so the build runs via a wrapper that tees to a log.
 _BUILD_DIR = ".releasy"
 _BUILD_SCRIPT = f"{_BUILD_DIR}/build.sh"
 
 
 def build_log_path(branch: str) -> str:
-    """Build-log path for ``branch``, relative to the repo root.
-
-    One log per branch: a later unit's build must not overwrite the log of
-    a branch that failed, which is the only record of why it failed.
-    """
+    """Per-branch build-log path relative to the repo root (a failed branch's log must survive)."""
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", branch).strip("-")
     return f"{_BUILD_DIR}/build-{slug}.log" if slug else f"{_BUILD_DIR}/build.log"
 
@@ -162,18 +95,10 @@ def build_log_path(branch: str) -> str:
 def _write_build_script(
     repo_path: Path, build_command: str, log_path: str,
 ) -> None:
-    """Materialise the build wrapper inside the repo.
-
-    Overwrites any previous copy so config / log-path changes take effect.
-    """
     target = repo_path / _BUILD_SCRIPT
     target.parent.mkdir(parents=True, exist_ok=True)
     body = build_command.rstrip() + "\n"
-    # Refresh submodules before every build: when the port branch
-    # ingests newer commits (cherry-pick / merge-target), submodule
-    # pointers can advance — building against stale checkouts then
-    # produces confusing compile or runtime failures. No-op when the
-    # repo has none.
+    # Ported commits can advance submodule pointers.
     script = (
         "#!/usr/bin/env bash\n"
         "# Auto-generated by RelEasy. Do not edit by hand — regenerated\n"
@@ -198,59 +123,47 @@ def _write_build_script(
         gitignore.write_text("*\n", encoding="utf-8")
 
 
-# ---------------------------------------------------------------------------
-# Prompt rendering
-# ---------------------------------------------------------------------------
+def _prompt_path(config: Config, raw: str) -> Path:
+    """``raw`` when absolute; else under ``config.repo_dir``, falling back to the bundled copy."""
+    p = Path(raw)
+    if p.is_absolute():
+        return p
+    local = (config.repo_dir / p).resolve()
+    bundled = Path(__file__).parent / p
+    return bundled if not local.exists() and bundled.exists() else local
 
 
-def _resolve_prompt_template(config: Config, ctx: AIResolveContext) -> Path:
-    """Pick the prompt file path for ``ctx.operation`` and resolve it.
+def _fill_placeholders(template: str, placeholders: dict[str, str]) -> str:
+    """Substitute ``{ident}`` placeholders; unknown ones are left verbatim."""
+    def _replace(match: re.Match[str]) -> str:
+        return placeholders.get(match.group(1), match.group(0))
 
-    Cherry-pick uses ``ai_resolve.prompt_file`` for the legacy single-
-    commit flow (cherry-pick still in progress, Claude resolves and
-    runs ``git cherry-pick --continue``), or ``ai_resolve.split_prompt_file``
-    in split-commit mode (cherry-pick already concluded as a "with
-    conflicts" commit, Claude makes a second resolution commit on top).
-    Merge uses ``ai_resolve.merge_prompt_file``. The three templates
-    share the same placeholder vocabulary but differ in flow narrative.
-    """
+    return re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", _replace, template)
+
+
+def _prompt_file_key(ctx: AIResolveContext) -> str:
+    """``config.ai_resolve`` attribute naming the prompt template for ``ctx``."""
     if ctx.operation == "merge":
-        raw = config.ai_resolve.merge_prompt_file
-    elif ctx.skip_build:
-        # Resolve-only: same split-commit contract as split_prompt_file, minus
-        # the Build step (RelEasy builds afterwards).
-        raw = config.ai_resolve.resolve_only_prompt_file
-    elif ctx.split_mode:
-        raw = config.ai_resolve.split_prompt_file
-    else:
-        raw = config.ai_resolve.prompt_file
-    prompt_path = Path(raw)
-    if not prompt_path.is_absolute():
-        prompt_path = (config.repo_dir / prompt_path).resolve()
-    return prompt_path
+        return "merge_prompt_file"
+    if ctx.skip_build:
+        return "resolve_only_prompt_file"
+    if ctx.split_mode:
+        return "split_prompt_file"
+    return "prompt_file"
 
 
 def _render_prompt(config: Config, repo_path: Path, ctx: AIResolveContext) -> str:
-    """Load the prompt template and fill in placeholders."""
-    prompt_path = _resolve_prompt_template(config, ctx)
+    key = _prompt_file_key(ctx)
+    prompt_path = _prompt_path(config, getattr(config.ai_resolve, key))
 
     if not prompt_path.exists():
-        if ctx.operation == "merge":
-            which = "ai_resolve.merge_prompt_file"
-        elif ctx.skip_build:
-            which = "ai_resolve.resolve_only_prompt_file"
-        elif ctx.split_mode:
-            which = "ai_resolve.split_prompt_file"
-        else:
-            which = "ai_resolve.prompt_file"
         raise FileNotFoundError(
             f"AI prompt template not found: {prompt_path}. "
-            f"Set {which} in config."
+            f"Set ai_resolve.{key} in config."
         )
 
     template = prompt_path.read_text(encoding="utf-8")
 
-    from releasy.github_ops import get_origin_repo_slug
     repo_slug = get_origin_repo_slug(config) or "<unknown>"
 
     conflict_files_md = "\n".join(f"- `{f}`" for f in ctx.conflict_files) or "- (none)"
@@ -261,25 +174,12 @@ def _render_prompt(config: Config, repo_path: Path, ctx: AIResolveContext) -> st
     elif len(body) > 4000:
         body = body[:4000] + "\n\n_(truncated)_"
 
-    # SHA Claude can use to inspect the EXACT diff being applied (cherry-pick
-    # of a merge commit uses the first-parent diff, which is what `git show -m
-    # --first-parent` prints). For open PRs we fall back to head_sha so Claude
-    # still has a concrete ref; the prompt also tells it to use `gh pr diff`
-    # as a cross-check.
     source_pr_merge_sha = (
         ctx.source_pr.merge_commit_sha or ctx.source_pr.head_sha or ""
     )
 
-    # Origin remote / default branch — referenced by the prereq-detection
-    # section of the cherry-pick prompt so commands stay literal-copy
-    # ready (not "git log -S … origin/master" hard-coded when the user
-    # configured a different remote_name).
     origin_remote_name = config.origin.remote_name
-    # The "default" branch on origin to search prereq history against.
-    # We don't have a config knob for this today (target_branch is the
-    # *port target*, which is exactly the branch where the prereq is
-    # missing — not the right thing to search). Default to ``master``,
-    # the convention for the upstream-mirror repos RelEasy targets.
+    # Prereq history search branch; not target_branch, which is where the prereq is missing.
     origin_branch_default = "master"
 
     if config.upstream is not None:
@@ -301,17 +201,7 @@ def _render_prompt(config: Config, repo_path: Path, ctx: AIResolveContext) -> st
             "above is searched)_\n"
         )
 
-    # The user can attach a per-PR / per-group note to the resolver via
-    # ``ai_context:`` in the session file. We render it as a dedicated
-    # section so it's prominent without us having to edit the template
-    # for every consumer; when the user supplied nothing, the placeholder
-    # collapses to an empty string so the prompt simply skips the
-    # section. Leading newline keeps an empty render flush against the
-    # surrounding content (no stray blank lines), and the trailing
-    # newlines keep the populated render from running into whatever
-    # follows in the template (notably a `---` separator that would
-    # otherwise be parsed as a setext heading underline for the last
-    # line of the user's note).
+    # Trailing newline: a following `---` would make the last line a setext heading.
     user_context_text = (ctx.user_context or "").strip()
     if user_context_text:
         user_context_section = (
@@ -342,54 +232,24 @@ def _render_prompt(config: Config, repo_path: Path, ctx: AIResolveContext) -> st
         "build_log": build_log_path(ctx.port_branch),
         "max_iterations": str(config.ai_resolve.max_iterations),
         "label": config.ai_resolve.label,
-        # Merge-only — rendered as a literal placeholder for cherry-pick
-        # prompts that don't reference it (no-op there). For merge prompts
-        # this lets Claude link the rebase PR in narration if helpful.
         "rebase_pr_url": ctx.rebase_pr_url or "",
-        # Prereq-detection placeholders (cherry-pick prompt only — the
-        # merge prompt doesn't reference them, so empty values are safe).
         "origin_remote_name": origin_remote_name,
         "origin_branch": origin_branch_default,
         "upstream_remote_name": upstream_remote_name,
         "upstream_branch": upstream_branch,
         "upstream_fetch_section": upstream_fetch_section,
-        # User-supplied per-PR / per-group note from the session file.
-        # Either an empty string (no note ⇒ section skipped) or a fully
-        # rendered "## User-supplied context" markdown block.
         "user_context_section": user_context_section,
-        # Split-mode only: the SHA of the "with conflicts" commit that
-        # holds the conflict markers verbatim. Claude must NOT amend it;
-        # the resolution lives in a new commit on top. Empty for non-split
-        # invocations so the placeholder collapses cleanly.
         "pre_resolve_sha": ctx.pre_resolve_sha or "",
-        # Port direction. Either ``"backport"`` or ``"forward_port"``.
-        # Drives the "Port direction" section in the resolver prompt:
-        # backport-mode templates activate bucket-0; forward-port-mode
-        # templates keep the original MISSING_PREREQS-only flow.
         "port_direction": ctx.mode,
-        # Comma-separated list of source PR labels for the model to
-        # sanity-check the detected ``port_direction``. Empty when no
-        # labels were fetched (still acceptable — the ladder doesn't
-        # require labels to commit to a mode).
         "source_pr_labels": ", ".join(
             l for l in (ctx.source_pr.labels or []) if l
         ),
     }
 
-    def _replace(match: re.Match[str]) -> str:
-        key = match.group(1)
-        return placeholders.get(key, match.group(0))
-
-    return re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", _replace, template)
-
-
-# ---------------------------------------------------------------------------
-# Claude invocation
-# ---------------------------------------------------------------------------
+    return _fill_placeholders(template, placeholders)
 
 
 def _model_effort_args(config: Config) -> list[str]:
-    """Global --model / --effort flags, appended to every claude invocation."""
     args: list[str] = []
     if config.ai_model:
         args += ["--model", config.ai_model]
@@ -398,21 +258,14 @@ def _model_effort_args(config: Config) -> list[str]:
     return args
 
 
-# A single argv string is capped by the OS (Linux MAX_ARG_STRLEN = 128 KiB).
-# Prompts at/under this go inline as `-p <prompt>` (proven path); larger ones
-# are fed via stdin (`claude -p` reads the prompt from stdin) so there is no
-# size limit. Kept well under 128 KiB for headroom.
+# Larger prompts go via stdin: one argv string is capped at 128 KiB (Linux MAX_ARG_STRLEN).
 _PROMPT_ARG_MAX_BYTES = 96 * 1024
 
 
 def _build_claude_argv(
     config: Config, allowed_tools: list[str] | None = None,
 ) -> list[str]:
-    """Base print-mode argv WITHOUT the prompt — the prompt is supplied at
-    spawn time (inline for small prompts, via stdin for large ones).
-
-    Returns the ``codex exec`` argv instead under ``ai_backend: codex``.
-    """
+    """Print-mode argv without the prompt (``codex exec`` argv under ``ai_backend: codex``)."""
     tools = allowed_tools if allowed_tools is not None else config.ai_resolve.allowed_tools
     if _codex_backend_selected(config):
         return _build_codex_argv(config, tools)
@@ -434,9 +287,7 @@ def _argv_with_inline_prompt(base_argv: list[str], prompt: str) -> list[str]:
     return base_argv[:2] + [prompt] + base_argv[2:]
 
 
-# Tools that let the agent change files. A codex call granted none of them
-# runs in codex's read-only sandbox; otherwise it gets full access (codex's
-# workspace-write sandbox blocks network and ``.git`` writes).
+# Any of these grants codex full access (workspace-write blocks network and ``.git``).
 _CODEX_WRITE_TOOLS = frozenset({"Edit", "Write", "NotebookEdit"})
 
 
@@ -445,7 +296,6 @@ def _codex_backend_selected(config: Config) -> bool:
 
 
 def _build_codex_argv(config: Config, allowed_tools: list[str]) -> list[str]:
-    """``codex exec`` argv WITHOUT the prompt (see :func:`_build_claude_argv`)."""
     codex = getattr(config, "ai_codex", None) or AICodexConfig()
     cmd = [codex.command, "exec", "--json", "--skip-git-repo-check"]
     if _CODEX_WRITE_TOOLS & set(allowed_tools):
@@ -460,11 +310,6 @@ def _build_codex_argv(config: Config, allowed_tools: list[str]) -> list[str]:
     return cmd
 
 
-# ---------------------------------------------------------------------------
-# Backend selection (CLI subprocess vs Anthropic API token)
-# ---------------------------------------------------------------------------
-
-
 def _api_backend_selected(config: Config) -> bool:
     return str(getattr(config, "ai_backend", "cli") or "cli").lower() == "api"
 
@@ -472,13 +317,7 @@ def _api_backend_selected(config: Config) -> bool:
 def _build_api_spec(
     config: Config, allowed_tools: list[str] | None = None,
 ) -> "ApiAgentSpec | None":
-    """API-backend spec for this invocation, or ``None`` in CLI mode.
-
-    Counterpart of :func:`_build_claude_argv`: it reads the same
-    ``config.ai_resolve.allowed_tools`` view, so the per-command shims in
-    ``analyze_fails`` / ``review_response`` keep selecting their own tool
-    set, plus the global ``ai_api`` block.
-    """
+    """API-backend spec for this invocation, or ``None`` when another backend is selected."""
     if not _api_backend_selected(config):
         return None
 
@@ -506,15 +345,26 @@ def _build_api_spec(
     )
 
 
+def _section_config(
+    config: Config, command: str, allowed_tools: list[str], extra_args: list[str],
+) -> SimpleNamespace:
+    """Config view whose ``ai_resolve`` carries another section's command/tools/args."""
+    return SimpleNamespace(
+        ai_resolve=SimpleNamespace(
+            command=command, allowed_tools=allowed_tools, extra_args=extra_args,
+        ),
+        ai_model=config.ai_model,
+        ai_effort=config.ai_effort,
+        ai_backend=config.ai_backend,
+        ai_api=config.ai_api,
+        ai_codex=config.ai_codex,
+    )
+
+
 def _resolve_backend(
     config: Config, command: str, allowed_tools: list[str] | None = None,
 ) -> tuple["ApiAgentSpec | None", str | None]:
-    """Pick the backend and check it can run.
-
-    Returns ``(api_spec, error)``: ``api_spec`` is ``None`` in CLI mode,
-    ``error`` is a user-facing reason the backend is unusable (missing
-    binary / missing token / missing SDK) or ``None`` when it's good to go.
-    """
+    """``(api_spec, error)``: spec is None unless the API backend; error says why it can't run."""
     spec = _build_api_spec(config, allowed_tools)
     if spec is not None:
         from releasy.api_agent import check_available
@@ -527,7 +377,6 @@ def _resolve_backend(
 
 
 def _backend_label(config: Config, command: str) -> str:
-    """How to name the backend in progress output."""
     if _codex_backend_selected(config):
         codex = getattr(config, "ai_codex", None) or AICodexConfig()
         return f"{codex.command} ({codex.model})" if codex.model else codex.command
@@ -551,22 +400,14 @@ def _flatten(text: str) -> str:
 
 
 def _render_event(line: str, start: float) -> str | None:
-    """Turn one stream-json event into a human-readable status line.
-
-    Returns ``None`` when the event has nothing user-visible to report.
-    """
+    """One stream-json event as a console status line, or None if nothing to show."""
     try:
         ev = json.loads(line)
     except json.JSONDecodeError:
         stripped = line.strip()
         if not stripped:
             return None
-        # ``escape`` everything that originates in claude's stream: its
-        # text routinely contains ``[…]`` (diff hunks, doc snippets, paths
-        # like ``[/<sub-path>]``) that Rich would otherwise parse as markup
-        # and throw ``MarkupError`` on — which used to tear down the whole
-        # stream and SIGTERM a healthy claude. Our own ``[dim]`` etc. tags
-        # are added *outside* the escaped segments so they still render.
+        # Stream text often contains ``[…]`` that Rich would parse as markup.
         return f"[dim]│[/dim] {escape(stripped)}"
 
     elapsed = _fmt_elapsed(time.monotonic() - start)
@@ -658,8 +499,7 @@ def _codex_tool_result(text: str, is_error: bool) -> dict:
     ]}}
 
 
-# Informational stderr lines ``codex exec`` prints; kept out of the
-# transcript so they don't leak into the assistant text.
+# Informational ``codex exec`` stderr lines, kept out of the transcript.
 _CODEX_STDIN_NOTICES = frozenset({
     "Reading prompt from stdin...",
     "Reading additional input from stdin...",
@@ -667,13 +507,7 @@ _CODEX_STDIN_NOTICES = frozenset({
 
 
 def _translate_codex_line(line: str) -> list[str]:
-    """Rewrite one ``codex exec --json`` event as Claude stream-json lines.
-
-    Keeps rendering, marker parsing and limit detection backend-agnostic.
-    Lines that aren't codex events (claude's own stream-json, plain text)
-    come back unchanged; codex events with nothing to show come back as
-    ``[]``. Errors become plain ``[codex] …`` text lines.
-    """
+    """``codex exec --json`` event as Claude stream-json lines; other lines pass through."""
     if line.strip() in _CODEX_STDIN_NOTICES:
         return []
     try:
@@ -737,13 +571,7 @@ def _translate_codex_line(line: str) -> list[str]:
 
 
 def _kill_proc_tree(proc: subprocess.Popen) -> None:
-    """SIGTERM (then SIGKILL) the entire process group of ``proc``.
-
-    Claude spawns child tools (ninja, gcc, gh, …); without targeting the
-    whole group those survive after we kill claude itself. ``proc`` is
-    started with ``start_new_session=True`` so it owns its own process
-    group whose pgid equals the child pid.
-    """
+    """SIGTERM (then SIGKILL) ``proc``'s whole process group so its child tools die too."""
     if proc.poll() is not None:
         return
     try:
@@ -769,14 +597,11 @@ def _kill_proc_tree(proc: subprocess.Popen) -> None:
         pass
 
 
-# Session-exhaustion wait defaults — baked in so every _spawn_claude caller
-# waits by default; config-aware callers override via _exhaustion_kwargs.
 _DEFAULT_EXHAUSTION_MAX_WAIT_SECONDS = 60 * 3600  # 60h
 _DEFAULT_EXHAUSTION_POLL_SECONDS = 30 * 60  # 30m
 
 
 def _exhaustion_kwargs(config: Config) -> dict:
-    """``_spawn_claude`` session-exhaustion kwargs derived from config."""
     ai = config.ai_resolve
     return {
         "exhaustion_wait": ai.wait_on_session_exhaustion,
@@ -814,16 +639,8 @@ def _spawn_claude(
     exhaustion_poll_seconds: int = _DEFAULT_EXHAUSTION_POLL_SECONDS,
     exhaustion_extra_patterns: tuple[str, ...] = (),
 ) -> tuple[int, str, bool]:
-    """Run the agent, waiting out an exhausted usage session.
-
-    Wraps :func:`_spawn_claude_once` (or :func:`_run_api_agent_once` when
-    ``api`` is set — the API backend produces the same stream-json
-    transcript, so the wait / retry ladder is backend-agnostic): on a
-    session-exhaustion failure (not a transient API error — those retry one
-    level up), sleep and re-prompt until it works or the wait cap is hit,
-    then return the last result.
-    """
-    # A non-positive poll interval would busy-loop; treat it as "disabled".
+    """Run the agent, re-prompting after a sleep while the usage session is exhausted."""
+    # A non-positive poll interval would busy-loop.
     wait_enabled = (
         exhaustion_wait
         and exhaustion_poll_seconds > 0
@@ -866,12 +683,7 @@ def _spawn_claude(
 def _run_api_agent_once(
     api: "ApiAgentSpec", repo_path: Path, timeout: int, prompt: str,
 ) -> tuple[int, str, bool]:
-    """API-backend twin of :func:`_spawn_claude_once`.
-
-    Runs the agent loop in-process against the Messages API and renders its
-    stream-json events through :func:`_render_event`, so the console output
-    and the returned transcript are indistinguishable from the CLI path.
-    """
+    """API-backend twin of :func:`_spawn_claude_once`."""
     from releasy.api_agent import run_agent
 
     start = time.monotonic()
@@ -889,8 +701,6 @@ def _run_api_agent_once(
         try:
             console.print(f"    {rendered}")
         except Exception:
-            # Same belt-and-suspenders as the CLI path: a Rich markup
-            # error must never abort a healthy run.
             console.print(f"    {rendered}", markup=False, highlight=False)
 
     return run_agent(api, repo_path, timeout, prompt, _render)
@@ -899,19 +709,9 @@ def _run_api_agent_once(
 def _spawn_claude_once(
     argv: list[str], repo_path: Path, timeout: int, prompt: str,
 ) -> tuple[int, str, bool]:
-    """Run claude as a subprocess, streaming stdout/stderr to the console.
+    """Run the CLI agent, streaming to the console. Returns (exit_code, output, timed_out).
 
-    Parses Claude's stream-json events and pretty-prints each tool call,
-    message, and tool result. Emits a heartbeat when claude is quiet so
-    the user can tell it's still working. Ctrl-C kills the whole claude
-    process group (claude + ninja + whatever else it spawned) and
-    re-raises ``KeyboardInterrupt``.
-
-    The prompt goes inline as ``-p <prompt>`` when small, or via stdin when it
-    would overflow the OS arg limit (``_PROMPT_ARG_MAX_BYTES``). ``argv`` is
-    the base print-mode argv (no prompt) from :func:`_build_claude_argv`.
-
-    Returns (exit_code, combined_output, timed_out).
+    Ctrl-C kills the whole process group and re-raises ``KeyboardInterrupt``.
     """
     use_stdin = len(prompt.encode("utf-8")) > _PROMPT_ARG_MAX_BYTES
     full_argv = argv if use_stdin else _argv_with_inline_prompt(argv, prompt)
@@ -926,9 +726,7 @@ def _spawn_claude_once(
     # A backgrounded command dies with the `-p` session, before it reports.
     env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
 
-    # start_new_session=True puts claude in its own process group so:
-    #   1. it does NOT receive the terminal's Ctrl-C (we control it),
-    #   2. we can kill the entire tree (claude + nested tools) at once.
+    # Own process group: no terminal Ctrl-C, and the whole tree can be killed at once.
     proc = subprocess.Popen(
         full_argv,
         cwd=repo_path,
@@ -941,9 +739,7 @@ def _spawn_claude_once(
         start_new_session=True,
     )
 
-    # Feed a large prompt via stdin in a thread so a >pipe-buffer write can't
-    # deadlock against us reading stdout. Broken pipe (claude exited early /
-    # was killed) is benign.
+    # Feed from a thread so a >pipe-buffer write can't deadlock against stdout reads.
     if use_stdin:
         def _feed() -> None:
             try:
@@ -998,11 +794,7 @@ def _spawn_claude_once(
                 try:
                     console.print(f"    {rendered}")
                 except Exception:
-                    # Belt-and-suspenders: _render_event already escapes
-                    # claude-originated text, but a console-rendering error
-                    # must NEVER tear down the stream loop — that would kill
-                    # an otherwise-healthy claude (exit 143). Fall back to a
-                    # raw, markup-free print of this one line.
+                    # A rendering error must not tear down the stream and kill claude.
                     console.print(
                         f"    {rendered}", markup=False, highlight=False,
                     )
@@ -1032,16 +824,8 @@ def _spawn_claude_once(
     return exit_code, "".join(collected), timed_out
 
 
-# ---------------------------------------------------------------------------
-# Post-condition verification
-# ---------------------------------------------------------------------------
-
-
 def _extract_assistant_text(output: str) -> str:
-    """Pull all assistant text out of a stream-json transcript.
-
-    Falls back to the raw output when nothing parses as JSON.
-    """
+    """All assistant text in a stream-json transcript (raw output if nothing parses)."""
     chunks: list[str] = []
     parsed_any = False
     for line in output.splitlines():
@@ -1067,9 +851,7 @@ def _extract_assistant_text(output: str) -> str:
     return "\n".join(chunks)
 
 
-# Heuristics for transient Anthropic streaming-API failures that abort
-# the turn before Claude can do any real work. We retry on these; we do
-# NOT retry on real resolver errors (build failed, UNRESOLVED, etc.).
+# Transient API failures that abort the turn before any work; these are retried.
 _TRANSIENT_API_ERROR_RES = [
     re.compile(r"API Error:\s*Stream idle timeout", re.IGNORECASE),
     re.compile(r"API Error:\s*Overloaded", re.IGNORECASE),
@@ -1083,12 +865,6 @@ _TRANSIENT_API_ERROR_RES = [
 
 
 def _find_transient_api_error(output: str) -> str | None:
-    """Return a short human-readable reason if the turn was aborted by a
-    transient Anthropic API error, else ``None``.
-
-    We look both in raw lines and in the assistant text extracted from
-    the stream-json transcript.
-    """
     assistant = _extract_assistant_text(output)
     for haystack in (assistant, output):
         for pat in _TRANSIENT_API_ERROR_RES:
@@ -1098,11 +874,8 @@ def _find_transient_api_error(output: str) -> str | None:
     return None
 
 
-# Signals that the Claude usage session is spent (warrants the scheduled
-# wait, not a 15s retry). Distinct from the transient "API Error: …" patterns
-# above. Only consulted on a non-zero exit. NB: the "monthly spend limit ·
-# run /usage-credits" wording is the CLI mislabeling a session limit that
-# resets — correct to wait out, not a real billing cap.
+# Spent usage session (waited out, not retried). The CLI's "monthly spend limit ·
+# run /usage-credits" wording is a mislabelled session limit that does reset.
 _SESSION_EXHAUSTED_RES = [
     re.compile(r"\blimit reached\b", re.IGNORECASE),
     re.compile(r"reached your (?:usage |5-hour |weekly |daily )?limit", re.IGNORECASE),
@@ -1119,11 +892,9 @@ _SESSION_EXHAUSTED_RES = [
 def _find_session_exhausted(
     output: str, extra_patterns: tuple[str, ...] = (),
 ) -> str | None:
-    """Short reason if the run failed on an exhausted usage limit, else None.
+    """Matched text if the run hit an exhausted usage limit, else None.
 
-    Scans the raw transcript only (the limit notice is a CLI message; skipping
-    model text avoids false positives). ``extra_patterns`` are user regexes
-    OR-ed with the built-ins.
+    Scans the raw transcript, not model text, to avoid false positives.
     """
     for pat in _SESSION_EXHAUSTED_RES:
         m = pat.search(output)
@@ -1133,21 +904,14 @@ def _find_session_exhausted(
         try:
             m = re.search(raw, output, re.IGNORECASE)
         except re.error:
-            continue  # a malformed user pattern must not crash the run
+            continue
         if m:
             return m.group(0)
     return None
 
 
 def _extract_cost_usd(output: str) -> float | None:
-    """Sum ``total_cost_usd`` across every ``result`` event in the transcript.
-
-    Claude emits one ``result``-typed stream-json event per session
-    summarising the run. When ``resolve_with_claude`` retries after a
-    transient API error, each attempt produces its own result event and
-    the costs need to be added together to reflect the full bill for the
-    invocation. Returns ``None`` if no usable cost field was found.
-    """
+    """Sum ``total_cost_usd`` over all ``result`` events; None if there is none."""
     total: float | None = None
     for line in output.splitlines():
         line = line.strip()
@@ -1170,11 +934,7 @@ _MISSING_PREREQS_RE = re.compile(
     re.MULTILINE,
 )
 _REASON_RE = re.compile(r"^REASON:\s*(.+?)\s*$", re.MULTILINE)
-# A token that *looks like* a GitHub PR URL — broad on purpose so we
-# accept variants like ``https://github.com/owner/repo/pull/123#whatever``
-# without dropping them. Validation happens downstream via
-# ``parse_pr_url``; the parser's job is just to peel them off the
-# MISSING_PREREQS line.
+# Deliberately broad; ``parse_pr_url`` validates downstream.
 _PR_URL_TOKEN_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+[\w/#?=&.\-]*",
     re.IGNORECASE,
@@ -1182,22 +942,11 @@ _PR_URL_TOKEN_RE = re.compile(
 
 
 def _parse_missing_prereqs(output: str) -> tuple[list[str], str | None]:
-    """Extract MISSING_PREREQS PR URLs (and the one-line REASON) from the
-    transcript.
-
-    The prompt's contract: Claude prints ``MISSING_PREREQS: url1 url2 ...``
-    on one line and ``REASON: <one-liner>`` on the next, followed by
-    ``UNRESOLVED`` on its own line. We accept any whitespace separator
-    between URLs (space, tab, comma) and trim trailing punctuation.
-
-    Returns ``([], None)`` when no MISSING_PREREQS line was emitted.
-    """
+    """PR URLs from ``MISSING_PREREQS:`` lines and the ``REASON:`` text; ``([], None)`` if none."""
     text = _extract_assistant_text(output)
     urls: list[str] = []
     seen: set[str] = set()
-    # Walk every MISSING_PREREQS occurrence — there should normally only
-    # be one, but if Claude restated it (e.g. once mid-narration and once
-    # at the tail) we union them rather than picking arbitrarily.
+    # Union all occurrences in case Claude restated the line.
     for m in _MISSING_PREREQS_RE.finditer(text):
         for tok in _PR_URL_TOKEN_RE.finditer(m.group(1)):
             url = tok.group(0).rstrip(".,;:)]\"'")
@@ -1212,10 +961,7 @@ def _parse_missing_prereqs(output: str) -> tuple[list[str], str | None]:
 
 
 def _count_iterations(output: str) -> int | None:
-    """Best-effort: count how many build attempts Claude ran.
-
-    Looks for patterns in its own narration. Returns None when unknown.
-    """
+    """Best-effort build-attempt count from Claude's narration; None when unknown."""
     text = _extract_assistant_text(output)
     patterns = [
         r"build attempt[s]?:?\s*(\d+)",
@@ -1232,25 +978,15 @@ def _count_iterations(output: str) -> int | None:
     return best
 
 
-# ``src/Core/SettingsChangesHistory.cpp`` is an append-only registry of
-# ClickHouse settings changes. Every conflict-resolve invocation must
-# leave the port branch's diff of this file as a **subset** of the
-# rows the source PR itself added — extra rows are essentially always
-# bad: they're context lines the AI accidentally uncommented or stale
-# entries from "ours" that bracketed a real source-PR edit. The rule
-# is in the prompt (see resolve_conflict.md → "Append-only registries"),
-# but PR #1812 showed prompt-only enforcement isn't reliable, so we
-# also verify mechanically here.
+# Append-only registry: rows the port adds must be a subset of the source PR's
+# own additions. The prompt says so too, but that alone proved unreliable.
 _SETTINGS_HISTORY_FILE = "src/Core/SettingsChangesHistory.cpp"
 
-# Matches ``+    {"setting_name", ...`` — the canonical row shape of
-# this registry. Captures the setting name. We anchor on ``+`` so we
-# only see additions; deletions and context lines never contribute.
+# An added ``{"setting_name", ...`` row.
 _SETTINGS_HISTORY_ROW_RE = re.compile(r'^\+\s*\{"([^"]+)"')
 
 
 def _settings_history_added_names(stdout: str) -> set[str]:
-    """Pull setting names out of a unified-diff stdout snippet."""
     return {
         m.group(1) for line in stdout.splitlines()
         if (m := _SETTINGS_HISTORY_ROW_RE.match(line))
@@ -1260,13 +996,7 @@ def _settings_history_added_names(stdout: str) -> set[str]:
 def _check_settings_history_whitelist(
     repo_path: Path, ctx: AIResolveContext, new_head: str,
 ) -> tuple[bool, str | None]:
-    """Verify the port's SettingsChangesHistory.cpp adds ⊆ source PR's adds.
-
-    No-op when we can't compute either side (missing start / source SHA,
-    file untouched by the port). On violation, returns a specific error
-    naming the unauthorized setting(s); the caller surfaces it like any
-    other postcondition failure and resets to ``ctx.start_sha``.
-    """
+    """Check the port's SettingsChangesHistory.cpp additions ⊆ the source PR's additions."""
     source_sha = ctx.source_pr.merge_commit_sha or ctx.source_pr.head_sha
     if not source_sha or not ctx.start_sha:
         return True, None
@@ -1283,8 +1013,7 @@ def _check_settings_history_whitelist(
     if not added_on_port:
         return True, None
 
-    # ``-m --first-parent`` matches how the prompt itself tells Claude
-    # to read the source PR's diff — see resolve_conflict.md:352.
+    # Same diff the prompt tells Claude to read.
     src = run_git(
         ["show", "-m", "--first-parent", "--no-color", source_sha,
          "--", _SETTINGS_HISTORY_FILE],
@@ -1311,28 +1040,20 @@ def _check_settings_history_whitelist(
     )
 
 
-# Postcondition failures whose ``err_kind`` may be handed back to Claude for
-# an in-place correction (bounded by ``ai_resolve.postcondition_retries``)
-# instead of discarding the whole resolution. These are blemishes on an
-# otherwise-good resolve — never "claude didn't finish" signals.
+# ``err_kind``s handed back to Claude for an in-place correction.
 _CORRECTABLE_POSTCONDITIONS = {"settings_history"}
 
-# …and of those, the ones that must NOT sink the resolution once the
-# correction budget is spent. The cherry-pick concluded, the tree is clean
-# and HEAD advanced — only a registry file is suspect. Discarding all of
-# that leaves a human to redo the whole port by hand, so RelEasy keeps the
-# resolution, pushes it, and flags the complaint on the PR instead.
-# Gated by ``ai_resolve.warn_on_unfixed_postconditions``.
+# ``err_kind``s that keep the resolution (flagged on the PR) once corrections
+# run out, when ``ai_resolve.warn_on_unfixed_postconditions`` is on.
 _DOWNGRADABLE_POSTCONDITIONS = {"settings_history"}
 
 
 def flatten_resolve_warnings(warnings: list[str]) -> list[str]:
-    """One squashed single-line entry per warning, fit for a markdown bullet."""
+    """One single-line entry per non-empty warning."""
     return [" ".join(w.split()) for w in warnings if w and w.strip()]
 
 
 def resolve_warning_comment_body(warnings: list[str]) -> str:
-    """Render kept-with-warnings notes as a PR comment body."""
     lines = [
         "## RelEasy — resolution kept with warnings",
         "",
@@ -1349,12 +1070,7 @@ def resolve_warning_comment_body(warnings: list[str]) -> str:
 def flag_resolution_warnings_on_pr(
     config: Config, pr_url: str | None, warnings: list[str],
 ) -> bool:
-    """Best-effort: comment + label a PR whose resolution was kept with warnings.
-
-    Reuses ``ai_resolve.verify_label`` — same "a human must look at this
-    resolution" meaning as a flagged verifier pass, so existing dashboards
-    and filters keep working. Never raises; True iff the comment landed.
-    """
+    """Comment on and ``verify_label`` a PR kept with warnings; True iff the comment landed."""
     if not warnings or not pr_url:
         return False
     parsed = parse_pr_url(pr_url)
@@ -1366,8 +1082,7 @@ def flag_resolution_warnings_on_pr(
         return False
     owner, repo, number = parsed
 
-    # ``add_issue_comment`` / ``add_label_to_pr`` address the origin repo by
-    # NUMBER, so a URL from any other repo would land on an unrelated PR.
+    # The comment/label helpers address origin by PR number.
     origin_slug = get_origin_repo_slug(config)
     if origin_slug and f"{owner}/{repo}".lower() != origin_slug.lower():
         console.print(
@@ -1393,11 +1108,7 @@ def flag_resolution_warnings_on_pr(
     return posted
 
 
-# Focused follow-up prompt for the ``settings_history`` postcondition. The
-# resolution is already committed; Claude only trims the unauthorized rows
-# and amends. Placeholders are filled with the same ``\{ident\}`` re.sub used
-# by :func:`_render_prompt`; literal ``{"..."}`` registry rows are left alone
-# because the char after ``{`` isn't an identifier.
+# Literal ``{"..."}`` rows survive placeholder filling: ``"`` is not an identifier char.
 _SETTINGS_HISTORY_FIX_PROMPT = """\
 You are fixing ONE specific problem in an ALREADY-COMPLETED cherry-pick. Do not start over.
 
@@ -1450,11 +1161,7 @@ def _render_correction_prompt(
     config: Config, repo_path: Path, ctx: AIResolveContext,
     err_kind: str, err: str | None,
 ) -> str:
-    """Render the focused follow-up prompt for a correctable postcondition.
-
-    Raises ``ValueError`` for an ``err_kind`` we have no correction prompt
-    for, so :func:`resolve_with_claude` falls back to plain failure.
-    """
+    """Follow-up prompt for a correctable postcondition; ``ValueError`` if there is none."""
     if err_kind != "settings_history":
         raise ValueError(f"no correction prompt for postcondition {err_kind!r}")
 
@@ -1469,57 +1176,23 @@ def _render_correction_prompt(
         "start_sha": ctx.start_sha or "",
         "err": (err or "").strip(),
     }
-
-    def _replace(match: re.Match[str]) -> str:
-        return placeholders.get(match.group(1), match.group(0))
-
-    return re.sub(
-        r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", _replace, _SETTINGS_HISTORY_FIX_PROMPT,
-    )
+    return _fill_placeholders(_SETTINGS_HISTORY_FIX_PROMPT, placeholders)
 
 
 def _verify_postconditions(
     config: Config, repo_path: Path, ctx: AIResolveContext,
 ) -> tuple[bool, str | None, str | None, str | None]:
-    """Step-mode check: cherry-pick fully concluded, tree clean, HEAD moved.
+    """Check the operation concluded, nothing is unmerged, HEAD advanced and the registry is clean.
 
-    RelEasy itself owns push / PR / label, so we only verify Claude's
-    local-repo invariants:
-
-    - no cherry-pick / merge / rebase still in progress,
-    - working tree is clean (no unstaged conflict-resolution leftovers),
-    - the port branch advanced past ``ctx.start_sha`` (i.e. at least one
-      commit was actually made),
-    - in split mode, additionally HEAD has advanced past
-      ``ctx.pre_resolve_sha`` so the resolution lives in its own commit
-      on top of the "with conflicts" commit (Claude must not have
-      amended that one), and HEAD is not a fixup of HEAD~1 — there
-      really is a separate resolution commit,
-    - any additions to ``src/Core/SettingsChangesHistory.cpp`` are a
-      subset of the rows the source PR's own diff adds — see
-      :func:`_check_settings_history_whitelist`.
-
-    Returns ``(ok, new_head_sha, error_message, err_kind)``. ``err_kind`` is
-    a stable tag for the failure mode — ``None`` on success or for failures
-    that aren't worth re-prompting Claude about, and a member of
-    :data:`_CORRECTABLE_POSTCONDITIONS` (e.g. ``"settings_history"``) when
-    the resolution is otherwise good but trips a fixable content check that
-    :func:`resolve_with_claude` can hand back to Claude.
+    Returns ``(ok, new_head, error, err_kind)``; ``err_kind`` is set only for
+    :data:`_CORRECTABLE_POSTCONDITIONS`.
     """
     if is_operation_in_progress(repo_path):
         return False, None, (
             "cherry-pick/merge/rebase still in progress after claude exited"
         ), None
 
-    # Look only for **unmerged paths** — the unambiguous signal that the
-    # cherry-pick wasn't finished. Other dirt (modified/staged/deleted
-    # tracked files, untracked scratch in tmp/ or build/) is noise from
-    # build steps, generated headers, server runtime data, etc. — it
-    # does not invalidate a cherry-pick that was already committed
-    # (and the HEAD-advanced check below independently confirms the
-    # commit actually happened). Failing on dirty tmp files would
-    # reject legitimate resolutions, which is exactly the bug we hit on
-    # 2026-05-19 with the Iceberg PR #90740 port.
+    # Only unmerged paths count; other dirt is build/runtime noise.
     porc = run_git(
         ["status", "--porcelain", "--untracked-files=no"],
         repo_path, check=False,
@@ -1558,25 +1231,14 @@ def _verify_postconditions(
     return True, new_head, None, None
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-
 def _invoke_claude_with_retries(
     config: Config, repo_path: Path, prompt: str,
     *, timeout: int | None = None, allowed_tools: list[str] | None = None,
 ) -> tuple[int, str, bool, float | None]:
-    """Run claude on ``prompt``, retrying on transient Anthropic API errors.
+    """Run claude on ``prompt``, retrying transient API errors.
 
-    Returns ``(exit_code, output, timed_out, cost_usd)`` for the final
-    attempt. Cost is summed across attempts — each retry is a separately
-    billed turn even when only the last one succeeds. Shared by the main
-    resolve and the postcondition-correction passes so both honour
-    ``api_retries`` / backoff identically.
-
-    ``timeout`` / ``allowed_tools`` override the resolve defaults (used by
-    ``build_verify`` for the run-tests step).
+    Returns the final attempt's ``(exit_code, output, timed_out)`` plus the
+    cost summed across attempts.
     """
     spawn_timeout = (
         timeout if timeout is not None else config.ai_resolve.timeout_seconds
@@ -1598,10 +1260,7 @@ def _invoke_claude_with_retries(
                 f"(attempt {attempt}/{max_attempts}, sleeping {backoff}s)"
                 f"[/yellow]"
             )
-            try:
-                time.sleep(backoff)
-            except KeyboardInterrupt:
-                raise
+            time.sleep(backoff)
 
         exit_code, output, timed_out = _spawn_claude(
             argv, repo_path, spawn_timeout, prompt=prompt, api=api,
@@ -1639,7 +1298,7 @@ def resolve_with_claude(
             success=False, error=backend_error, api_aborted=True,
         )
 
-    # In resolve-only mode build_verify owns the build wrapper.
+    # In resolve-only mode build_verify writes the build wrapper.
     if not ctx.skip_build:
         try:
             _write_build_script(
@@ -1686,11 +1345,8 @@ def resolve_with_claude(
     tail_lines = assistant_text.strip().splitlines()[-40:] if assistant_text.strip() else []
     tail_str = "\n".join(tail_lines)
 
-    # Check MISSING_PREREQS *before* the generic UNRESOLVED check: the prompt
-    # contract is "MISSING_PREREQS: ... ; REASON: ... ; UNRESOLVED" together,
-    # so an UNRESOLVED tail line by itself doesn't disambiguate the two.
-    # Scan the full transcript (not just the tail) because Claude sometimes
-    # emits the structured marker mid-narration before its closing summary.
+    # Before UNRESOLVED (it is printed with MISSING_PREREQS too); full transcript,
+    # since the marker can come mid-narration.
     missing_prereq_prs, missing_prereq_note = _parse_missing_prereqs(output)
     if missing_prereq_prs:
         return AIResolveResult(
@@ -1730,17 +1386,10 @@ def resolve_with_claude(
 
     ok, new_head, err, err_kind = _verify_postconditions(config, repo_path, ctx)
 
-    # Corrective re-resolution: a content-correctable postcondition (today
-    # only the append-only SettingsChangesHistory.cpp whitelist) is a
-    # fixable blemish on an otherwise-good resolution. Rather than discard
-    # the whole resolve (the caller hard-resets to start_sha on failure),
-    # hand the exact error back to Claude and let it trim the offending file
-    # in place. The resolution is still committed on the branch here, so the
-    # follow-up amends it. Bounded by ``postcondition_retries``.
+    # Hand a correctable failure back to Claude to amend the committed resolution in place.
     fix_passes = max(0, config.ai_resolve.postcondition_retries)
     pass_no = 0
-    # Set when a correction pass died mid-flight (timeout / dropped turn);
-    # the loop stops and the repo is re-read once before deciding.
+    # Set when a correction pass died mid-flight (timeout / dropped turn).
     bail_note: str | None = None
     bail_timed_out = False
     while (
@@ -1753,10 +1402,8 @@ def resolve_with_claude(
                 config, repo_path, ctx, err_kind, err,
             )
         except ValueError:
-            break  # no correction prompt for this kind — fail as usual
+            break
 
-        # Count (and announce) only passes that actually invoke Claude, so
-        # ``pass_no`` is an accurate attempt count for the diagnostics below.
         pass_no += 1
         console.print(
             f"    [yellow]↻ postcondition '{err_kind}' failed — asking "
@@ -1777,12 +1424,8 @@ def resolve_with_claude(
             )
             bail_timed_out = True
             break
-        # A transient API error means the turn was dropped before Claude
-        # could act — re-prompting just burns the rest of the budget, so
-        # bail now with a diagnostic that names the real cause (the main
-        # resolve path does the same on a non-zero exit). For a non-transient
-        # exit we still re-verify: Claude may have committed the fix and then
-        # exited non-zero on an unrelated late step.
+        # A transient error dropped the turn: bail. Other non-zero exits still
+        # re-verify, since the fix may have landed before a late failure.
         if fc != 0:
             transient = _find_transient_api_error(fout)
             if transient:
@@ -1796,17 +1439,13 @@ def resolve_with_claude(
         )
 
     if bail_note:
-        # Re-read the repo before judging: a pass that died late may still
-        # have landed its amend, and the downgrade decision below must see
-        # the current state rather than the one that triggered the pass.
+        # A pass that died late may still have landed its amend.
         ok, new_head, err, err_kind = _verify_postconditions(
             config, repo_path, ctx,
         )
         if not ok:
             err = f"{err}\n({bail_note})"
     elif not ok and pass_no:
-        # Make it clear the corrective loop ran, so the surfaced error isn't
-        # mistaken for an un-attempted first-pass failure.
         err = f"{err}\n(still failing after {pass_no} correction pass(es))"
 
     if not ok:
@@ -1820,8 +1459,6 @@ def resolve_with_claude(
                 error=err, timed_out=bail_timed_out,
                 cost_usd=cost_usd_total,
             )
-        # Keep the resolution: it is complete apart from this check, and
-        # the caller flags it on the PR instead of dropping the work.
         console.print(
             f"    [yellow]⚠ postcondition '{err_kind}' is still failing — "
             "keeping the resolution anyway; it is flagged for review on "
@@ -1840,42 +1477,13 @@ def resolve_with_claude(
     )
 
 
-# ---------------------------------------------------------------------------
-# High-level wrapper used by every caller (cherry-pick + merge resolvers)
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Stand-alone text generation (changelog entry synthesis)
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class AITextResult:
-    """Outcome of a one-shot Claude text-generation call.
-
-    Used by callers (e.g. CHANGELOG entry synthesis) that just want a
-    short text back without any tool use or post-condition checks.
-    """
     success: bool
     text: str | None = None
     error: str | None = None
     timed_out: bool = False
     cost_usd: float | None = None
-
-
-def _resolve_changelog_prompt_path(config: Config) -> Path:
-    """Resolve the changelog-synthesis prompt template path.
-
-    Same convention as :func:`_resolve_prompt_template`: relative paths
-    are anchored at ``config.repo_dir`` so per-project overrides drop
-    into a ``prompts/`` directory next to ``config.yaml``.
-    """
-    raw = config.ai_changelog.prompt_file
-    p = Path(raw)
-    if not p.is_absolute():
-        p = (config.repo_dir / p).resolve()
-    return p
 
 
 def synthesize_text(
@@ -1886,20 +1494,7 @@ def synthesize_text(
     timeout_seconds: int,
     command: str,
 ) -> AITextResult:
-    """Run Claude on ``prompt`` and return the assistant's reply text.
-
-    No tools are made available — this is pure text generation. Cost is
-    extracted from the stream-json transcript when present; the call is
-    routed through :func:`_spawn_claude` so the user sees the same
-    streaming heartbeat / Ctrl-C semantics as the conflict resolver.
-
-    The CWD passed to Claude is a throwaway temp dir so it has nowhere
-    interesting to write into even if the model misinterprets the
-    no-tools constraint.
-    """
-    # Empty allow-list keeps this call in pure text-generation mode on both
-    # backends (``--allowedTools ""`` for the CLI, no tool definitions for
-    # the API).
+    """Run Claude on ``prompt`` with no tools, in a throwaway cwd, and return its reply text."""
     api, backend_error = _resolve_backend(config, command, allowed_tools=[])
     if backend_error:
         return AITextResult(success=False, error=backend_error)
@@ -1925,13 +1520,10 @@ def synthesize_text(
     import tempfile
 
     with tempfile.TemporaryDirectory(prefix="releasy-ai-text-") as td:
-        try:
-            exit_code, output, timed_out = _spawn_claude(
-                argv, Path(td), timeout_seconds, prompt=prompt, api=api,
-                **_exhaustion_kwargs(config),
-            )
-        except KeyboardInterrupt:
-            raise
+        exit_code, output, timed_out = _spawn_claude(
+            argv, Path(td), timeout_seconds, prompt=prompt, api=api,
+            **_exhaustion_kwargs(config),
+        )
 
     cost = _extract_cost_usd(output)
 
@@ -1968,23 +1560,15 @@ def synthesize_changelog_entry(
     base_branch: str,
     source_repo: str,
 ) -> AITextResult:
-    """Render the changelog-synthesis prompt and ask Claude to fill it.
-
-    Caller (``releasy.pipeline``) is responsible for building
-    ``pr_blocks`` — a markdown chunk containing each source PR's
-    title + body in cherry-pick order, already truncated to a
-    reasonable size — so the prompt template stays decoupled from the
-    project-specific PR-info dataclass.
-    """
-    prompt_path = _resolve_changelog_prompt_path(config)
+    """Render the changelog-synthesis prompt around caller-built ``pr_blocks`` and run it."""
+    prompt_path = _prompt_path(config, config.ai_changelog.prompt_file)
     if not prompt_path.exists():
         return AITextResult(
             success=False,
             error=(
                 "changelog-synthesis prompt template not found: "
                 f"{prompt_path}. Set ai_changelog.prompt_file in config "
-                "to point at a real file (or copy the bundled "
-                "prompts/synthesize_changelog.md alongside config.yaml)."
+                "to point at a real file."
             ),
         )
 
@@ -1995,12 +1579,7 @@ def synthesize_changelog_entry(
         "source_repo": source_repo,
         "pr_blocks": pr_blocks,
     }
-
-    def _replace(match: re.Match[str]) -> str:
-        key = match.group(1)
-        return placeholders.get(key, match.group(0))
-
-    rendered = re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", _replace, template)
+    rendered = _fill_placeholders(template, placeholders)
 
     return synthesize_text(
         config, rendered,
@@ -2013,18 +1592,9 @@ def synthesize_changelog_entry(
 def attempt_ai_resolve(
     config: Config, repo_path: Path, ctx: AIResolveContext,
 ) -> AIResolveResult:
-    """Render the prompt, run claude, and clean up on failure.
+    """:func:`resolve_with_claude`; on failure abort the git operation and reset to ``start_sha``.
 
-    Wraps :func:`resolve_with_claude` with the cleanup contract every
-    caller needs: on a failed resolve the in-progress git operation
-    (cherry-pick / merge / rebase) is aborted and HEAD is hard-reset to
-    ``ctx.start_sha`` so the working tree is back to a known-good state.
-    Callers (the cherry-pick step, the PR-merge updater) only need to
-    decide *what to do* on success/failure, not *how to clean up*.
-
-    If ``ctx.start_sha`` isn't set the helper fills it from the current
-    HEAD before invoking Claude, so PR-conflict-resolution callers don't
-    have to remember to capture it themselves.
+    ``ctx.start_sha`` defaults to the current HEAD.
     """
     if ctx.start_sha is None:
         head = run_git(["rev-parse", "--verify", "HEAD"], repo_path, check=False)
@@ -2035,8 +1605,6 @@ def attempt_ai_resolve(
     if result.success:
         return result
 
-    # Reset the worktree so the caller can decide what to do next without
-    # tripping over half-baked merge / cherry-pick state.
     if is_operation_in_progress(repo_path):
         run_git(["cherry-pick", "--abort"], repo_path, check=False)
         run_git(["merge", "--abort"], repo_path, check=False)
@@ -2047,11 +1615,7 @@ def attempt_ai_resolve(
     return result
 
 
-# Post-resolve verification (advisory): a read-only second Claude pass
-# that diffs the landed resolution against the source PR. Findings drive
-# a label + PR comment; never rolls back.
-
-# Read-only allowlist; Edit/Write would defeat the audit's purpose.
+# Advisory read-only verifier pass over the landed resolution.
 _VERIFY_ALLOWED_TOOLS = (
     "Read", "Glob", "Grep",
     "Bash(git:*)", "Bash(gh:*)",
@@ -2068,7 +1632,6 @@ class VerifyContext:
     port_branch: str
     base_branch: str
     source_pr: PRInfo
-    # The AI's work lives in start_sha..new_head (1 or 2 commits).
     start_sha: str
     new_head: str
     conflict_files: list[str] = field(default_factory=list)
@@ -2078,8 +1641,7 @@ class VerifyContext:
 
 @dataclass
 class VerifyResult:
-    # ``success`` is True iff the verifier RAN cleanly (any verdict);
-    # False = timeout / exit-code error / malformed transcript.
+    # True iff the verifier ran cleanly, whatever the verdict.
     success: bool
     verdict: VerifyVerdict = "unknown"
     summary: str = ""
@@ -2089,16 +1651,8 @@ class VerifyResult:
     cost_usd: float | None = None
 
 
-def _resolve_verify_prompt_path(config: Config) -> Path:
-    raw = config.ai_resolve.verify_prompt_file
-    p = Path(raw)
-    if not p.is_absolute():
-        p = (config.repo_dir / p).resolve()
-    return p
-
-
 def _render_verify_prompt(config: Config, repo_path: Path, ctx: VerifyContext) -> str:
-    prompt_path = _resolve_verify_prompt_path(config)
+    prompt_path = _prompt_path(config, config.ai_resolve.verify_prompt_file)
     if not prompt_path.exists():
         raise FileNotFoundError(
             f"Verifier prompt template not found: {prompt_path}. "
@@ -2107,7 +1661,6 @@ def _render_verify_prompt(config: Config, repo_path: Path, ctx: VerifyContext) -
 
     template = prompt_path.read_text(encoding="utf-8")
 
-    from releasy.github_ops import get_origin_repo_slug
     repo_slug = get_origin_repo_slug(config) or "<unknown>"
 
     conflict_files_md = "\n".join(f"- `{f}`" for f in ctx.conflict_files) or "- (none)"
@@ -2154,15 +1707,9 @@ def _render_verify_prompt(config: Config, repo_path: Path, ctx: VerifyContext) -
         ),
     }
 
-    def _replace(match: re.Match[str]) -> str:
-        key = match.group(1)
-        return placeholders.get(key, match.group(0))
-
-    return re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", _replace, template)
+    return _fill_placeholders(template, placeholders)
 
 
-# Match each verdict line; last occurrence wins so mid-run rephrasings
-# can't pin us to a stale answer.
 _VERIFY_VERDICT_RE = re.compile(
     r"^\s*VERDICT\s*:\s*(OK|NEEDS_ATTENTION)\s*$",
     re.IGNORECASE | re.MULTILINE,
@@ -2174,11 +1721,7 @@ _VERIFY_END_RE = re.compile(r"^\s*END_VERIFY\s*$", re.IGNORECASE | re.MULTILINE)
 
 
 def _parse_verify_output(output: str) -> tuple[VerifyVerdict, str, list[str]]:
-    """Parse VERDICT / SUMMARY / FINDINGS from a transcript.
-
-    Returns ``("unknown", "", [])`` on a malformed transcript so the
-    caller can downgrade to advisory-only.
-    """
+    """Parse VERDICT / SUMMARY / FINDINGS; verdict is ``"unknown"`` when malformed."""
     text = _extract_assistant_text(output)
 
     verdict: VerifyVerdict = "unknown"
@@ -2216,8 +1759,7 @@ def _parse_verify_output(output: str) -> tuple[VerifyVerdict, str, list[str]]:
             if m:
                 line = m.group(1).strip()
             else:
-                # First non-bullet line ends the block (stops capturing
-                # trailing narration as findings).
+                # First non-bullet line ends the block.
                 break
         if not line or line.lower() == "(none)":
             continue
@@ -2248,13 +1790,10 @@ def verify_ai_resolution(
         f"(timeout {config.ai_resolve.verify_timeout_seconds}s, read-only)[/magenta]"
     )
 
-    try:
-        exit_code, output, timed_out = _spawn_claude(
-            argv, repo_path, config.ai_resolve.verify_timeout_seconds,
-            prompt=prompt, api=api, **_exhaustion_kwargs(config),
-        )
-    except KeyboardInterrupt:
-        raise
+    exit_code, output, timed_out = _spawn_claude(
+        argv, repo_path, config.ai_resolve.verify_timeout_seconds,
+        prompt=prompt, api=api, **_exhaustion_kwargs(config),
+    )
 
     cost = _extract_cost_usd(output)
 

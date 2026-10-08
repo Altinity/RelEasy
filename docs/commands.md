@@ -1,1367 +1,447 @@
 # Command reference
 
-`releasy <command> --help` is authoritative. This page is the quick map.
-
-For the model behind these commands, see [concepts.md](concepts.md). For
-config they read, see [configuration.md](configuration.md).
+`releasy <command> --help` is authoritative; this page summarizes behavior.
+Concepts: [concepts.md](concepts.md). Config keys:
+[configuration.md](configuration.md).
 
 ## Contents
 
-- [Global options](#global-options)
-- [At a glance: which command does what](#at-a-glance-which-command-does-what)
-- Pipeline:
-  [`run`](#releasy-run) ·
-  [`refresh`](#releasy-refresh) ·
-  [`graph discover`](#releasy-graph-discover) ·
-  [`graph update`](#releasy-graph-update) ·
-  [`graph sync`](#releasy-graph-sync) ·
-  [`analyze-fails`](#releasy-analyze-fails) ·
-  [`continue`](#releasy-continue) ·
-  [Sequential mode](#sequential-mode) ·
-  [`skip`](#releasy-skip) ·
-  [`hold`](#releasy-hold) ·
-  [`unhold`](#releasy-unhold) ·
-  [`mark-reverted`](#releasy-mark-reverted) ·
-  [`abort`](#releasy-abort) ·
+- Pipeline: [`run`](#releasy-run) · [`continue`](#releasy-continue) ·
+  [Sequential mode](#sequential-mode) · [`refresh`](#releasy-refresh) ·
+  [`analyze-fails`](#releasy-analyze-fails) · [`skip`](#releasy-skip) ·
+  [`hold`](#releasy-hold) · [`unhold`](#releasy-unhold) ·
+  [`mark-reverted`](#releasy-mark-reverted) · [`abort`](#releasy-abort) ·
   [`clear`](#releasy-clear)
-- One-off porting:
-  [`cherry-pick`](#releasy-cherry-pick) ·
-  [`project-backport`](#releasy-project-backport) ·
-  [`rebase`](#releasy-rebase)
-- Inspection: [`status`](#releasy-status)
-- Multi-project:
-  [`new`](#releasy-new) ·
-  [`list`](#releasy-list) ·
-  [`where`](#releasy-where) ·
-  [`adopt`](#releasy-adopt)
-- Project board:
-  [`setup-project`](#releasy-setup-project) ·
-  [`project push`](#releasy-project-push) ·
-  [`project pull`](#releasy-project-pull)
-- Release:
-  [`release`](#releasy-release) ·
-  [`draft-release`](#releasy-draft-release)
-- Features: [`feature *`](#feature-management)
-- PR membership: [`pr *`](#pr-membership)
+- Dependency graph: [`graph discover`](#releasy-graph-discover) ·
+  [`graph update`](#releasy-graph-update) · [`graph sync`](#releasy-graph-sync)
+- One-off porting: [`cherry-pick`](#releasy-cherry-pick) ·
+  [`project-backport`](#releasy-project-backport) · [`rebase`](#releasy-rebase)
+- Projects: [`status`](#releasy-status) · [`new`](#releasy-new) ·
+  [`list`](#releasy-list) · [`where`](#releasy-where) · [`adopt`](#releasy-adopt)
+- Project board: [`setup-project`](#releasy-setup-project) ·
+  [`project push`](#releasy-project-push) · [`project pull`](#releasy-project-pull)
+- Release: [`release`](#releasy-release) · [`draft-release`](#releasy-draft-release)
+- Session editing: [`feature`](#feature-management) · [`pr`](#pr-membership)
 
 ## Global options
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--config <path>` | Path to `config.yaml` | `./config.yaml` |
-| `--session-file <path>` | Path to session file. Overrides `session_file:` in config. | `<config-dir>/<target_branch>.session.yaml` (or `<name>` when unset) |
-| `--version` | Print version and exit | — |
+| `--config`, `--config-file <path>` | Path to `config.yaml`. | `./config.yaml` |
+| `--session-file <path>` | Session file; overrides `session_file:`. | `<config-dir>/<target_branch>.session.yaml` |
+| `--version` | Print version. | — |
 
-## At a glance: which command does what
-
-| | `run` | `continue` | `refresh` | `refresh --merge-target` | `refresh --analyze-fails` | `refresh --address-review` | `analyze-fails` |
-|--|:-----:|:----------:|:---------:|:------------------------:|:-------------------------:|:--------------------------:|:---------------:|
-| Discovers new PRs | ✅ | — | — | — | — | — | — |
-| Creates new port branches | ✅ | — | — | — | — | — | — |
-| Opens new rebase PRs | ✅ new | ✅ missed | — | — | — | — | — |
-| AI-resolves cherry-pick conflicts | ✅ | — | — | — | — | — | — |
-| AI-resolves merge conflicts (target moved on) | — | — | — | ✅ | — | — | — |
-| AI-investigates failing CI | — | — | — | — | ✅ | — | ✅ |
-| AI-addresses reviewer comments | — | — | — | — | — | ✅ | — |
-| Refreshes merged/superseded state | — | — | ✅ | ✅ | ✅ | ✅ | — |
-| Iterates state entries | only skip / ensure-PR | ✅ all | ✅ all tracked | ✅ all tracked | ✅ all tracked | ✅ all tracked | ✅ all tracked |
-| Mutates work-dir | ✅ cherry-picks | ✅ push only | — | ✅ merges | ✅ commits | ✅ commits | ✅ commits |
-| Pushes to origin | ✅ | ✅ | — | ✅ (merges only) | ✅ (plain) | ✅ (plain) | ✅ (plain) |
-
-One-liners:
-
-- **`run`** — *do new work.* Discover, cherry-pick, push, open PRs.
-- **`continue`** — *I fixed something by hand; reconcile state.* Push/open
-  what's pending. No git ops beyond push + status checks.
-- **`refresh`** — *re-sync status across tracked PRs* (merged-from-upstream
-  sweep, supersede detection, label reconciliation). With
-  `--merge-target` it also merges target in and AI-resolves conflicts;
-  with `--analyze-fails` it triages failing CI; with `--address-review`
-  it lets the AI act on reviewer feedback. The three flags compose;
-  inside one invocation they run in the fixed order
-  *merge-target → analyze-fails → address-review*.
-- **`analyze-fails`** — *CI is red; let AI triage.* Iterative per-shard
-  fix loop. Also available as `refresh --analyze-fails` when you want
-  to bundle it with the other refresh passes under one lock and one
-  status-sync.
-
-> **Why both `run` and `continue`?** `run` only acts on PRs it's
-> cherry-picking right now. If you fix a conflict by hand on a branch
-> with **no rebase PR yet**, `run` either skips it (`if_exists: skip`)
-> or rebuilds from base (`recreate`). `continue` preserves your manual
-> fix and just pushes + opens the PR.
-
-[`graph discover`](#releasy-graph-discover) is a read-only diagnostic
-sibling of `run` — see its section. [`graph update`](#releasy-graph-update)
-refines that graph from issue comments (no git);
-[`graph sync`](#releasy-graph-sync) pushes port progress back to the issue
-as checkboxes (`run` / `refresh` do it for you).
-
-The rest ([`skip`](#releasy-skip), [`hold`](#releasy-hold) /
-[`unhold`](#releasy-unhold),
-[`mark-reverted`](#releasy-mark-reverted), [`abort`](#releasy-abort),
-[`status`](#releasy-status), board-sync, release, feature) never touch git
-history.
+Commands marked *stateless* need no project: only `RELEASY_GITHUB_TOKEN`.
 
 ## Pipeline
 
 ### `releasy run`
 
-*Port PRs onto the base branch.*
+Discover PRs, cherry-pick each unit onto its own branch, push, open PRs.
 
-Discovers PRs from `pr_sources`, creates port branches from
-`origin/<base>`, cherry-picks, opens PRs. AI-resolves cherry-pick
-conflicts when `ai_resolve.enabled` is on. Unresolved → singleton dropped
-or partial-group draft PR with `ai-needs-attention`. See
-[Conflict resolution](concepts.md#conflict-resolution).
-
-A **partial-group draft PR** is auto-resumed on the next `run` (with
-`retry_failed` on): the not-yet-applied PRs are appended and re-resolved,
-up to `pr_policy.max_partial_continue_attempts` (default 2) before it's
-left for manual help. No need to set `if_exists: append` by hand.
-
-Resuming takes precedence over `if_exists: recreate` — an exhausted or
-timed-out resolver is not a reason to discard the PRs that did land. The
-redo cases are the terminal ones: a rebase PR **closed without merging**
-becomes `status: closed` and is rebuilt from base on a renumbered branch
-(`pr_policy.recreate_closed_prs`), and a conflict on the *first*
-cherry-pick has nothing to keep. Set
-`pr_policy.max_partial_continue_attempts: 0` to opt out and get plain
-`if_exists` handling back. A `build_failed` branch (resolution landed, the
-build/test loop didn't pass) resumes on the same terms, bounded by
-`ai_resolve.max_verify_resume_attempts` — unless it has fallen more than
-`ai_resolve.max_resume_base_drift` commits behind base, which re-ports it
-from base rather than building stale code. A build that never reaches the
-compiler (missing build dir, broken toolchain) is an environment fault: it
-spends no fix attempt and no resume.
-
-A unit parked on a **[stall](concepts.md#stall-reasons)** that cannot clear on
-its own — waiting for another unit's PR to merge, or on a prereq nobody ports
-— is skipped rather than re-resolved: the verdict would be the same at full
-token price. A resolution that reached a dead end — the resolver gave up,
-or the prereq dive ran out of road — is retried
-`ai_resolve.max_dead_end_attempts` times and then parked the same way.
-The skip lifts by itself once what it waits on moves. Use
-`--ignore-stalls` (or `pr_policy.honor_stall_reasons: false`) to force the
-retry anyway.
-
-For PRs with an existing rebase PR, `run` doesn't rebuild — it routes
-through the same merge-target flow [`refresh`](#releasy-refresh) uses:
-clean merge → leave alone; conflict → AI-resolve and plain push (never
-force). New commits are cherry-picked on top of an existing PR only with
-`if_exists: append`, or for a group that gained members after its PR was
-opened — those are appended whatever `if_exists` says.
-
-**Redo one unit from scratch** with `--only <id> --redo` (or `--pr <URL>
---redo`). Its state entry is dropped, so stalls, resume / retry counters
-and partial-group bookkeeping start over. If it has a port PR, an open one
-is closed (with a "Superseded" comment) and the unit is rebuilt from base
-on a renumbered branch (`<id>-1`, `-2`, …) with a fresh PR; without a PR,
-its recorded branch is rebuilt from base in place. The old PR is closed
-before the re-port starts — a failed re-port does not reopen it. Refused
-for a merged port (unless it was [`mark-reverted`](#releasy-mark-reverted))
-and in sequential mode. Every other unit is untouched.
-
-**Outdated ports are redone automatically.** When a PR leaves a unit that
-already has an in-flight port (vetoed via [`pr remove`](#pr-membership) or a
-[`graph update`](#releasy-graph-update) comment, or moved to another unit by
-[`graph discover`](#releasy-graph-discover) / `graph update`), the port is
-marked **outdated** with the reason. The next `run` re-ports it exactly as
-`--redo` would, no flag needed; the graph issue shows `♻ outdated` until
-then. Merged, closed and other terminal ports are never marked.
-
-**A standalone PR folded into a group** stops being its own unit: `run` (and
-[`continue`](#releasy-continue)) drops its state entry and, if its port is
-still in flight, closes its open port PR as superseded by the group — the
-group's combined PR is then the only port of it. A port PR already merged
-or closed on GitHub is left alone, and so is one whose new group is
-[on hold](#releasy-hold). The old branch stays on origin.
-
-```bash
-releasy run [--onto <ver>] [--work-dir <path>]
-            [--resolve-conflicts | --no-resolve-conflicts]
-            [--retry-failed | --no-retry-failed]
-            [--merge-target | --no-merge-target]
-            [--only <url-or-id> | --pr <URL>] [--redo]
-            [--ignore-stalls] [--dry-run]
-```
+- Conflicts are AI-resolved when `ai_resolve.enabled`; otherwise see
+  [Conflicts](concepts.md#conflicts).
+- Units with an open rebase PR are not rebuilt: the base is merged in (pushed
+  only on conflict, or always with `--merge-target`; never force-pushed). New
+  commits are added only with `if_exists: append` or for a group that gained
+  members.
+- Partially applied groups and `build_failed` branches are resumed, bounded by
+  `pr_policy.max_partial_continue_attempts` and
+  `ai_resolve.max_verify_resume_attempts` / `max_resume_base_drift`.
+- Units with a blocking [stall](concepts.md#stall-reasons) are skipped.
+- A unit marked **outdated** (a PR left it via `pr remove`, a graph veto, or
+  regrouping) is re-ported as with `--redo`.
+- A standalone PR folded into a group loses its own entry; its in-flight port
+  PR is closed as superseded by the group's PR.
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--onto <ver>` | Version label for derived base name. Naming-only — never resolved as a git ref. | from `target_branch` |
-| `--work-dir <path>` | Working dir for git ops. | config / cwd |
-| `--resolve-conflicts` / `--no-resolve-conflicts` | Kill-switch for AI resolver. AI runs only if both this and `ai_resolve.enabled` are true. | on |
-| `--retry-failed` / `--no-retry-failed` | Re-attempt entries in `conflict` status. No-PR-yet: rebuild from base (only when `if_exists: recreate`). PR open: merge-target flow (PR always preserved). | `pr_policy.retry_failed` |
-| `--merge-target` / `--no-merge-target` | Push a merge commit on PRs even without conflicts. Never force-pushes. | off |
-| `--only <url-or-id>` | Single PR URL **or** group/singleton id. Drops everything else. **Non-zero** if nothing matches. Mutex with `--pr`. | — |
-| `--pr <URL>` | Single PR by URL. Exits **cleanly (0)** when the PR isn't in session scope. Use from webhook/cron callers. Mutex with `--only`. | — |
-| `--redo` | Re-port the `--only` / `--pr` unit from scratch: drop its state; close its open port PR and rebuild on a renumbered branch, or rebuild its PR-less branch in place. Refused for a merged port and in sequential mode. Requires `--only` or `--pr`. | off |
-| `--ignore-stalls` | Re-attempt units parked on a [stall](concepts.md#stall-reasons) that can't clear by itself (waiting for another unit's PR to merge, on a prereq nobody ports, or a conflict whose re-resolution attempts are spent). | off |
-| `--dry-run` | No writes anywhere (state / git / GitHub). Read-only fetches still happen; cannot predict cherry-pick conflicts. | off |
-
-Exit: `1` on any `conflict` (in scope), else `0`.
-
-### `releasy refresh`
-
-*Maintenance pass over tracked PRs.*
-
-**Never opens PRs, never discovers, never cherry-picks.** Status sync
-always runs (catch merges/closes upstream, supersede sweep,
-merged-label apply, session-label reconcile). The three branch-mutating
-passes are opt-in via flags — bare `refresh` only re-syncs state.
-
-**`--merge-target`** — for each tracked PR, merge `origin/<base>`
-into the PR branch via `git merge --no-ff`:
-
-- **clean** → push the merge commit (you opted in)
-- **conflict + AI resolves** → push, restore status, set `ai_resolved`
-- **conflict + AI gives up** → reset local, mark `conflict`
-
-**`--analyze-fails`** — for each tracked PR, walk every failed status
-entry on the PR's head SHA (praktika and TestFlows regression reports
-alike), bundle the failing tests per shard, and let Claude run the
-iterative fix-build-rerun loop. Same
-machinery as the standalone [`analyze-fails`](#releasy-analyze-fails)
-command — see that section for outcome classifications, flaky-elsewhere
-heuristic, and config. Per-PR sub-flags: `--no-flaky-check`,
-`--no-baseline-check`, `--post-comment` / `--no-post-comment`.
-
-**`--address-review`** — for each tracked PR, fetch comments and let
-the AI append fix commits. Filters compose: trust gate
-(`trusted_associations` by default, plus any `trusted_reviewers`)
-+ `--since` + dropped if hidden (minimized/outdated) +
-kept only when the inline thread is unresolved or the top-level
-comment has no later reply by the PR author. Linear history only —
-append commits, never amend/rebase/force-push. Stateful
-`last_review_addressed_at` stamp drives implicit re-run `--since` on
-tracked PRs.
-
-All three flags compose. Inside one invocation the phase order is
-fixed:
-
-```
-status sync → merge-target → analyze-fails → address-review
-```
-
-PRs left in `conflict` by the merge phase skip both subsequent passes.
-The ordering exists because `analyze-fails` reads commit statuses
-tied to the *current* head SHA — any push that lands first
-(merge-target, address-review) would invalidate the CI report it
-consumes.
-
-Uses `ai_resolve.merge_prompt_file` for conflicts,
-`analyze_fails.prompt_file` for CI triage, and
-`review_response.prompt_file` for review feedback. Suitable for cron.
-Note that [`run`](#releasy-run) also applies the merge flow to PRs
-with its own `--merge-target` — explicit `refresh` is mainly for
-cron cadence, CI triage, and the review pass.
-
-```bash
-releasy refresh [--pr <URL>]
-                [--work-dir <path>]
-                [--resolve-conflicts | --no-resolve-conflicts]
-                [--merge-target | --no-merge-target]
-                [--analyze-fails | --no-analyze-fails]
-                [--no-flaky-check] [--no-baseline-check]
-                [--post-comment | --no-post-comment]
-                [--address-review | --no-address-review]
-                [--only <url-or-id>]
-                [--dry-run]
-                [--stateless ...]
-```
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--pr <URL>` | Operate on one PR by URL. **Stateful mode** silently exits (0) when the URL isn't tracked in this session. **Stateless mode** (`--stateless`) acts on any PR. Required with `--stateless`. | walk every tracked PR |
-| `--work-dir <path>` | Working dir. | config / cwd |
-| `--resolve-conflicts` / `--no-resolve-conflicts` | Toggle AI resolver (only meaningful with `--merge-target`). | on |
-| `--merge-target` / `--no-merge-target` | Merge `origin/<base>` into PR branches + push. | off |
-| `--analyze-fails` / `--no-analyze-fails` | Run the AI CI-triage pass on each in-scope PR. | off |
-| `--no-flaky-check` | (with `--analyze-fails`) skip flaky-elsewhere cross-check. | off |
-| `--no-baseline-check` | (with `--analyze-fails`) skip the pre-change comparison against the target branch. | off |
-| `--post-comment` / `--no-post-comment` | (with `--analyze-fails`) post per-PR summary comment. | `analyze_fails.post_comment_to_pr` |
-| `--address-review` / `--no-address-review` | Run the AI review-feedback pass. Needs at least one trust source — `review_response.trusted_associations` (defaults to OWNER/MEMBER/COLLABORATOR/CONTRIBUTOR) or `review_response.trusted_reviewers`. Refuses only if both are empty. | off |
-| `--only <url-or-id>` | Single tracked PR (URL — source or rebase) or feature/group id. | — |
-| `--dry-run` | No writes anywhere; print intended actions. | off |
-| `--stateless` | Skip session/state. Requires `--pr`. | off |
-
-Stateless-only overrides: `--origin`, `--build-command`,
-`--claude-command`, `--prompt-file`, `--timeout`, `--max-iterations`.
-Rejected without `--stateless`.
-
-Exit: `1` if any PR ended up in `conflict`, any address-review run
-failed, or any analyze-fails per-PR run errored — else `0`.
-
-### `releasy graph discover`
-
-*Auto-discover PR groups (and optionally post them as an issue).*
-
-Walks candidates **oldest-merged first**, trial-cherry-picking each onto the
-target in a scratch worktree. A real (non-cosmetic) conflict means the PR
-continues an earlier one, so the two are **grouped**: every connected set of
-such PRs collapses into one combined unit, cherry-picked together in
-**apply order** (prerequisite first). Cosmetic conflicts (whitespace, comment
-drift, independent regions) are *not* grouped — they port standalone and are
-resolved trivially at run time. Writes a deps overlay at
-`<session-stem>.deps.yaml` (multi-PR `auto_discovered` groups, `sort: listed`)
-that [`run`](#releasy-run) picks up. Main session is never modified.
-
-With `--open-issue` it posts the result as a GitHub issue on origin — each
-group shown as a numbered apply sequence, every entry with a progress
-checkbox — so the team can review and steer it via
-[`graph update`](#releasy-graph-update) and track what's ported via
-[`graph sync`](#releasy-graph-sync). Re-running `--open-issue` updates the
-same issue, not a duplicate, and keeps the checkboxes.
-
-Declared `pr_sources.groups[]` are treated as **single super-nodes** —
-discovery never subdivides or auto-merges them (it only warns if one shares a
-dependency with other PRs).
-
-```bash
-releasy graph discover [--onto <ver>] [--work-dir <path>]
-                       [-o <path>] [--deps-file <path> | --no-write]
-                       [--no-ai] [--max-depth <N>] [--limit <N>]
-                       [--include-already-merged] [--redo]
-                       [--open-issue] [--issue-title <text>]
-```
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--redo` | Re-discover from scratch, ignoring the prior graph. By default a re-run reuses every already-discovered unit and only trial-picks PRs new since the last run (see **Incremental re-runs**). | off |
-
-| Output | Where | Override |
-|--------|-------|----------|
-| Diagnostic report (always written) | `<config-dir>/graph.<base>.yaml` | `-o <path>` |
-| Deps overlay (consumed by `run`) | `<session-stem>.deps.yaml` | `pr_sources.deps_file:` in session, or `--deps-file <path>`, or `--no-write` to skip |
-| Graph issue (with `--open-issue`) | a new/updated issue on origin | `--issue-title <text>`; labels = `graph.issue_labels` + target-branch name |
-
-`--no-write` and `--deps-file` are mutually exclusive. So are `-o` and
-`--open-issue` — the tracked report must stay at the default path so
-`graph update` can find it.
-
-**Hybrid AI flow per conflict:**
-
-1. **Deterministic** — `git log target..source -- <file>` →
-   `Source-PR:` trailers + merge-containment → candidate unit IDs. A PR a
-   unit carries inside a combined port (its body's `Cherry-picked from …`)
-   resolves to that unit too, so a prereq naming the original PR — not the
-   port that brings it — still lands on the right dependency.
-2. **Candidates found** → ask Claude (text-only, no tools) to
-   confirm/refine. `discovery_method: git-graph+claude`.
-3. **No candidates** → invoke full AI resolver (tools, builds). Outcomes:
-   `MISSING_PREREQS:` → those become deps (`ai-resolve`); resolver
-   succeeds → no deps needed (`ai-resolve-clean`); resolver fails →
-   empty deps + warning (`git-graph`).
-4. **Always reset** the scratch worktree.
-
-`--no-ai` skips both AI steps. Trade-off: fast/free but the deterministic
-mapping misses semantic dependencies.
-
-**Port-branch caching:** trial-pick results are preserved as
-`feature/<base>/<unit_id>` and reused by [`run`](#releasy-run) via
-`if_exists: skip` — no re-cherry-pick. This covers **standalone** PRs and
-**auto-discovered groups**: a group's combined branch `feature/<base>/<group-id>`
-is built (members cherry-picked in apply order, cross-repo commits fetched as
-needed) and cached when it applies cleanly. A group that conflicts combined — or
-whose commits can't be fetched — isn't cached (`run` rebuilds and resolves it).
-User-declared `pr_sources.groups[]` are not combined-cached. `--no-write`
-disables caching (true dry-run).
-
-**Upstream-backport recursion** (opt-in): when a **cross-repo** PR
-(`repo_slug` ≠ origin) conflicts on a prerequisite that isn't among the
-candidates, and `ai_resolve.auto_add_prerequisite_prs.enabled` is set with an
-`upstream` remote configured, the prerequisite PR is fetched from `upstream`,
-added to the candidate set, trial-picked, and folded into the same group
-(prerequisite first). Recurses on the prereq's own prereqs, bounded by
-`--max-depth` (default `max_prereq_depth`). Without those settings — or if the
-upstream commit can't be fetched — it's flagged `missing-prerequisites`.
-
-**Round-trip notes:**
-
-- Groups are emitted as multi-PR `auto_discovered` entries (`sort: listed`,
-  prerequisite first). Move an entry into the main session (drop
-  `auto_discovered:`) to make it permanent.
-- An `auto_discovered` group read back on a later run stays auto-owned (it is
-  re-emitted to the overlay, and may grow if a new PR traces into it; `run`
-  appends a new member onto the group's open PR). Session
-  groups are never rewritten here; `graph update` reconciles those in place,
-  creating the session entry if it's missing.
-- Re-running rewrites the deps file from scratch — hand-edits are lost; use
-  `--no-write` / `--deps-file <path>` to redirect.
-- `depends_on` on a **session** group is an input as well as an output: the
-  edge is re-applied even when this run's trial-pick didn't re-derive it.
-  Overlay (`auto_discovered`) edges are not replayed — discovery must be able
-  to drop one once the prerequisite lands in the base branch.
-
-**Re-scanning for new PRs:** just re-run `graph discover` — there is no
-`graph refresh`. It re-queries `pr_sources` (labels etc.) fresh each run, so
-PRs that newly match are picked up and PRs that landed in target drop out; the
-summary prints a refresh-diff (`refresh: N removed [...] · M added [...]`).
-
-**Incremental re-runs (default):** a re-run **reuses every unit already in the
-prior `graph.<base>.yaml`** — standalone PRs *and* groups — and only trial-picks
-PRs that are new in `pr_sources` since the last run (skipping their re-pick,
-prereq-tracing, and AI). A reused group is rebuilt from its recorded members; a
-brand-new PR that conflicts into a member **attaches** to that group. A PR that
-was re-merged (same URL, new SHA) or that dropped out of the candidate set is
-re-discovered, not reused.
-
-Pass **`--redo`** to ignore the prior graph and trial-pick everything from
-scratch.
-
-After writing the deps overlay, discovery marks any tracked in-flight port
-that carries a PR its unit no longer has as **outdated** — the next
-[`run`](#releasy-run) re-ports it from scratch.
-
-When `origin/<base>` has **moved** since the last run, discovery still reuses
-the prior groupings but treats cached branches as stale: reused units are
-emitted `cached: false` (so `run` re-picks them onto the new tip) and a warning
-nudges you toward `--redo`. The refresh-diff (`refresh: N removed · M added`)
-still reports what changed either way.
-
-Exit: `0` regardless of conflicts found — read-only diagnostic.
-
-### `releasy graph update`
-
-*Refine the discovered graph from trusted member comments on its issue.*
-
-Feeds new trusted comments on the graph issue (from
-[`graph discover --open-issue`](#releasy-graph-discover)) to Claude with the
-prior graph and rebuilds the graph from the reply. **No git, no trial-picks.**
-
-A member can ask for any change in prose; Claude decides:
-
-- **add** a PR ("also port #2000");
-- **veto** a PR ("don't port #1010") → recorded, and (unless
-  `graph.apply_exclusions: false`) added to `exclude_prs` so
-  [`run`](#releasy-run) skips it;
-- **hold** a PR ("park #2234 until the follow-up lands") → added to
-  `pr_sources.on_hold`. Not a veto: the unit stays in the graph with its
-  edges, [`run`](#releasy-run) skips it, and the issue lists it under
-  **On hold**;
-- **release** a held PR ("#2234 can go ahead now") → dropped from
-  `on_hold`, ported on the next [`run`](#releasy-run);
-- **regroup** into an atomic unit, or **reorder** via `depends_on`.
-
-A veto or regroup that takes a PR out of a unit already being ported marks
-that port **outdated**: the next [`run`](#releasy-run) re-ports the unit
-from scratch without it (closing its open port PR, if any). The summary
-comment lists the outdated ports.
-
-A PR added here was never trial-picked, so its dependencies are whatever the
-reply declared — usually nothing. Such units are marked
-`discovery_method: graph-update-unanalysed` and warned about; run
-[`graph discover`](#releasy-graph-discover) before [`run`](#releasy-run) to
-analyse them, or declare `depends_on` in the comment.
-
-```bash
-releasy graph update [--onto <ver>] [--since <iso>] [--work-dir <path>]
-                     [--post-comment | --no-post-comment] [--dry-run]
-```
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--onto <ver>` | Base branch; must match the `graph discover` value. | `target_branch` |
-| `--since <iso>` | Only ingest comments after this ISO-8601 timestamp. | stored last-ingest watermark |
-| `--work-dir <path>` | Locate config / report; no git ops run. | config / cwd |
-| `--post-comment` / `--no-post-comment` | Summary comment on the issue after applying. | `graph.post_comment` |
-| `--dry-run` | Show the rebuilt graph + intended session edits; write nothing. | off |
-
-**Trust gate.** Only comments whose `author_association` is in
-`graph.trusted_associations` (default `OWNER, MEMBER, COLLABORATOR`) or whose
-login is in `graph.trusted_reviewers` reach Claude. RelEasy's own comments
-are skipped.
-
-**Addressed comments** are collapsed as **Outdated** (unless
-`graph.minimize_addressed_comments: false`); comments Claude ignored or
-couldn't action (questions, 👍) stay visible so a human sees what's pending.
-
-**Holds are replace-not-merge.** The reply's `on_hold` list becomes the new
-`pr_sources.on_hold` in full — that is what lets a comment put a PR back in
-work by leaving it out. A reply that omits the key entirely changes no
-holds; an explicitly empty list releases every one. You can also edit
-`pr_sources.on_hold` by hand — the next write of the issue (any `run`,
-`graph sync` or `graph update`) moves the unit into or out of the **On
-hold** section to match.
-
-Rewrites the report, deps overlay, and session (`include_prs` /
-`exclude_prs` / `on_hold`), and refreshes the issue. Deps here are AI/human-asserted, not
-trial-pick-verified — re-run `graph discover` for verified deps.
-
-Exit: `0` on success or clean no-op; `1` on fetch error, malformed reply,
-dependency cycle, or a session edit that couldn't be applied.
-
-### `releasy graph sync`
-
-*Refresh the graph issue's progress checkboxes from the pipeline state.*
-
-Re-renders the issue from [`graph discover
---open-issue`](#releasy-graph-discover) with live progress: every unit and
-every PR inside a group gets a checkbox, annotated with the unit's status and
-a link to the port PR releasy opened. **No git, no AI, no comment ingest** —
-cheap enough to run any time.
-
-```bash
-releasy graph sync [--onto <ver>] [--dry-run]
-```
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--onto <ver>` | Base branch; must match the `graph discover` value. | `target_branch` |
-| `--dry-run` | Show what would be posted; don't touch the issue. | off |
-
-**A box is ticked once releasy has opened the port PR** — including the draft
-PR of a partially-applied group, where the group's member PRs are ticked up to
-the pick that conflicted (`🔴 conflict · 1/3 picked`). A `closed` (unmerged)
-PR unticks the box again; `superseded` counts as done. Markers:
-
-| Marker | Meaning |
-|--------|---------|
-| `✅ merged` | Port PR merged into the target branch |
-| `🟡 in review` | Port PR open |
-| `🟠 branch pushed, no PR yet` | Branch on origin, PR not opened |
-| `🚧 build failed` | Resolved locally; build/tests retried next run |
-| `🔴 conflict` | Unresolved (`· n/m picked` for a partial group) |
-| `⏸ blocked` | Waiting on `depends_on` units (named inline) |
-| `⛔ PR closed unmerged` · `♻ superseded` · `⏭ skipped` | Terminal |
-| `↩ reverted (do not re-port)` | Merged, then reverted on target — terminal |
-| `⬜ not started` | No state entry yet |
-
-**Each group is a foldable `<details>` block** headed by its unit ID, PR count
-and status marker. Merged (and `superseded`) groups are folded shut — the work
-is done, there's nothing to read; everything else stays expanded. Standalone
-PRs are one line each and stay plain checkboxes.
-
-**↩ Reverted** is its own section, and the only one at the bottom that is
-**not** folded: these units were ported, merged, and then reverted on the
-target branch deliberately ([`releasy mark-reverted`](#releasy-mark-reverted)).
-A revert is a decision someone made *after* the port landed, so it does not
-belong in Discarded — where everything was dropped by releasy itself — and
-anyone about to re-port the change has to read it first. Entries carry the
-recorded reason and a link to the port PR, and don't count as ported: the
-change is not in the target branch.
-
-Two foldables sit below it, **both shut by default**:
-
-**🗑 Discarded** collects every unit releasy will do no more work on, moved
-out of the lists above and listed with the marker that says why — `⛔ PR
-closed unmerged`, then `⏭ skipped` (explicit `releasy skip`, or an implicit
-drop such as an empty cherry-pick), then `♻ superseded`. Entries carry no
-checkbox: nothing there is on the working list. None of them count as
-*ported* — that tally measures what releasy itself landed, and a superseded
-unit shipped via somebody else's PR — but they all still appear in the
-per-status breakdown, so the totals stay whole. Units that discovery dropped
-before they reached the graph (already present in the target branch) are
-listed as bare IDs at the end of the same section — the report keeps no PR
-URLs or titles for them — and counted separately in its header.
-
-**🚫 Excluded** is the PRs vetoed by members in issue comments.
-
-A unit that stopped short also carries **why**, after the port-PR link:
-
-```
-🔴 conflict · 1/3 picked #2146 · ⏳ waiting for `auto-grp-pr-1687` to merge
-```
-
-That is the [stall reason](concepts.md#stall-reasons) from the pipeline state,
-with `(×N runs)` once it has survived more than one run. `⏸ blocked` and
-`⏭ skipped` already spell their reason out in the marker and don't repeat it.
-
-`run` and `refresh` do this automatically at the end — set
-`graph.sync_progress: false` to turn that off and drive it manually. Ticking a
-box by hand in the GitHub UI is not read back; the next sync overwrites it.
-
-Exit: `0` on success; `1` when there is no graph report, the graph has no
-issue, or the issue edit failed.
-
-### `releasy analyze-fails`
-
-*Investigate red CI on a PR (or every tracked PR).*
-
-> Also available as **[`refresh --analyze-fails`](#releasy-refresh)** — same
-> per-shard fix loop, runs alongside `--merge-target` / `--address-review`
-> under a single project lock. Prefer the refresh form when you want a
-> bundled cron pass; reach for standalone `analyze-fails` when CI triage
-> is the only thing you're doing.
-
-Walks **every** failed commit-status entry on the PR's head SHA and reads
-whichever report its `target_url` points at:
-
-- the **praktika** JSON viewer (`json.html?…` → sibling
-  `result_<task>.json`) — Fast test, Quick functional tests, Stateless,
-  Integration, and every other in-repo job;
-- a **TestFlows** `report.html` — the `Regression <arch> <suite>` checks,
-  whose failures come from the sibling `fails.log.txt`. Only the deepest
-  failing scenarios are kept (TestFlows also reports every enclosing
-  feature and module), and `Known`/`XFail` entries are excluded.
-
-Every failed check ends up in exactly one of three places, so none can
-go missing:
-
-- **A shard of its own.** Checks with no per-test results — a build,
-  packaging, image or scan check, a job killed before its test phase, a
-  `target_url` that is only a job log — become a one-record *job-level*
-  shard carrying the failure reason, the status description and the
-  report URL. Its prompt says to read the log rather than run a suite,
-  and its name never reaches a test runner. Turn this off with
-  [`analyze_fails.job_level_failures: false`](configuration.md#key-options).
-- **Covered by another shard.** The same test failing in several shards
-  is investigated once; a check whose failures all duplicate another's
-  is listed as covered there (console and PR comment) instead of
-  vanishing from the shard count.
-- **A warning with the reason.** Only the workflow-level rolled-up `PR`
-  status lands here — the per-job statuses cover it.
-
-Narrow the sweep with
-[`analyze_fails.categories`](configuration.md#key-options) — e.g. drop
-`regression`, which needs the external
-[`Altinity/clickhouse-regression`](https://github.com/Altinity/clickhouse-regression)
-repo to reproduce.
-
-Per failed shard, bundles all failures into a single Claude invocation
-that runs iteratively: triage → pick highest-leverage root cause → fix →
-build → re-run still-failing tests in one batch → repeat (up to
-`max_iterations`). Each shard's prompt carries a category-specific
-reproduction recipe and triage prior; categories with no recipe are
-handed over with instructions to find the job definition first.
-
-#### Baseline: what was red before the change
-
-Before triaging, `analyze-fails` reads the **last CI run on the target
-branch that predates the PR's diff** and compares it against the PR's
-failures. That run is found by walking back from the merge base until a
-commit with CI statuses turns up — most release-branch commits are
-GitHub merge commits no workflow ever ran on, while a merged PR's own
-head commit carries a full run. Runs that never exercised the checks
-this PR failed are passed over for an older one that did (a run with no
-Fast test check answers nothing about a Fast test failure); when that
-happens the prompt says so, since "new since baseline" then also admits
-"broken by something merged after the baseline". Up to
-[`baseline_scan_commits`](configuration.md#key-options) commits are
-tried — only the chosen run's reports are fetched, the rest cost one
-status call each. `--no-baseline-check` (or `baseline_check: false`)
-skips the pass.
-
-Every failure is then labelled in the prompt:
-
-| Verdict | Meaning |
-|---------|---------|
-| **pre-existing** | Already red at the baseline commit. The PR's diff isn't in that commit, so it cannot be the cause — `[unrelated]`, no edits, no reproduction runs. |
-| **new since baseline** | Did not fail there, and its category did run. The prime suspects; where the build budget goes. |
-| **baseline says nothing** | The baseline run never ran that check. Falls back to the diff and flaky-elsewhere. |
-
-A shard with nothing new since the baseline is told to verify the
-comparison and report `UNRELATED` without building. Baseline evidence
-outranks the category prior and the flaky-elsewhere annotation — it is a
-direct observation of the same test on the same branch without this PR's
-diff, not a heuristic. On Altinity/ClickHouse#2210 it accounts for 377 of
-385 failures.
-
-One baseline is decoded per merge base and reused across every PR cut
-from it, so a multi-PR refresh pays for it once.
-
-A **flaky-elsewhere map** cross-references failures across other tracked
-PRs (`flaky_elsewhere_threshold` default 2) so master-side flakes that
-postdate the baseline still get classified `UNRELATED` instead of fix
-attempts.
-
-Per-shard outcomes:
-
-| Outcome | Meaning |
-|---------|---------|
-| `DONE` | Every test now passes (or confirmed flake). |
-| `PARTIAL` | Some fixed; some still failing or unexplored. Common. |
-| `UNRELATED` | Whole shard is master-side flake. No code changes. |
-| `UNRESOLVED` | Couldn't make progress. |
-
-#### Second opinion: auditing the outcome
-
-One session's judgement decides whether code lands on someone's PR, so
-a **second, independent session audits the outcome** — a fresh context
-with read-only tools, given the commits, the failure list with baseline
-verdicts, and the first session's claims (framed as claims to check,
-not as evidence). It asks four questions:
-
-- Do the commits **fix** anything, or **neuter** the test — weakened or
-  deleted assertions, a reference file rewritten to match whatever the
-  binary now prints, a widened tolerance, a retry around a real bug?
-- Does every edit **trace to a listed failure**, or is something out of
-  scope — including code edited for a failure that predates the PR?
-- Does the verdict **match the evidence**: `UNRELATED` over a
-  new-since-baseline failure needs a concrete stated reason, and `DONE`
-  needs a re-run that actually happened.
-- Is the branch **append-only**?
-
-It runs only on shards **in doubt**, so it doesn't double the bill:
-
-| Shard | Audited? |
-|-------|----------|
-| Committed code | **Yes** — a commit is about to be pushed on one session's say-so |
-| `UNRELATED`/`DONE` while a failure passed at the baseline and fails on no other tracked PR | **Yes** — the verdict contradicts the evidence |
-| No commits, every failure pre-existing at baseline | No — already evidenced |
-| `UNRESOLVED`, nothing committed | No — no conclusion to audit; a human is needed either way |
-
-**A dispute sends the shard back.** The audit's findings go to a fresh
-investigator, which starts from the disputed round's tip — so the
-commits under objection are still there to `git revert` (append-only,
-never a rewrite). It is told to revert what the audit called neutering
-or out-of-scope, re-triage what the audit called unevidenced, and, if
-it still believes the previous conclusion, to say so with the evidence
-that answers the finding. Standing its ground is allowed; ignoring the
-finding is not. Each round is audited in turn, capped by
-`analyze_fails.max_investigation_rounds` (default 2 — one redo). Set it
-to `1` for advisory-only.
-
-The audit never acts on its own: no automatic revert, no blocked push.
-A dispute still standing after the last round labels the PR
-[`ai-needs-verify`](configuration.md#key-options), turns the run's
-verdict into `DISPUTED`, and puts the findings in the comment for a
-human to judge. A dispute a redo settled leaves no label — the rejected
-round stays in the comment as `REDONE`, with its findings, so the trail
-is visible. An audit that times out or returns no parsable verdict
-leaves that round's verdict standing, with a warning.
-
-The one thing it *does* block: if the read-only auditor is caught
-modifying the work-dir (its `Bash(git:*)` grant is broad enough to
-commit), the PR is not pushed at all — what would be pushed is no
-longer what was audited.
-
-Turn it off with `analyze_fails.verify_outcome: false`.
-
-The failed-test list lands at `.releasy/failed-tests.txt` for the AI to
-read. Anthropic spend rolls into `ai_cost_usd` (same field as `run` /
-`refresh`) and surfaces on the board's
-[`AI Cost`](configuration.md#what-gets-synced) column.
-
-```bash
-releasy analyze-fails [--pr <URL>] [--work-dir <path>]
-                      [--dry-run]
-                      [--push | --no-push]
-                      [--no-flaky-check] [--no-baseline-check]
-                      [--post-comment | --no-post-comment]
-                      [--only <url-or-id>]
-                      [--stateless ...]
-```
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--pr <URL>` | PR on origin. Omit to iterate every tracked PR with a `rebase_pr_url`. | — |
-| `--work-dir <path>` | Working dir. | config / cwd |
-| `--dry-run` | List failed tests, baseline verdicts + flake counts, exit. No Claude, no push. | off |
-| `--push` / `--no-push` | Push AI commits. Plain push, no force; race aborts. | on |
-| `--no-flaky-check` | Skip flaky-elsewhere assessment. | off |
-| `--no-baseline-check` | Skip the pre-change comparison (see [Baseline](#baseline-what-was-red-before-the-change)). | off |
-| `--post-comment` / `--no-post-comment` | Per-PR summary comment with outcomes + commit list. | `analyze_fails.post_comment_to_pr` |
-| `--only <url-or-id>` | Single tracked PR / feature / group. Mutex with `--pr` and `--stateless`. | — |
-| `--stateless` | Skip session/state/lock; act on `--pr` alone. `config.yaml` still loaded if present. | off |
-
-Stateless-only overrides: `--origin`, `--build-command`, `--claude-command`,
-`--prompt-file`, `--timeout`, `--max-iterations`, `--max-prs`.
-
-Custom Claude allowlists for test runners go in `config.yaml`. Use
-`{work_dir}` (alias `{repo_dir}`, `{cwd}`) so paths aren't hard-coded:
-
-```yaml
-analyze_fails:
-  allowed_tools:
-    - Read
-    - Bash(git:*)
-    - Bash(tests/clickhouse-test:*)
-    - Bash({work_dir}/build/programs/clickhouse:*)
-```
-
-Exit: `1` on any per-PR failure (fetch / push race / non-linear history);
-`0` otherwise even if everything is `UNRELATED`.
-
-> **Linear history only** — same as `refresh --address-review`. Append
-> commits only. To retract: `git revert <sha>`.
+| `--onto <ver>` | Version label for the derived base name; not a git ref. | `target_branch` |
+| `--work-dir <path>` | Working dir for git. | config / cwd |
+| `--resolve-conflicts` / `--no-resolve-conflicts` | AI resolver (also needs `ai_resolve.enabled`). | on |
+| `--retry-failed` / `--no-retry-failed` | Re-attempt `conflict` entries. | `pr_policy.retry_failed` |
+| `--merge-target` / `--no-merge-target` | Push a base merge into open PRs even without conflicts. | off |
+| `--only <url-or-id>` | One PR URL or unit id (`pr-123`, group id). Exit 1 if no match. | — |
+| `--pr <url>` | One PR by URL; exit 0 if not in scope (for webhooks/cron). Mutex with `--only`. | — |
+| `--redo` | With `--only`/`--pr`: drop the unit's state, close its open port PR and rebuild on a renumbered branch (or rebuild a PR-less branch in place). Refused for merged ports and in sequential mode. | off |
+| `--ignore-stalls` | Retry stalled units anyway. | off |
+| `--dry-run` | No writes (state, git, GitHub); can't predict conflicts. | off |
+
+Exit `1` if any in-scope unit is in `conflict`.
 
 ### `releasy continue`
 
-*Reconcile state after a manual fix.*
-
-Walks every port in state. Doesn't discover, doesn't cherry-pick, doesn't
-merge. Per entry:
-
-| State | Action |
-|-------|--------|
-| `skipped` | leave |
-| `conflict`, AI gave up (`failed_step_index` set) | highlight; user must act |
-| `conflict`, branch clean (manually resolved) | push, open PR (if `auto_pr`), flip to `needs_review` |
-| `conflict`, still unresolved | highlight with conflict files + `git status` hint |
-| `branch_created` (branch on origin, no PR) | push (if needed) + open PR |
-| `needs_review` | leave |
-
-Always finishes with a project-board reconcile.
-
-```bash
-releasy continue [--branch <branch-or-feature-id>] [--work-dir <path>]
-                 [--dry-run]
-```
+Reconcile state after a manual fix: no discovery, no cherry-picks. Pushes and
+opens PRs for resolved conflicts and for branches without a PR, reports
+unresolved conflicts, then syncs the board. Unlike `run`, it keeps a hand-made
+fix on a branch that has no PR yet.
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--branch <name>` | Operate on one entry — flip from `conflict` to `needs_review`. | full pass |
+| `--branch <id>` | Only mark this branch / feature id resolved. | all entries |
 | `--work-dir <path>` | Working dir. | config / cwd |
-| `--dry-run` | Show what would happen — no state writes, pushes, PR opens, or project sync. Read-only GitHub fetches still happen. | off |
+| `--dry-run` | No writes, pushes, PRs or board sync. | off |
 
-Exit: `1` if any conflict remains (full pass) or the branch couldn't be
-marked resolved.
+Exit `1` if a conflict remains.
 
 ### Sequential mode
 
-When `sequential: true` is in `config.yaml`, both [`run`](#releasy-run)
-and [`continue`](#releasy-continue) (without `--branch`) process **one
-PR per invocation**. Queue is sorted by `merged_at`.
+With `sequential: true`, `run` and `continue` (without `--branch`) port one PR
+per invocation in `merged_at` order. The next invocation proceeds only if the
+previous rebase PR has merged; otherwise it exits `1`. Incompatible with
+`pr_sources.groups`; `continue` needs `target_branch`.
 
-1. **First invocation** → port earliest PR, push, open rebase PR, exit.
-2. **You** review, approve, merge that PR on GitHub.
-3. **Next invocation** → checks GitHub:
-   - Previous PR **merged** → mark `merged`, re-fetch, port the next.
-   - Previous PR **not merged** → exit `1`, change nothing.
-4. Repeat. AI-unresolvable conflict → stops; resolve manually + run
-   `releasy continue --branch <id>`.
+### `releasy refresh`
 
-Constraints:
-- Incompatible with `pr_sources.groups` (session load fails).
-- Requires `target_branch:` in config.
-- Re-run [`setup-project`](#releasy-setup-project) once to provision the
-  new `merged` Status option.
+Maintenance over tracked PRs; never discovers, cherry-picks or opens PRs.
+Always syncs status (upstream merges/closes, superseded sweep, `merged_label`,
+`pr_labels`). Optional passes, in this fixed order:
 
-```bash
-releasy run
-# (review, approve, merge on GitHub, then:)
-releasy continue
-```
+1. `--merge-target` — merge `origin/<base>` into each PR branch; AI-resolve
+   conflicts; plain push. Unresolved → `conflict`, skipped by later passes.
+2. `--analyze-fails` — same as [`analyze-fails`](#releasy-analyze-fails).
+3. `--address-review` — AI appends commits for trusted, unresolved review
+   comments newer than the last addressed run (see `review_response`).
+   History stays linear.
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--pr <url>` | One PR; exit 0 if untracked (any PR with `--stateless`). | all tracked |
+| `--only <url-or-id>` | One tracked PR or unit id. | — |
+| `--work-dir <path>` | Working dir. | config / cwd |
+| `--resolve-conflicts` / `--no-resolve-conflicts` | AI resolver for merge conflicts. | on |
+| `--merge-target` / `--no-merge-target` | Pass 1. | off |
+| `--analyze-fails` / `--no-analyze-fails` | Pass 2. | off |
+| `--no-flaky-check`, `--no-baseline-check`, `--post-comment` / `--no-post-comment` | Pass 2 options, as in `analyze-fails`. | — |
+| `--address-review` / `--no-address-review` | Pass 3. | off |
+| `--ai-backend cli\|codex\|api` | Override `ai_backend`. | config |
+| `--dry-run` | No writes. | off |
+| `--stateless` | No session/state/lock; requires `--pr`. Uses `config.yaml` if present. | off |
+| `--origin`, `--build-command`, `--claude-command`, `--prompt-file`, `--timeout`, `--max-iterations` | Overrides, `--stateless` only. | config |
+
+Exit `1` if any PR ends in `conflict` or a pass fails.
+
+### `releasy analyze-fails`
+
+AI triage of failed CI on a PR (or every tracked PR). Reads every failed
+commit status: praktika JSON reports and TestFlows regression reports. Checks
+without per-test results become job-level shards
+(`analyze_fails.job_level_failures`). Per shard, one AI session loops triage →
+fix → build → re-run, up to `analyze_fails.max_iterations`.
+
+- **Baseline:** failures are compared with the last target-branch CI run
+  predating the PR and labelled *pre-existing*, *new since baseline* or
+  *baseline says nothing*.
+- **Flaky-elsewhere:** failures seen on ≥ `flaky_elsewhere_threshold` other
+  tracked PRs are flagged as likely flakes.
+- **Audit:** shards with commits, or with a verdict contradicting the
+  evidence, are audited by a read-only session. A dispute triggers a new round
+  (up to `max_investigation_rounds`); a remaining dispute labels the PR
+  `ai-needs-verify`.
+- Outcomes: `DONE`, `PARTIAL`, `UNRELATED`, `UNRESOLVED` (`DISPUTED` if an
+  audit dispute stands). Commits are append-only; push is plain.
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--pr <url>` | PR to analyze. | all tracked with a rebase PR |
+| `--only <url-or-id>` | One tracked PR or unit. Mutex with `--pr`, `--stateless`. | — |
+| `--work-dir <path>` | Working dir. | config / cwd |
+| `--dry-run` | List failures and verdicts; no AI, no push. | off |
+| `--push` / `--no-push` | Push AI commits. | on |
+| `--no-flaky-check` | Skip flaky-elsewhere map. | off |
+| `--no-baseline-check` | Skip baseline comparison. | off |
+| `--post-comment` / `--no-post-comment` | Summary comment per PR. | `analyze_fails.post_comment_to_pr` |
+| `--ai-backend cli\|codex\|api` | Override `ai_backend`. | config |
+| `--stateless` | No session/state/lock; acts on `--pr`. | off |
+| `--origin`, `--build-command`, `--claude-command`, `--prompt-file`, `--timeout`, `--max-iterations`, `--max-prs` | Overrides, `--stateless` only. | config |
+
+Exit `1` on any per-PR failure (fetch, push race, non-linear history).
 
 ### `releasy skip`
 
-*Drop a conflicted port from this run.*
-
-Marks `skipped` so subsequent passes ignore it. Doesn't touch git.
-
-```bash
-releasy skip --branch <branch-or-feature-id>
-```
+`releasy skip --branch <id>` — mark a port `skipped`. State only.
 
 ### `releasy hold`
 
-*Park a PR until it is ready — without vetoing it.*
-
-Appends the URL to
-[`pr_sources.on_hold`](configuration.md#on-hold-vs-excluded). A hold is
-**not** a veto: the PR keeps its unit, its dependency edges and any port
-branch / PR it already has. [`run`](#releasy-run) walks past the unit,
-anything declaring that unit in `depends_on` reports as `blocked` (a held
-unit never reaches `merged`), and the graph issue lists it under **⏸ On
-hold** from the next write of the issue onward.
-
-Session-only — nothing in git, state, or the PR is touched.
-
-```bash
-releasy hold <pr-url> [--reason <text>]
-```
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `<pr-url>` | The PR to park. Matched by full owner/repo/number. | required |
-| `--reason <text>` | What it is waiting on. Shown on the graph issue and by `releasy pr list`. | none |
-
-```bash
-releasy hold https://github.com/Altinity/ClickHouse/pull/2294 \
-  --reason "waiting for the export follow-up"
-```
-
-**Holding one PR of a group holds the whole group** — its members
-cherry-pick as one atomic unit, so porting the rest without the held one
-would ship a broken subset. To park just one member, split it out of the
-group first (a comment on the graph issue +
-[`graph update`](#releasy-graph-update) does that).
-
-Re-holding refreshes the reason. Refused (exit `1`) for a PR already vetoed
-in `exclude_prs` — re-add it with [`pr add`](#pr-membership) first.
-[`pr remove`](#pr-membership) clears any hold on the URL it vetoes.
-
-Exit: `0` on success or a no-change re-hold; `1` on a malformed URL or a
-vetoed PR.
+`releasy hold <pr-url> [--reason <text>]` — add the PR to
+`pr_sources.on_hold` ([semantics](configuration.md#on-hold-vs-excluded)).
+Re-holding updates the reason. Refused (exit `1`) for a PR in `exclude_prs`.
 
 ### `releasy unhold`
 
-*Put a held PR back in work.*
-
-Drops the URL from `pr_sources.on_hold`. The unit ports on the next
-[`run`](#releasy-run), and the next write of the graph issue moves it out of
-the **On hold** section back into the working lists.
-
-```bash
-releasy unhold <pr-url>
-```
-
-A PR that was not on hold is a no-op, reported and exit `0`. Exit `1` only
-on a malformed URL.
+`releasy unhold <pr-url>` — remove it from `pr_sources.on_hold`; it ports on
+the next `run`.
 
 ### `releasy mark-reverted`
 
-*Record that a merged port was reverted on the target branch.*
-
-For the port that landed and was then reverted on purpose. Marks the entry
-`reverted`: `run` and `refresh` leave it alone, `pr_policy.recreate_closed_prs`
-does not reach it, and no sweep flips it back (they only look at in-flight
-entries). Only
-[`pr_policy.recreate_reverted_prs`](configuration.md#reference) — its own knob,
-off by default — re-ports it, on a renumbered branch. `graph sync` then states
-the revert in the graph issue's own **↩ Reverted** section, so the next person
-reading the graph sees it before they think about re-porting.
-
-State-only — git and the port PR are untouched; the revert is already yours.
-
-```bash
-releasy mark-reverted --branch <branch-or-feature-id> [--reason <text>]
-```
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--branch <id>` | Branch name or feature ID whose port was reverted. | required |
-| `--reason <text>` | Why. Shown by `status` and on the graph issue — cite the revert PR here. | `port reverted on target — do not re-port` |
-
-```bash
-releasy mark-reverted --branch pr-1806 \
-  --reason "port PR #2148 merged, then reverted by #2217"
-```
-
-To undo it — the revert was itself a mistake — edit the entry's `status:` in
-the state file (`releasy where` prints the path) back to `merged`.
+`releasy mark-reverted --branch <id> [--reason <text>]` — mark a merged port
+`reverted` (state only). `run`/`refresh` then leave it alone; only
+`pr_policy.recreate_reverted_prs` re-ports it. The reason (default
+`port reverted on target — do not re-port`) shows in `status` and on the
+graph issue. To undo, set the entry's `status:` back to `merged` in the state
+file (`releasy where`).
 
 ### `releasy abort`
 
-*Stop tracking this run as in-progress.*
-
-Persists state. No undo for ports already pushed — branches and PRs stay
-exactly as they are.
-
-```bash
-releasy abort
-```
+Persist state and exit; nothing is rolled back.
 
 ### `releasy clear`
 
-*Wipe local-only port artifacts that never reached a PR.*
+`releasy clear [<identifier>] [--work-dir <path>] [--dry-run] [-y|--yes]` —
+for ports that never got a PR: abort any in-progress git operation, delete the
+local branch, and drop the state entry. `<identifier>` is a feature id,
+branch, source PR number or URL; without it, every `conflict` /
+`branch_created` entry without a PR is listed and cleared after confirmation
+(`--yes` skips it). Refuses entries with an open rebase PR.
 
-With an identifier, clears that one feature. Without it, scans state for
-every feature stuck in a damaged local-only state (`conflict` or
-`branch_created` with no rebase PR), lists them, and clears after a
-confirmation prompt. For each: aborts any in-progress
-cherry-pick / merge / rebase, force-deletes the local port branch, and
-drops the state entry so the next `run` starts fresh. **Refuses** any
-feature whose rebase PR is already open — those live on GitHub and are
-out of scope.
+## Dependency graph
 
-```bash
-releasy clear [<identifier>] [--work-dir <path>] [--dry-run] [--yes]
-```
+### `releasy graph discover`
+
+Trial-cherry-picks candidate PRs (oldest merged first) onto the target in a
+scratch worktree. PRs that really conflict with an earlier one are grouped
+into one unit, applied prerequisite first. Writes:
+
+| Output | Default path | Override |
+|--------|--------------|----------|
+| Report | `<config-dir>/graph.<base>.yaml` | `-o` |
+| Deps overlay (read by `run`) | `<session-stem>.deps.yaml` | `pr_sources.deps_file`, `--deps-file`, `--no-write` |
+| Graph issue (`--open-issue`) | issue on origin | `--issue-title` |
+
+- Re-runs reuse the prior graph and only trial-pick new PRs (`--redo` starts
+  over). Hand edits to the overlay are overwritten; move a group into the
+  session to keep it.
+- Declared session groups are never split or merged; their `depends_on` edges
+  are kept.
+- Clean trial picks are cached as port branches that `run` reuses.
+- Conflicts are mapped to prerequisites via git history, refined by AI
+  (`--no-ai` disables). With `ai_resolve.auto_add_prerequisite_prs` and an
+  `upstream` remote, missing upstream prerequisites are pulled in recursively.
+- Ports whose unit lost a PR are marked outdated for `run`.
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `<identifier>` | Feature ID / branch / source-PR number / source-PR URL. Omit to sweep all damaged local-only entries. | sweep all |
-| `--work-dir <path>` | Working dir for git ops. | config / cwd |
-| `--dry-run` | Show what would be cleaned; change nothing. | off |
-| `--yes` / `-y` | Skip the confirmation prompt in sweep mode. | off |
+| `--onto <ver>` | Base branch. | `target_branch` |
+| `--work-dir <path>` | Working dir. | config / cwd |
+| `-o`, `--output <path>` | Report path. Mutex with `--open-issue`. | see above |
+| `--deps-file <path>` / `--no-write` | Redirect / skip the overlay (mutex). | — |
+| `--no-ai` | Deterministic mapping only. | off |
+| `--max-depth <n>` | Upstream prerequisite recursion cap. | `auto_add_prerequisite_prs.max_prereq_depth` |
+| `--limit <n>` | Scan only the most recent N units. | all |
+| `--include-already-merged` | Keep units already in target in the report. | off |
+| `--redo` | Ignore the prior graph. | off |
+| `--open-issue` / `--no-open-issue` | Open or update the graph issue. | off |
+| `--issue-title <text>` | Issue title. | `Port graph for <base>` |
+
+Exit `0` regardless of conflicts.
+
+### `releasy graph update`
+
+Feeds new trusted comments on the graph issue (`graph.trusted_*`) to the AI
+and rebuilds the graph — no git. Comments can add, veto (→ `exclude_prs`),
+hold / release (→ `on_hold`), regroup or reorder PRs. Rewrites the report,
+overlay and session, refreshes the issue, and collapses addressed comments.
+Added PRs are not trial-picked; run `graph discover` to analyze them.
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--onto <ver>` | Base branch (same as for `discover`). | `target_branch` |
+| `--since <iso>` | Only comments after this time. | stored watermark |
+| `--work-dir <path>` | Locates config/report. | config / cwd |
+| `--post-comment` / `--no-post-comment` | Summary comment. | `graph.post_comment` |
+| `--dry-run` | Show result; write nothing. | off |
+
+Exit `1` on fetch error, malformed AI reply, cycle, or failed session edit.
+
+### `releasy graph sync`
+
+Re-renders the graph issue with per-unit progress checkboxes and status
+markers (merged, in review, conflict, blocked, …, plus the stall reason). A box
+is ticked once the port PR exists. Merged/superseded groups are folded;
+reverted, discarded and excluded units get their own sections. Runs
+automatically after `run` / `refresh` (`graph.sync_progress`). No git, no AI.
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--onto <ver>` | Base branch. | `target_branch` |
+| `--open-issue` | Create the issue from the saved report if it has none. | off |
+| `--dry-run` | Print; don't edit the issue. | off |
+
+Exit `1` if there is no report, no issue, or the edit fails.
 
 ## One-off porting
 
 ### `releasy cherry-pick`
 
-*One-off cross-repo cherry-pick — no config, no state.*
-
-Cherry-picks a PR (`.../pull/N`, merge commit with `-m 1`), commit
-(`.../commit/<sha>`), or tag from any public GitHub repo onto a fresh
-branch off `--target` in `--origin`; optionally AI-resolves conflicts,
-pushes, and opens a PR back to `--target`. **Persists nothing** — no
-config / state / lock / board. Re-running makes a brand-new branch each
-time (pin it with `--branch-name`).
-
-The opened PR **respects the target branch's PR template**: its body is a
-provenance line, the source PR's `Changelog category` + `Changelog entry`
-with a ` (<source-PR-url> by @<author>)` attribution suffix, and the
-`CI/CD Options` section copied verbatim from the target branch's
-`.github/PULL_REQUEST_TEMPLATE.md` (falling back to a bundled default block
-if the template lacks one). The raw upstream body is not pasted in — it
-would carry upstream's own template. `--formatting-example` overrides just
-the `CI/CD Options` section.
-
-```bash
-releasy cherry-pick --origin <url> --target <branch> --commit <github-url>
-                    [--branch-name <name>] [--push | --no-push] [--with-pr]
-                    [--resolve-conflicts --build-command <cmd>]
-                    [--mode backport|forward_port]
-                    [--claude-command <exe>] [--prompt-file <path>]
-                    [--timeout <s>] [--max-iterations <n>]
-                    [--formatting-example <pr-url>] [--work-dir <path>]
-```
+*Stateless.* Cherry-pick a PR (merge commit, `-m 1`), commit or tag from any
+public GitHub repo onto a new branch off `--target` in `--origin`; optionally
+AI-resolve, push and open a PR. The PR body uses the source changelog entry
+and the target's PR-template `CI/CD Options` section.
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--origin <url>` (required) | Origin remote (ssh/https) to clone, push to, and open the PR against. | — |
-| `--target <branch>` (required) | Existing origin branch to base the port on / open the PR against. | — |
-| `--commit <url>` (required) | GitHub URL to cherry-pick: PR, commit, or tag; any public repo (incl. forks). | — |
-| `--branch-name <name>` | Port branch name. | `releasy/port/<id>-<6hex>` |
-| `--push` / `--no-push` | Push the branch to origin. | on |
-| `--with-pr` | Open a PR from the branch back to `--target` (implies `--push`; needs `RELEASY_GITHUB_TOKEN`). | off |
-| `--resolve-conflicts` | On conflict, invoke Claude. Requires `--build-command`. | off |
-| `--mode backport\|forward_port` | Port direction for the resolver. `backport` adapts code (adjust signatures, drop non-crucial upstream functionality) and declares a prerequisite only when the PR truly can't stand without it; `forward_port` is strict (reports `MISSING_PREREQS`). | `backport` |
-| `--build-command <cmd>` | Shell command Claude runs to verify the resolution compiles. Required with `--resolve-conflicts`. | — |
+| `--origin <url>` | Origin remote (required). | — |
+| `--target <branch>` | Existing origin branch (required). | — |
+| `--commit <url>` | PR / commit / tag URL (required). | — |
+| `--branch-name <name>` | Port branch. | `releasy/port/<id>-<6hex>` |
+| `--push` / `--no-push` | Push the branch. | on |
+| `--with-pr` | Open a PR into `--target`. | off |
+| `--resolve-conflicts` | AI-resolve; needs `--build-command`. | off |
+| `--mode backport\|forward_port` | Resolver mode. | `backport` |
+| `--build-command <cmd>` | Build check for the resolver. | — |
 | `--claude-command <exe>` | Claude executable. | `claude` |
-| `--prompt-file <path>` | AI-resolve prompt template. | bundled |
-| `--timeout <s>` | Per-attempt Claude timeout (seconds). | `7200` |
-| `--max-iterations <n>` | Max build attempts per resolve. | `5` |
-| `--formatting-example <pr-url>` | Override the "CI/CD Options" section with this origin-repo PR's instead of the target template's (needs `--with-pr`). | target PR template |
-| `--work-dir <path>` | Working dir for git ops. | cwd |
+| `--ai-backend cli\|api` | AI backend. | `cli` |
+| `--prompt-file <path>` | Resolver prompt. | bundled |
+| `--timeout <s>` | Per-attempt timeout. | `7200` |
+| `--max-iterations <n>` | Build attempts. | `5` |
+| `--formatting-example <pr-url>` | Take `CI/CD Options` from this PR (needs `--with-pr`). | target template |
+| `--work-dir <path>` | Working dir. | cwd |
 
 ### `releasy project-backport`
 
-*Batch backport upstream PRs queued in a GitHub Project — no config, no state.*
-
-For "Stable" releases. Walks a GitHub Project (one view per version), and
-for every item whose **content is an upstream `ClickHouse/ClickHouse` PR**
-whose **`Port Versions` field includes `--version`**, opens a Backport PR
-into `--target` on origin (Altinity/ClickHouse): cherry-picks the upstream
-merge commit (`-m 1`), optionally AI-resolves conflicts in backport mode,
-pushes, and opens the PR. The PR title is `<version> Backport of #<n> -
-<upstream title>`; the body carries the upstream PR's changelog
-category + entry (entry text with ` (<upstream url> by @<author>)`
-appended) followed by the `CI/CD Options` section taken verbatim from the
-target branch's `PULL_REQUEST_TEMPLATE.md`; a `<version>` label is added.
-After creating the PR it is **added back to the same project** with its
-`Port Versions` set to `<version>` (nothing is ever deleted).
-
-**Persists nothing** — the GitHub Project + open origin PRs are the only
-source of truth. Re-running is **idempotent**: any item that already has a
-backport PR into `--target` (matched by branch name, then by an open PR
-titled `Backport of #<n>` / referencing the upstream URL) is skipped. Only
-ever opens PRs into origin — never upstream. Needs `RELEASY_GITHUB_TOKEN`
-with the `project` scope.
-
-```bash
-releasy project-backport --project <project-url> --version <ver> --target <branch>
-                         [--origin <url>] [--work-dir <path>]
-                         [--resolve-conflicts --build-command <cmd>]
-                         [--claude-command <exe>] [--prompt-file <path>]
-                         [--timeout <s>] [--max-iterations <n>]
-                         [--limit <n>] [--dry-run]
-```
+*Stateless.* For each item in a GitHub Project that is an upstream
+`ClickHouse/ClickHouse` PR with `--version` in its `Port Versions` field:
+cherry-pick it onto `--target`, open a backport PR on origin (title
+`<version> Backport of #<n> - <title>`, label `<version>`), and add that PR to
+the project. Items that already have a backport PR are skipped. Token needs
+the `project` scope.
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--project <url>` (required) | GitHub ProjectV2 URL, e.g. `https://github.com/orgs/Altinity/projects/26`. | — |
-| `--version <ver>` (required) | Target version (e.g. `24.8`). Filters items by `Port Versions`; also the PR label, title prefix, and `Port Versions` value set on the new card. | — |
-| `--target <branch>` (required) | Existing origin branch to cherry-pick onto and open PRs against (e.g. `customizations/24.8.14`). | — |
-| `--origin <url>` | Origin remote to clone / push / open PRs against. | `git@github.com:Altinity/ClickHouse.git` |
-| `--work-dir <path>` | Working dir for git ops. If omitted, a stable cache clone is created/reused. | `$XDG_CACHE_HOME/releasy/Altinity-ClickHouse` |
-| `--resolve-conflicts` | On conflict, invoke the AI resolver (backport mode). Requires `--build-command`. | off |
-| `--build-command <cmd>` | Shell command Claude runs to verify the resolution compiles. Required with `--resolve-conflicts`. | — |
-| `--claude-command <exe>` | Claude executable. | `claude` |
-| `--prompt-file <path>` | AI-resolve prompt template. | bundled |
-| `--timeout <s>` | Per-attempt Claude timeout (seconds). | `7200` |
-| `--max-iterations <n>` | Max build attempts per resolve. | `5` |
-| `--limit <n>` | Process at most `n` items (newest upstream PR first). | all |
-| `--dry-run` | Plan only: list qualifying items and what would be created / skipped. No clone, cherry-pick, push, or GitHub writes. | off |
+| `--project <url>` | ProjectV2 URL (required). | — |
+| `--version <ver>` | Version, e.g. `24.8` (required). | — |
+| `--target <branch>` | Existing origin branch (required). | — |
+| `--origin <url>` | Origin remote. | `git@github.com:Altinity/ClickHouse.git` |
+| `--work-dir <path>` | Working dir. | `$XDG_CACHE_HOME/releasy/Altinity-ClickHouse` |
+| `--resolve-conflicts` | AI-resolve (backport mode); needs `--build-command`. | off |
+| `--build-command`, `--claude-command`, `--ai-backend cli\|api`, `--prompt-file`, `--timeout`, `--max-iterations` | As in `cherry-pick`. | — |
+| `--limit <n>` | Process at most N items, newest first. | all |
+| `--dry-run` | Plan only. | off |
 
 ### `releasy rebase`
 
-*Re-port an existing rebase PR onto a different target branch.*
-
-For each PR in scope: skips if it already targets `--target`; otherwise
-branches off `origin/<target>`, cherry-picks its commits one at a time
-(AI-resolving conflicts; falls back to a single squashed
-`git merge --squash` if the cherry-pick path won't apply), pushes a fresh
-branch, opens a new PR (referencing `Port of <old PR> onto <target>`),
-and closes the original with a `superseded by <new PR>` comment. With
-`--pr` only that PR; without it, every tracked rebase PR in state.
-**Never mutates the state file** — it's a one-way porter, not a migration.
-
-```bash
-releasy rebase --target <branch> [--pr <url>] [--only <url-or-id>]
-               [--resolve-conflicts | --no-resolve-conflicts]
-               [--work-dir <path>] [--dry-run]
-```
+Re-port rebase PRs onto another branch: for each PR not already targeting
+`--target`, cherry-pick its commits onto a new branch from `origin/<target>`
+(falling back to a squash merge), open a new PR, and close the old one as
+superseded. Does not modify state.
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--target <branch>` (required) | Existing origin branch to rebase onto. | — |
-| `--pr <url>` | The rebase PR to port. Omit to walk every tracked rebase PR. | all tracked |
-| `--only <url-or-id>` | Restrict the walk to one tracked PR (source or rebase URL) or feature / group ID. Mutex with `--pr`; non-zero if no match. | — |
-| `--resolve-conflicts` / `--no-resolve-conflicts` | AI resolver on conflicts (needs `ai_resolve.enabled`). | on |
-| `--work-dir <path>` | Working dir for git ops. | config / cwd |
-| `--dry-run` | No branches / cherry-picks / pushes / PR changes. Read-only fetches still happen. | off |
+| `--target <branch>` | Existing origin branch (required). | — |
+| `--pr <url>` | One rebase PR. | all tracked |
+| `--only <url-or-id>` | One tracked PR or unit. Mutex with `--pr`. | — |
+| `--resolve-conflicts` / `--no-resolve-conflicts` | AI resolver (needs `ai_resolve.enabled`). | on |
+| `--work-dir <path>` | Working dir. | config / cwd |
+| `--dry-run` | No writes. | off |
 
-## Inspection
+## Projects
 
 ### `releasy status`
 
-*Print current pipeline state.*
-
-Rich-text per-status sub-tables, ordered with conflicts first (see
-`STATUS_DISPLAY_ORDER` in [`src/releasy/state.py`](../src/releasy/state.py)).
-Reads state only — no git, no network.
-
-Parked entries get a **Why** column carrying their
-[stall reason](concepts.md#stall-reasons) — what the unit is waiting on, and
-`(×N runs)` once it has been stuck for more than one run.
-
-```bash
-releasy status
-```
-
-## Multi-project
-
-See [concepts.md → Multiple projects](concepts.md#multiple-projects-in-parallel).
+Print state grouped by status, with a **Why** column for stalls. Read-only.
 
 ### `releasy new`
 
-*Scaffold a fresh project.*
-
-Writes `config.yaml` (at `--out`) + sibling `<target_branch>.session.yaml`
-(falls back to `<name>` when `--target-branch` is omitted). Refuses
-to overwrite. Prints config's absolute path on stdout (everything else on
-stderr) so it composes:
-
-```bash
-cd $(dirname "$(releasy new --target-branch antalya-25.8 --project antalya)")
-```
-
-```bash
-releasy new [--name <slug>] [--target-branch <branch>] [--project <id>] [--out <path>]
-```
+Write `config.yaml` and a sibling `<target_branch>.session.yaml` (or
+`<name>.session.yaml`). Refuses to overwrite. Prints the config path on
+stdout.
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--name <slug>` | `[A-Za-z0-9._-]{1,64}`. | auto: `<target-branch>-<6hex>` |
-| `--target-branch <branch>` | Seeds `target_branch:` + auto-name. | empty |
-| `--project <id>` | Seeds `project:`. | empty |
-| `--out <path>` | Config path. Refuses to overwrite. | `./config.yaml` |
-
-Auto-generated names get a 6-hex CSPRNG suffix so back-to-back calls don't
-collide.
+| `--name <slug>` | Project name. | `<target-branch>-<6hex>` |
+| `--target-branch <branch>` | Seeds `target_branch`. | empty |
+| `--project <id>` | Seeds `project`. | empty |
+| `--out <path>` | Config path. | `./config.yaml` |
 
 ### `releasy list`
 
-*Every project on this machine.* Alias: `releasy ls`.
-
-One row per project: name, phase, feature counts, last-run timestamp,
-owning config path.
-
-```bash
-releasy list
-```
+List all projects on this machine with their config paths. Alias: `ls`.
 
 ### `releasy where`
 
-*Print the state-file path for the current config.*
-
-```bash
-releasy where
-# /home/<you>/.local/state/releasy/antalya-26.3.state.yaml
-```
+Print the state-file path for the current config.
 
 ### `releasy adopt`
 
-*Rebind state to the current config.*
+Rebind the state file to the current config (after moving it); creates empty
+state if none exists.
 
-After moving/renaming a `config.yaml`, the next mutating command trips an
-ownership-collision check. Run `adopt` from the new location to rebind;
-the old path is appended to a history list for audit.
+## Project board
 
-If no state exists yet, creates an empty one — doubles as "register this
-config without doing anything else".
-
-```bash
-releasy adopt
-```
-
-## Project board sync
-
-No-ops unless `notifications.github_project` is set and
-`RELEASY_GITHUB_TOKEN` has `project` scope. UI setup:
-[configuration.md → GitHub Project board](configuration.md#github-project-board).
+Needs a token with `project` scope; `project push` / `pull` also need
+`notifications.github_project`. See
+[GitHub Project board](configuration.md#github-project-board).
 
 ### `releasy setup-project`
 
-*Create / verify the GitHub Project.*
-
-If configured: verifies project, reconciles Status options to the
-canonical set, provisions `AI Cost`. If unset: creates a new project,
-prints the URL, runs an initial sync.
-
-```bash
-releasy setup-project
-```
-
-> **Destructive:** drops non-canonical Status options. Cards on dropped
-> options are re-synced based on local state immediately after.
+If `notifications.github_project` is unset, create a project and print the URL
+to add to config. Otherwise verify it: reconcile Status options (non-canonical
+ones are dropped), create missing `AI Cost` / assignee fields, then sync cards.
 
 ### `releasy project push`
 
-*Push local state to the project board.*
-
-Reconciles every known feature: attaches missing PR cards, refreshes
-existing, updates Status, and deletes cards no longer backed by local
-state. No git, no PRs — only the board. Use after hand-editing state,
-rotating tokens, or wiring up a new project URL.
-
-```bash
-releasy project push
-```
-
-Exit: `1` if sync was skipped (no project / no token / bad URL) or any
-item failed, `0` otherwise.
+Reconcile the board with local state (add, update, remove cards). Exit `1` if
+sync was skipped or any item failed.
 
 ### `releasy project pull`
 
-*Rebuild local state from GitHub + the project board.*
+Rebuild local state from GitHub and the board (e.g. on a new machine).
+Merged into existing state; the board wins for `Skipped` and `AI Cost`.
 
-Use when local state is missing or stale (fresh machine, teammate
-takeover, throwaway CI runner) but the world outside is intact. Read-only
-on git — only the GitHub APIs are hit. Merges into any existing state
-file; the board wins for `Skipped` and `AI Cost`, GitHub wins for PR
-status, local-only fields (`ai_iterations`, `failed_step_index`,
-`partial_pr_count`) are preserved.
-
-```bash
-releasy project pull
-```
-
-Requires `notifications.github_project` in config and
-`RELEASY_GITHUB_TOKEN` with `project` scope.
-
-## Release construction
+## Release
 
 ### `releasy release`
 
-*Build a release branch from a tag.*
+`releasy release --base-tag <tag> --name <branch> [--strict] [--include-skipped] [--work-dir <path>]`
 
-Creates a release base branch from `--base-tag` and merges every finished
-port (`needs_review`, optionally `skipped`) onto it.
-
-```bash
-releasy release --base-tag <tag> --name <branch> [--strict] [--include-skipped] [--work-dir <path>]
-```
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--base-tag <tag>` (required) | Tag/ref to base on. Must be local or fetchable from origin. | — |
-| `--name <branch>` (required) | Release branch name. | — |
-| `--strict` | Abort if any enabled feature isn't `needs_review`. | off |
-| `--include-skipped` | Include `skipped` features. | off |
-| `--work-dir <path>` | Working dir. | config / cwd |
+Create branch `--name` from `--base-tag` and merge every enabled port with
+state that is not `conflict` (and not `skipped`, unless `--include-skipped`).
+`--strict` aborts if any enabled port is in conflict, skipped, or has no
+state.
 
 ### `releasy draft-release`
 
-*Generate a release changelog from the PRs in a `--from`..`--to` range.*
-
-When `--from` is an **ancestor** of `--to` (the usual same-branch release),
-walks the commit range and collects its **first-parent** PRs — the exact
-delta. `--base` is not consulted in this mode. When `--from` is **not** an
-ancestor (e.g. an upstream fork tag not on the branch), falls back to a
-**date-window Search call** for PRs whose base is `--base` (the target
-branch) that merged in the `--from`..`--to` window. Either way, forward-ports
-(`forwardport` / `forward-port` label or title) are dropped, each PR is
-classified by its Changelog category, and the result is rendered as
-Altinity's release-notes markdown. `--prs` / `--prs-file` supply an explicit
-PR set instead, bypassing discovery. With `-o` writes to disk and publishes
-nothing; without it, creates a **draft** GitHub release on origin (tag =
-`--name`, commitish = `--to`) and prints its URL.
-
-For an Altinity-shaped tag the body also carries a **Build report** link. Its
-workflow-run id is looked up under `REFs/<tag>/<sha>/` in the build-artifacts
-bucket; if CI hasn't published for that ref yet the link keeps a `RUN-ID-TBD`
-placeholder. `--build-report-url` supplies the link outright.
-
-A **Release notes** link follows it, derived from the tag as
-`docs.altinity.com/releasenotes/altinity-<project>-release-notes/<major>.<minor>/`.
-Only `antalya` and `stable` are split by version that way; other projects
-(`fips`) get no link unless `--release-notes-url` supplies one.
-
-The walk reads PR numbers from GitHub's merge-commit / squash-merge subjects,
-so rebase-merged PRs (which leave no PR reference) aren't detected — origin
-uses squash / merge-commit.
-
-`--from` / `--to` are resolved against a local clone, remote-first: a bare
-name hits `refs/remotes/<origin>/<name>` before `refs/tags/<name>` and before
-any local branch, so a stale local checkout can't decide what the release
-contains. A local branch that isn't on origin is still usable — it's reported
-when used.
-
-Needs no project. With `--work-dir` the origin (and upstream) remote is read
-from that clone's git remotes and no `config.yaml` is loaded — so the command
-runs anywhere, on any repo, with just `RELEASY_GITHUB_TOKEN`. Without
-`--work-dir`, `config.yaml` supplies both the origin remote and the work dir.
-An explicit `--config` wins over `--work-dir`.
-
-```bash
-releasy draft-release --from <ref> --to <ref> [--base <branch>]
-                      [--prs <url> ...] [--prs-file <path>]
-                      [--name <tag>] [--title <text>] [-o <file>]
-                      [--docker-image-url <url>] [--build-report-url <url>]
-                      [--release-notes-url <url>] [--work-dir <path>]
-```
+*Stateless with `--work-dir`.* Build release notes from PRs merged between
+`--from` (exclusive) and `--to`, and create a **draft** GitHub release on
+origin (or write markdown with `-o`). If `--from` is an ancestor of `--to`,
+the first-parent PRs of the range are used; otherwise PRs into `--base` merged
+in the date window. Forward-ports are dropped. Refs resolve remote-first.
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--from <ref>` (required) | Range lower bound, **exclusive** (usually the previous release / upstream fork tag). Resolved remote-first. | — |
-| `--to <ref>` (required) | Range upper bound (inclusive) and draft commitish (release-branch tip or the tag being cut). Resolved remote-first. | — |
-| `--base <branch>` | Branch whose merged PRs are collected — **only used in the date-window fallback** (when `--from` isn't an ancestor of `--to`). | target branch → `--to` |
-| `--prs <url>` | Explicit PR URL to include (repeatable); bypasses discovery. | — |
-| `--prs-file <path>` | File of PR URLs (one per line, `#` comments ok); merged with `--prs`. | — |
-| `--name <tag>` | Release tag. Defaults to `--to` when it's a tag; left blank if `--to` is a commit / branch. | — |
-| `--title <text>` | Changelog heading / draft display name. | prettified `--name` |
-| `-o` / `--output <file>` | Write markdown to file instead of creating a draft release. | — |
-| `--docker-image-url <url>` | Docker image URL; placeholder `sha256-TBD` if omitted. | — |
-| `--build-report-url <url>` | CI build report (`ci_run_report.html`) URL. Omitted, the workflow-run id is resolved from the build-artifacts bucket, falling back to a `RUN-ID-TBD` placeholder. | — |
-| `--release-notes-url <url>` | docs.altinity.com release-notes URL. Omitted, it's derived from the tag for `antalya` / `stable`; other projects get no link. | — |
-| `--work-dir <path>` | Existing clone for resolving `--from` / `--to`. Given, it also supplies the origin/upstream remotes and no `config.yaml` is read. | config / cwd |
+| `--from <ref>` | Lower bound, exclusive (required). | — |
+| `--to <ref>` | Upper bound and release commitish (required). | — |
+| `--base <branch>` | Branch for the date-window fallback. | `target_branch`, else `--to` |
+| `--prs <url>` | Explicit PR (repeatable); skips discovery. | — |
+| `--prs-file <path>` | File of PR URLs (`#` comments allowed). | — |
+| `--name <tag>` | Release tag. | `--to` if it is a tag |
+| `--title <text>` | Heading / display name. | prettified `--name` |
+| `-o`, `--output <file>` | Write markdown instead of a draft release. | — |
+| `--docker-image-url <url>` | Docker image link. | `sha256-TBD` placeholder |
+| `--build-report-url <url>` | CI report link. | looked up, else `RUN-ID-TBD` |
+| `--release-notes-url <url>` | Release-notes link. | derived for `antalya` / `stable` |
+| `--work-dir <path>` | Clone to resolve refs; its remotes replace `config.yaml`. | config / cwd |
 
 ## Feature management
 
-Manages the static `features:` list in the session file (the dynamic
-counterpart is `pr_sources.*`). Schema:
-[configuration.md](configuration.md#target_branchsessionyaml-per-effort-source-data).
+Edit the session's `features:` list.
 
-```bash
-releasy feature add --id <id> --source-branch <branch> --description <desc>
-releasy feature enable --id <id>
-releasy feature disable --id <id>
-releasy feature remove --id <id>
-releasy feature list
-```
-
-| Subcommand | Description |
-|------------|-------------|
-| `add` | Append entry. Requires `--id`, `--source-branch`, `--description`. |
-| `enable` | Set `enabled: true`. Requires `--id`. |
-| `disable` | Set `enabled: false`. Requires `--id`. |
-| `remove` | Delete from session. Doesn't touch branches. Requires `--id`. |
-| `list` | Print features grouped by enabled/disabled. |
+| Command | Description |
+|---------|-------------|
+| `releasy feature add --id <id> --source-branch <branch> --description <text>` | Add a feature. |
+| `releasy feature enable --id <id>` / `disable --id <id>` | Toggle `enabled`. |
+| `releasy feature remove --id <id>` | Remove it (branches untouched). |
+| `releasy feature list` | List features. |
 
 ## PR membership
 
-Add, remove, and list individual PR URLs in the session so you never
-hand-edit `pr_sources.include_prs`, `pr_sources.exclude_prs`, or
-`pr_sources.groups[].prs`. Schema:
-[configuration.md](configuration.md#target_branchsessionyaml-per-effort-source-data).
+Edit session PR lists without hand-editing YAML.
 
-```bash
-releasy pr add <PR-URL> [--group <id>] [--context <text>]
-releasy pr remove <PR-URL> [--keep-discovery]
-releasy pr list
-```
+| Command | Description |
+|---------|-------------|
+| `releasy pr add <url> [--group <id>] [--context <text>]` | Add to `include_prs` (or a group's `prs`); removes it from `exclude_prs`. `--context` sets `ai_context`. |
+| `releasy pr remove <url> [--keep-discovery]` | Remove from all lists and drop its singleton state. Adds it to `exclude_prs` unless `--keep-discovery`. An in-flight group port losing it is marked outdated. |
+| `releasy pr list` | Show every URL in the session, with hold reasons and `ai_context`. |
 
-| Subcommand | Description |
-|------------|-------------|
-| `add` | Append URL to `pr_sources.include_prs` (or `groups[<id>].prs` with `--group`). Validates the URL via the GitHub API, idempotent on re-add, and clears the URL from `exclude_prs` if it was previously excluded. Optional `--context` sets the per-PR `ai_context` note. |
-| `remove` | Drop the URL from every session list (`include_prs`, every group's `prs`, `on_hold`, both `ai_context` dicts) and purge the matching singleton `FeatureState`. By default also appends the URL to `exclude_prs` so label-driven discovery doesn't re-add it on the next refresh; pass `--keep-discovery` to skip that step. A multi-PR group's state entry is kept; if its port is still in flight it is marked **outdated**, and the next [`run`](#releasy-run) re-ports the group from scratch without the PR. |
-| `list` | Print every URL the session references — top-level `include_prs`, each group's `prs`, `on_hold` (with its reasons) and `exclude_prs` — with their `ai_context` notes. |
-
-Exit: `1` on a malformed URL, an unreachable PR, a group id that doesn't
-exist, or any cross-list collision (URL already in `include_prs` when
-adding with `--group`, etc.); `0` otherwise. All mutating subcommands
-take the project lock; `list` is read-only.
+Exit `1` on a malformed or unreachable URL, unknown group, or cross-list
+collision.
