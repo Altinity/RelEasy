@@ -30,6 +30,8 @@ ambiguous) — not the whole suite:
 
 {runner_hints}
 
+{previous_attempt}
+
 Run from the repo root. Use the existing built binary under `build/`; do
 **not** rebuild. If a runner needs a scratch dir it manages itself (e.g.
 `ci/tmp`), that is fine.
@@ -45,6 +47,11 @@ Run from the repo root. Use the existing built binary under `build/`; do
      `.reference` file to match the PR's intended output is in scope; do
      **not** loosen a test to hide a real regression, and do **not** pull
      code from other PRs.
+   - A clash between the PR's behaviour and a `{base_branch}` change is
+     yours to fix too: pick the smallest change that keeps the PR's
+     intended behaviour working on `{base_branch}`, apply it, and state
+     the choice and its trade-off in your final report. "Needs a design
+     decision" is not a reason to stop.
    - `git add -u && git commit --amend --no-edit` (HEAD must stay the
      resolution commit; `HEAD~1` must stay `{pre_resolve_sha}`).
    - You may re-run the tests to confirm. RelEasy will rebuild + re-run
@@ -56,7 +63,7 @@ Run from the repo root. Use the existing built binary under `build/`; do
 
 - The port's tests pass (after any in-scope fix you committed) → final line
   exactly `TESTS PASSED`.
-- A genuine, port-caused failure you cannot fix within scope → final line
+- A port-caused failure you tried to fix and could not → final line
   `TESTS FAILED: <one-line reason>`.
 - The tests could not be run (command denied, runner or binary missing,
   infra error before any test executed) → final line

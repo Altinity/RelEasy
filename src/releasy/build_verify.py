@@ -193,6 +193,19 @@ def _runner_hints(test_files: list[str]) -> str:
     return "\n\n".join(blocks)
 
 
+def _previous_attempt_section(previous_error: str | None) -> str:
+    if not previous_error:
+        return ""
+    return (
+        "## Previous attempt\n\n"
+        "An earlier run tested this same resolution and stopped with:\n\n"
+        f"> {previous_error}\n\n"
+        "Re-running and reaching the same verdict is not acceptable. Treat "
+        "this as the problem to solve now: fix the failure, amend HEAD, and "
+        "re-run the tests.\n"
+    )
+
+
 def _render(template_path: Path, mapping: dict[str, str]) -> str:
     return _fill_placeholders(template_path.read_text(encoding="utf-8"), mapping)
 
@@ -238,8 +251,12 @@ def verify_build_and_tests(
     base_branch: str,
     base_sha: str,
     max_build_attempts: int | None = None,
+    previous_error: str | None = None,
 ) -> VerifyResult:
-    """Build the branch and run the PR's tests (``base_sha`` scopes test detection)."""
+    """Build the branch and run the PR's tests (``base_sha`` scopes test detection).
+
+    ``previous_error``: an earlier run's verdict, handed to the first test session to fix.
+    """
     max_build = max_build_attempts or config.ai_resolve.max_build_attempts
     max_iters = max(1, config.ai_resolve.max_verify_iterations)
     log_path = build_log_path(port_branch)
@@ -392,6 +409,8 @@ def verify_build_and_tests(
         )
         mapping["test_files"] = "\n".join(f"- `{f}`" for f in test_files)
         mapping["runner_hints"] = _runner_hints(test_files)
+        mapping["previous_attempt"] = _previous_attempt_section(previous_error)
+        previous_error = None
         try:
             prompt = _render(test_prompt_path, mapping)
         except OSError as exc:

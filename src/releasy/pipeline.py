@@ -3377,6 +3377,7 @@ def _should_verify_build(config: Config, unit: "FeatureUnit") -> bool:
 def _run_verify_phase(
     config: Config, repo_path: Path, unit: "FeatureUnit",
     branch: str, base_branch: str, onto: str,
+    *, previous_error: str | None = None,
 ) -> "VerifyResult":
     """Build the branch + run the PR's tests; accumulate AI cost on the unit."""
     from releasy.build_verify import verify_build_and_tests
@@ -3384,6 +3385,7 @@ def _run_verify_phase(
     result = verify_build_and_tests(
         config, repo_path, unit.primary_pr(),
         port_branch=branch, base_branch=base_branch, base_sha=onto,
+        previous_error=previous_error,
     )
     if result.cost_usd is not None:
         unit.ai_cost_usd_total = (
@@ -3526,7 +3528,10 @@ def _resume_build_failed_unit(
     if prev_state.ai_cost_usd is not None and unit.ai_cost_usd_total is None:
         unit.ai_cost_usd_total = prev_state.ai_cost_usd
 
-    vres = _run_verify_phase(config, repo_path, unit, branch, base_branch, onto)
+    vres = _run_verify_phase(
+        config, repo_path, unit, branch, base_branch, onto,
+        previous_error=prev_state.last_verify_error,
+    )
     if vres.success:
         _maybe_synthesize_changelog(config, unit, base_branch)
         _finish_clean_unit(
