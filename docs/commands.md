@@ -239,7 +239,8 @@ Exit `0` regardless of conflicts.
 
 Feeds new trusted comments on the graph issue (`graph.trusted_*`) to the AI
 and rebuilds the graph — no git. Comments can add, veto (→ `exclude_prs`),
-hold / release (→ `on_hold`), regroup or reorder PRs. Rewrites the report,
+hold / release (→ `on_hold`), declare an existing port PR (→
+`existing_ports`), regroup or reorder PRs. Rewrites the report,
 overlay and session, refreshes the issue, and collapses addressed comments.
 Added PRs are not trial-picked; run `graph discover` to analyze them.
 
@@ -441,7 +442,8 @@ Edit session PR lists without hand-editing YAML.
 |---------|-------------|
 | `releasy pr add <url> [--group <id>] [--context <text>]` | Add to `include_prs` (or a group's `prs`); removes it from `exclude_prs`. `--context` sets `ai_context`. |
 | `releasy pr remove <url> [--keep-discovery]` | Remove from all lists and drop its singleton state. Adds it to `exclude_prs` unless `--keep-discovery`. An in-flight group port losing it is marked outdated. |
-| `releasy pr list` | Show every URL in the session, with hold reasons and `ai_context`. |
+| `releasy pr existing-port <url> <port-pr-url>` | Record a port PR opened outside releasy as `<url>`'s port in `existing_ports` ([semantics](configuration.md#existing-ports)). Refused for a URL in `exclude_prs`. |
+| `releasy pr list` | Show every URL in the session, with hold reasons, existing ports and `ai_context`. |
 
 Exit `1` on a malformed or unreachable URL, unknown group, or cross-list
 collision.

@@ -37,6 +37,27 @@ Change holds with [`releasy hold`](commands.md#releasy-hold) /
 [`graph update`](commands.md#releasy-graph-update), or by editing
 `pr_sources.on_hold`.
 
+### Existing ports
+
+`existing_ports` maps a source PR to a port PR opened outside releasy. `run`
+never ports such a unit; it tracks the existing PR as the unit's port instead:
+
+- state entry with the PR's own branch, mode `forward_port`, and status from
+  GitHub (open → `needs_review`, merged → `merged`, closed → `closed`);
+- session labels (`pr_labels` + `pr_labels_by_mode.forward_port`) and a
+  project-board card;
+- `refresh`, `analyze-fails`, `rebase` and `project pull` treat it like any
+  other tracked port; dependents wait for it to merge.
+
+The source PR is always included (as with `include_prs`) and always a
+standalone unit: it is dropped from any group. An open port PR releasy had
+already opened for it is closed as superseded; a merged one is kept.
+
+Add pairs with [`releasy pr existing-port`](commands.md#pr-membership), a
+graph-issue comment ("#2575 is a forward-port of #2490") +
+[`graph update`](commands.md#releasy-graph-update), or by editing
+`pr_sources.existing_ports`.
+
 ## Key options
 
 `config.yaml` unless marked **(session)**.
@@ -206,6 +227,7 @@ e.g. `Bash({work_dir}/build/programs/clickhouse:*)`.
 | `pr_sources.include_prs` | Always include. URL or `{url, ai_context}`. | `[]` |
 | `pr_sources.exclude_prs` | Always exclude. | `[]` |
 | `pr_sources.on_hold` | Park. URL or `{url, reason}`. | `[]` |
+| `pr_sources.existing_ports` | Ported outside releasy; [tracked, not ported](#existing-ports). `{url, port_pr}`. | `[]` |
 | `pr_sources.groups[]` | `id` (branch name), `prs` (URL or `{url, ai_context}`), `description` (PR title), `sort` (`listed` / `merged_at`), `depends_on` (unit ids that must merge first), `if_exists`, `ai_context`, `mode`. | `[]` |
 | `pr_sources.forward_port_labels` | Labels marking a PR as a forward-port. | `[]` |
 | `pr_sources.deps_file` | Deps overlay path (relative to the session file). | `<session-stem>.deps.yaml` |

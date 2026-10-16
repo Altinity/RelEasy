@@ -2836,6 +2836,7 @@ def _normalize_addressed(value: object) -> set[str]:
 
 def _render_current_graph_block(
     report: DiscoveryReport, held: dict[tuple, str] | None = None,
+    existing_ports: dict[str, str] | None = None,
 ) -> str:
     out: list[str] = []
     for n in report.nodes:
@@ -2861,6 +2862,11 @@ def _render_current_graph_block(
                 f"- https://github.com/{owner}/{repo}/pull/{num} — "
                 f"{reason or '(no reason recorded)'}"
             )
+    if existing_ports:
+        out.append("")
+        out.append("Already ported by existing PRs (keep each as its own single-PR unit):")
+        for url, port_pr in existing_ports.items():
+            out.append(f"- {url} — ported by {port_pr}")
     return "\n".join(out) or "_(empty graph)_"
 
 
@@ -2885,7 +2891,7 @@ def _ask_claude_for_new_graph(
     placeholders = {
         "base_branch": report.base_branch,
         "current_graph_block": _render_current_graph_block(
-            report, hold_map(config),
+            report, hold_map(config), config.pr_sources.existing_ports,
         ),
         "candidate_pr_list": candidate_pr_list,
         "comments_block": _render_comments_block(
@@ -3190,6 +3196,36 @@ def _parse_spec_holds(
     return out
 
 
+def _parse_spec_existing_ports(
+    spec: dict, warnings_acc: list[str],
+) -> dict[str, str]:
+    """The spec's ``existing_ports`` block as source PR URL → port PR URL."""
+    raw = spec.get("existing_ports") or []
+    if not isinstance(raw, list):
+        warnings_acc.append(
+            f"graph update: `existing_ports` is not a list "
+            f"({type(raw).__name__}); ignoring it"
+        )
+        return {}
+    out: dict[str, str] = {}
+    for e in raw:
+        if not isinstance(e, dict):
+            warnings_acc.append(
+                f"graph update: existing_ports entry is not a mapping "
+                f"({e!r}); skipping"
+            )
+            continue
+        url = str(e.get("url", "")).strip()
+        port_pr = str(e.get("port_pr", "")).strip()
+        if parse_pr_url(url) is None or parse_pr_url(port_pr) is None:
+            warnings_acc.append(
+                f"graph update: existing_ports entry has bad URL {e!r}; skipping"
+            )
+            continue
+        out[url] = port_pr
+    return out
+
+
 def _apply_spec_holds(
     config: Config, holds: dict[str, str],
 ) -> tuple[list[str], list[str], list[str]]:
@@ -3400,10 +3436,23 @@ def run_graph_update(
     for w in hold_warnings:
         console.print(f"  [yellow]warning:[/yellow] {w}")
     new_report.warnings += hold_warnings
+    port_warnings: list[str] = []
+    spec_ports = _parse_spec_existing_ports(spec, port_warnings)
+    graph_refs = {parse_pr_url(u) for u in new_urls}
+    for url, port_pr in spec_ports.items():
+        if parse_pr_url(url) not in graph_refs:
+            port_warnings.append(
+                f"graph update: {url} is recorded as ported by {port_pr} "
+                "but is not in the graph"
+            )
+    for w in port_warnings:
+        console.print(f"  [yellow]warning:[/yellow] {w}")
+    new_report.warnings += port_warnings
 
     _print_graph_update_summary(
         new_report, added, excluded_urls,
         sorted(spec_holds) if spec_holds is not None else None,
+        spec_ports,
     )
 
     if dry_run:
@@ -3440,6 +3489,19 @@ def run_graph_update(
             config, spec_holds,
         )
         failures += hold_failures
+
+    tracked_ports: dict[str, str] = {}
+    recorded_ports = {
+        parse_pr_url(u): parse_pr_url(p)
+        for u, p in config.pr_sources.existing_ports.items()
+    }
+    for url, port_pr in spec_ports.items():
+        if recorded_ports.get(parse_pr_url(url)) == parse_pr_url(port_pr):
+            continue
+        if pr_membership.set_existing_port(config, url, port_pr):
+            tracked_ports[url] = port_pr
+        else:
+            failures.append(f"existing port {_pr_short(url)}")
 
     _write_report(new_report, report_path)
     if config.session and config.session.session_path:
@@ -3480,7 +3542,7 @@ def run_graph_update(
     if post_comment:
         summary = _render_update_comment(
             new_report, added, newly_excluded, len(ingest), failures,
-            newly_held, released, outdated,
+            newly_held, released, outdated, tracked_ports,
         )
         add_issue_comment(config, new_report.issue_number, summary)
 
@@ -3594,6 +3656,7 @@ def _report_outdated(unit_ids: list[str]) -> None:
 def _print_graph_update_summary(
     report: DiscoveryReport, added: list[str], excluded: list[str],
     on_hold: list[str] | None = None,
+    existing_ports: dict[str, str] | None = None,
 ) -> None:
     console.print("")
     console.print(f"graph update · base={report.base_branch}")
@@ -3610,6 +3673,17 @@ def _print_graph_update_summary(
             "  on hold: "
             + (", ".join(_pr_short(u) for u in on_hold) or "(none)")
         )
+    if existing_ports:
+        console.print(
+            "  ported by existing PRs: "
+            + _render_port_pairs(existing_ports)
+        )
+
+
+def _render_port_pairs(existing_ports: dict[str, str]) -> str:
+    return ", ".join(
+        f"{_pr_short(u)} → {_pr_short(p)}" for u, p in existing_ports.items()
+    )
 
 
 def _render_update_comment(
@@ -3621,6 +3695,7 @@ def _render_update_comment(
     newly_held: list[str] | None = None,
     released: list[str] | None = None,
     outdated: list[str] | None = None,
+    existing_ports: dict[str, str] | None = None,
 ) -> str:
     failures = failures or []
     lines = [
@@ -3647,6 +3722,12 @@ def _render_update_comment(
         lines.append(
             f"- ▶ back in work (removed from `on_hold`): "
             f"{', '.join(_pr_short(u) for u in released)}"
+        )
+    if existing_ports:
+        lines.append(
+            f"- 🔗 already ported by an existing PR (added to "
+            f"`existing_ports`; tracked as its port, not re-ported): "
+            f"{_render_port_pairs(existing_ports)}"
         )
     if outdated:
         lines.append(

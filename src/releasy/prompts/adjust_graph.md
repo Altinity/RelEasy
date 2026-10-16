@@ -21,6 +21,11 @@ ignore non-actionable comments (questions, 👍). Allowed actions:
   is a follow-up for another ("#2250 is a follow-up for #2234") goes in
   that PR's unit, after it — this includes a PR a comment adds.
 - **Reorder** — add/remove `depends_on` edges.
+- **Existing port** ("#2575 is a forward-port of #2490", "#2490 is already
+  ported in #2575") — someone opened the port PR by hand. List the pair under
+  `existing_ports`. The source PR (#2490) stays in the graph as its own
+  single-PR unit: split it out of any group and never merge it into one. The
+  port PR (#2575) goes in no unit and not under `exclude`.
 
 ## Current graph
 
@@ -58,6 +63,9 @@ exclude:                      # omit if nothing vetoed
 on_hold:                      # OMIT ENTIRELY if no comment touches holds
   - url: <pr-url>             # (omitting it keeps the current holds as-is)
     reason: <what it waits on>
+existing_ports:               # omit if no comment declares one
+  - url: <source-pr-url>
+    port_pr: <existing-port-pr-url>
 addressed: [C1, C3]           # comment handles you applied; omit the rest
 ```
 
@@ -67,6 +75,9 @@ unit *or* `exclude`, never both; `depends_on` ids must exist in this block; no
 cycles. List under `addressed` only the comment handles you actually applied —
 leave out questions, 👍, and requests you ignored or disagreed with, so they
 stay visible for a human.
+
+`existing_ports` lists only pairs new in these comments; the ones shown
+above under "Already ported by existing PRs" are kept automatically.
 
 `on_hold` is the **complete** new hold list and *replaces* the current one,
 so re-list every PR that should stay on hold (they are shown above under

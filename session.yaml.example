@@ -56,7 +56,11 @@ features:
 #     - url: https://github.com/Altinity/ClickHouse/pull/2249
 #       reason: waiting for the upstream follow-up
 #
-#   groups:                         # several PRs → one branch, one combined PR
+#   existing_ports:                 # ported outside releasy; tracked, not ported
+#     - url: https://github.com/Altinity/ClickHouse/pull/2490
+#       port_pr: https://github.com/Altinity/ClickHouse/pull/2575
+#
+#   groups:                        # several PRs → one branch, one combined PR
 #     - id: iceberg-rest-catalog    # branch feature/<base>/<id>
 #       description: "Iceberg REST catalog support"   # PR title
 #       # ai_context: "..."         # hint for every step in the group

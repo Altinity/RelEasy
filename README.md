@@ -28,6 +28,7 @@ All commands need `RELEASY_GITHUB_TOKEN`.
 - Triage red CI → `releasy analyze-fails`
 - Re-port all PRs onto another branch → `releasy rebase --target <branch>`
 - Park a PR → `releasy hold <pr-url> --reason <why>` (undo: `releasy unhold`)
+- Track a port PR opened by hand → `releasy pr existing-port <pr-url> <port-pr-url>`
 - Discard a local-only broken port → `releasy clear <id>`
 - Record a reverted port → `releasy mark-reverted --branch <id>`
 - See where everything stands → `releasy status`

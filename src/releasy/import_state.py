@@ -11,6 +11,7 @@ from releasy.config import Config, get_github_token
 from releasy.github_ops import (
     ProjectBoardCard,
     fetch_project_board_snapshot,
+    fetch_pr_by_url,
     find_latest_pr_for_branch,
     get_origin_repo_slug,
     pr_ref_label,
@@ -132,14 +133,30 @@ def import_from_github(config: Config) -> bool:
         primary = unit.primary_pr()
         label = pr_ref_label(primary.repo_slug, primary.number, origin_slug)
 
-        rebase_pr = find_latest_pr_for_branch(
-            config, branch_name, base_branch,
-        )
+        if unit.existing_port_pr is not None:
+            rebase_pr = fetch_pr_by_url(
+                config, unit.existing_port_pr, include_closed=True,
+            )
+            if rebase_pr is None:
+                summary.append((
+                    feature_id, "fetch-failed",
+                    (
+                        f"{label} — could not fetch existing port PR "
+                        f"{unit.existing_port_pr}"
+                    ),
+                ))
+                continue
+            branch_name = rebase_pr.head_ref
+        else:
+            rebase_pr = find_latest_pr_for_branch(
+                config, branch_name, base_branch,
+            )
 
         card: ProjectBoardCard | None = None
         if rebase_pr is not None and rebase_pr.url in by_pr_url:
             card = by_pr_url[rebase_pr.url]
-        elif feature_id in by_feature_id:
+        # An existing-port unit's feature_id card belongs to releasy's own old port.
+        elif unit.existing_port_pr is None and feature_id in by_feature_id:
             card = by_feature_id[feature_id]
 
         board_status_lc = (card.status or "").strip().lower() if card else ""
@@ -167,6 +184,8 @@ def import_from_github(config: Config) -> bool:
             pr_urls=[pr.url for pr in unit.prs] if unit.is_group else [],
             rebase_pr_url=rebase_pr.url if rebase_pr else None,
         )
+        if unit.existing_port_pr is not None:
+            new_fs.mode = "forward_port"
 
         if rebase_pr and ai_label and ai_label in (rebase_pr.labels or []):
             new_fs.ai_resolved = True
@@ -250,7 +269,10 @@ def _print_summary(summary: list[tuple[str, str, str]]) -> None:
     for fid, kind, note in summary:
         groups.setdefault(kind, []).append((fid, note))
 
-    order = ["added", "updated", "added-skipped", "updated-skipped", "no-pr"]
+    order = [
+        "added", "updated", "added-skipped", "updated-skipped", "no-pr",
+        "fetch-failed",
+    ]
     for kind in order + [k for k in groups if k not in order]:
         rows = groups.get(kind)
         if not rows:
@@ -261,6 +283,7 @@ def _print_summary(summary: list[tuple[str, str, str]]) -> None:
             "added-skipped": "yellow",
             "updated-skipped": "yellow",
             "no-pr": "dim",
+            "fetch-failed": "red",
         }.get(kind, "white")
         heading = {
             "added": f"Added ({len(rows)})",
@@ -268,6 +291,9 @@ def _print_summary(summary: list[tuple[str, str, str]]) -> None:
             "added-skipped": f"Added, marked skipped ({len(rows)})",
             "updated-skipped": f"Updated, marked skipped ({len(rows)})",
             "no-pr": f"No PR / no board card ({len(rows)}) — skipped",
+            "fetch-failed": (
+                f"Existing port PR unreadable ({len(rows)}) — left as is"
+            ),
         }.get(kind, f"{kind} ({len(rows)})")
         console.print(f"\n  [{style}]{heading}[/{style}]")
         for fid, note in rows:

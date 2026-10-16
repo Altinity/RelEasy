@@ -170,6 +170,8 @@ class PRSourcesConfig:
     # session file's directory.
     deps_file: str | None = None
     on_hold_reasons: dict[str, str] = field(default_factory=dict)
+    # Source PR URL → port PR opened outside releasy; tracked as that unit's port.
+    existing_ports: dict[str, str] = field(default_factory=dict)
     # Per-URL ai_context from dict-form ``include_prs`` entries.
     include_pr_contexts: dict[str, str] = field(default_factory=dict)
     # Case-insensitive labels marking a source PR as a forward-port.
@@ -1693,6 +1695,31 @@ def load_session(
         value_key="reason",
     )
 
+    existing_port_urls, existing_ports = _parse_pr_url_entries(
+        ps_raw.get("existing_ports", []) or [],
+        where="pr_sources.existing_ports",
+        value_key="port_pr",
+    )
+    from releasy.github_ops import get_origin_repo_slug, parse_pr_url
+
+    origin_slug = (get_origin_repo_slug(config) or "").lower()
+    for url in existing_port_urls:
+        if url not in existing_ports:
+            raise ValueError(
+                f"pr_sources.existing_ports: {url!r} has no 'port_pr'"
+            )
+        if parse_pr_url(url) is None:
+            raise ValueError(
+                f"pr_sources.existing_ports: {url!r} is not a GitHub PR URL"
+            )
+        port_ref = parse_pr_url(existing_ports[url])
+        if port_ref is None or f"{port_ref[0]}/{port_ref[1]}".lower() != origin_slug:
+            raise ValueError(
+                f"pr_sources.existing_ports: port_pr "
+                f"{existing_ports[url]!r} for {url!r} is not a PR on origin "
+                f"({origin_slug or 'unknown'})"
+            )
+
     fp_labels_raw = ps_raw.get("forward_port_labels", []) or []
     if isinstance(fp_labels_raw, str):
         fp_labels_raw = [fp_labels_raw]
@@ -1711,6 +1738,7 @@ def load_session(
         exclude_prs=ps_raw.get("exclude_prs", []) or [],
         on_hold=on_hold_list,
         on_hold_reasons=on_hold_reasons,
+        existing_ports=existing_ports,
         include_authors=_str_list("include_authors"),
         exclude_authors=_str_list("exclude_authors"),
         groups=groups,
@@ -1959,6 +1987,10 @@ def save_session(session: SessionConfig, path: Path | None = None) -> None:
     if ps.on_hold:
         ps_data["on_hold"] = _dump_pr_url_list(
             ps.on_hold, ps.on_hold_reasons, "reason",
+        )
+    if ps.existing_ports:
+        ps_data["existing_ports"] = _dump_pr_url_list(
+            list(ps.existing_ports), ps.existing_ports, "port_pr",
         )
     if ps.include_authors:
         ps_data["include_authors"] = ps.include_authors

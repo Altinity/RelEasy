@@ -407,6 +407,8 @@ class PRInfo:
     author: str | None = None  # GitHub login of the PR author
     # Open PR's GitHub mergeable_state ("clean", "dirty" = conflicting, ...)
     mergeable_state: str | None = None
+    # Head branch; None when it lives outside the PR's repo (a fork).
+    head_ref: str | None = None
 
     def __post_init__(self) -> None:
         if self.labels is None:
@@ -660,6 +662,12 @@ def _pr_info_from_gh(
         merged_at=pr.merged_at.isoformat() if pr.merged_at else None,
         labels=[lbl.name for lbl in pr.labels],
         author=_pr_author(pr),
+        head_ref=(
+            pr.head.ref
+            if pr.head.repo is not None
+            and pr.head.repo.full_name.lower() == slug.lower()
+            else None
+        ),
     )
 
 

@@ -2659,6 +2659,24 @@ def pr_remove(
             raise SystemExit(1)
 
 
+@pr.command(name="existing-port")
+@click.argument("url")
+@click.argument("port_pr")
+@click.pass_context
+def pr_existing_port(ctx: click.Context, url: str, port_pr: str) -> None:
+    """Record PORT_PR, opened outside releasy, as URL's port.
+
+    Writes ``pr_sources.existing_ports``. `run` tracks PORT_PR as the
+    unit's forward-port instead of porting URL, and keeps URL out of
+    groups. Refused for a URL in ``exclude_prs``.
+    """
+    from releasy.pr_membership import set_existing_port
+
+    with _locked_config(ctx, session="required") as config:
+        if not set_existing_port(config, url, port_pr):
+            raise SystemExit(1)
+
+
 @pr.command(name="list")
 @click.pass_context
 def pr_list(ctx: click.Context) -> None:

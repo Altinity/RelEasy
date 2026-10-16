@@ -8,6 +8,7 @@ from rich.table import Table
 from releasy.config import Config, save_session
 from releasy.github_ops import (
     fetch_pr_by_url, get_origin_repo_slug, parse_pr_url, pr_ref_label,
+    same_pr_url,
 )
 from releasy.state import (
     find_features_by_pr_url,
@@ -85,6 +86,13 @@ def add_pr(
         return False
 
     ps = session.pr_sources
+
+    if _url_in_list(url, list(ps.existing_ports.values())):
+        console.print(
+            f"[red]PR {url} is a port PR in pr_sources.existing_ports.[/red] "
+            "It is tracked as a port, not ported itself."
+        )
+        return False
 
     if group_id is not None:
         group = next((g for g in ps.groups if g.id == group_id), None)
@@ -202,6 +210,10 @@ def remove_pr(
     removed_from_hold = _remove_url_from_list(url, ps.on_hold)
     _drop_context(url, ps.on_hold_reasons)
 
+    ports_before = len(ps.existing_ports)
+    _drop_context(url, ps.existing_ports)
+    removed_from_ports = len(ps.existing_ports) < ports_before
+
     removed_from_groups: list[str] = []
     overlay_groups: list[str] = []
     for g in ps.groups:
@@ -223,6 +235,7 @@ def remove_pr(
     nothing_to_do = (
         not removed_from_top
         and not removed_from_hold
+        and not removed_from_ports
         and not removed_from_groups
         and not overlay_groups
         and not state_purged
@@ -244,6 +257,8 @@ def remove_pr(
         console.print("[dim]  - dropped from include_prs[/dim]")
     if removed_from_hold:
         console.print("[dim]  - dropped from on_hold[/dim]")
+    if removed_from_ports:
+        console.print("[dim]  - dropped from existing_ports[/dim]")
     for gid in removed_from_groups:
         console.print(f"[dim]  - dropped from group '{gid}'[/dim]")
     for gid in overlay_groups:
@@ -326,6 +341,96 @@ def unhold_pr(config: Config, url: str) -> bool:
     return True
 
 
+def set_existing_port(config: Config, url: str, port_pr: str) -> bool:
+    """Record ``port_pr`` (opened outside releasy) as ``url``'s port in ``pr_sources.existing_ports``."""
+    session = _require_session(config)
+
+    for u in (url, port_pr):
+        if parse_pr_url(u) is None:
+            console.print(f"[red]Malformed PR URL: {u}[/red]")
+            return False
+
+    ps = session.pr_sources
+    if _url_in_list(url, ps.exclude_prs):
+        console.print(
+            f"[red]PR {url} is vetoed in exclude_prs.[/red] Re-add it with "
+            "`releasy pr add` first."
+        )
+        return False
+
+    origin_slug = get_origin_repo_slug(config)
+    port_owner, port_repo, _ = parse_pr_url(port_pr)
+    if (
+        origin_slug is None
+        or f"{port_owner}/{port_repo}".lower() != origin_slug.lower()
+    ):
+        console.print(
+            f"[red]Port PR {port_pr} is not on origin "
+            f"({origin_slug or 'unknown'}).[/red]"
+        )
+        return False
+
+    target = parse_pr_url(url)
+    if target == parse_pr_url(port_pr):
+        console.print(f"[red]PR {url} cannot be its own port.[/red]")
+        return False
+    if (
+        _url_in_list(port_pr, ps.include_prs)
+        or _url_in_list(port_pr, list(ps.existing_ports))
+        or any(_url_in_list(port_pr, g.prs) for g in ps.groups)
+    ):
+        console.print(
+            f"[red]Port PR {port_pr} is itself a source PR in the "
+            "session.[/red] Remove it with `releasy pr remove` first."
+        )
+        return False
+
+    current = next(
+        (k for k in ps.existing_ports if parse_pr_url(k) == target), None,
+    )
+    if current is not None and (
+        parse_pr_url(ps.existing_ports[current]) == parse_pr_url(port_pr)
+    ):
+        console.print("[yellow]Existing port already recorded[/yellow] — no change.")
+        return True
+    old_port = ps.existing_ports.pop(current) if current is not None else None
+    ps.existing_ports[url] = port_pr
+
+    state = load_state(config)
+    ref = pr_ref_label(f"{target[0]}/{target[1]}", target[2], origin_slug)
+    outdated_groups = [
+        fid for fid, fs in find_features_by_pr_url(state, url)
+        if len(fs.pr_urls) > 1
+        and mark_outdated(fs, f"{ref} ported by {port_pr}")
+    ]
+    # The replaced port PR was opened outside releasy: forget it, don't close it.
+    dropped = [
+        fid for fid, fs in state.features.items()
+        if old_port is not None and fs.status != "merged"
+        and same_pr_url(fs.rebase_pr_url, old_port)
+    ]
+    for fid in dropped:
+        del state.features[fid]
+
+    save_session(session)
+    if outdated_groups or dropped:
+        save_state(state, config)
+    console.print(
+        f"[green]✓[/green] [cyan]{url}[/cyan] is ported by existing PR "
+        f"[cyan]{port_pr}[/cyan]"
+    )
+    for fid in outdated_groups:
+        console.print(
+            f"[dim]  - marked port of '{fid}' outdated (next `releasy run` "
+            "re-ports it from scratch)[/dim]"
+        )
+    for fid in dropped:
+        console.print(
+            f"[dim]  - stopped tracking {old_port} for '{fid}'[/dim]"
+        )
+    return True
+
+
 def list_prs(config: Config) -> None:
     """Print every PR URL the session references, grouped by location."""
     session = _require_session(config)
@@ -358,6 +463,15 @@ def list_prs(config: Config) -> None:
         table.add_column("reason", style="dim")
         for url in ps.on_hold:
             table.add_row(url, _lookup_context(url, ps.on_hold_reasons))
+        console.print(table)
+        any_printed = True
+
+    if ps.existing_ports:
+        table = Table(title="existing_ports (ported outside releasy)")
+        table.add_column("URL", style="cyan")
+        table.add_column("port PR", style="dim")
+        for url, port_pr in ps.existing_ports.items():
+            table.add_row(url, port_pr)
         console.print(table)
         any_printed = True
 

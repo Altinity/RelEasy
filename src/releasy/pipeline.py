@@ -150,6 +150,8 @@ class FeatureUnit:
     per_pr_ai_context: dict[str, str] = field(default_factory=dict)
     # ``pr_sources.on_hold`` reason (``""`` if none); ``None`` = not held.
     hold_reason: str | None = None
+    # Port PR opened outside releasy (``pr_sources.existing_ports``); tracked, never re-ported.
+    existing_port_pr: str | None = None
     # Per-run bookkeeping set by _process_feature_unit.
     ai_resolved_count: int = 0
     ai_iterations_total: int = 0
@@ -297,6 +299,16 @@ def hold_map(config: Config) -> dict[PRRef, str]:
     return out
 
 
+def existing_port_map(config: Config) -> dict[PRRef, str]:
+    """``pr_sources.existing_ports`` as source PR ref → port PR URL; unparseable URLs dropped."""
+    out: dict[PRRef, str] = {}
+    for url, port_pr in config.pr_sources.existing_ports.items():
+        parsed = parse_pr_url(url)
+        if parsed is not None and parse_pr_url(port_pr) is not None:
+            out[parsed] = port_pr
+    return out
+
+
 def _unit_hold_reason(
     unit: "FeatureUnit", holds: dict[PRRef, str],
 ) -> str | None:
@@ -360,6 +372,7 @@ def _build_group_units(
 ) -> tuple[list[FeatureUnit], set[PRRef]]:
     """Materialise group units; also returns the PR refs they claim (not to be ported as singletons)."""
     origin_slug = get_origin_repo_slug(config)
+    existing_ports = existing_port_map(config)
     units: list[FeatureUnit] = []
     claimed: set[PRRef] = set()
     for group in config.pr_sources.groups:
@@ -379,6 +392,13 @@ def _build_group_units(
                 console.print(
                     f"    [yellow]−[/yellow] {ref_label} excluded via "
                     "pr_sources.exclude_prs, dropping from group"
+                )
+                continue
+            if parsed in existing_ports:
+                console.print(
+                    f"    [yellow]−[/yellow] {ref_label} already ported by "
+                    f"{existing_ports[parsed]} (pr_sources.existing_ports), "
+                    "dropping from group"
                 )
                 continue
             pr = fetch_pr_by_number(config, num, slug=f"{owner}/{repo}")
@@ -445,12 +465,13 @@ def _prune_superseded_singletons(config: Config, state: PipelineState) -> bool:
     group_of: dict[PRRef, str] = {}
     group_feature_ids: set[str] = set()
     holds = hold_map(config)
+    existing_ports = existing_port_map(config)
     held_groups: set[str] = set()
     for group in config.pr_sources.groups:
         group_feature_ids.add(group.id)
         for url in group.prs:
             parsed = parse_pr_url(url)
-            if parsed is not None:
+            if parsed is not None and parsed not in existing_ports:
                 group_of.setdefault(parsed, group.id)
                 if parsed in holds:
                     held_groups.add(group.id)
@@ -537,7 +558,7 @@ def discover_feature_units(config: Config) -> list["FeatureUnit"]:
         parsed
         for url in prs_cfg.include_prs
         if (parsed := parse_pr_url(url)) is not None
-    }
+    } | set(existing_port_map(config))
     exclude_pr_refs: set[PRRef] = {
         parsed
         for url in prs_cfg.exclude_prs
@@ -634,6 +655,10 @@ def discover_feature_units(config: Config) -> list["FeatureUnit"]:
         _build_singleton_units(config, collected) + group_units
     )
     _mark_held_units(config, units, origin_slug)
+    existing_ports = existing_port_map(config)
+    for unit in units:
+        if not unit.is_group:
+            unit.existing_port_pr = existing_ports.get(unit.primary_pr().ref())
     return _topo_sort_units(units)
 
 
@@ -1252,6 +1277,9 @@ def run_pipeline(
         if unit.feature_id in existing_ids:
             continue
         existing_ids.add(unit.feature_id)
+        if unit.existing_port_pr is not None:
+            _track_existing_port(config, state, unit)
+            continue
         prev_fs = state.features.get(unit.feature_id)
         outdated = prev_fs is not None and bool(prev_fs.outdated)
         if outdated and unit.hold_reason is None:
@@ -1337,6 +1365,7 @@ def run_pipeline(
                                                 "skip — partial group, auto-continue cap reached"),
                 ("blocked-by-deps",             "blocked by unmet deps (no action)"),
                 ("skip-on-hold",                "skip — on hold (pr_sources.on_hold)"),
+                ("track-existing-port",         "track existing port PR (pr_sources.existing_ports)"),
                 ("skip-stalled",                "skip — stalled on something outside the unit"),
                 ("skip-conflict-retry-off",     "skip — prior conflict, retry-off"),
                 ("skip-merged",                 "skip — already merged"),
@@ -1451,6 +1480,22 @@ def run_sequential(
     origin_slug = get_origin_repo_slug(config)
 
     for unit in units:
+        if unit.existing_port_pr is not None:
+            _track_existing_port(config, state, unit)
+            fs = state.features.get(unit.feature_id)
+            if fs is None or (
+                fs.status != "merged"
+                and not same_pr_url(fs.rebase_pr_url, unit.existing_port_pr)
+            ):
+                console.print(
+                    f"\n[red]✗[/red] [cyan]{unit.feature_id}[/cyan] is not "
+                    f"tracking its existing port {unit.existing_port_pr} — "
+                    "sequential mode will not advance past it."
+                )
+                raise SystemExit(1)
+            # Only an open existing port reaches the in-flight wait below.
+            if fs.status != "needs_review":
+                continue
         fs = state.features.get(unit.feature_id)
         primary = unit.primary_pr()
         ref = pr_ref_label(primary.repo_slug, primary.number, origin_slug)
@@ -2622,6 +2667,95 @@ def _report_hold(
         "graph issue) to put it back in work[/dim]"
     )
     _dry_record(state, "skip-on-hold")
+
+
+def _track_existing_port(
+    config: Config, state: PipelineState, unit: FeatureUnit,
+) -> None:
+    """Record ``unit.existing_port_pr`` as the unit's forward-port PR.
+
+    A different open port PR releasy opened for the unit is closed as
+    superseded; a merged one is kept and the existing port is not recorded.
+    A tracked closed port is re-checked, in case it was reopened or merged.
+    """
+    port_url = unit.existing_port_pr
+    primary = unit.primary_pr()
+    ref = pr_ref_label(
+        primary.repo_slug, primary.number, get_origin_repo_slug(config),
+    )
+    _dry_record(state, "track-existing-port")
+    fs = state.features.get(unit.feature_id)
+    tracked = fs is not None and same_pr_url(fs.rebase_pr_url, port_url)
+    if tracked and fs.status != "closed":
+        console.print(
+            f"  [dim]{unit.feature_id} ({ref}) — ported by existing PR "
+            f"{port_url} ({fs.status})[/dim]"
+        )
+        return
+
+    info = fetch_pr_by_url(config, port_url, include_closed=True)
+    if info is None:
+        console.print(
+            f"\n    [red]✗[/red] [cyan]{unit.feature_id}[/cyan] ({ref}) — "
+            f"could not fetch existing port PR {port_url}; skipping"
+        )
+        return
+    if tracked and info.state == "closed":
+        console.print(
+            f"  [dim]{unit.feature_id} ({ref}) — ported by existing PR "
+            f"{port_url} (closed)[/dim]"
+        )
+        return
+
+    if fs is not None and fs.rebase_pr_url and not tracked:
+        prior = "merged" if fs.status == "merged" else _close_port_pr_if_open(
+            config, fs.rebase_pr_url,
+            f"Superseded by {port_url} (`pr_sources.existing_ports`).",
+        )
+        if prior == "merged":
+            console.print(
+                f"\n    [yellow]![/yellow] [cyan]{unit.feature_id}[/cyan] "
+                f"({ref}) — port PR {fs.rebase_pr_url} is already merged; "
+                f"not tracking {port_url}"
+            )
+            return
+        if prior is None:
+            console.print(
+                f"\n    [red]✗[/red] [cyan]{unit.feature_id}[/cyan] ({ref}) — "
+                f"could not close port PR {fs.rebase_pr_url}; not tracking "
+                f"{port_url}"
+            )
+            return
+        if not remove_pr_from_projects(
+            config, parse_pr_url(fs.rebase_pr_url)[2],
+        ):
+            console.print(
+                f"    [red]✗[/red] could not remove port PR "
+                f"{fs.rebase_pr_url} from its project boards"
+            )
+
+    status = {"open": "needs_review", "merged": "merged"}.get(
+        info.state, "closed",
+    )
+    new_fs = FeatureState(
+        status=status,
+        branch_name=info.head_ref,
+        rebase_pr_url=info.url,
+        mode="forward_port",
+        **_unit_pr_meta(unit),
+    )
+    if status == "closed":
+        new_fs.skip_reason = "rebase PR closed without merging"
+    state.features[unit.feature_id] = new_fs
+    _apply_session_labels_to_pr(
+        config, info.url, pr_number=info.number, mode="forward_port",
+    )
+    console.print(
+        f"\n    [green]✓[/green] [cyan]{unit.feature_id}[/cyan] ({ref}) — "
+        f"tracking existing port PR [link={info.url}]{info.url}[/link] "
+        f"({status})"
+    )
+    _persist_state(config, state)
 
 
 def _process_feature_unit(
