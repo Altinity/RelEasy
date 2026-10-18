@@ -44,6 +44,7 @@ from releasy.github_ops import (
     parse_cherry_picked_refs,
     parse_follow_up_refs,
     parse_pr_url,
+    same_pr_url,
     search_pr_urls,
     slug_to_https_url,
     update_issue,
@@ -53,6 +54,7 @@ from releasy.pipeline import (
     _SOURCE_PR_URL_RE,
     _cherry_pick_pr,
     discover_feature_units,
+    existing_port_map,
     hold_map,
 )
 from releasy.state import (
@@ -2279,6 +2281,35 @@ def build_progress_map(
     return out
 
 
+def _graph_progress(
+    config: Config, report: DiscoveryReport,
+) -> dict[str, FeatureState]:
+    """:func:`build_progress_map` from state, plus live status of existing ports ``run`` has not tracked yet."""
+    progress = build_progress_map(report, load_state(config))
+    ports = existing_port_map(config)
+    for n in report.nodes:
+        if len(n.pr_urls) != 1:
+            continue
+        port_url = ports.get(parse_pr_url(n.pr_urls[0]))
+        if port_url is None:
+            continue
+        fs = progress.get(n.unit_id)
+        if fs is not None and (
+            same_pr_url(fs.rebase_pr_url, port_url) or fs.status == "merged"
+        ):
+            continue
+        info = fetch_pr_by_url(config, port_url, include_closed=True)
+        if info is None:
+            continue
+        status = {"open": "needs_review", "merged": "merged"}.get(
+            info.state, "closed",
+        )
+        progress[n.unit_id] = FeatureState(
+            status=status, rebase_pr_url=info.url, mode="forward_port",
+        )
+    return progress
+
+
 def _unit_ported(fs: FeatureState | None) -> bool:
     """True once releasy has opened a port PR for the unit (not closed/superseded/reverted)."""
     if fs is None:
@@ -2668,7 +2699,7 @@ def open_or_update_graph_issue(
     None on failure/dry-run. ``progress`` defaults to the current state.
     """
     if progress is None:
-        progress = build_progress_map(report, load_state(config))
+        progress = _graph_progress(config, report)
     body = render_graph_issue_body(report, progress, hold_map(config))
     if report.issue_number is not None:
         res = update_issue(config, report.issue_number, body=body)
@@ -3601,7 +3632,7 @@ def sync_graph_progress(
         )
         return 1
 
-    progress = build_progress_map(report, load_state(config))
+    progress = _graph_progress(config, report)
     prior_number = report.issue_number
     opening = prior_number is None
     if config.dry_run and not quiet:
