@@ -2668,7 +2668,8 @@ def pr_existing_port(ctx: click.Context, url: str, port_pr: str) -> None:
 
     Writes ``pr_sources.existing_ports``. `run` tracks PORT_PR as the
     unit's forward-port instead of porting URL, and keeps URL out of
-    groups. Refused for a URL in ``exclude_prs``.
+    groups unless every PR in the group shares PORT_PR. Refused for a URL
+    in ``exclude_prs``.
     """
     from releasy.pr_membership import set_existing_port
 

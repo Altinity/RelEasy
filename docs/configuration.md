@@ -49,9 +49,11 @@ never ports such a unit; it tracks the existing PR as the unit's port instead:
 - `refresh`, `analyze-fails`, `rebase` and `project pull` treat it like any
   other tracked port; dependents wait for it to merge.
 
-The source PR is always included (as with `include_prs`) and always a
-standalone unit: it is dropped from any group. An open port PR releasy had
-already opened for it is closed as superseded; a merged one is kept.
+The source PR is always included (as with `include_prs`) and a standalone
+unit: it is dropped from any group, unless every PR in that group maps to the
+same port PR — then the group stays one unit tracking that PR. An open port
+PR releasy had already opened for the unit is closed as superseded; a merged
+one is kept.
 
 Add pairs with [`releasy pr existing-port`](commands.md#pr-membership), a
 graph-issue comment ("#2575 is a forward-port of #2490") +

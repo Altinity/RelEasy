@@ -24,8 +24,10 @@ ignore non-actionable comments (questions, 👍). Allowed actions:
 - **Existing port** ("#2575 is a forward-port of #2490", "#2490 is already
   ported in #2575") — someone opened the port PR by hand. List the pair under
   `existing_ports`. The source PR (#2490) stays in the graph as its own
-  single-PR unit: split it out of any group and never merge it into one. The
-  port PR (#2575) goes in no unit and not under `exclude`.
+  single-PR unit: split it out of any group and never merge it into one. When
+  one port PR covers several source PRs, list each pair and put exactly those
+  source PRs together in one group. The port PR (#2575) goes in no unit and
+  not under `exclude`.
 
 ## Current graph
 

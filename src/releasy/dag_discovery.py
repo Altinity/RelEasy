@@ -56,6 +56,7 @@ from releasy.pipeline import (
     discover_feature_units,
     existing_port_map,
     hold_map,
+    shared_existing_port,
 )
 from releasy.state import (
     FeatureState,
@@ -2288,9 +2289,7 @@ def _graph_progress(
     progress = build_progress_map(report, load_state(config))
     ports = existing_port_map(config)
     for n in report.nodes:
-        if len(n.pr_urls) != 1:
-            continue
-        port_url = ports.get(parse_pr_url(n.pr_urls[0]))
+        port_url = shared_existing_port(n.pr_urls, ports)
         if port_url is None:
             continue
         fs = progress.get(n.unit_id)
@@ -2895,7 +2894,10 @@ def _render_current_graph_block(
             )
     if existing_ports:
         out.append("")
-        out.append("Already ported by existing PRs (keep each as its own single-PR unit):")
+        out.append(
+            "Already ported by existing PRs (each its own single-PR unit; "
+            "PRs sharing one port PR form one group of just those PRs):"
+        )
         for url, port_pr in existing_ports.items():
             out.append(f"- {url} — ported by {port_pr}")
     return "\n".join(out) or "_(empty graph)_"

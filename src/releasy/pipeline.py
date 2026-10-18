@@ -309,6 +309,16 @@ def existing_port_map(config: Config) -> dict[PRRef, str]:
     return out
 
 
+def shared_existing_port(
+    urls: list[str], existing_ports: dict[PRRef, str],
+) -> str | None:
+    """The existing port PR covering every PR in ``urls``, or ``None`` if they don't all share one."""
+    ports = [existing_ports.get(parse_pr_url(u)) for u in urls]
+    if ports and all(same_pr_url(p, ports[0]) for p in ports):
+        return ports[0]
+    return None
+
+
 def _unit_hold_reason(
     unit: "FeatureUnit", holds: dict[PRRef, str],
 ) -> str | None:
@@ -380,6 +390,12 @@ def _build_group_units(
             f"\n  Resolving group [yellow]{group.id}[/yellow] "
             f"({len(group.prs)} PR(s))"
         )
+        port_pr = shared_existing_port(group.prs, existing_ports)
+        if port_pr is not None:
+            console.print(
+                f"    [dim]ported by existing PR {port_pr} "
+                "(pr_sources.existing_ports)[/dim]"
+            )
         group_prs: list[PRInfo] = []
         for url in group.prs:
             parsed = parse_pr_url(url)
@@ -394,7 +410,7 @@ def _build_group_units(
                     "pr_sources.exclude_prs, dropping from group"
                 )
                 continue
-            if parsed in existing_ports:
+            if parsed in existing_ports and port_pr is None:
                 console.print(
                     f"    [yellow]−[/yellow] {ref_label} already ported by "
                     f"{existing_ports[parsed]} (pr_sources.existing_ports), "
@@ -451,6 +467,7 @@ def _build_group_units(
             mode=_detect_port_mode(
                 config, group_prs[0], explicit_mode=group.mode,
             ),
+            existing_port_pr=port_pr,
         ))
     return units, claimed
 
@@ -467,11 +484,17 @@ def _prune_superseded_singletons(config: Config, state: PipelineState) -> bool:
     holds = hold_map(config)
     existing_ports = existing_port_map(config)
     held_groups: set[str] = set()
+    group_port: dict[str, str] = {}
     for group in config.pr_sources.groups:
         group_feature_ids.add(group.id)
+        port_pr = shared_existing_port(group.prs, existing_ports)
+        if port_pr is not None:
+            group_port[group.id] = port_pr
         for url in group.prs:
             parsed = parse_pr_url(url)
-            if parsed is not None and parsed not in existing_ports:
+            if parsed is not None and (
+                port_pr is not None or parsed not in existing_ports
+            ):
                 group_of.setdefault(parsed, group.id)
                 if parsed in holds:
                     held_groups.add(group.id)
@@ -500,7 +523,11 @@ def _prune_superseded_singletons(config: Config, state: PipelineState) -> bool:
             f"[cyan]{fid}[/cyan] (PR {ref_label} is now in group "
             f"[cyan]{gid}[/cyan])"
         )
-        if fs.rebase_pr_url and fs.status in OUTDATABLE_STATUSES:
+        # A port PR the group now tracks as its existing port stays open.
+        if (
+            fs.rebase_pr_url and fs.status in OUTDATABLE_STATUSES
+            and not same_pr_url(fs.rebase_pr_url, group_port.get(gid))
+        ):
             if gid in held_groups:
                 console.print(
                     f"    [dim]group is on hold — port PR {fs.rebase_pr_url} "
