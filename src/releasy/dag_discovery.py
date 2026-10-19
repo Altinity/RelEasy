@@ -53,6 +53,7 @@ from releasy.pipeline import (
     FeatureUnit,
     _SOURCE_PR_URL_RE,
     _cherry_pick_pr,
+    _singleton_feature_id,
     discover_feature_units,
     existing_port_map,
     hold_map,
@@ -64,6 +65,7 @@ from releasy.state import (
     find_merged_feature_for_prs,
     load_state,
     mark_outdated,
+    merged_port_refs,
     save_state,
 )
 from releasy.termlog import get_console
@@ -242,6 +244,11 @@ def run_discover_deps(
         except Exception:
             # A corrupt prior report degrades to a full re-scan.
             prior_report = None
+    state = load_state(config)
+    if prior_report is not None:
+        prior_report.nodes = [
+            _trim_to_merged_port(n, state) for n in prior_report.nodes
+        ]
     reuse_prior = prior_report if (cache_enabled and not redo) else None
     reuse_index: dict[str, DAGNode] = {}
     prior_groups: list[DAGNode] = []
@@ -286,7 +293,6 @@ def run_discover_deps(
         f"already in {base_branch}…[/dim]"
     )
 
-    state = load_state(config)
     state_already = _state_already_in_target(candidates, state)
     # Port branches `run` tracks: discovery never resets or deletes them.
     run_branches = {
@@ -1787,6 +1793,30 @@ def _reusable_prior_groups(
     return reused_member_ids, preseeded_edges, prior_group_pr_urls
 
 
+def _not_in_merged_port(
+    state: PipelineState, unit_id: str, pr_urls: list[str],
+) -> list[str]:
+    """``pr_urls`` the merged port of ``unit_id`` did not carry; ``[]`` unless it merged."""
+    ported = merged_port_refs(state, unit_id)
+    if ported is None:
+        return []
+    return [u for u in pr_urls if parse_pr_url(u) not in ported]
+
+
+def _trim_to_merged_port(node: DAGNode, state: PipelineState) -> DAGNode:
+    """``node`` without the PRs its merged port did not carry."""
+    late = set(_not_in_merged_port(state, node.unit_id, node.pr_urls))
+    if not late:
+        return node
+    keep = {i for i, u in enumerate(node.pr_urls) if u not in late}
+    return replace(
+        node,
+        pr_urls=[u for i, u in enumerate(node.pr_urls) if i in keep],
+        pr_titles=[t for i, t in enumerate(node.pr_titles) if i in keep],
+        merge_shas=[s for i, s in enumerate(node.merge_shas) if i in keep],
+    )
+
+
 def _branch_anchored_to(repo_path: Path, branch: str, base_ref: str) -> bool:
     """True if ``base_ref`` is an ancestor of ``branch``."""
     return run_git(
@@ -3019,7 +3049,8 @@ def _build_report_from_spec(
     """Build a new DiscoveryReport from Claude's spec + the prior graph; None on a cycle.
 
     With ``config``, new PRs' metadata is fetched. With ``state``, a new PR
-    a merged unit already ported is dropped.
+    a merged unit already ported is dropped, and a PR placed in a merged
+    unit its port did not carry becomes a unit of its own.
     """
     title_map: dict[str, str] = {}
     merged_map: dict[str, str | None] = {}
@@ -3041,10 +3072,42 @@ def _build_report_from_spec(
         if config is not None else {}
     )
 
+    def make_node(uid: str, prs: list[str], deps: list[str]) -> DAGNode:
+        if any(url not in prior_urls for url in prs):
+            method = "graph-update-unanalysed"
+        else:
+            method = prior_methods.get(uid) or "graph-update"
+        titles: list[str] = []
+        merged_ats: list[str] = []
+        shas: list[str] = []
+        for url in prs:
+            pr = fetched.get(url)
+            titles.append(pr.title if pr is not None else title_map.get(url, ""))
+            merged_at = pr.merged_at if pr is not None else merged_map.get(url)
+            if merged_at:
+                merged_ats.append(merged_at)
+            shas.append(
+                (pr.merge_commit_sha if pr is not None else sha_map.get(url))
+                or ""
+            )
+        return DAGNode(
+            unit_id=uid,
+            is_user_group=uid in prior_user_groups,
+            pr_urls=prs,
+            pr_titles=titles,
+            earliest_merged_at=min(merged_ats, default=None),
+            deps=deps,
+            discovery_method=method,
+            cached=False,
+            # Element-wise consumers need one SHA per PR or none at all.
+            merge_shas=shas if all(shas) else [],
+        )
+
     units = spec.get("units", [])
     nodes: list[DAGNode] = []
     seen_ids: set[str] = set()
     declared_urls: set[str] = set()
+    split_urls: list[str] = []
     for u in units:
         if not isinstance(u, dict) or not u.get("id"):
             warnings_acc.append(f"graph update: skipping malformed unit {u!r}")
@@ -3054,7 +3117,6 @@ def _build_report_from_spec(
             warnings_acc.append(f"graph update: duplicate unit id {uid!r}; skipping")
             continue
         prs: list[str] = []
-        has_new_pr = False
         for raw_url in u.get("prs", []) or []:
             url = str(raw_url).strip()
             if parse_pr_url(url) is None:
@@ -3082,7 +3144,6 @@ def _build_report_from_spec(
                         f"{fid}{via}; not adding it again"
                     )
                     continue
-                has_new_pr = True
                 warnings_acc.append(
                     f"graph update: PR {url} is new (not in the prior graph) "
                     f"— it will be added to the session and ported, but its "
@@ -3092,40 +3153,36 @@ def _build_report_from_spec(
                 )
             prs.append(url)
             declared_urls.add(url)
+        late = _not_in_merged_port(state, uid, prs) if state is not None else []
+        if late:
+            warnings_acc.append(
+                f"graph update: {uid!r} is merged and cannot change; "
+                f"{', '.join(late)} will be ported separately"
+            )
+            prs = [url for url in prs if url not in late]
+            split_urls.extend(late)
         if not prs:
             warnings_acc.append(f"graph update: unit {uid!r} has no valid PRs; skipping")
             continue
         deps = [str(d).strip() for d in (u.get("depends_on", []) or [])]
-        if has_new_pr:
-            method = "graph-update-unanalysed"
-        else:
-            method = prior_methods.get(uid) or "graph-update"
-        titles: list[str] = []
-        merged_ats: list[str] = []
-        shas: list[str] = []
-        for url in prs:
-            pr = fetched.get(url)
-            titles.append(pr.title if pr is not None else title_map.get(url, ""))
-            merged_at = pr.merged_at if pr is not None else merged_map.get(url)
-            if merged_at:
-                merged_ats.append(merged_at)
-            shas.append(
-                (pr.merge_commit_sha if pr is not None else sha_map.get(url))
-                or ""
-            )
-        nodes.append(DAGNode(
-            unit_id=uid,
-            is_user_group=uid in prior_user_groups,
-            pr_urls=prs,
-            pr_titles=titles,
-            earliest_merged_at=min(merged_ats, default=None),
-            deps=deps,
-            discovery_method=method,
-            cached=False,
-            # Element-wise consumers need one SHA per PR or none at all.
-            merge_shas=shas if all(shas) else [],
-        ))
+        nodes.append(make_node(uid, prs, deps))
         seen_ids.add(uid)
+
+    origin_slug = (
+        get_origin_repo_slug(config)
+        if split_urls and config is not None else None
+    )
+    for url in split_urls:
+        owner, repo, number = parse_pr_url(url)
+        sid = _singleton_feature_id(f"{owner}/{repo}", number, origin_slug)
+        if sid in seen_ids:
+            warnings_acc.append(
+                f"graph update: unit id {sid!r} for {url} is already taken; "
+                "dropping the PR from the graph"
+            )
+            continue
+        nodes.append(make_node(sid, [url], []))
+        seen_ids.add(sid)
 
     if not nodes:
         warnings_acc.append("graph update: spec produced no units; changing nothing")

@@ -71,6 +71,7 @@ from releasy.state import (
     find_merged_feature_for_prs,
     load_state,
     make_stall,
+    merged_port_refs,
     save_state,
 )
 
@@ -280,12 +281,14 @@ def _detect_port_mode(
     return "forward_port"
 
 
-def _singleton_feature_id(pr: PRInfo, origin_slug: str | None) -> str:
+def _singleton_feature_id(
+    repo_slug: str, number: int, origin_slug: str | None,
+) -> str:
     """``pr-<N>`` for origin PRs, ``<owner>-<repo>-pr-<N>`` for other repos."""
-    if origin_slug and pr.repo_slug == origin_slug:
-        return f"pr-{pr.number}"
-    owner, repo = pr.repo_slug.split("/", 1)
-    return f"{owner}-{repo}-pr-{pr.number}"
+    if origin_slug and repo_slug == origin_slug:
+        return f"pr-{number}"
+    owner, repo = repo_slug.split("/", 1)
+    return f"{owner}-{repo}-pr-{number}"
 
 
 def hold_map(config: Config) -> dict[PRRef, str]:
@@ -363,7 +366,9 @@ def _build_singleton_units(
     for pr, src in collected.values():
         unit_ai_context = src.ai_context or include_pr_contexts.get(pr.url, "")
         units.append(FeatureUnit(
-            feature_id=_singleton_feature_id(pr, origin_slug),
+            feature_id=_singleton_feature_id(
+                pr.repo_slug, pr.number, origin_slug,
+            ),
             prs=[pr],
             if_exists=src.if_exists,
             title_prefix=src.description,
@@ -375,21 +380,29 @@ def _build_singleton_units(
 
 def _build_group_units(
     config: Config,
+    state: PipelineState,
     excluded_pr_refs: set[PRRef],
     excluded_labels: set[str],
     included_authors: set[str],
     excluded_authors: set[str],
-) -> tuple[list[FeatureUnit], set[PRRef]]:
-    """Materialise group units; also returns the PR refs they claim (not to be ported as singletons)."""
+) -> tuple[list[FeatureUnit], set[PRRef], list[PRInfo]]:
+    """Materialise group units.
+
+    Also returns the PR refs they claim (not to be ported as singletons) and
+    the PRs listed in a merged group that its port did not carry (to be
+    ported as singletons).
+    """
     origin_slug = get_origin_repo_slug(config)
     existing_ports = existing_port_map(config)
     units: list[FeatureUnit] = []
     claimed: set[PRRef] = set()
+    released: list[PRInfo] = []
     for group in config.pr_sources.groups:
         console.print(
             f"\n  Resolving group [yellow]{group.id}[/yellow] "
             f"({len(group.prs)} PR(s))"
         )
+        ported = merged_port_refs(state, group.id)
         port_pr = shared_existing_port(group.prs, existing_ports)
         if port_pr is not None:
             console.print(
@@ -436,6 +449,13 @@ def _build_group_units(
                     "dropping from group"
                 )
                 continue
+            if ported is not None and parsed not in ported:
+                console.print(
+                    f"    [yellow]−[/yellow] {ref_label} is not in the "
+                    "group's merged port, porting it separately"
+                )
+                released.append(pr)
+                continue
             group_prs.append(pr)
             claimed.add(parsed)
             console.print(
@@ -469,7 +489,7 @@ def _build_group_units(
             ),
             existing_port_pr=port_pr,
         ))
-    return units, claimed
+    return units, claimed, released
 
 
 def _prune_superseded_singletons(config: Config, state: PipelineState) -> bool:
@@ -490,8 +510,11 @@ def _prune_superseded_singletons(config: Config, state: PipelineState) -> bool:
         port_pr = shared_existing_port(group.prs, existing_ports)
         if port_pr is not None:
             group_port[group.id] = port_pr
+        ported = merged_port_refs(state, group.id)
         for url in group.prs:
             parsed = parse_pr_url(url)
+            if ported is not None and parsed not in ported:
+                continue  # ported separately from the merged group
             if parsed is not None and (
                 port_pr is not None or parsed not in existing_ports
             ):
@@ -635,12 +658,12 @@ def discover_feature_units(config: Config) -> list["FeatureUnit"]:
                 )
                 console.print(f"    [dim]− {ref_label}: {reason}[/dim]")
 
+    default_source = (
+        config.pr_sources.by_labels[0]
+        if config.pr_sources.by_labels
+        else PRSourceConfig(labels=[], if_exists=config.pr_policy.if_exists)
+    )
     if include_pr_refs:
-        default_source = (
-            config.pr_sources.by_labels[0]
-            if config.pr_sources.by_labels
-            else PRSourceConfig(labels=[], if_exists=config.pr_policy.if_exists)
-        )
         for ref in sorted(include_pr_refs):
             if ref in collected:
                 continue
@@ -664,8 +687,8 @@ def discover_feature_units(config: Config) -> list["FeatureUnit"]:
             )
 
     excluded_label_set = set(prs_cfg.exclude_labels)
-    group_units, claimed_pr_refs = _build_group_units(
-        config, exclude_pr_refs, excluded_label_set,
+    group_units, claimed_pr_refs, released_prs = _build_group_units(
+        config, load_state(config), exclude_pr_refs, excluded_label_set,
         included_authors, excluded_authors,
     )
     for ref in claimed_pr_refs:
@@ -677,6 +700,8 @@ def discover_feature_units(config: Config) -> list["FeatureUnit"]:
                 f"  [dim]{ref_label} ({pr_info.title}) belongs to a group — "
                 "removed from singletons[/dim]"
             )
+    for pr in released_prs:
+        collected.setdefault(pr.ref(), (pr, default_source))
 
     units: list[FeatureUnit] = (
         _build_singleton_units(config, collected) + group_units

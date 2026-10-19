@@ -587,6 +587,21 @@ def mark_outdated(fs: FeatureState, reason: str) -> bool:
     return True
 
 
+def merged_port_refs(
+    state: PipelineState, feature_id: str,
+) -> set[tuple[str, str, int]] | None:
+    """PR refs ``feature_id``'s merged port carried; ``None`` unless it merged.
+
+    A merged unit is immutable: PRs listed in it beyond these are ported separately.
+    """
+    from releasy.github_ops import parse_pr_url
+
+    fs = state.features.get(feature_id)
+    if fs is None or fs.status != "merged" or not fs.pr_urls:
+        return None
+    return {r for u in fs.pr_urls if (r := parse_pr_url(u)) is not None}
+
+
 def find_merged_feature_for_prs(
     state: PipelineState,
     pr_urls: list[str],

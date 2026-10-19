@@ -14,6 +14,7 @@ from releasy.state import (
     find_features_by_pr_url,
     load_state,
     mark_outdated,
+    merged_port_refs,
     save_state,
 )
 
@@ -101,6 +102,13 @@ def add_pr(
                 f"[red]Group '{group_id}' not found in session.[/red] "
                 f"Existing groups: "
                 f"{', '.join(g.id for g in ps.groups) or '(none)'}"
+            )
+            return False
+        ported = merged_port_refs(load_state(config), group_id)
+        if ported is not None and parse_pr_url(url) not in ported:
+            console.print(
+                f"[red]Group '{group_id}' is merged and cannot change.[/red] "
+                "Add the PR without --group to port it separately."
             )
             return False
         target_list = group.prs
