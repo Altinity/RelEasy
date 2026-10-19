@@ -903,34 +903,53 @@ def build_changelog(
             f"Walking [cyan]{from_ref}..{to_ref}[/cyan] — "
             f"[cyan]{len(numbers)}[/cyan] PR(s) merged onto the branch..."
         )
-        fetched = fetch_prs_by_numbers(
-            config, numbers, slug=origin_slug, include_closed=True,
-        )
-        # value None = transient fetch failure (refuse — would ship incomplete);
-        # key absent = 404 / bad subject parse (skip). See fetch_prs_by_numbers.
-        failed = [n for n in numbers if n in fetched and fetched[n] is None]
-        if failed:
-            console.print(
-                f"[red]Could not fetch {len(failed)} PR(s) in the range: "
-                f"{', '.join(f'#{n}' for n in failed)}.[/red] "
-                "Refusing to draft an incomplete changelog."
+        seen: set[int] = set()
+        while numbers:
+            fetched = fetch_prs_by_numbers(
+                config, numbers, slug=origin_slug, include_closed=True,
             )
-            return None
-        for n in numbers:
-            pr = fetched.get(n)
-            if pr is None:
+            # value None = transient fetch failure (refuse — would ship incomplete);
+            # key absent = 404 / bad subject parse (skip). See fetch_prs_by_numbers.
+            failed = [n for n in numbers if n in fetched and fetched[n] is None]
+            if failed:
                 console.print(
-                    f"  [yellow]![/yellow] #{n} is not a PR on {origin_slug} "
-                    "— skipping"
+                    f"[red]Could not fetch {len(failed)} PR(s) in the range: "
+                    f"{', '.join(f'#{n}' for n in failed)}.[/red] "
+                    "Refusing to draft an incomplete changelog."
                 )
-                continue
-            if pr.state != "merged":
-                console.print(
-                    f"  [yellow]![/yellow] #{n} is {pr.state}, not merged "
-                    "— skipping"
-                )
-                continue
-            prs.append(pr)
+                return None
+            seen.update(numbers)
+            synced: list[int] = []
+            for n in numbers:
+                pr = fetched.get(n)
+                if pr is None:
+                    console.print(
+                        f"  [yellow]![/yellow] #{n} is not a PR on {origin_slug} "
+                        "— skipping"
+                    )
+                    continue
+                if pr.state != "merged":
+                    console.print(
+                        f"  [yellow]![/yellow] #{n} is {pr.state}, not merged "
+                        "— skipping"
+                    )
+                    continue
+                prs.append(pr)
+                # A customizations sync PR brings in the PRs merged into that branch.
+                if (pr.head_ref or "").startswith("customizations/") and pr.merge_commit_sha:
+                    inner = first_parent_pr_numbers(
+                        repo_path,
+                        f"{pr.merge_commit_sha}^1", f"{pr.merge_commit_sha}^2",
+                        exclude=(from_sha,),
+                    )
+                    new = [m for m in inner if m not in seen and m not in synced]
+                    if new:
+                        console.print(
+                            f"  [dim]#{n} syncs {pr.head_ref} — "
+                            f"expanding {len(new)} PR(s)[/dim]"
+                        )
+                        synced.extend(new)
+            numbers = synced
     else:
         anc_unknown = ancestry is None
         base = base_branch or config.target_branch or to_ref

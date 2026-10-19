@@ -510,10 +510,15 @@ def pr_number_from_subject(subject: str) -> int | None:
 
 def first_parent_pr_numbers(
     repo_path: Path, from_ref: str, to_ref: str,
+    *, exclude: tuple[str, ...] = (),
 ) -> list[int]:
-    """Sorted unique PR numbers on the first-parent chain of ``from_ref..to_ref``."""
+    """Sorted unique PR numbers on the first-parent chain of ``from_ref..to_ref``.
+
+    Commits reachable from any ``exclude`` ref are left out too.
+    """
     result = run_git(
-        ["log", "--first-parent", "--format=%s", f"{from_ref}..{to_ref}"],
+        ["log", "--first-parent", "--format=%s", f"{from_ref}..{to_ref}",
+         *(f"^{ref}" for ref in exclude)],
         repo_path, check=False,
     )
     if result.returncode != 0:
