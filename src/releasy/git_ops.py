@@ -457,7 +457,7 @@ def resolve_ref_prefer_remote(
         (ref, "other"),
     ):
         result = run_git(
-            ["rev-parse", "--verify", "--quiet", candidate],
+            ["rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"],
             repo_path, check=False,
         )
         sha = (result.stdout or "").strip()
