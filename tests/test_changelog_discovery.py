@@ -176,8 +176,11 @@ class EntriesForPr(unittest.TestCase):
         pr = _pr(1, body=_body("Not for Changelog (changelog entry is not required)", "x"))
         self.assertEqual(self._entries(pr), [])
 
-    def test_no_entry_dropped(self):
-        self.assertEqual(self._entries(_pr(1, body=_body("New Feature", None))), [])
+    def test_no_entry_falls_back_to_title(self):
+        e = self._one(_pr(1, body=_body("Build/Testing/Packaging Improvement", None),
+                          title="Alpine CVE fixes"))
+        self.assertEqual(e.section, cl.SECTION_BUILD)
+        self.assertEqual(e.description, "Alpine CVE fixes")
 
     def test_category_absent_folds_to_improvements(self):
         e = self._one(_pr(1, body=_body(None, "Tweak something.")))

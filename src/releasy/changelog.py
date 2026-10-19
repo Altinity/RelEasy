@@ -128,14 +128,10 @@ def _classify_category(category_text: str | None) -> str | None:
 
 
 def _description_for_pr(pr: PRInfo) -> str | None:
-    """Text of the body's ``Changelog entry`` section (never the title), or ``None``."""
+    """Text of the body's ``Changelog entry`` section, else the PR title, or ``None``."""
     section = _section_text(pr.body or "", "changelog entry")
-    if not section:
-        return None
-    cleaned = _strip_template_chrome(section)
-    if not cleaned:
-        return None
-    return cleaned
+    cleaned = _strip_template_chrome(section) if section else None
+    return cleaned or (pr.title or "").strip() or None
 
 
 def _strip_template_chrome(section: str) -> str | None:
