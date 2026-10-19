@@ -770,12 +770,8 @@ def build_changelog(
     repo_path, _ = ensure_work_repo(config, work_dir)
     console.print(f"[dim]Repo: {repo_path}[/dim]")
 
-    def _try_fetch(remote: str, *, with_tags: bool) -> bool:
-        argv = ["fetch"]
-        if with_tags:
-            argv.append("--tags")
-        argv.append(remote)
-        result = run_git(argv, repo_path, check=False)
+    def _try_fetch(remote: str) -> bool:
+        result = run_git(["fetch", "--no-tags", remote], repo_path, check=False)
         if result.returncode == 0:
             return True
         stderr = (result.stderr or "").strip()
@@ -784,18 +780,9 @@ def build_changelog(
             console.print(f"[dim]{stderr}[/dim]")
         return False
 
-    # A --tags fetch can fail on moved-tag collisions; then fetch branches
-    # only and force-refresh the --from / --to tags below.
-    origin_tags_fresh = False
     console.print(f"Fetching [cyan]{config.origin.remote_name}[/cyan]...", end=" ")
-    if _try_fetch(config.origin.remote_name, with_tags=True):
+    if _try_fetch(config.origin.remote_name):
         console.print("[green]done[/green]")
-        origin_tags_fresh = True
-    elif _try_fetch(config.origin.remote_name, with_tags=False):
-        console.print(
-            "  [dim]retried without --tags; will force-refresh --from / "
-            "--to tags individually below[/dim]"
-        )
     else:
         console.print(
             f"[red]Could not fetch origin ({config.origin.remote_name}).[/red] "
@@ -803,7 +790,6 @@ def build_changelog(
         )
         return None
 
-    upstream_tags_fresh = False
     if config.upstream:
         ensure_remote(
             repo_path, config.upstream.remote_name, config.upstream.remote,
@@ -811,30 +797,24 @@ def build_changelog(
         console.print(
             f"Fetching [cyan]{config.upstream.remote_name}[/cyan]...", end=" ",
         )
-        if _try_fetch(config.upstream.remote_name, with_tags=True):
+        if _try_fetch(config.upstream.remote_name):
             console.print("[green]done[/green]")
-            upstream_tags_fresh = True
-        elif _try_fetch(config.upstream.remote_name, with_tags=False):
-            console.print(
-                "  [dim]retried without --tags; will force-refresh "
-                "--from / --to tags individually below[/dim]"
-            )
         else:
             console.print("[yellow]skipped[/yellow]")
 
-    candidates: list[tuple[str, bool]] = [
-        (config.origin.remote, origin_tags_fresh),
-    ]
+    # Only the --from / --to tags, force-fetched so a stale local tag is
+    # overwritten; origin first, upstream only if origin lacks it.
+    tag_sources = [config.origin.remote]
     if config.upstream:
-        candidates.append((config.upstream.remote, upstream_tags_fresh))
+        tag_sources.append(config.upstream.remote)
     for ref in (from_ref, to_ref):
-        for url, already_fresh in candidates:
-            if already_fresh:
-                continue
-            run_git(
+        for url in tag_sources:
+            result = run_git(
                 ["fetch", "--no-tags", url, f"+refs/tags/{ref}:refs/tags/{ref}"],
                 repo_path, check=False,
             )
+            if result.returncode == 0:
+                break
 
     # Prefer origin: a stale local branch of the same name must never win.
     remote_name = config.origin.remote_name
