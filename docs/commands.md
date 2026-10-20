@@ -258,7 +258,8 @@ Exit `1` on fetch error, malformed AI reply, cycle, or failed session edit.
 
 Re-renders the graph issue with per-unit progress checkboxes and status
 markers (merged, in review, conflict, blocked, …, plus the stall reason). A box
-is ticked once the port PR exists. Merged/superseded groups are folded;
+is ticked once the port PR exists. Not-yet-merged units are listed first,
+merged ones in a separate section below; all groups are folded. On-hold,
 reverted, discarded and excluded units get their own sections. Runs
 automatically after `run` / `refresh` (`graph.sync_progress`). No git, no AI.
 

@@ -1322,7 +1322,7 @@ class ProgressCheckboxes(unittest.TestCase):
 
     def test_group_renders_as_details_block(self):
         body = self._body([self._grp()], self._state())
-        self.assertIn("<details open>", body)
+        self.assertIn("<details>", body)
         self.assertIn("</details>", body)
         # GitHub renders the checkboxes only after a blank line following <summary>.
         self.assertIn("</summary>\n\n1. [ ] [#1]", body)
@@ -1342,17 +1342,32 @@ class ProgressCheckboxes(unittest.TestCase):
                 self.assertNotIn("<details open>", body)
                 self.assertIn("<b>Discarded</b>", body)
 
-    def test_unfinished_group_stays_open(self):
+    def test_unfinished_group_is_folded(self):
         for status in ("needs_review", "conflict", "blocked"):
             with self.subTest(status=status):
                 fs = FeatureState(status=status, rebase_pr_url=URL(60))
                 body = self._body([self._grp()], self._state(grp=fs))
-                self.assertIn("<details open>", body)
+                self.assertIn("<details>\n<summary>☑", body)
+                self.assertNotIn("<details open>", body)
 
-    def test_untracked_group_stays_open_and_unticked(self):
+    def test_untracked_group_is_folded_and_unticked(self):
         body = self._body([self._grp()], self._state())
-        self.assertIn("<details open>", body)
+        self.assertNotIn("<details open>", body)
         self.assertIn("<summary>☐ <b><code>grp</code></b>", body)
+
+    def test_unmerged_section_comes_before_merged(self):
+        body = self._body(
+            [node("pr-1", 1), node("pr-2", 2)],
+            self._state(**{
+                "pr-1": FeatureState(status="merged", rebase_pr_url=URL(60)),
+                "pr-2": FeatureState(status="needs_review", rebase_pr_url=URL(61)),
+            }),
+        )
+        unmerged_at = body.index("### 🚧 Not yet merged")
+        merged_at = body.index("### ✅ Merged")
+        self.assertLess(unmerged_at, merged_at)
+        self.assertIn("[#2](", body[unmerged_at:merged_at])
+        self.assertIn("[#1](", body[merged_at:])
 
     def test_standalone_entries_stay_plain_checkboxes(self):
         body = self._body([node("pr-1", 1)], self._state())

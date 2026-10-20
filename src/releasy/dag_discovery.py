@@ -2246,9 +2246,6 @@ _NOT_STARTED_MARKER = "⬜ not started"
 # Not a BranchStatus: a hold prefixes the progress note instead of replacing it.
 _HOLD_MARKER = "⏸ on hold"
 
-# Statuses whose group is folded shut in the issue.
-_FOLDED_STATUSES: frozenset[str] = frozenset({"merged"})
-
 # Terminal statuses listed (in this order) under the folded "Discarded" section.
 _DISCARDED_STATUSES: tuple[str, ...] = ("closed", "skipped", "superseded")
 
@@ -2519,11 +2516,7 @@ def render_graph_issue_body(
     }
     on_hold = [n for n in report.nodes if n.unit_id in hold_reasons]
     parked_ids |= set(hold_reasons)
-    groups = [n for n in all_groups if n.unit_id not in parked_ids]
-    singles = [
-        n for n in report.nodes
-        if len(n.pr_urls) == 1 and n.unit_id not in parked_ids
-    ]
+    working = [n for n in report.nodes if n.unit_id not in parked_ids]
     headline = (
         f"**{report.candidate_unit_count} unit(s) across "
         f"{report.candidate_pr_count} PR(s)** — {len(all_groups)} group(s), "
@@ -2552,8 +2545,8 @@ def render_graph_issue_body(
     lines.append("")
     lines.append(
         "_A box is ticked once releasy has opened the port PR (a "
-        "partially-applied group counts — its draft PR is linked). Merged "
-        "groups and the Discarded / Excluded lists are folded shut. Run "
+        "partially-applied group counts — its draft PR is linked). Groups "
+        "and the Discarded / Excluded lists are folded shut. Run "
         "`releasy graph sync` to refresh._"
     )
     lines.append("")
@@ -2586,42 +2579,58 @@ def render_graph_issue_body(
         ]
         return out
 
-    if groups:
-        lines.append("### Groups (port together, in apply order)")
-        lines.append("")
-        for n in groups:
-            fs = progress.get(n.unit_id)
-            total = len(n.pr_urls)
-            landed = _picks_landed(fs, total)
-            folded = fs is not None and fs.status in _FOLDED_STATUSES
-            glyph = "☑" if _unit_ported(fs) else "☐"
-            lines.append("<details>" if folded else "<details open>")
-            lines.append(
-                f"<summary>{glyph} <b><code>{n.unit_id}</code></b> "
-                f"· {total} PRs{_progress_note(fs, total, html=True)}</summary>"
-            )
-            # Blank line ends the raw-HTML block so the list renders as markdown.
+    def _render_units(units: list[DAGNode]) -> None:
+        unit_groups = [n for n in units if len(n.pr_urls) > 1]
+        unit_singles = [n for n in units if len(n.pr_urls) == 1]
+        if unit_groups:
+            lines.append("#### Groups (port together, in apply order)")
             lines.append("")
-            for i, url in enumerate(n.pr_urls):
+            for n in unit_groups:
+                fs = progress.get(n.unit_id)
+                total = len(n.pr_urls)
+                landed = _picks_landed(fs, total)
+                glyph = "☑" if _unit_ported(fs) else "☐"
+                lines.append("<details>")
                 lines.append(
-                    f"{i + 1}. {_box(i < landed)} [{_pr_short(url)}]({url}) "
-                    f"{_title_of(n, i)}".rstrip()
+                    f"<summary>{glyph} <b><code>{n.unit_id}</code></b> "
+                    f"· {total} PRs{_progress_note(fs, total, html=True)}</summary>"
+                )
+                # Blank line ends the raw-HTML block so the list renders as markdown.
+                lines.append("")
+                for i, url in enumerate(n.pr_urls):
+                    lines.append(
+                        f"{i + 1}. {_box(i < landed)} [{_pr_short(url)}]({url}) "
+                        f"{_title_of(n, i)}".rstrip()
+                    )
+                lines.append("")
+                lines.append("</details>")
+                lines.append("")
+        if unit_singles:
+            lines.append("#### Standalone PRs")
+            lines.append("")
+            for n in unit_singles:
+                url = n.pr_urls[0]
+                fs = progress.get(n.unit_id)
+                lines.append(
+                    f"- {_box(_unit_ported(fs))} [{_pr_short(url)}]({url}) "
+                    f"{_title_of(n, 0)}".rstrip() + _progress_note(fs, 1)
                 )
             lines.append("")
-            lines.append("</details>")
-            lines.append("")
 
-    if singles:
-        lines.append("### Standalone PRs")
+    def _is_merged(n: DAGNode) -> bool:
+        fs = progress.get(n.unit_id)
+        return fs is not None and fs.status == "merged"
+
+    unmerged = [n for n in working if not _is_merged(n)]
+    merged = [n for n in working if _is_merged(n)]
+    if unmerged:
+        lines.append("### 🚧 Not yet merged")
         lines.append("")
-        for n in singles:
-            url = n.pr_urls[0]
-            fs = progress.get(n.unit_id)
-            lines.append(
-                f"- {_box(_unit_ported(fs))} [{_pr_short(url)}]({url}) "
-                f"{_title_of(n, 0)}".rstrip() + _progress_note(fs, 1)
-            )
+        _render_units(unmerged)
+    if merged:
+        lines.append("### ✅ Merged")
         lines.append("")
+        _render_units(merged)
 
     if on_hold:
         lines.append("### ⏸ On hold — not being ported right now")
