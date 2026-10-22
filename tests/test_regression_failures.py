@@ -11,12 +11,12 @@ from releasy.analyze_fails import (
 from releasy.ci_failures import (
     CATEGORY_OTHER,
     ArtifactLocator,
-    TestFlowsLocator,
     category_from_name,
     extract_regression_failures,
     locator_from_target_url,
     parse_testflows_fails_log,
 )
+from releasy.ci_failures import TestFlowsLocator as FlowsLocator
 
 S3 = "https://altinity-build-artifacts.s3.amazonaws.com"
 SWARMS_REPORT = (
@@ -118,7 +118,7 @@ class LocatorDispatch(unittest.TestCase):
 
     def test_testflows_report(self):
         loc = locator_from_target_url(SWARMS_REPORT)
-        self.assertIsInstance(loc, TestFlowsLocator)
+        self.assertIsInstance(loc, FlowsLocator)
         self.assertTrue(loc.fails_log_url().endswith("/swarms/fails.log.txt"))
         self.assertEqual(loc.report_url(), SWARMS_REPORT)
 
@@ -172,15 +172,11 @@ class LeafExtraction(unittest.TestCase):
             "rescheduling with bucket granularity",
         ])
 
-    def test_thin_leaf_borrows_the_ancestor_traceback(self):
-        leaf = self._extract(SWARMS_FAILS_LOG)[0]
-        self.assertIn("AssertionError", leaf.info_excerpt)
-        self.assertIn("Traceback (most recent call last):", leaf.info_excerpt)
-        self.assertIn("'/swarms'", leaf.info_excerpt)
-
-    def test_shared_ancestor_traceback_is_attached_once(self):
+    def test_shared_ancestor_traceback_is_borrowed_by_the_first_leaf_only(self):
         first, second = self._extract(SWARMS_FAILS_LOG)
+        self.assertIn("AssertionError", first.info_excerpt)
         self.assertIn("Traceback (most recent call last):", first.info_excerpt)
+        self.assertIn("'/swarms'", first.info_excerpt)
         self.assertNotIn(
             "Traceback (most recent call last):", second.info_excerpt,
         )

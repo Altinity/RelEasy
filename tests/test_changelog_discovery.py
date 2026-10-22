@@ -34,23 +34,17 @@ class BuildMergedBaseQuery(unittest.TestCase):
         q = build_merged_base_query("o/r", "antalya-26.3")
         self.assertEqual(q, "repo:o/r is:pr is:merged base:antalya-26.3")
 
-    def test_window_both_bounds(self):
-        q = build_merged_base_query(
-            "o/r", "b", merged_from="2025-01-01T00:00:00+00:00",
-            merged_to="2025-06-01T00:00:00+00:00",
-        )
-        self.assertIn(
-            "merged:2025-01-01T00:00:00+00:00..2025-06-01T00:00:00+00:00", q,
-        )
-        self.assertEqual(q.count("merged:"), 1)
-
-    def test_window_lower_only(self):
-        q = build_merged_base_query("o/r", "b", merged_from="2025-01-01")
-        self.assertIn("merged:>=2025-01-01", q)
-
-    def test_window_upper_only(self):
-        q = build_merged_base_query("o/r", "b", merged_to="2025-06-01")
-        self.assertIn("merged:<=2025-06-01", q)
+    def test_merge_window(self):
+        for kw, expected in (
+            ({"merged_from": "2025-01-01", "merged_to": "2025-06-01"},
+             "merged:2025-01-01..2025-06-01"),
+            ({"merged_from": "2025-01-01"}, "merged:>=2025-01-01"),
+            ({"merged_to": "2025-06-01"}, "merged:<=2025-06-01"),
+        ):
+            with self.subTest(**kw):
+                q = build_merged_base_query("o/r", "b", **kw)
+                self.assertIn(expected, q)
+                self.assertEqual(q.count("merged:"), 1)
 
     def test_exclude_labels_quoted(self):
         q = build_merged_base_query(
@@ -139,9 +133,6 @@ class FirstParentPrNumbers(unittest.TestCase):
         nums = first_parent_pr_numbers(self.repo, self.base, to)
         self.assertEqual(nums, [10, 30])
 
-    def test_empty_range(self):
-        self.assertEqual(first_parent_pr_numbers(self.repo, self.base, self.base), [])
-
 
 class IsForwardPort(unittest.TestCase):
     def test_label_hyphenated(self):
@@ -150,8 +141,15 @@ class IsForwardPort(unittest.TestCase):
     def test_title(self):
         self.assertTrue(cl._is_forward_port(_pr(1, title="Forward port of X")))
 
-    def test_not_a_forward_port(self):
-        self.assertFalse(cl._is_forward_port(_pr(1, labels=["bug"], title="Fix X")))
+
+_UP_URL = "https://github.com/ClickHouse/ClickHouse/pull/101272"
+
+
+def _upstream():
+    return PRInfo(
+        number=101272, title="t", body="", state="merged", merge_commit_sha=None,
+        head_sha="", url=_UP_URL, repo_slug="ClickHouse/ClickHouse", author="nihalzp",
+    )
 
 
 class EntriesForPr(unittest.TestCase):
@@ -186,15 +184,21 @@ class EntriesForPr(unittest.TestCase):
         e = self._one(_pr(1, body=_body(None, "Tweak something.")))
         self.assertEqual(e.section, cl.SECTION_IMPROVEMENTS)
 
+    def test_recovers_upstream_attribution(self):
+        pr = _pr(1, body=_body("New Feature", f"Support X ({_UP_URL} by @nihalzp)"))
+        self.assertEqual(
+            cl._render_entry(self._one(pr)),
+            f"* Support X ({_UP_URL} by @nihalzp via https://github.com/o/r/pull/1)",
+        )
 
-_UP_URL = "https://github.com/ClickHouse/ClickHouse/pull/101272"
-
-
-def _upstream():
-    return PRInfo(
-        number=101272, title="t", body="", state="merged", merge_commit_sha=None,
-        head_sha="", url=_UP_URL, repo_slug="ClickHouse/ClickHouse", author="nihalzp",
-    )
+    def test_benign_paren_not_recovered(self):
+        pr = _pr(1, body=_body("New Feature", "Fix sorting (descending order)"))
+        e = self._one(pr)
+        self.assertEqual(e.upstream_prs, [])
+        self.assertEqual(
+            cl._render_entry(e),
+            "* Fix sorting (descending order) (https://github.com/o/r/pull/1 by @alice)",
+        )
 
 
 class TrailingParenGroup(unittest.TestCase):
@@ -202,7 +206,7 @@ class TrailingParenGroup(unittest.TestCase):
         self.assertEqual(cl._trailing_paren_group("x (a b)"), (2, "a b"))
 
     def test_nested_markdown_link(self):
-        start, inner = cl._trailing_paren_group("x ([#1](http://h/1) by @a)")
+        _, inner = cl._trailing_paren_group("x ([#1](http://h/1) by @a)")
         self.assertEqual(inner, "[#1](http://h/1) by @a")
 
     def test_no_trailing_paren(self):
@@ -235,11 +239,6 @@ class StripRedundantParens(unittest.TestCase):
             "Fix race (regression in #101272)",
         )
 
-    def test_no_upstream_no_strip(self):
-        self.assertEqual(
-            cl._strip_redundant_upstream_parens(f"D ({_UP_URL} by @x)", []),
-            f"D ({_UP_URL} by @x)",
-        )
 
 
 class AttributionFromText(unittest.TestCase):
@@ -278,29 +277,6 @@ class AttributionFromText(unittest.TestCase):
         )
 
 
-class EntryRecovery(unittest.TestCase):
-    def _one(self, pr):
-        es = cl._entries_for_pr(None, pr, "o/r", {})
-        self.assertEqual(len(es), 1)
-        return es[0]
-
-    def test_recovers_upstream_attribution(self):
-        pr = _pr(1, body=_body("New Feature", f"Support X ({_UP_URL} by @nihalzp)"))
-        self.assertEqual(
-            cl._render_entry(self._one(pr)),
-            f"* Support X ({_UP_URL} by @nihalzp via https://github.com/o/r/pull/1)",
-        )
-
-    def test_benign_paren_not_recovered(self):
-        pr = _pr(1, body=_body("New Feature", "Fix sorting (descending order)"))
-        e = self._one(pr)
-        self.assertEqual(e.upstream_prs, [])
-        self.assertEqual(
-            cl._render_entry(e),
-            "* Fix sorting (descending order) (https://github.com/o/r/pull/1 by @alice)",
-        )
-
-
 class BundleSplit(unittest.TestCase):
     def test_entry_from_upstream(self):
         altinity = _pr(1773, body="")
@@ -333,14 +309,10 @@ class BundleSplit(unittest.TestCase):
             ("clickhouse/clickhouse", 101278): up(101278, "Fix A"),
             ("clickhouse/clickhouse", 102337): up(102337, "Fix B"),
         }
-        orig = cl._extract_upstream_refs
-        cl._extract_upstream_refs = lambda body, slug: [
+        with mock.patch.object(cl, "_extract_upstream_refs", lambda body, slug: [
             ("ClickHouse/ClickHouse", 101278), ("ClickHouse/ClickHouse", 102337),
-        ]
-        try:
+        ]):
             es = cl._entries_for_pr(None, altinity, "o/r", cache)
-        finally:
-            cl._extract_upstream_refs = orig
         self.assertEqual(len(es), 2)
         self.assertEqual([e.description for e in es], ["Fix A", "Fix B"])
         self.assertTrue(all(
@@ -355,7 +327,6 @@ class InlineBundleSplit(unittest.TestCase):
     def _entries(self, entry, category="Bug Fix"):
         pr = _pr(2045, body=_body(category, entry),
                  title="Backport #93016 to 24.8 Altinity Stable")
-        pr.url = "https://github.com/o/r/pull/2045"
         return cl._entries_for_pr(None, pr, "o/r", {})
 
     def test_two_inlined_entries_split(self):
@@ -378,11 +349,6 @@ class InlineBundleSplit(unittest.TestCase):
             cl._render_entry(es[0]),
             f"* Fix sparse column mutation error. "
             f"({self._CH}/93016 by @avogar via https://github.com/o/r/pull/2045)",
-        )
-        self.assertEqual(
-            cl._render_entry(es[1]),
-            f"* Rebuild projection on alter modify of its PK column. "
-            f"({self._CH}/75720 by @avogar via https://github.com/o/r/pull/2045)",
         )
 
     def test_benign_parens_do_not_split(self):

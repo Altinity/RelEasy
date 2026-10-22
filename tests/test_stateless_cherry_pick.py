@@ -5,7 +5,6 @@ import unittest
 import releasy.stateless as st
 from releasy.github_ops import PRInfo
 
-
 CH_BODY = (
     "### Changelog category (leave one):\n\n- Bug Fix\n\n"
     "### Changelog entry (a user-readable short description of the changes "
@@ -46,6 +45,13 @@ class CiOptionsSectionTest(unittest.TestCase):
             self.assertTrue(section.startswith("### CI/CD Options"))
             self.assertIn("ci_exclude_fast", section)
 
+    def test_keeps_trailing_content_below_checkboxes(self):
+        section = st._ci_options_section(
+            TARGET_TEMPLATE + "\n#### Notes\nRun the thing.\n",
+        )
+        self.assertIn("#### Notes", section)
+        self.assertIn("Run the thing.", section)
+
 
 class ChangelogBlockTest(unittest.TestCase):
     def test_entry_gets_url_and_author_attribution(self):
@@ -71,9 +77,9 @@ class ChangelogBlockTest(unittest.TestCase):
 class PrBodyTest(unittest.TestCase):
     def test_full_body_composition(self):
         ci = st._ci_options_section(TARGET_TEMPLATE)
-        body = _pr().url
-        out = st._pr_body(_pr().url, _pr(), ci)
-        self.assertTrue(out.startswith(f"Cherry-picked from {body}."))
+        url = _pr().url
+        out = st._pr_body(url, _pr(), ci)
+        self.assertTrue(out.startswith(f"Cherry-picked from {url}."))
         self.assertIn("by @alice).", out)
         self.assertIn("### CI/CD Options", out)
         self.assertIn("<!---ci_exclude_fast--> Fast test", out)

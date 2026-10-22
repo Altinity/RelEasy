@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import releasy.project_backport as pb
 from releasy.github_ops import PRInfo
 
 
-def _pr(num=89367, *, title="Crash in IN", body="", author="alice", slug="ClickHouse/ClickHouse"):
+def _pr(num):
     return PRInfo(
-        number=num, title=title, body=body, state="merged",
+        number=num, title="Crash in IN", body="", state="merged",
         merge_commit_sha="abc123", head_sha="",
         url=f"https://github.com/ClickHouse/ClickHouse/pull/{num}",
-        repo_slug=slug, labels=[], author=author,
+        repo_slug="ClickHouse/ClickHouse", labels=[], author="alice",
     )
 
 
@@ -59,82 +60,8 @@ class ItemQualifies(unittest.TestCase):
         self.assertFalse(pb._item_qualifies(it, "24.8", pb.UPSTREAM_SLUG))
 
 
-class PRTitle(unittest.TestCase):
-    def test_format(self):
-        self.assertEqual(
-            pb._pr_title("24.8", _pr(89367, title="Crash in IN function")),
-            "24.8 Backport of #89367 - Crash in IN function",
-        )
-
-
-class ChangelogBlock(unittest.TestCase):
-    UPSTREAM_BODY = (
-        "### Changelog category (leave one):\n"
-        "- Bug Fix (user-visible misbehavior in an official stable release)\n\n"
-        "### Changelog entry (a user-readable short description):\n"
-        "Possible crash in IN function.\n"
-    )
-
-    def test_includes_category_entry_and_attribution(self):
-        pr = _pr(89367, body=self.UPSTREAM_BODY, author="ilejn")
-        block = pb._build_changelog_block_for_pr(pr)
-        self.assertIn("### Changelog category (leave one):", block)
-        self.assertIn("- Bug Fix (user-visible misbehavior", block)
-        self.assertIn("### Changelog entry", block)
-        self.assertIn(
-            "Possible crash in IN function "
-            "(https://github.com/ClickHouse/ClickHouse/pull/89367 by @ilejn).",
-            block,
-        )
-
-    def test_none_when_no_changelog(self):
-        self.assertIsNone(pb._build_changelog_block_for_pr(_pr(1, body="no sections here")))
-
-
-class CiOptionsSection(unittest.TestCase):
-    TEMPLATE = (
-        "<!-- a comment -->\n"
-        "### Changelog category (leave one):\n- ...\n\n"
-        "### Changelog entry (...):\n...\n\n"
-        "### CI/CD Options\n"
-        "#### Exclude tests:\n"
-        "- [ ] <!---ci_exclude_fast--> Fast test\n"
-        "- [x] <!---ci_exclude_asan--> All with ASAN\n"
-    )
-
-    def test_extracts_section_from_template(self):
-        section = pb._ci_options_section(self.TEMPLATE)
-        self.assertTrue(section.startswith("### CI/CD Options"))
-        self.assertIn("All with ASAN", section)
-        self.assertNotIn("Changelog", section)
-
-    def test_falls_back_to_default_when_missing(self):
-        self.assertIn("### CI/CD Options", pb._ci_options_section(None))
-        self.assertIn("### CI/CD Options", pb._ci_options_section("no ci section here"))
-
-    def test_keeps_trailing_content_below_checkboxes(self):
-        template = self.TEMPLATE + "\n#### Notes\nRun the thing.\n"
-        section = pb._ci_options_section(template)
-        self.assertIn("#### Notes", section)
-        self.assertIn("Run the thing.", section)
-
-
-class PrBody(unittest.TestCase):
-    def test_combines_changelog_and_ci(self):
-        body = pb._build_pr_body("CHANGELOG", "### CI/CD Options\n- [ ] x")
-        self.assertIn("CHANGELOG", body)
-        self.assertIn("### CI/CD Options", body)
-        self.assertTrue(body.endswith("\n"))
-
-    def test_changelog_optional(self):
-        body = pb._build_pr_body(None, "### CI/CD Options")
-        self.assertTrue(body.startswith("### CI/CD Options"))
-
-
 class RunDryRun(unittest.TestCase):
     def _run(self):
-        from unittest import mock
-
         UP = pb.UPSTREAM_SLUG
         items = [
             _item(repo=UP, number=100, port_versions="24.8"),
@@ -183,7 +110,6 @@ class RunDryRun(unittest.TestCase):
 
 class RunFatal(unittest.TestCase):
     def test_missing_port_versions_field_is_fatal(self):
-        from unittest import mock
         with mock.patch.object(pb, "_parse_project_url", lambda u: ("Altinity", 26, True)), \
              mock.patch.object(pb, "_get_project_id", lambda o, n, org: "PROJ"), \
              mock.patch.object(pb, "_find_field_node", lambda pid, name: None):

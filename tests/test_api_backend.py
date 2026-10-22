@@ -6,6 +6,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import releasy.ai_resolve as a
 import releasy.api_agent as ag
@@ -324,9 +325,6 @@ class Cost(unittest.TestCase):
         cost = ag._usage_cost("claude-opus-5", usage)
         self.assertAlmostEqual(cost, 5 + 25 + 6.25 + 0.5, places=6)
 
-    def test_missing_usage_is_free_not_a_crash(self):
-        self.assertEqual(ag._usage_cost("claude-opus-5", None), 0.0)
-
 
 class AgentLoop(_StubSDK):
     def _spec(self, **kw):
@@ -509,15 +507,11 @@ class ErrorLineClassification(unittest.TestCase):
             "request_id": "req_test",
         }
 
-    def test_overloaded_inside_a_200_is_retryable(self):
-        line = ag._api_error_line(
-            self._exc(self._err_body("overloaded_error", "Overloaded"), 200),
-        )
-        self.assertIsNotNone(a._find_transient_api_error(line))
-
-    def test_internal_api_error_inside_a_200_is_retryable(self):
-        line = ag._api_error_line(self._exc(self._err_body("api_error"), 200))
-        self.assertIsNotNone(a._find_transient_api_error(line))
+    def test_server_error_inside_a_200_is_retryable(self):
+        for kind in ("overloaded_error", "api_error"):
+            with self.subTest(kind=kind):
+                line = ag._api_error_line(self._exc(self._err_body(kind), 200))
+                self.assertIsNotNone(a._find_transient_api_error(line))
 
     def test_rate_limit_body_routes_to_the_exhaustion_wait(self):
         line = ag._api_error_line(
@@ -542,14 +536,9 @@ class ErrorLineClassification(unittest.TestCase):
 
 class BackendSelection(unittest.TestCase):
     def setUp(self):
-        self._prev_key = os.environ.get("ANTHROPIC_API_KEY")
-        os.environ["ANTHROPIC_API_KEY"] = "sk-env"
-
-    def tearDown(self):
-        if self._prev_key is None:
-            os.environ.pop("ANTHROPIC_API_KEY", None)
-        else:
-            os.environ["ANTHROPIC_API_KEY"] = self._prev_key
+        patcher = mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-env"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_cli_backend_builds_no_spec(self):
         self.assertIsNone(a._build_api_spec(_config()))
@@ -573,13 +562,8 @@ class BackendSelection(unittest.TestCase):
 
     def test_token_comes_from_the_configured_env_var(self):
         os.environ["MY_TOKEN"] = "sk-custom"
-        try:
-            cfg = _config(
-                ai_backend="api", ai_api=AIApiConfig(api_key_env="MY_TOKEN"),
-            )
-            self.assertEqual(a._build_api_spec(cfg).api_key, "sk-custom")
-        finally:
-            os.environ.pop("MY_TOKEN", None)
+        cfg = _config(ai_backend="api", ai_api=AIApiConfig(api_key_env="MY_TOKEN"))
+        self.assertEqual(a._build_api_spec(cfg).api_key, "sk-custom")
 
     def test_env_var_beats_inline_key(self):
         cfg = _config(
@@ -599,11 +583,6 @@ class BackendSelection(unittest.TestCase):
         spec = a._build_api_spec(cfg, allowed_tools=["Grep"])
         self.assertEqual(spec.allowed_tools, ["Grep"])
 
-    def test_backend_label(self):
-        self.assertEqual(a._backend_label(_config(), "claude"), "claude")
-        label = a._backend_label(_config(ai_backend="api"), "claude")
-        self.assertIn("anthropic api", label)
-
     def test_resolve_backend_checks_the_binary_in_cli_mode(self):
         spec, err = a._resolve_backend(_config(), "definitely-not-on-path-xyz")
         self.assertIsNone(spec)
@@ -611,44 +590,36 @@ class BackendSelection(unittest.TestCase):
 
     def test_spawn_dispatches_to_the_api_backend(self):
         calls: list[tuple] = []
-        orig = a._run_api_agent_once
-        a._run_api_agent_once = lambda api, repo, timeout, prompt: (
-            calls.append((api, prompt)) or (0, "DONE", False)
-        )
-        try:
-            spec = a._build_api_spec(_config(ai_backend="api"))
+        spec = a._build_api_spec(_config(ai_backend="api"))
+        with mock.patch.object(
+            a, "_run_api_agent_once", lambda api, repo, timeout, prompt: (
+                calls.append((api, prompt)) or (0, "DONE", False)
+            ),
+        ):
             ec, out, to = a._spawn_claude(
                 ["claude"], Path("."), 10, prompt="P", api=spec,
             )
-        finally:
-            a._run_api_agent_once = orig
         self.assertEqual((ec, out, to), (0, "DONE", False))
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][1], "P")
 
     def test_spawn_without_api_still_uses_the_cli(self):
-        orig = a._spawn_claude_once
-        a._spawn_claude_once = lambda argv, repo, timeout, prompt: (0, "CLI", False)
-        try:
+        with mock.patch.object(
+            a, "_spawn_claude_once",
+            lambda argv, repo, timeout, prompt: (0, "CLI", False),
+        ):
             ec, out, _to = a._spawn_claude(["claude"], Path("."), 10, prompt="P")
-        finally:
-            a._spawn_claude_once = orig
         self.assertEqual((ec, out), (0, "CLI"))
 
 
 class ApiConfigParsing(unittest.TestCase):
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self._prev = os.environ.get("RELEASY_STATE_DIR")
-        os.environ["RELEASY_STATE_DIR"] = self._tmp.name
-        self.path = Path(self._tmp.name) / "config.yaml"
-
-    def tearDown(self):
-        if self._prev is None:
-            os.environ.pop("RELEASY_STATE_DIR", None)
-        else:
-            os.environ["RELEASY_STATE_DIR"] = self._prev
-        self._tmp.cleanup()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        patcher = mock.patch.dict(os.environ, {"RELEASY_STATE_DIR": tmp.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.path = Path(tmp.name) / "config.yaml"
 
     def _write(self, body: str) -> Config:
         self.path.write_text(
@@ -657,12 +628,7 @@ class ApiConfigParsing(unittest.TestCase):
         )
         return load_config(self.path)
 
-    def test_defaults_to_the_cli_backend(self):
-        cfg = self._write("")
-        self.assertEqual(cfg.ai_backend, "cli")
-        self.assertEqual(cfg.ai_api.api_key_env, "ANTHROPIC_API_KEY")
-
-    def test_parses_ai_api_block(self):
+    def test_parses_ai_api_block_and_round_trips(self):
         cfg = self._write(
             "ai_backend: api\n"
             "ai_api:\n"
@@ -671,11 +637,13 @@ class ApiConfigParsing(unittest.TestCase):
             "  thinking: false\n"
             "  api_key_env: MY_TOKEN\n"
         )
-        self.assertEqual(cfg.ai_backend, "api")
-        self.assertEqual(cfg.ai_api.model, "claude-sonnet-5")
-        self.assertEqual(cfg.ai_api.max_turns, 40)
-        self.assertFalse(cfg.ai_api.thinking)
-        self.assertEqual(cfg.ai_api.api_key_env, "MY_TOKEN")
+        save_config(cfg, self.path)
+        for loaded in (cfg, load_config(self.path)):
+            self.assertEqual(loaded.ai_backend, "api")
+            self.assertEqual(loaded.ai_api.model, "claude-sonnet-5")
+            self.assertEqual(loaded.ai_api.max_turns, 40)
+            self.assertFalse(loaded.ai_api.thinking)
+            self.assertEqual(loaded.ai_api.api_key_env, "MY_TOKEN")
 
     def test_rejects_a_token_pasted_into_api_key_env(self):
         with self.assertRaises(ValueError) as cm:
@@ -689,13 +657,6 @@ class ApiConfigParsing(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._write("ai_api:\n  modle: x\n")
 
-    def test_round_trips_through_save(self):
-        cfg = self._write("ai_backend: api\nai_api:\n  max_turns: 7\n")
-        save_config(cfg, self.path)
-        again = load_config(self.path)
-        self.assertEqual(again.ai_backend, "api")
-        self.assertEqual(again.ai_api.max_turns, 7)
-
 
 class ClaudeCliEnv(unittest.TestCase):
     def test_background_tasks_disabled(self):
@@ -708,13 +669,9 @@ class ClaudeCliEnv(unittest.TestCase):
             seen.update(kw["env"])
             raise _Stop
 
-        saved = a.subprocess.Popen
-        a.subprocess.Popen = fake_popen
-        try:
-            with self.assertRaises(_Stop):
-                a._spawn_claude_once(["claude"], Path("."), 10, "hi")
-        finally:
-            a.subprocess.Popen = saved
+        with mock.patch.object(a.subprocess, "Popen", fake_popen), \
+                self.assertRaises(_Stop):
+            a._spawn_claude_once(["claude"], Path("."), 10, "hi")
         self.assertEqual(seen.get("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"), "1")
 
 

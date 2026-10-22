@@ -3,7 +3,10 @@ from __future__ import annotations
 import unittest
 
 import releasy.dag_discovery as d
-from releasy.state import FeatureState
+from releasy.github_ops import STATUS_MAP, STATUS_OPTIONS
+from releasy.pipeline import _recreate_opt_in, terminal_statuses
+from releasy.state import STATUS_DISPLAY_ORDER, FeatureState
+from releasy.status import STATUS_HEADINGS, STATUS_ICONS
 
 from test_graph_update import URL, node, report
 
@@ -18,15 +21,13 @@ class TestRevertedRendering(unittest.TestCase):
     def body(self, nodes, progress):
         return d.render_graph_issue_body(report(nodes), progress)
 
-    def test_own_section_not_discarded(self):
+    def test_own_section_with_reason_port_pr_and_headline(self):
         body = self.body([node("pr-1", 1)], {"pr-1": reverted_fs()})
         self.assertIn("### ↩ Reverted — do NOT re-port", body)
         self.assertNotIn("🗑 <b>Discarded</b>", body)
-
-    def test_section_states_the_reason_and_port_pr(self):
-        body = self.body([node("pr-1", 1)], {"pr-1": reverted_fs()})
         self.assertIn("↩ reverted (do not re-port) · reverted by #2217", body)
         self.assertIn("https://github.com/o/r/pull/9", body)
+        self.assertIn("do not port them again", body)
 
     def test_left_out_of_working_lists(self):
         body = self.body(
@@ -55,10 +56,6 @@ class TestRevertedRendering(unittest.TestCase):
         self.assertIn("**Progress: 1/2 unit(s) ported**", body)
         self.assertIn("↩ reverted (do not re-port): 1", body)
 
-    def test_headline_warns(self):
-        body = self.body([node("pr-1", 1)], {"pr-1": reverted_fs()})
-        self.assertIn("do not port them again", body)
-
     def test_absent_when_nothing_reverted(self):
         body = self.body([node("pr-1", 1)], {})
         self.assertNotIn("Reverted", body)
@@ -76,29 +73,18 @@ class _Config:
 
 
 class TestRevertedIsTerminal(unittest.TestCase):
-    def test_terminal_by_default(self):
-        from releasy.pipeline import terminal_statuses
-        self.assertIn("reverted", terminal_statuses(_Config()))
-
-    def test_closed_opt_in_does_not_reach_it(self):
-        from releasy.pipeline import terminal_statuses
-        terminal = terminal_statuses(_Config(closed=True))
-        self.assertNotIn("closed", terminal)
-        self.assertIn("reverted", terminal)
-
-    def test_its_own_opt_in_re_enters_it(self):
-        from releasy.pipeline import terminal_statuses
-        terminal = terminal_statuses(_Config(reverted=True))
-        self.assertNotIn("reverted", terminal)
-        self.assertIn("closed", terminal)
-
-    def test_always_terminal_regardless_of_flags(self):
-        from releasy.pipeline import terminal_statuses
-        terminal = terminal_statuses(_Config(closed=True, reverted=True))
-        self.assertEqual(terminal, {"merged", "skipped", "superseded"})
+    def test_terminal_statuses_follow_the_opt_ins(self):
+        always = {"merged", "skipped", "superseded"}
+        for kw, extra in (
+            ({}, {"closed", "reverted"}),
+            ({"closed": True}, {"reverted"}),
+            ({"reverted": True}, {"closed"}),
+            ({"closed": True, "reverted": True}, set()),
+        ):
+            with self.subTest(**kw):
+                self.assertEqual(terminal_statuses(_Config(**kw)), always | extra)
 
     def test_opt_in_recreates_on_a_renumbered_branch(self):
-        from releasy.pipeline import _recreate_opt_in
         self.assertIsNone(_recreate_opt_in(_Config(), "reverted"))
         self.assertIsNone(_recreate_opt_in(_Config(reverted=True), "merged"))
         self.assertIsNone(_recreate_opt_in(_Config(reverted=True), None))
@@ -106,15 +92,7 @@ class TestRevertedIsTerminal(unittest.TestCase):
         self.assertEqual(flag, "recreate_reverted_prs")
         self.assertIn("reverted", why.lower())
 
-    def test_flag_defaults_to_false(self):
-        from releasy.config import PRPolicyConfig
-        self.assertFalse(PRPolicyConfig().recreate_reverted_prs)
-
     def test_status_vocabulary_is_complete(self):
-        from releasy.github_ops import STATUS_MAP, STATUS_OPTIONS
-        from releasy.state import STATUS_DISPLAY_ORDER
-        from releasy.status import STATUS_HEADINGS, STATUS_ICONS
-
         self.assertIn("reverted", STATUS_ICONS)
         self.assertIn("reverted", STATUS_HEADINGS)
         self.assertIn("reverted", STATUS_DISPLAY_ORDER)

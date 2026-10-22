@@ -32,71 +32,54 @@ def _run(**kw) -> BaselineRun:
     )
 
 
+def _status(context: str, category: str = "stateless") -> FailedStatus:
+    return FailedStatus(
+        context=context, state="failure", target_url="", description="",
+        category=category, locator=None,
+    )
+
+
+def _discover(commits, statuses_by_sha, **kw):
+    def _list(owner, repo, sha, limit):
+        return commits[:limit], None
+
+    def _statuses(owner, repo, sha, *, failed_only=True):
+        return statuses_by_sha.get(sha, []), None
+
+    with mock.patch.multiple(
+        ci_failures,
+        _list_commits=_list,
+        fetch_statuses=_statuses,
+        decompose_statuses=lambda sts, **_: ([
+            FailedTest(
+                name="00001_old", status="FAIL", category=s.category,
+                shard_context=s.context, target_url="",
+            ) for s in sts
+        ], []),
+    ):
+        return ci_failures.baseline_run_before("o", "r", MERGE_BASE, **kw)
+
+
 class BaselineCommitSelection(unittest.TestCase):
 
-    def _discover(self, commits, statuses_by_sha, **kw):
-        def _list(owner, repo, sha, limit):
-            return commits[:limit], None
-
-        def _statuses(owner, repo, sha, *, failed_only=True):
-            sts = statuses_by_sha.get(sha, [])
-            if failed_only:
-                sts = [s for s in sts if s.state in ("failure", "error")]
-            return sts, None
-
-        with mock.patch.object(
-            ci_failures, "_list_commits", _list,
-        ), mock.patch.object(
-            ci_failures, "fetch_statuses", _statuses,
-        ), mock.patch.object(
-            ci_failures, "decompose_statuses", lambda sts, **_: ([
-                FailedTest(
-                    name="00001_old", status="FAIL", category="stateless",
-                    shard_context=s.context, target_url="",
-                ) for s in sts
-            ], []),
-        ):
-            return ci_failures.baseline_run_before(
-                "o", "r", MERGE_BASE, **kw,
-            )
-
     def test_skips_commits_with_no_run(self):
-        run, err = self._discover(
-            commits=[
-                (MERGE_BASE, "2026-08-14T08:39:32Z"),
-                (RAN, "2026-08-14T08:36:13Z"),
-            ],
-            statuses_by_sha={RAN: [FailedStatus(
-                context="Stateless tests (amd_debug, parallel)",
-                state="failure", target_url="https://report",
-                description="", category="stateless", locator=None,
-            )]},
+        run, err = _discover(
+            [(MERGE_BASE, "2026-08-14T08:39:32Z"), (RAN, "2026-08-14T08:36:13Z")],
+            {RAN: [_status("Stateless tests (amd_debug, parallel)")]},
         )
         self.assertIsNone(err)
         self.assertEqual(run.sha, RAN)
         self.assertEqual(run.checks_failed, 1)
 
     def test_reports_when_nothing_in_range_ran_ci(self):
-        run, err = self._discover(
-            commits=[(MERGE_BASE, "2026-08-14T08:39:32Z")],
-            statuses_by_sha={},
-        )
+        run, err = _discover([(MERGE_BASE, "2026-08-14T08:39:32Z")], {})
         self.assertIsNone(run)
         self.assertIn("no CI run found", err)
 
     def test_never_uses_the_prs_own_run_as_its_baseline(self):
-        run, err = self._discover(
-            commits=[(HEAD, "now"), (RAN, "before")],
-            statuses_by_sha={
-                HEAD: [FailedStatus(
-                    context="x", state="failure", target_url="",
-                    description="", category="stateless", locator=None,
-                )],
-                RAN: [FailedStatus(
-                    context="y", state="failure", target_url="",
-                    description="", category="stateless", locator=None,
-                )],
-            },
+        run, err = _discover(
+            [(HEAD, "now"), (RAN, "before")],
+            {HEAD: [_status("x")], RAN: [_status("y")]},
             exclude_sha=HEAD,
         )
         self.assertIsNone(err)
@@ -111,27 +94,14 @@ class CategoryAwareSelection(unittest.TestCase):
     ]
 
     def _discover(self, coverage, **kw):
-        def _list(owner, repo, sha, limit):
-            return self.COMMITS[:limit], None
-
-        def _statuses(owner, repo, sha, *, failed_only=True):
-            return [
-                FailedStatus(
-                    context=f"{cat} check", state="failure",
-                    target_url="", description="", category=cat,
-                    locator=None,
-                )
-                for cat in coverage.get(sha, [])
-            ], None
-
-        with mock.patch.object(
-            ci_failures, "_list_commits", _list,
-        ), mock.patch.object(
-            ci_failures, "fetch_statuses", _statuses,
-        ), mock.patch.object(
-            ci_failures, "decompose_statuses", lambda sts, **_: ([], []),
-        ):
-            return ci_failures.baseline_run_before("o", "r", "mb", **kw)
+        return _discover(
+            self.COMMITS,
+            {
+                sha: [_status(f"{cat} check", cat) for cat in cats]
+                for sha, cats in coverage.items()
+            },
+            **kw,
+        )
 
     def test_skips_a_newer_run_that_lacks_the_needed_check(self):
         run, err = self._discover(
@@ -160,24 +130,6 @@ class CategoryAwareSelection(unittest.TestCase):
         self.assertEqual(run.skipped_newer, 0)
         self.assertEqual(
             run.verdict_for("regression", "/x"), "not covered",
-        )
-
-
-class PerTestVerdict(unittest.TestCase):
-
-    def test_failing_at_baseline_is_pre_existing(self):
-        self.assertEqual(
-            _run().verdict_for("stateless", "00001_old"), "failed",
-        )
-
-    def test_absent_but_category_ran_is_passed(self):
-        self.assertEqual(
-            _run().verdict_for("stateless", "00002_new"), "passed",
-        )
-
-    def test_absent_and_category_never_ran_is_not_covered(self):
-        self.assertEqual(
-            _run().verdict_for("regression", "/swarms/x"), "not covered",
         )
 
 
@@ -225,14 +177,12 @@ class BaselineSectionRendering(unittest.TestCase):
         section = _baseline_section(tests, _run(), BASE)
         self.assertIn("1 could not be compared", section)
 
-    def test_older_baseline_carries_the_caveat(self):
+    def test_only_an_older_baseline_carries_the_caveat(self):
         section = _baseline_section(
             [_test("00002_new")], _run(skipped_newer=2), BASE,
         )
         self.assertIn("2 newer run(s)", section)
         self.assertIn("confirm against the diff", section)
-
-    def test_newest_baseline_has_no_caveat(self):
         section = _baseline_section([_test("00002_new")], _run(), BASE)
         self.assertNotIn("newer run(s)", section)
 

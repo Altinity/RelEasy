@@ -3,8 +3,12 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
+import releasy.github_ops as gh
 import releasy.pipeline as p
+import releasy.refresh as r
 from releasy.config import (
     Config,
     OriginConfig,
@@ -12,6 +16,7 @@ from releasy.config import (
     load_session,
     save_session,
 )
+from releasy.state import FeatureState, PipelineState
 
 
 def _config(
@@ -115,24 +120,21 @@ class Parsing(unittest.TestCase):
 class Reconcile(unittest.TestCase):
     def setUp(self):
         self.added: list[tuple[int, str]] = []
-        self._real_add = p.add_label_to_pr
-        p.add_label_to_pr = lambda cfg, num, lbl: (  # type: ignore[assignment]
-            self.added.append((num, lbl)) or True
-        )
-        import releasy.github_ops as gh
-
-        self._real_fetch = gh.fetch_pr_by_url
         self.current: dict[str, list[str]] = {}
-        gh.fetch_pr_by_url = (  # type: ignore[assignment]
-            lambda cfg, url, include_closed=False: type(
-                "I", (), {"labels": self.current.get(url, [])},
-            )()
-        )
-        self._gh = gh
-
-    def tearDown(self):
-        p.add_label_to_pr = self._real_add  # type: ignore[assignment]
-        self._gh.fetch_pr_by_url = self._real_fetch  # type: ignore[assignment]
+        for patcher in (
+            mock.patch.object(
+                p, "add_label_to_pr",
+                lambda cfg, num, lbl: self.added.append((num, lbl)) or True,
+            ),
+            mock.patch.object(
+                gh, "fetch_pr_by_url",
+                lambda cfg, url, include_closed=False: SimpleNamespace(
+                    labels=self.current.get(url, []),
+                ),
+            ),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_only_missing_labels_are_added_per_mode(self):
         cfg = _config(["v26.6"], {"forward_port": ["forwardport"]})
@@ -156,25 +158,16 @@ class Reconcile(unittest.TestCase):
 
 
 class TrackedPortMode(unittest.TestCase):
-    def _cfg_with_state(self, features):
-        import releasy.refresh as r
-        from releasy.state import PipelineState
-        cfg = _config()
-        state = PipelineState(features=features)
-        return r, cfg, state
-
     def test_mode_read_off_the_matching_entry(self):
-        from releasy.state import FeatureState
-        r, cfg, state = self._cfg_with_state({
+        state = PipelineState(features={
             "grp": FeatureState(
                 pr_url="https://github.com/acme/repo/pull/1",
                 rebase_pr_url="https://github.com/acme/repo/pull/2",
                 mode="forward_port",
             ),
         })
-        saved = r.load_state
-        r.load_state = lambda c: state
-        try:
+        cfg = _config()
+        with mock.patch.object(r, "load_state", lambda c: state):
             self.assertEqual(
                 r._tracked_port_mode(cfg, "https://github.com/acme/repo/pull/2"),
                 "forward_port",
@@ -182,23 +175,14 @@ class TrackedPortMode(unittest.TestCase):
             self.assertIsNone(
                 r._tracked_port_mode(cfg, "https://github.com/acme/repo/pull/99"),
             )
-        finally:
-            r.load_state = saved
 
     def test_stateless_never_loads_state(self):
-        import releasy.refresh as r
         cfg = _config()
         cfg.stateless = True
-        saved = r.load_state
-
-        def boom(_c):
-            raise AssertionError("stateless must not load state")
-
-        r.load_state = boom
-        try:
+        with mock.patch.object(
+            r, "load_state", side_effect=AssertionError("stateless must not load state"),
+        ):
             self.assertIsNone(r._tracked_port_mode(cfg, "https://x/y/pull/1"))
-        finally:
-            r.load_state = saved
 
 
 if __name__ == "__main__":

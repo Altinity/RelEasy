@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import releasy.dag_discovery as d
 import releasy.pipeline as pl
@@ -26,13 +27,10 @@ def group_state(status="build_failed", **kw):
 class MarkOutdatedUnits(unittest.TestCase):
     def mark(self, state, nodes):
         cfg = cfg_with(Path(tempfile.mkdtemp()))
-        saved = d.load_state, d.save_state
-        d.load_state = lambda c: state
-        d.save_state = lambda s, c: None
-        try:
+        with mock.patch.multiple(
+            d, load_state=lambda c: state, save_state=lambda s, c: None,
+        ):
             return d.mark_outdated_units(cfg, report(nodes))
-        finally:
-            d.load_state, d.save_state = saved
 
     def test_lost_member_marks_port(self):
         state = group_state()
@@ -76,25 +74,19 @@ class AbsorbedSingleton(unittest.TestCase):
         })
         closed = []
         self.unboarded = []
-        saved = (
-            pl.fetch_pr_by_url, pl.close_pull_request, pl.remove_pr_from_projects,
-        )
-        pl.fetch_pr_by_url = lambda c, u, include_closed=False: (
-            SimpleNamespace(state=pr_state)
-        )
-        pl.close_pull_request = (
-            lambda c, n, comment=None: closed.append((n, comment)) or True
-        )
-        pl.remove_pr_from_projects = (
-            lambda c, n: self.unboarded.append(n) or True
-        )
-        try:
+        with mock.patch.multiple(
+            pl,
+            fetch_pr_by_url=lambda c, u, include_closed=False: (
+                SimpleNamespace(state=pr_state)
+            ),
+            close_pull_request=lambda c, n, comment=None: (
+                closed.append((n, comment)) or True
+            ),
+            remove_pr_from_projects=lambda c, n: (
+                self.unboarded.append(n) or True
+            ),
+        ):
             self.assertTrue(pl._prune_superseded_singletons(cfg, state))
-        finally:
-            (
-                pl.fetch_pr_by_url, pl.close_pull_request,
-                pl.remove_pr_from_projects,
-            ) = saved
         self.assertNotIn("pr-2", state.features)
         return closed
 

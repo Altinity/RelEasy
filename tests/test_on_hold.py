@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
@@ -20,7 +21,7 @@ from releasy.config import (
     save_session,
 )
 from releasy.github_ops import PRInfo
-from releasy.state import FeatureState
+from releasy.state import FeatureState, PipelineState
 
 from test_graph_update import URL, node, report
 
@@ -55,65 +56,34 @@ def cfg_with(tmp, **ps_kwargs):
 
 
 class SessionRoundTrip(unittest.TestCase):
-    def _roundtrip(self, on_hold_yaml):
+    def _load(self, pr_sources):
         tmp = Path(tempfile.mkdtemp())
         session_path = tmp / "b.session.yaml"
-        session_path.write_text(yaml.dump({
-            "features": [],
-            "pr_sources": {"include_prs": [URL(1)], "on_hold": on_hold_yaml},
-        }))
+        session_path.write_text(yaml.dump({"features": [], "pr_sources": pr_sources}))
         cfg = Config(
             name="n", origin=OriginConfig(remote="git@github.com:o/r.git"),
             project="p", config_path=tmp / "config.yaml",
         )
         return load_session(cfg, session_path)
 
-    def test_forms_mix(self):
-        ps = self._roundtrip(
-            [URL(1), {"url": URL(2), "reason": "why"}],
-        ).pr_sources
-        self.assertEqual(ps.on_hold, [URL(1), URL(2)])
-        self.assertEqual(ps.on_hold_reasons, {URL(2): "why"})
+    def test_both_forms_parse_and_save_back(self):
+        forms = [URL(1), {"url": URL(2), "reason": "why"}]
+        session = self._load({"include_prs": [URL(1)], "on_hold": forms})
+        self.assertEqual(session.pr_sources.on_hold, [URL(1), URL(2)])
+        self.assertEqual(session.pr_sources.on_hold_reasons, {URL(2): "why"})
+        self.assertEqual(session.load_warnings, [])
+        save_session(session)
+        disk = yaml.safe_load(session.session_path.read_text())
+        self.assertEqual(disk["pr_sources"]["on_hold"], forms)
 
     def test_unknown_key_rejected(self):
         with self.assertRaises(ValueError):
-            self._roundtrip([{"url": URL(1), "ai_context": "nope"}])
-
-    def test_save_preserves_both_forms(self):
-        session = self._roundtrip([URL(1), {"url": URL(2), "reason": "why"}])
-        save_session(session)
-        disk = yaml.safe_load(session.session_path.read_text())
-        self.assertEqual(
-            disk["pr_sources"]["on_hold"],
-            [URL(1), {"url": URL(2), "reason": "why"}],
-        )
-
-    def test_absent_key_means_no_holds(self):
-        tmp = Path(tempfile.mkdtemp())
-        session_path = tmp / "b.session.yaml"
-        session_path.write_text(yaml.dump(
-            {"features": [], "pr_sources": {"include_prs": [URL(1)]}},
-        ))
-        cfg = Config(
-            name="n", origin=OriginConfig(remote="git@github.com:o/r.git"),
-            project="p", config_path=tmp / "config.yaml",
-        )
-        self.assertEqual(load_session(cfg, session_path).pr_sources.on_hold, [])
+            self._load({"on_hold": [{"url": URL(1), "ai_context": "nope"}]})
 
     def test_hold_and_veto_on_one_pr_warns(self):
-        session = self._roundtrip([URL(1)])
-        self.assertEqual(session.load_warnings, [])
-        tmp = Path(tempfile.mkdtemp())
-        session_path = tmp / "b.session.yaml"
-        session_path.write_text(yaml.dump({
-            "features": [],
-            "pr_sources": {"on_hold": [URL(1)], "exclude_prs": [URL(1)]},
-        }))
-        cfg = Config(
-            name="n", origin=OriginConfig(remote="git@github.com:o/r.git"),
-            project="p", config_path=tmp / "config.yaml",
-        )
-        warnings = load_session(cfg, session_path).load_warnings
+        warnings = self._load(
+            {"on_hold": [URL(1)], "exclude_prs": [URL(1)]},
+        ).load_warnings
         self.assertTrue(
             any("on_hold" in w and "exclude_prs" in w for w in warnings),
             warnings,
@@ -150,6 +120,18 @@ class HoldMapping(unittest.TestCase):
         self.assertEqual(units[0].hold_reason, "")
         self.assertIsNone(units[1].hold_reason)
 
+    def test_group_member_hold_marks_the_group_unit(self):
+        tmp = Path(tempfile.mkdtemp())
+        cfg = cfg_with(
+            tmp,
+            groups=[PRGroupConfig(id="G", prs=[URL(1), URL(2)])],
+            on_hold=[URL(2)],
+        )
+        cfg.pr_sources.on_hold_reasons[URL(2)] = "waiting on #3"
+        units = [unit("G", 1, 2, group=True)]
+        pl._mark_held_units(cfg, units, "o/r")
+        self.assertEqual(units[0].hold_reason, "waiting on #3")
+
 
 class MembershipEdits(unittest.TestCase):
     def test_hold_then_release(self):
@@ -158,16 +140,11 @@ class MembershipEdits(unittest.TestCase):
         self.assertTrue(pm.hold_pr(cfg, URL(1), "waiting"))
         self.assertEqual(cfg.pr_sources.on_hold, [URL(1)])
         self.assertEqual(cfg.pr_sources.on_hold_reasons[URL(1)], "waiting")
+        self.assertEqual(cfg.pr_sources.include_prs, [URL(1)])
+        self.assertEqual(cfg.pr_sources.exclude_prs, [])
         self.assertTrue(pm.unhold_pr(cfg, URL(1)))
         self.assertEqual(cfg.pr_sources.on_hold, [])
         self.assertEqual(cfg.pr_sources.on_hold_reasons, {})
-
-    def test_hold_stays_out_of_include_and_exclude(self):
-        tmp = Path(tempfile.mkdtemp())
-        cfg = cfg_with(tmp, include_prs=[URL(1)])
-        pm.hold_pr(cfg, URL(1), "waiting")
-        self.assertEqual(cfg.pr_sources.include_prs, [URL(1)])
-        self.assertEqual(cfg.pr_sources.exclude_prs, [])
 
     def test_re_hold_updates_the_reason(self):
         tmp = Path(tempfile.mkdtemp())
@@ -183,11 +160,6 @@ class MembershipEdits(unittest.TestCase):
         self.assertFalse(pm.hold_pr(cfg, URL(1), "waiting"))
         self.assertEqual(cfg.pr_sources.on_hold, [])
 
-    def test_release_of_an_unheld_pr_is_a_no_op(self):
-        tmp = Path(tempfile.mkdtemp())
-        cfg = cfg_with(tmp)
-        self.assertTrue(pm.unhold_pr(cfg, URL(1)))
-
     def test_malformed_url_refused(self):
         tmp = Path(tempfile.mkdtemp())
         cfg = cfg_with(tmp)
@@ -198,15 +170,10 @@ class MembershipEdits(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp())
         cfg = cfg_with(tmp, include_prs=[URL(1)], on_hold=[URL(1)])
         cfg.pr_sources.on_hold_reasons[URL(1)] = "waiting"
-        saved = pm.load_state, pm.save_state
-        pm.load_state = lambda c: __import__(
-            "releasy.state", fromlist=["PipelineState"],
-        ).PipelineState()
-        pm.save_state = lambda s, c: None
-        try:
+        with mock.patch.multiple(
+            pm, load_state=lambda c: PipelineState(), save_state=lambda s, c: None,
+        ):
             self.assertTrue(pm.remove_pr(cfg, URL(1)))
-        finally:
-            pm.load_state, pm.save_state = saved
         self.assertEqual(cfg.pr_sources.on_hold, [])
         self.assertEqual(cfg.pr_sources.on_hold_reasons, {})
         self.assertIn(URL(1), cfg.pr_sources.exclude_prs)
@@ -222,10 +189,11 @@ def hold_entry(out):
 
 
 class IssueRendering(unittest.TestCase):
-    def test_own_section_with_the_reason(self):
+    def test_own_unfolded_section_with_the_reason(self):
         out = body([node("pr-1", 1)], held={REF(1): "waiting for follow-up"})
         self.assertIn("### ⏸ On hold — not being ported right now", out)
         self.assertIn("⏸ on hold: waiting for follow-up", out)
+        self.assertNotIn("<summary>⏸", out)
 
     def test_left_out_of_working_lists(self):
         out = body([node("pr-1", 1), node("pr-2", 2)], held={REF(1): "w"})
@@ -238,10 +206,6 @@ class IssueRendering(unittest.TestCase):
         self.assertNotIn("### Groups (port together, in apply order)", out)
         self.assertIn("**`G`** · 2 PRs", out)
         self.assertIn(URL(2), out)
-
-    def test_not_folded(self):
-        out = body([node("pr-1", 1)], held={REF(1): "w"})
-        self.assertNotIn("<summary>⏸", out)
 
     def test_hold_with_no_reason_still_reads(self):
         entry = hold_entry(body([node("pr-1", 1)], held={REF(1): ""}))
@@ -259,21 +223,17 @@ class IssueRendering(unittest.TestCase):
             hold_entry(body([node("pr-1", 1)], held={REF(1): "w"})),
         )
 
-    def test_held_unit_counted_once_in_the_tally(self):
+    def test_held_unit_counted_once_in_the_tally_and_headline(self):
         out = body([node("pr-1", 1), node("pr-2", 2)], held={REF(1): "w"})
         summary = [l for l in out.splitlines() if l.startswith("**Progress:")][0]
         self.assertIn("⬜ not started: 1", summary)
         self.assertIn("⏸ on hold: 1", summary)
+        self.assertIn("1 unit(s) are **on hold**", out)
 
     def test_merged_unit_ignores_the_hold(self):
         fs = FeatureState(status="merged", rebase_pr_url=URL(9))
         out = body([node("pr-1", 1)], {"pr-1": fs}, {REF(1): "w"})
         self.assertNotIn("### ⏸ On hold", out)
-
-    def test_counted_in_the_progress_line_and_headline(self):
-        out = body([node("pr-1", 1), node("pr-2", 2)], held={REF(1): "w"})
-        self.assertIn("⏸ on hold: 1", out)
-        self.assertIn("1 unit(s) are **on hold**", out)
 
     def test_no_holds_no_section(self):
         self.assertNotIn("### ⏸ On hold", body([node("pr-1", 1)]))
@@ -350,15 +310,11 @@ class SpecHolds(unittest.TestCase):
 
 class DependentsBlock(unittest.TestCase):
     def test_dependent_of_a_held_unit_is_unmet(self):
-        from releasy.state import PipelineState
-
         dependent = unit("pr-3", 3)
         dependent.depends_on = ["pr-1"]
         self.assertEqual(pl._unmet_deps(dependent, PipelineState()), ["pr-1"])
 
     def test_dependent_of_a_merged_unit_is_not(self):
-        from releasy.state import PipelineState
-
         dependent = unit("pr-3", 3)
         dependent.depends_on = ["pr-1"]
         state = PipelineState()
@@ -369,6 +325,7 @@ class DependentsBlock(unittest.TestCase):
 class CLIWiring(unittest.TestCase):
     def setUp(self):
         from click.testing import CliRunner
+
         import releasy.cli as cli_mod
 
         self.runner = CliRunner()
@@ -402,15 +359,11 @@ class CLIWiring(unittest.TestCase):
         self.assertEqual(res.exit_code, 0, res.output)
         self.assertIn(("hold_pr", (self.cfg, URL(1), "why"), {}), self.calls)
 
-    def test_hold_without_reason_passes_empty_string(self):
+    def test_hold_without_reason_passes_empty_string_and_needs_the_session(self):
         self._stub("hold_pr", True)
         res = self.runner.invoke(self.cli, ["hold", URL(1)])
         self.assertEqual(res.exit_code, 0, res.output)
         self.assertIn(("hold_pr", (self.cfg, URL(1), ""), {}), self.calls)
-
-    def test_hold_needs_the_session(self):
-        self._stub("hold_pr", True)
-        self.runner.invoke(self.cli, ["hold", URL(1)])
         self.assertIn(("locked_config", "required"), self.calls)
 
     def test_hold_refusal_exits_nonzero(self):
@@ -430,24 +383,8 @@ class CLIWiring(unittest.TestCase):
         self.assertEqual(res.exit_code, 1)
 
 
-class GroupHoldEndToEnd(unittest.TestCase):
-    def test_group_member_hold_marks_the_group_unit(self):
-        tmp = Path(tempfile.mkdtemp())
-        cfg = cfg_with(
-            tmp,
-            groups=[PRGroupConfig(id="G", prs=[URL(1), URL(2)])],
-            on_hold=[URL(2)],
-        )
-        cfg.pr_sources.on_hold_reasons[URL(2)] = "waiting on #3"
-        units = [unit("G", 1, 2, group=True)]
-        pl._mark_held_units(cfg, units, "o/r")
-        self.assertEqual(units[0].hold_reason, "waiting on #3")
-
-
 def _tracked_state():
     """A held group (port PR 91) and a free singleton (port PR 92)."""
-    from releasy.state import PipelineState
-
     state = PipelineState(base_branch="b")
     state.features["G"] = FeatureState(
         status="needs_review", pr_url=URL(1), pr_urls=[URL(1), URL(2)],

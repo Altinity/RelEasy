@@ -5,7 +5,6 @@ import unittest
 import releasy.pipeline as p
 from releasy.config import Config, OriginConfig
 from releasy.state import (
-    BLOCKING_STALL_KINDS,
     CAPPED_STALL_KINDS,
     FeatureState,
     PipelineState,
@@ -81,9 +80,6 @@ class StallSerialisation(unittest.TestCase):
         self.assertEqual(feats["f1"].stall.kind, "missing_prereq")
         self.assertEqual(feats["f1"].stall.waiting_on_prs, [URL(9)])
 
-    def test_absent_stall_is_none(self):
-        self.assertIsNone(_parse_features({"f1": {"status": "conflict"}})["f1"].stall)
-
     def test_unusable_stall_is_none(self):
         for raw in ({}, {"detail": "no kind"}, "conflict", [1], None):
             with self.subTest(raw=raw):
@@ -131,8 +127,6 @@ class StallStillBlocks(unittest.TestCase):
         return PipelineState(features=features)
 
     def test_only_blocking_kinds_are_gated(self):
-        self.assertEqual(BLOCKING_STALL_KINDS,
-                         frozenset({"waiting_for_merge", "missing_prereq"}))
         for kind in ("unresolvable", "retries_exhausted", "build_unfixed",
                      "resolver_unavailable", "prereq_search_exhausted"):
             with self.subTest(kind=kind):

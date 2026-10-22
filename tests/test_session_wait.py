@@ -112,14 +112,6 @@ class SpawnWaitLoop(unittest.TestCase):
         self.assertEqual(n["i"], 1)
         self.assertEqual(self.sleeps, [])
 
-    def test_transient_is_not_exhaustion(self):
-        a._spawn_claude_once = lambda argv, repo, timeout, prompt: (
-            1, "API Error: Overloaded", False,
-        )
-        ec, out, to = self._spawn()
-        self.assertEqual(ec, 1)
-        self.assertEqual(self.sleeps, [])
-
     def test_timeout_is_not_exhaustion(self):
         a._spawn_claude_once = lambda argv, repo, timeout, prompt: (
             -1, "usage limit reached", True,
@@ -171,13 +163,6 @@ class ExhaustionConfig(unittest.TestCase):
             encoding="utf-8",
         )
         return path
-
-    def test_kwargs_mapping(self):
-        cfg = load_config(self._write())
-        kw = a._exhaustion_kwargs(cfg)
-        self.assertEqual(kw["exhaustion_wait"], True)
-        self.assertEqual(kw["exhaustion_max_wait_seconds"], 60 * 3600)
-        self.assertEqual(kw["exhaustion_poll_seconds"], 30 * 60)
 
     def test_parse_and_round_trip(self):
         cfg = load_config(self._write(

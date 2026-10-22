@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import releasy.dag_discovery as d
 import releasy.pipeline as pl
@@ -61,16 +62,16 @@ class GraphUpdateDoesNotReadd(unittest.TestCase):
 
 
 class RemoveSkipsMergedGroup(unittest.TestCase):
+    def remove(self, cfg, state):
+        with mock.patch.multiple(
+            pm, load_state=lambda c: state, save_state=lambda s, c: None,
+        ):
+            return pm.remove_pr(cfg, URL(2))
+
     def test_veto_purges_singleton_keeps_merged_group(self):
         cfg = cfg_with(Path(tempfile.mkdtemp()), include_prs=[URL(2)])
         state = merged_group_state()
-        saved = pm.load_state, pm.save_state
-        pm.load_state = lambda c: state
-        pm.save_state = lambda s, c: None
-        try:
-            self.assertTrue(pm.remove_pr(cfg, URL(2)))
-        finally:
-            pm.load_state, pm.save_state = saved
+        self.assertTrue(self.remove(cfg, state))
         self.assertEqual(set(state.features), {"grp"})
         self.assertNotIn(URL(2), cfg.pr_sources.include_prs)
         self.assertIn(URL(2), cfg.pr_sources.exclude_prs)
@@ -79,13 +80,7 @@ class RemoveSkipsMergedGroup(unittest.TestCase):
         cfg = cfg_with(Path(tempfile.mkdtemp()), include_prs=[URL(2)])
         state = merged_group_state()
         state.features["grp"].status = "build_failed"
-        saved = pm.load_state, pm.save_state
-        pm.load_state = lambda c: state
-        pm.save_state = lambda s, c: None
-        try:
-            self.assertTrue(pm.remove_pr(cfg, URL(2)))
-        finally:
-            pm.load_state, pm.save_state = saved
+        self.assertTrue(self.remove(cfg, state))
         self.assertEqual(set(state.features), {"grp"})
         self.assertEqual(state.features["grp"].outdated, "#2 removed")
         self.assertIn(URL(2), cfg.pr_sources.exclude_prs)

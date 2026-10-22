@@ -76,22 +76,16 @@ class RejectUnlabeledOriginPrereqs(unittest.TestCase):
         self.cfg = _cfg([["antalya-26.3"]])
         self.trigger = _pr(100, ["antalya-26.3"])
 
-    def test_cross_repo_triggering_pr_disables_gate(self):
-        trigger = _pr(100, [], repo=FORK)
-        out = _reject_unlabeled_origin_prereqs(
-            self.cfg, trigger, [_pr(1, [])],
-        )
-        self.assertEqual(out, [])
-
-    def test_gate_disabled_via_config(self):
-        cfg = _cfg([["antalya-26.3"]], require=False)
-        out = _reject_unlabeled_origin_prereqs(cfg, self.trigger, [_pr(1, [])])
-        self.assertEqual(out, [])
-
-    def test_no_by_labels_is_noop(self):
-        cfg = _cfg([])
-        out = _reject_unlabeled_origin_prereqs(cfg, self.trigger, [_pr(1, [])])
-        self.assertEqual(out, [])
+    def test_gate_inactive(self):
+        for name, cfg, trigger in (
+            ("cross-repo trigger", self.cfg, _pr(100, [], repo=FORK)),
+            ("disabled in config", _cfg([["antalya-26.3"]], require=False), self.trigger),
+            ("no by_labels", _cfg([]), self.trigger),
+        ):
+            with self.subTest(name):
+                self.assertEqual(
+                    _reject_unlabeled_origin_prereqs(cfg, trigger, [_pr(1, [])]), [],
+                )
 
     def test_mixed_only_unlabeled_in_origin_rejected(self):
         out = _reject_unlabeled_origin_prereqs(

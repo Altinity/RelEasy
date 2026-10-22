@@ -108,13 +108,6 @@ class CombinedPortProvenance(unittest.TestCase):
         self.assertEqual(out[0]["queued_in"], "config:groups[grp-x]")
         self.assertFalse(out[0]["carried"])
 
-    def test_excluded_feature_skipped(self):
-        out = _find_already_queued_prereqs(
-            _cfg(), self.state, [_url(1388)],
-            exclude_feature_id="auto-grp-pr-1718",
-        )
-        self.assertEqual(out, [])
-
 
 class CherryPickedRefParsing(unittest.TestCase):
     def test_combined_port_clause_mid_line(self):

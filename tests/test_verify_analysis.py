@@ -232,53 +232,38 @@ class AuditDriver(unittest.TestCase):
         self.assertFalse(outcome.disputed)
         self.assertTrue(any("no parsable verdict" in w for w in run.warnings))
 
-    def test_a_shard_not_in_doubt_spawns_no_session(self):
-        config = build_stateless_analyze_fails_config(
-            origin_url="https://github.com/o/r",
-        )
+    def _audit_without_spawn(self, config, classification, commits_added, tests):
         outcome = ShardOutcome(
             category="stateless", shard_context=SHARD,
             target_url="https://report", test_count=1,
-            classification="UNRELATED", commits_added=0,
+            classification=classification, commits_added=commits_added,
         )
         run = PRRunResult(pr_url=PR, head_sha="dead", head_ref="head")
-        with mock.patch.object(
-            analyze_fails, "_invoke_verifier",
-        ) as spawn:
+        with mock.patch.object(analyze_fails, "_invoke_verifier") as spawn:
             analyze_fails._audit_shard_outcome(
                 config, Path("/work/ch"), run, outcome,
                 pr_url=PR, pr_number=7, pr_branch="head",
                 base_branch="base", category="stateless",
-                tests=[_test("00001_old")], baseline=_baseline(),
-                flaky_map={}, commit_range="",
+                tests=tests, baseline=_baseline(),
+                flaky_map={}, commit_range="a..b",
             )
         spawn.assert_not_called()
-        self.assertIsNone(outcome.verify_reason)
         self.assertEqual(run.shards_audited, 0)
+        return outcome
+
+    def test_a_shard_not_in_doubt_spawns_no_session(self):
+        outcome = self._audit_without_spawn(
+            build_stateless_analyze_fails_config(origin_url="https://github.com/o/r"),
+            "UNRELATED", 0, [_test("00001_old")],
+        )
+        self.assertIsNone(outcome.verify_reason)
 
     def test_turning_the_audit_off_skips_it_entirely(self):
         config = build_stateless_analyze_fails_config(
             origin_url="https://github.com/o/r",
         )
         config.analyze_fails.verify_outcome = False
-        outcome = ShardOutcome(
-            category="stateless", shard_context=SHARD,
-            target_url="https://report", test_count=1,
-            classification="DONE", commits_added=3,
-        )
-        run = PRRunResult(pr_url=PR, head_sha="dead", head_ref="head")
-        with mock.patch.object(
-            analyze_fails, "_invoke_verifier",
-        ) as spawn:
-            analyze_fails._audit_shard_outcome(
-                config, Path("/work/ch"), run, outcome,
-                pr_url=PR, pr_number=7, pr_branch="head",
-                base_branch="base", category="stateless",
-                tests=[_test("00002_new")], baseline=_baseline(),
-                flaky_map={}, commit_range="a..b",
-            )
-        spawn.assert_not_called()
-        self.assertEqual(run.shards_audited, 0)
+        self._audit_without_spawn(config, "DONE", 3, [_test("00002_new")])
 
 
 class RedoPrompt(unittest.TestCase):
@@ -368,7 +353,7 @@ class RoundLoop(unittest.TestCase):
             )
         return run, calls
 
-    def test_dispute_triggers_exactly_one_redo(self):
+    def test_dispute_triggers_exactly_one_redo_and_only_it_is_tallied(self):
         run, calls = self._process([
             ("DONE", 1, "needs_attention"),
             ("UNRELATED", 0, "ok"),
@@ -378,12 +363,6 @@ class RoundLoop(unittest.TestCase):
         self.assertTrue(run.outcomes[0].superseded)
         self.assertFalse(run.outcomes[1].superseded)
         self.assertEqual(run.outcomes[1].round_index, 2)
-
-    def test_only_the_final_round_is_tallied(self):
-        run, _ = self._process([
-            ("DONE", 1, "needs_attention"),
-            ("UNRELATED", 0, "ok"),
-        ])
         self.assertEqual(run.shards_processed, 1)
         self.assertEqual(run.shards_done, 0)
         self.assertEqual(run.shards_unrelated, 1)
@@ -444,13 +423,10 @@ class DisputeSurfacing(unittest.TestCase):
         run.outcomes.append(outcome)
         return run
 
-    def test_disputed_run_never_reads_as_done(self):
+    def test_disputed_run_never_reads_as_done_and_quotes_findings(self):
         body = _format_pr_comment(self._run())
         self.assertIn("analyze-fails` — DISPUTED", body)
         self.assertIn("1 still disputed", body)
-
-    def test_findings_are_quoted_in_the_comment(self):
-        body = _format_pr_comment(self._run())
         self.assertIn("DONE — DISPUTED", body)
         self.assertIn("removes the EXPECT_EQ", body)
         self.assertIn("deletes the assertion", body)

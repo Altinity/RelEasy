@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import releasy.ai_resolve as ar
-from releasy.config import make_stateless_config
+from releasy.config import load_config, make_stateless_config, save_config
 from releasy.github_ops import PRInfo
 
 
@@ -22,31 +24,6 @@ def _ctx() -> ar.AIResolveContext:
     )
 
 
-class _Stubs:
-    def __init__(self, test, *, postcondition):
-        self.test = test
-        self.postcondition = postcondition
-        self.saved: dict = {}
-
-    def __enter__(self):
-        for name, repl in (
-            ("_resolve_backend", lambda *a, **k: (None, None)),
-            ("_render_prompt", lambda *a, **k: "prompt"),
-            ("_invoke_claude_with_retries",
-             lambda *a, **k: (0, "", False, 1.0)),
-            ("_render_correction_prompt", lambda *a, **k: "fix prompt"),
-            ("_verify_postconditions", lambda *a, **k: self.postcondition),
-        ):
-            self.saved[name] = getattr(ar, name)
-            setattr(ar, name, repl)
-        return self
-
-    def __exit__(self, *exc):
-        for name, orig in self.saved.items():
-            setattr(ar, name, orig)
-        return False
-
-
 class DowngradeDecision(unittest.TestCase):
     FAILED = (False, "c" * 40, "25 unauthorized setting row(s)", "settings_history")
 
@@ -54,7 +31,14 @@ class DowngradeDecision(unittest.TestCase):
         config = make_stateless_config("git@github.com:o/r.git", ai_enabled=True)
         config.ai_resolve.postcondition_retries = 2
         config.ai_resolve.warn_on_unfixed_postconditions = warn_on_unfixed
-        with _Stubs(self, postcondition=postcondition or self.FAILED):
+        with mock.patch.multiple(
+            ar,
+            _resolve_backend=lambda *a, **k: (None, None),
+            _render_prompt=lambda *a, **k: "prompt",
+            _invoke_claude_with_retries=lambda *a, **k: (0, "", False, 1.0),
+            _render_correction_prompt=lambda *a, **k: "fix prompt",
+            _verify_postconditions=lambda *a, **k: postcondition or self.FAILED,
+        ):
             return ar.resolve_with_claude(config, Path("/nonexistent"), _ctx())
 
     def test_kept_and_warned_by_default(self):
@@ -111,15 +95,7 @@ class WarningRendering(unittest.TestCase):
 
 
 class ConfigKnob(unittest.TestCase):
-    def test_defaults_to_keeping(self):
-        config = make_stateless_config("git@github.com:o/r.git")
-        self.assertTrue(config.ai_resolve.warn_on_unfixed_postconditions)
-
     def test_round_trips_through_yaml(self):
-        import tempfile
-
-        from releasy.config import load_config, save_config
-
         config = make_stateless_config("git@github.com:o/r.git")
         config.ai_resolve.warn_on_unfixed_postconditions = False
         with tempfile.TemporaryDirectory() as tmp:

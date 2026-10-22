@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -14,10 +15,10 @@ from releasy.ci_failures import (
     CATEGORY_OTHER,
     FailedStatus,
     FailedTest,
-    TestFlowsLocator,
     extract_failed_tests,
     job_level_failure,
 )
+from releasy.ci_failures import TestFlowsLocator as FlowsLocator
 
 SHARD = "Stateless tests (amd_asan, distributed plan, parallel, 2/4)"
 REPORT_URL = "https://artifacts.example/json.html?PR=2195&sha=abc&name_0=PR"
@@ -139,7 +140,8 @@ class JobLevelPromptRendering(unittest.TestCase):
         self.assertIn("not a test", block)
 
     def test_manifest_keeps_real_tests_of_a_mixed_shard(self):
-        with _tmpdir() as repo:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
             _write_failed_tests_manifest(repo, [
                 job_level_failure(_status(), "died in setup"),
                 FailedTest(
@@ -161,7 +163,7 @@ def _testflows_status(context: str) -> FailedStatus:
         context=context, state="failure",
         target_url=f"https://artifacts.example/{context}/report.html",
         description="", category="regression",
-        locator=TestFlowsLocator(
+        locator=FlowsLocator(
             report_dir=f"https://artifacts.example/{context}",
         ),
     )
@@ -274,18 +276,6 @@ class UndecomposableCheckPolicy(unittest.TestCase):
         self.assertIn(
             "Grype Scan", failures.skipped_status_warnings[0],
         )
-
-
-def _tmpdir():
-    import tempfile
-    from contextlib import contextmanager
-
-    @contextmanager
-    def _ctx():
-        with tempfile.TemporaryDirectory() as d:
-            yield Path(d)
-
-    return _ctx()
 
 
 if __name__ == "__main__":

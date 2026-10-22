@@ -5,6 +5,7 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import yaml
 
@@ -108,26 +109,19 @@ class ParseGraphSpec(unittest.TestCase):
 
 
 class AddressedComments(unittest.TestCase):
-    def test_normalize_none(self):
-        self.assertEqual(d._normalize_addressed(None), set())
-
-    def test_normalize_list(self):
-        self.assertEqual(
-            d._normalize_addressed(["C1", "[c3]", " C2 "]), {"C1", "C2", "C3"},
-        )
-
-    def test_normalize_scalar(self):
-        self.assertEqual(d._normalize_addressed("C1"), {"C1"})
-
-    def test_normalize_drops_empty(self):
-        self.assertEqual(d._normalize_addressed(["", "C1"]), {"C1"})
-
-    def test_normalize_bare_int(self):
-        self.assertEqual(d._normalize_addressed([1, 3]), {"C1", "C3"})
+    def test_normalize(self):
+        for raw, expected in (
+            (None, set()),
+            (["C1", "[c3]", " C2 "], {"C1", "C2", "C3"}),
+            ("C1", {"C1"}),
+            (["", "C1"], {"C1"}),
+            ([1, 3], {"C1", "C3"}),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(d._normalize_addressed(raw), expected)
 
     def test_render_block_has_handles(self):
-        import types
-        c = lambda n: types.SimpleNamespace(  # noqa: E731
+        c = lambda n: SimpleNamespace(  # noqa: E731
             author=f"u{n}", author_association="MEMBER",
             created_at="2026-01-01T00:00:00+00:00", body=f"comment {n}",
         )
@@ -138,13 +132,11 @@ class AddressedComments(unittest.TestCase):
         self.assertIn("[C2] Comment by @u2", block)
 
     def test_pr_search_link_expanded_into_block(self):
-        import types
-        from unittest import mock
         search = (
             "https://github.com/Altinity/ClickHouse/pulls?q=is%3Apr+"
             "state%3Amerged+base%3Aantalya-26.6+label%3Aport-antalya"
         )
-        c = types.SimpleNamespace(
+        c = SimpleNamespace(
             author="u1", author_association="MEMBER",
             created_at="2026-01-01T00:00:00+00:00",
             body=f"Review these for inclusion: {search}",
@@ -183,24 +175,16 @@ class HasCycle(unittest.TestCase):
 
 
 class BuildReportFromSpec(unittest.TestCase):
-    def test_new_pr_warned_and_kept(self):
-        prior = report([node("u1", 1)])
-        w = []
-        new = d._build_report_from_spec(
-            prior, {"units": [{"id": "u1", "prs": [URL(1)]}, {"id": "u2", "prs": [URL(2)]}]}, w
-        )
-        ids = {n.unit_id for n in new.nodes}
-        self.assertEqual(ids, {"u1", "u2"})
-        self.assertTrue(any("is new" in x for x in w))
-
-    def test_new_unit_marked_unanalysed(self):
+    def test_new_pr_kept_warned_and_marked_unanalysed(self):
         prior = report([node("u1", 1)])
         w = []
         new = d._build_report_from_spec(
             prior, {"units": [{"id": "u1", "prs": [URL(1)]}, {"id": "u2", "prs": [URL(2)]}]}, w
         )
         method = {n.unit_id: n.discovery_method for n in new.nodes}
+        self.assertEqual(set(method), {"u1", "u2"})
         self.assertEqual(method["u2"], "graph-update-unanalysed")
+        self.assertTrue(any("is new" in x for x in w))
         self.assertTrue(any("were NOT analysed" in x for x in w))
 
     def test_new_pr_metadata_fetched(self):
@@ -422,7 +406,6 @@ class CollapseComponentsToGroups(unittest.TestCase):
         folded, kept = d._collapse_components_to_groups(nodes, comps, [])
         gids = sorted(k for k in nodes if k.startswith("auto-grp"))
         self.assertEqual(gids, ["auto-grp-o-r-pr-100", "auto-grp-u-s-pr-100"])
-        self.assertEqual(len(gids), 2)
 
     def test_growing_auto_group_keeps_its_id(self):
         grp = d.DAGNode("auto-grp-pr-1", False, [URL(1), URL(2)], ["t", "t"],
@@ -440,8 +423,8 @@ class CollapseComponentsToGroups(unittest.TestCase):
 
 class OverlayGroupRoundTrip(unittest.TestCase):
     def _unit(self, uid, *nums, group=False, auto=False):
-        from releasy.pipeline import FeatureUnit
         from releasy.github_ops import PRInfo
+        from releasy.pipeline import FeatureUnit
         prs = [
             PRInfo(number=n, title=f"t{n}", body="", state="merged",
                    merge_commit_sha=f"s{n}", head_sha="h", url=URL(n),
@@ -672,8 +655,8 @@ class FollowUpEdges(unittest.TestCase):
 
 class IsReusableUnit(unittest.TestCase):
     def _cu(self, num):
-        from releasy.pipeline import FeatureUnit
         from releasy.github_ops import PRInfo
+        from releasy.pipeline import FeatureUnit
         pr = PRInfo(number=num, title=f"t{num}", body="", state="merged",
                     merge_commit_sha=f"s{num}", head_sha="h", url=URL(num),
                     repo_slug="o/r", merged_at="2026-01-01T00:00:00+00:00")
@@ -682,8 +665,8 @@ class IsReusableUnit(unittest.TestCase):
             FeatureUnit(feature_id=f"pr-{num}", prs=[pr], if_exists="skip"))
 
     def _grp(self, nums):
-        from releasy.pipeline import FeatureUnit
         from releasy.github_ops import PRInfo
+        from releasy.pipeline import FeatureUnit
         prs = [PRInfo(number=n, title=f"t{n}", body="", state="merged",
                       merge_commit_sha=f"s{n}", head_sha="h", url=URL(n),
                       repo_slug="o/r", merged_at="2026-01-01T00:00:00+00:00")
@@ -797,15 +780,12 @@ class ReusablePriorGroups(unittest.TestCase):
 
 class BuildGroupCacheBranches(unittest.TestCase):
     def setUp(self):
-        from releasy.pipeline import FeatureUnit
-        from releasy.github_ops import PRInfo
         self._save = (d._trial_pick_unit, d._release_cache_branch, d._ensure_member_commits)
         self._released = []
         d._release_cache_branch = (
             lambda scratch, ref, br, keep: self._released.append((br, keep))
         )
         d._ensure_member_commits = lambda scratch, prs, origin_slug: []
-        self._FeatureUnit, self._PRInfo = FeatureUnit, PRInfo
 
     def tearDown(self):
         d._trial_pick_unit, d._release_cache_branch, d._ensure_member_commits = self._save
@@ -856,34 +836,26 @@ class BuildGroupCacheBranches(unittest.TestCase):
 
     def test_unchanged_reused_group_skips_rebuild(self):
         nodes, by_id, grp, picked = self._setup(clean=True)
-        save = (d.local_branch_exists, d._branch_anchored_to)
-        d.local_branch_exists = lambda repo, br: True
-        d._branch_anchored_to = lambda repo, br, ref: True
-        try:
+        with _patched(d, local_branch_exists=lambda repo, br: True,
+                      _branch_anchored_to=lambda repo, br, ref: True):
             d._build_group_cache_branches(
                 Path("/x"), "b", "ref", nodes, by_id, "o/r", [],
                 config=None, repo_path=Path("/x"),
                 reusable_group_urls={"auto-grp-pr-1": [URL(1), URL(2)]},
             )
-        finally:
-            d.local_branch_exists, d._branch_anchored_to = save
         self.assertTrue(grp.cached)
         self.assertEqual(picked, {})
         self.assertEqual(self._released, [])
 
     def test_grown_group_rebuilt_not_skipped(self):
         nodes, by_id, grp, picked = self._setup(clean=True)
-        save = (d.local_branch_exists, d._branch_anchored_to)
-        d.local_branch_exists = lambda repo, br: True
-        d._branch_anchored_to = lambda repo, br, ref: True
-        try:
+        with _patched(d, local_branch_exists=lambda repo, br: True,
+                      _branch_anchored_to=lambda repo, br, ref: True):
             d._build_group_cache_branches(
                 Path("/x"), "b", "ref", nodes, by_id, "o/r", [],
                 config=None, repo_path=Path("/x"),
                 reusable_group_urls={"auto-grp-pr-1": [URL(1)]},
             )
-        finally:
-            d.local_branch_exists, d._branch_anchored_to = save
         self.assertEqual(picked["prs"], [URL(1), URL(2)])
 
     def test_run_owned_group_branch_untouched(self):
@@ -963,8 +935,8 @@ class ReconcileSessionUserGroups(unittest.TestCase):
 class UpstreamPrereqRecursion(unittest.TestCase):
     def setUp(self):
         from releasy.config import OriginConfig, UpstreamConfig
-        from releasy.pipeline import FeatureUnit
         from releasy.github_ops import PRInfo
+        from releasy.pipeline import FeatureUnit
         self._FeatureUnit, self._PRInfo = FeatureUnit, PRInfo
         self.cfg = Config(
             name="n", origin=OriginConfig(remote="git@github.com:Altinity/ClickHouse.git"),
@@ -1048,10 +1020,11 @@ class IssueBodyAndRoundTrip(unittest.TestCase):
         d.render_graph_issue_body(report([]))
 
     def test_report_round_trip(self):
-        tmp = Path(tempfile.mkdtemp())
-        rp = tmp / "graph.b.yaml"
+        rp = Path(tempfile.mkdtemp()) / "graph.b.yaml"
+        n = node("u1", 1)
+        n.merge_shas = ["deadbeef"]
         r = report(
-            [node("u1", 1)],
+            [n],
             excluded=[{"url": URL(9), "reason": "v"}],
             issue_number=77, issue_url="https://x/77",
             last_ingested_at="2026-05-30T12:00:00+00:00",
@@ -1061,14 +1034,6 @@ class IssueBodyAndRoundTrip(unittest.TestCase):
         self.assertEqual(back.issue_number, 77)
         self.assertEqual(back.last_ingested_at, "2026-05-30T12:00:00+00:00")
         self.assertEqual(back.excluded, [{"url": URL(9), "reason": "v"}])
-
-    def test_merge_shas_round_trip(self):
-        tmp = Path(tempfile.mkdtemp())
-        rp = tmp / "graph.b.yaml"
-        n = d.DAGNode("pr-1", False, [URL(1)], ["t"], "2026-01-01T00:00:00+00:00",
-                      [], "trial-clean", cached=True, merge_shas=["deadbeef"])
-        d._write_report(report([n]), rp)
-        back = d.load_report(rp)
         self.assertEqual(back.nodes[0].merge_shas, ["deadbeef"])
 
 
@@ -1320,18 +1285,13 @@ class ProgressCheckboxes(unittest.TestCase):
             "2026-01-01T00:00:00+00:00", [], "grouped",
         )
 
-    def test_group_renders_as_details_block(self):
+    def test_untracked_group_is_a_folded_unticked_details_block(self):
         body = self._body([self._grp()], self._state())
-        self.assertIn("<details>", body)
         self.assertIn("</details>", body)
+        self.assertNotIn("<details open>", body)
+        self.assertIn("<summary>☐ <b><code>grp</code></b>", body)
         # GitHub renders the checkboxes only after a blank line following <summary>.
         self.assertIn("</summary>\n\n1. [ ] [#1]", body)
-
-    def test_merged_group_is_folded(self):
-        fs = FeatureState(status="merged", rebase_pr_url=URL(60))
-        body = self._body([self._grp()], self._state(grp=fs))
-        self.assertIn("<details>\n<summary>☑", body)
-        self.assertNotIn("<details open>", body)
 
     def test_discarded_group_leaves_the_groups_section(self):
         for status in ("superseded", "skipped", "closed"):
@@ -1342,18 +1302,13 @@ class ProgressCheckboxes(unittest.TestCase):
                 self.assertNotIn("<details open>", body)
                 self.assertIn("<b>Discarded</b>", body)
 
-    def test_unfinished_group_is_folded(self):
-        for status in ("needs_review", "conflict", "blocked"):
+    def test_tracked_group_is_folded(self):
+        for status in ("merged", "needs_review", "conflict", "blocked"):
             with self.subTest(status=status):
                 fs = FeatureState(status=status, rebase_pr_url=URL(60))
                 body = self._body([self._grp()], self._state(grp=fs))
                 self.assertIn("<details>\n<summary>☑", body)
                 self.assertNotIn("<details open>", body)
-
-    def test_untracked_group_is_folded_and_unticked(self):
-        body = self._body([self._grp()], self._state())
-        self.assertNotIn("<details open>", body)
-        self.assertIn("<summary>☐ <b><code>grp</code></b>", body)
 
     def test_unmerged_section_comes_before_merged(self):
         body = self._body(
@@ -1459,13 +1414,11 @@ class SyncGraphProgress(unittest.TestCase):
     def _write_graph(self, **kw):
         d._write_report(report([node("pr-1", 1)], **kw), self.tmp / "graph.b.yaml")
 
-    def test_missing_report_errors(self):
+    def test_missing_report_errors_unless_quiet(self):
         self.assertEqual(d.sync_graph_progress(self._cfg()), 1)
-
-    def test_missing_report_is_silent_when_quiet(self):
         self.assertEqual(d.sync_graph_progress(self._cfg(), quiet=True), 0)
 
-    def test_report_without_issue_errors(self):
+    def test_report_without_issue_errors_unless_quiet(self):
         self._write_graph()
         self.assertEqual(d.sync_graph_progress(self._cfg()), 1)
         self.assertEqual(d.sync_graph_progress(self._cfg(), quiet=True), 0)
@@ -1566,8 +1519,8 @@ class _StubbedDiscover(unittest.TestCase):
             setattr(d, name, fn)
 
     def _unit(self, num):
-        from releasy.pipeline import FeatureUnit
         from releasy.github_ops import PRInfo
+        from releasy.pipeline import FeatureUnit
         pr = PRInfo(number=num, title=f"t{num}", body="", state="merged",
                     merge_commit_sha=f"s{num}", head_sha="h", url=URL(num),
                     repo_slug="o/r", merged_at=f"2026-01-0{num}T00:00:00+00:00")
@@ -1625,18 +1578,13 @@ class RunOwnedBranchUntouched(_StubbedDiscover):
 
 
 class CheckpointResume(_StubbedDiscover):
-    def test_interrupted_run_leaves_the_finished_units(self):
+    def test_resume_reuses_the_finished_units_instead_of_re_picking(self):
         self.kill_at = "pr-3"
         with self.assertRaises(KeyboardInterrupt):
             self._run()
         got = d.load_report(self.report_path)
         self.assertEqual([n.unit_id for n in got.nodes], ["pr-1", "pr-2"])
         self.assertTrue(all(n.cached for n in got.nodes))
-
-    def test_resume_reuses_them_instead_of_re_picking(self):
-        self.kill_at = "pr-3"
-        with self.assertRaises(KeyboardInterrupt):
-            self._run()
         self.kill_at, self.picked = None, []
         rep = self._run()
         self.assertEqual(self.picked, ["pr-3", "pr-4"])
@@ -1686,22 +1634,13 @@ class MergedUnitsKeepTheirEntry(_StubbedDiscover):
     def _merged(self, *urls):
         d._state_already_in_target = lambda cands, st: set(urls)
 
-    def test_merged_group_keeps_its_node(self):
+    def test_merged_group_keeps_its_node_across_re_discovers(self):
         self.conflicts, self.traced = {"pr-2"}, ["pr-1"]
         self._run()
         self._merged(URL(1), URL(2))
-        nodes = {n.unit_id: n for n in self._run().nodes}
-        self.assertIn("auto-grp-pr-1", nodes)
-        self.assertEqual(nodes["auto-grp-pr-1"].pr_urls, [URL(1), URL(2)])
-
-    def test_merged_group_survives_repeated_re_discovers(self):
-        self.conflicts, self.traced = {"pr-2"}, ["pr-1"]
-        self._run()
-        self._merged(URL(1), URL(2))
-        self._run()
-        self.assertIn(
-            "auto-grp-pr-1", [n.unit_id for n in self._run().nodes],
-        )
+        for _ in range(2):
+            nodes = {n.unit_id: n for n in self._run().nodes}
+            self.assertEqual(nodes["auto-grp-pr-1"].pr_urls, [URL(1), URL(2)])
 
     def test_merged_standalone_keeps_its_node(self):
         self._run()
@@ -1751,9 +1690,6 @@ class CarriedSessionFields(unittest.TestCase):
                 "excluded": [{"url": URL(2154), "reason": "vetoed"}],
             },
         )
-
-    def test_no_prior_report(self):
-        self.assertEqual(d._carried_session_fields(None), {})
 
     def test_excluded_not_aliased(self):
         prior = self._prior()

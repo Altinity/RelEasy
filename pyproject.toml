@@ -31,3 +31,6 @@ packages = ["src/releasy"]
 [tool.ruff]
 line-length = 100
 target-version = "py39"
+
+[tool.ruff.lint.isort]
+known-local-folder = ["test_graph_update", "test_on_hold"]
