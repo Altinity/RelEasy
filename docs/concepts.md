@@ -77,7 +77,8 @@ records its owning config path; after moving a config, run
 
 AI-resolved ports also carry `ai_resolved` and the `ai-resolved` PR label.
 Units in `pr_sources.on_hold` keep whatever status they had and are skipped by
-`run` (see [on hold vs. excluded](configuration.md#on-hold-vs-excluded)).
+`run`, `refresh`, `rebase` and `analyze-fails` (see
+[on hold vs. excluded](configuration.md#on-hold-vs-excluded)).
 
 ## Conflicts
 

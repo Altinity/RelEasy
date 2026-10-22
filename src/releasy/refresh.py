@@ -146,6 +146,8 @@ def refresh_tracked_prs(
         _apply_merged_labels,
         _refresh_all_merge_status_from_github,
         _setup_repo,
+        hold_map,
+        is_feature_held,
     )
 
     state = load_state(config)
@@ -216,6 +218,8 @@ def refresh_tracked_prs(
     closed_count = 0
     superseded_count = 0
     reverted_count = 0
+    held_count = 0
+    holds = hold_map(config)
     for fid, fs in state.features.items():
         if fs.status in ("skipped", "merged"):
             continue
@@ -229,6 +233,9 @@ def refresh_tracked_prs(
             superseded_count += 1
             continue
         if not fs.branch_name or not fs.rebase_pr_url:
+            continue
+        if is_feature_held(fs, holds):
+            held_count += 1
             continue
         candidates.append((fid, fs))
 
@@ -246,6 +253,11 @@ def refresh_tracked_prs(
         console.print(
             f"  [dim]Skipping {reverted_count} entry/ies whose port was "
             "reverted on the target branch.[/dim]"
+        )
+    if held_count:
+        console.print(
+            f"  [dim]Skipping {held_count} entry/ies on hold "
+            "(pr_sources.on_hold).[/dim]"
         )
 
     if only is not None:

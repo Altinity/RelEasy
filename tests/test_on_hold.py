@@ -444,5 +444,68 @@ class GroupHoldEndToEnd(unittest.TestCase):
         self.assertEqual(units[0].hold_reason, "waiting on #3")
 
 
+def _tracked_state():
+    """A held group (port PR 91) and a free singleton (port PR 92)."""
+    from releasy.state import PipelineState
+
+    state = PipelineState(base_branch="b")
+    state.features["G"] = FeatureState(
+        status="needs_review", pr_url=URL(1), pr_urls=[URL(1), URL(2)],
+        branch_name="feature/b/G", rebase_pr_url=URL(91),
+    )
+    state.features["pr-3"] = FeatureState(
+        status="needs_review", pr_url=URL(3), pr_urls=[URL(3)],
+        branch_name="feature/b/pr-3", rebase_pr_url=URL(92),
+    )
+    return state
+
+
+class MaintenanceSkipsHeld(unittest.TestCase):
+    def setUp(self):
+        self.cfg = cfg_with(Path(tempfile.mkdtemp()), on_hold=[URL(2)])
+
+    def _patch(self, mod, name, value):
+        self.addCleanup(setattr, mod, name, getattr(mod, name))
+        setattr(mod, name, value)
+
+    def test_analyze_fails_drops_held_group(self):
+        import releasy.analyze_fails as af
+
+        urls = af.tracked_pr_urls(_tracked_state(), holds=pl.hold_map(self.cfg))
+        self.assertEqual(urls, [URL(92)])
+
+    def test_rebase_skips_held_group(self):
+        import releasy.rebase as rb
+
+        rebased = []
+        self._patch(rb, "load_state", lambda cfg: _tracked_state())
+        self._patch(rb, "_setup", lambda *a, **kw: Path("/nonexistent"))
+        self._patch(rb, "rebase_one_pr", lambda cfg, repo, url, *a, **kw: (
+            rebased.append(url) or rb.RebaseOutcome(pr_url=url)
+        ))
+        rb.rebase_all_tracked(self.cfg, "t")
+        self.assertEqual(rebased, [URL(92)])
+
+    def test_refresh_skips_held_group(self):
+        import releasy.refresh as rf
+
+        processed = []
+        self._patch(rf, "load_state", lambda cfg: _tracked_state())
+        self._patch(rf, "is_operation_in_progress", lambda repo: False)
+        self._patch(rf, "remote_branch_exists", lambda *a: True)
+        self._patch(rf, "_persist", lambda *a: None)
+        self._patch(rf, "_process_one", lambda cfg, repo, st, fid, *a, **kw: (
+            processed.append(fid) or "ok"
+        ))
+        self._patch(pl, "_setup_repo", lambda *a: Path("/nonexistent"))
+        self._patch(pl, "_refresh_all_merge_status_from_github", lambda *a: None)
+        self._patch(pl, "_refresh_all_superseded_status_from_github",
+                    lambda *a: None)
+        self._patch(pl, "_apply_merged_labels", lambda *a: None)
+        self._patch(pl, "_all_session_label_names", lambda cfg: [])
+        rf.refresh_tracked_prs(self.cfg, force_merge=True)
+        self.assertEqual(processed, ["pr-3"])
+
+
 if __name__ == "__main__":
     unittest.main()

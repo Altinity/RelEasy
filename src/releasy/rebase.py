@@ -558,7 +558,10 @@ def rebase_all_tracked(
     only: OnlyFilter | None = None,
 ) -> RebaseSummary:
     """Rebase every tracked rebase PR (or just ``only``) onto ``target_branch``."""
+    from releasy.pipeline import hold_map, is_feature_held
+
     state = load_state(config)
+    holds = hold_map(config)
     candidates: list[tuple[str, str]] = []  # (feature_id, rebase_pr_url)
     for fid, fs in state.features.items():
         if fs.status == "skipped":
@@ -566,6 +569,11 @@ def rebase_all_tracked(
         if not fs.rebase_pr_url:
             continue
         if only is not None and not only.matches_state(fid, fs):
+            continue
+        if is_feature_held(fs, holds):
+            console.print(
+                f"  [dim]{fid} — on hold (pr_sources.on_hold), skipping[/dim]"
+            )
             continue
         candidates.append((fid, fs.rebase_pr_url))
 

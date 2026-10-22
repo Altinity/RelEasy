@@ -335,6 +335,13 @@ def _unit_hold_reason(
     return "; ".join(dict.fromkeys(r for r in reasons if r))
 
 
+def is_feature_held(fs: FeatureState, holds: dict[PRRef, str]) -> bool:
+    """True if any source PR of the tracked entry is on hold."""
+    return any(
+        parse_pr_url(u) in holds for u in [fs.pr_url, *fs.pr_urls] if u
+    )
+
+
 def _author_filter_reason(
     author: str | None,
     included_authors: set[str],

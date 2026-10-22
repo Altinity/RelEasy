@@ -142,8 +142,11 @@ class AnalyzeFailsResult:
 def tracked_pr_urls(
     state: PipelineState | None,
     only: OnlyFilter | None = None,
+    holds: dict[tuple[str, str, int], str] | None = None,
 ) -> list[str]:
-    """Deduplicated PR URLs of tracked features not already finished locally."""
+    """Deduplicated PR URLs of tracked features not already finished locally; ``holds`` drops held ones."""
+    from releasy.pipeline import is_feature_held
+
     if state is None:
         return []
     seen: set[str] = set()
@@ -157,6 +160,8 @@ def tracked_pr_urls(
         ):
             continue
         if only is not None and not only.matches_state(fid, fs):
+            continue
+        if holds and is_feature_held(fs, holds):
             continue
         seen.add(url)
         out.append(url)
@@ -2046,10 +2051,13 @@ def analyze_fails(
     if pr_url:
         primary_pr_urls = [pr_url]
     else:
+        from releasy.pipeline import hold_map
         if state is not None and not dry_run:
             from releasy.pipeline import _refresh_all_merge_status_from_github
             _refresh_all_merge_status_from_github(config, state)
-        primary_pr_urls = tracked_pr_urls(state, only=only)
+        primary_pr_urls = tracked_pr_urls(
+            state, only=only, holds=hold_map(config),
+        )
         if not primary_pr_urls:
             if only is not None:
                 return AnalyzeFailsResult(

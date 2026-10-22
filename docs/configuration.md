@@ -29,8 +29,9 @@ union(by_labels) − exclude_labels − exclude_authors
 
 `exclude_prs` is a veto: the PR leaves the graph. `on_hold` is a pause: the
 unit keeps its dependency edges and any existing port PR, `run` skips it, and
-units that `depends_on` it report `blocked`. Holding one PR of a group holds
-the whole group.
+units that `depends_on` it report `blocked`. `refresh`, `rebase` and
+`analyze-fails` skip it too, unless pointed at its PR URL directly. Holding
+one PR of a group holds the whole group.
 
 Change holds with [`releasy hold`](commands.md#releasy-hold) /
 [`unhold`](commands.md#releasy-unhold), a graph-issue comment +
