@@ -119,6 +119,7 @@ config dir, falling back to the prompts bundled with releasy.
 | `enabled` | Use AI to resolve conflicts. | `false` |
 | `timeout_seconds` | Per-invocation timeout. | `7200` |
 | `build_command` | Build command. | `cd build && ninja` |
+| `build_dir` | Repo-relative build dir. When a build fails before compiling, or the fix-build agent answers `RECONFIGURE`, its `CMakeCache.txt` and `CMakeFiles/` are wiped and the build re-runs (once per verify pass, no fix attempt spent). A `CMake Error` that survives the wipe goes to the fix-build agent. | `build` |
 | `deterministic_build` | AI resolves only; RelEasy builds and runs the PR's tests, looping fresh-context build fixes. `false` = single AI session resolves and builds. | `true` |
 | `max_build_attempts` | Build-fix attempts per run before parking as `build_failed`. | `5` |
 | `max_verify_resume_attempts` | Runs that resume a `build_failed` branch. `0` disables. | `2` |

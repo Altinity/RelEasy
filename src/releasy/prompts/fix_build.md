@@ -63,6 +63,24 @@ whole log (it is huge and will be rejected).
    violation.
 4. Leave the working tree clean (`git status --porcelain` empty).
 
+## CMake configure failures
+
+A `CMake Error` raised from a project `CMakeLists.txt` / `.cmake` file
+(a missing source file, an unknown target, a removed option) is a code
+problem: fix it like a compile error.
+
+If instead the build stopped at toolchain setup (e.g. the compiler check
+`is not able to compile a simple test program`, a wrong compiler such as
+`clang-cl` picked up from a stale `CMakeCache.txt`) and no project
+source was compiled, make no commit and emit, on the final line, exactly:
+
+```
+RECONFIGURE: <one-line reason>
+```
+
+RelEasy then wipes the build dir's CMake cache and rebuilds from a fresh
+configure.
+
 ## When you cannot fix it
 
 If the error is **not** fixable by a bucket-1 / bucket-2 edit — e.g. it
@@ -77,6 +95,8 @@ CANNOT FIX: <one-line reason>
 ## Output contract
 
 - Made a scoped fix and amended HEAD → final line is exactly `FIXED`.
+- Toolchain / stale-cache failure, no project code compiled → final line
+  is `RECONFIGURE: <reason>`.
 - Could not fix within scope → final line is `CANNOT FIX: <reason>`.
 
 ## Hard rules (non-negotiable)

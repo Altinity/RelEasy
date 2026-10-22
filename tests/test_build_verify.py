@@ -260,6 +260,19 @@ class BuildReachedCompiler(unittest.TestCase):
         )
         self.assertFalse(bv.build_reached_compiler(self.repo, self.LOG))
 
+    def test_cmake_compiler_check_failure(self):
+        self._log(
+            "-- Check for working C compiler: /usr/bin/clang-cl-21 - broken\n"
+            "CMake Error at /usr/share/cmake-3.28/Modules/CMakeTestCCompiler.cmake:67 (message):\n"
+            "    [2/2] : && /usr/bin/clang-cl-21   x.o -o cmTC_c6c9a   && :\n"
+            "    FAILED: cmTC_c6c9a \n"
+            "    /usr/bin/ld: Error: unable to disambiguate: -nologo\n"
+            "    clang-cl-21: error: linker command failed with exit code 1\n"
+            "    ninja: build stopped: subcommand failed.\n"
+            "-- Configuring incomplete, errors occurred!\n"
+        )
+        self.assertFalse(bv.build_reached_compiler(self.repo, self.LOG))
+
     def test_absent_log(self):
         self.assertFalse(bv.build_reached_compiler(self.repo, self.LOG))
 
@@ -292,6 +305,116 @@ class EnvironmentFaultShortCircuit(unittest.TestCase):
         self.assertEqual(res.build_attempts, 0)
         claude.assert_not_called()
         self.assertIn("never reached the compiler", res.error)
+
+
+class ReconfigureWipesCMakeCache(unittest.TestCase):
+    """A poisoned CMake cache (e.g. clang-cl picked) is wiped and rebuilt, not parked."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Path(tmp.name)
+        (self.repo / ".releasy").mkdir()
+        self.cache = self.repo / "build" / "CMakeCache.txt"
+        (self.repo / "build" / "CMakeFiles").mkdir(parents=True)
+        self.cache.write_text("CMAKE_C_COMPILER:STRING=/usr/bin/clang-cl-21\n")
+        self.builds = 0
+
+    def _verify(self, log: str, claude: mock.Mock):
+        def _build(*a, **kw):
+            self.builds += 1
+            if self.cache.exists():
+                (self.repo / bv.build_log_path("feature/b/1")).write_text(log)
+                return (1, False)
+            return (0, False)
+
+        with mock.patch.multiple(
+            bv,
+            run_build=_build,
+            _write_build_script=lambda *a, **kw: None,
+            _render=lambda *a, **kw: "prompt",
+            _common_placeholders=lambda *a, **kw: {},
+            _invoke_claude_with_retries=claude,
+        ):
+            return bv.verify_build_and_tests(
+                _write_config(
+                    self.repo / "config.yaml",
+                    "ai_resolve:\n  run_pr_tests: false\n",
+                ),
+                self.repo, _pr(),
+                port_branch="feature/b/1", base_branch="b", base_sha="deadbeef",
+            )
+
+    def test_reconfigure_marker(self):
+        claude = mock.Mock(return_value=(
+            0, "RECONFIGURE: clang-cl-21 picked instead of clang-22", False, 0.0,
+        ))
+        res = self._verify(
+            "-- Check for working C compiler: /usr/bin/clang-cl-21 - broken\n"
+            "-- Configuring incomplete, errors occurred!\n"
+            "ninja: error: rebuilding 'build.ninja': subcommand failed\n",
+            claude,
+        )
+        self.assertTrue(res.success)
+        self.assertEqual(self.builds, 2)
+        claude.assert_called_once()
+        self.assertFalse((self.repo / "build" / "CMakeFiles").exists())
+
+    def test_never_reached_compiler(self):
+        claude = mock.Mock(return_value=(0, "FIXED", False, 0.0))
+        res = self._verify("-- Configuring incomplete, errors occurred!\n", claude)
+        self.assertTrue(res.success)
+        self.assertEqual(self.builds, 2)
+        claude.assert_not_called()
+
+
+class CMakeListsErrorGoesToFixer(unittest.TestCase):
+    """A CMake Error that survives a fresh configure is the port's to fix."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Path(tmp.name)
+        (self.repo / ".releasy").mkdir()
+
+    def test_fixer_called_after_wipe(self):
+        fixed = []
+        builds = []
+
+        def _build(*a, **kw):
+            builds.append(1)
+            if fixed:
+                return (0, False)
+            (self.repo / bv.build_log_path("feature/b/1")).write_text(
+                "CMake Error at src/CMakeLists.txt:12 (add_library):\n"
+                "  Cannot find source file:\n    Storages/Gone.cpp\n"
+                "-- Configuring incomplete, errors occurred!\n"
+            )
+            return (1, False)
+
+        def _claude(*a, **kw):
+            fixed.append(1)
+            return (0, "FIXED", False, 0.0)
+
+        with mock.patch.multiple(
+            bv,
+            run_build=_build,
+            _write_build_script=lambda *a, **kw: None,
+            _render=lambda *a, **kw: "prompt",
+            _common_placeholders=lambda *a, **kw: {},
+            _invoke_claude_with_retries=_claude,
+        ):
+            res = bv.verify_build_and_tests(
+                _write_config(
+                    self.repo / "config.yaml",
+                    "ai_resolve:\n  run_pr_tests: false\n",
+                ),
+                self.repo, _pr(),
+                port_branch="feature/b/1", base_branch="b", base_sha="deadbeef",
+            )
+        self.assertTrue(res.success)
+        self.assertEqual(len(builds), 3)
+        self.assertEqual(len(fixed), 1)
 
 
 class RunTestsAllowlistPaths(unittest.TestCase):

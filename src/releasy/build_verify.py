@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import fnmatch
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -96,31 +97,57 @@ def _tail_bytes(text: str, budget: int) -> tuple[str, bool]:
 
 # A red build whose log holds none of these never reached the compiler.
 _COMPILE_ERROR_RE = re.compile(r"\berror:|^FAILED:|^ninja: build stopped")
+_CMAKE_ERROR_RE = re.compile(r"^CMake Error\b")
+
+
+def _read_log(repo_path: Path, log_path: str) -> str | None:
+    try:
+        return (repo_path / log_path).read_text(
+            encoding="utf-8", errors="replace",
+        )
+    except OSError:
+        return None
 
 
 def build_reached_compiler(repo_path: Path, log_path: str) -> bool:
     """True when the build log holds a real compile/link failure."""
-    try:
-        text = (repo_path / log_path).read_text(
-            encoding="utf-8", errors="replace",
-        )
-    except OSError:
+    text = _read_log(repo_path, log_path)
+    if text is None:
         return False
-    return any(_COMPILE_ERROR_RE.search(ln) for ln in text.splitlines())
+    # Indented lines are CMake's echo of its own try-compile, not project code.
+    return any(
+        _COMPILE_ERROR_RE.search(ln)
+        for ln in text.splitlines() if not ln[:1].isspace()
+    )
+
+
+def cmake_configure_failed(repo_path: Path, log_path: str) -> bool:
+    """True when the build log holds a ``CMake Error``."""
+    text = _read_log(repo_path, log_path)
+    return text is not None and any(
+        _CMAKE_ERROR_RE.search(ln) for ln in text.splitlines()
+    )
+
+
+def wipe_cmake_cache(repo_path: Path, build_dir: str) -> None:
+    """Drop ``CMakeCache.txt`` and ``CMakeFiles/`` so the next build reconfigures."""
+    root = repo_path / build_dir
+    (root / "CMakeCache.txt").unlink(missing_ok=True)
+    shutil.rmtree(root / "CMakeFiles", ignore_errors=True)
 
 
 def _build_log_excerpt(
     repo_path: Path, log_path: str, tail_lines: int,
 ) -> str:
     """Grepped error/FAILED lines + the tail of the build log, byte-bounded."""
-    try:
-        text = (repo_path / log_path).read_text(
-            encoding="utf-8", errors="replace",
-        )
-    except OSError:
+    text = _read_log(repo_path, log_path)
+    if text is None:
         return "(build log unavailable)"
     raw_lines = text.splitlines()
-    error_lines = [ln for ln in raw_lines if _COMPILE_ERROR_RE.search(ln)]
+    error_lines = [
+        ln for ln in raw_lines
+        if _COMPILE_ERROR_RE.search(ln) or _CMAKE_ERROR_RE.search(ln)
+    ]
     extra = len(error_lines) - 60
     error_lines = [_cap_line(ln) for ln in error_lines[:60]]
     if extra > 0:
@@ -129,7 +156,10 @@ def _build_log_excerpt(
     # Errors first, capped to half the budget; the tail fills the rest.
     err_block = ""
     if error_lines:
-        err_block = "# Grepped error: / FAILED: lines\n" + "\n".join(error_lines)
+        err_block = (
+            "# Grepped error: / FAILED: / CMake Error lines\n"
+            + "\n".join(error_lines)
+        )
         err_block, _ = _tail_bytes(err_block, _MAX_EXCERPT_BYTES // 2)
 
     budget = _MAX_EXCERPT_BYTES - len(err_block.encode("utf-8"))
@@ -282,6 +312,7 @@ def verify_build_and_tests(
     cost_total: float | None = None
     consecutive_build_failures = 0
     iterations = 0
+    reconfigured = False
 
     def _add_cost(c: float | None) -> None:
         nonlocal cost_total
@@ -301,7 +332,19 @@ def verify_build_and_tests(
             )
 
         if rc != 0:
-            if not build_reached_compiler(repo_path, log_path):
+            reached_compiler = build_reached_compiler(repo_path, log_path)
+            if not reached_compiler and not reconfigured:
+                reconfigured = True
+                console.print(
+                    "    [yellow]↻ build never reached the compiler — "
+                    "wiping the CMake cache and rebuilding[/yellow]"
+                )
+                wipe_cmake_cache(repo_path, config.ai_resolve.build_dir)
+                continue
+            # A CMake Error that survives a fresh configure goes to the fixer.
+            if not reached_compiler and not cmake_configure_failed(
+                repo_path, log_path,
+            ):
                 # Environment fault: no code fix can help, don't spend an attempt.
                 console.print(
                     f"    [red]✗ build never reached the compiler[/red] "
@@ -368,8 +411,30 @@ def verify_build_and_tests(
                     cost_usd=cost_total, new_head=_head_sha(repo_path),
                 )
             marker = _last_marker(
-                _extract_assistant_text(out), ("FIXED", "CANNOT FIX"),
+                _extract_assistant_text(out),
+                ("FIXED", "CANNOT FIX", "RECONFIGURE"),
             )
+            if marker and marker.startswith("RECONFIGURE"):
+                if reconfigured:
+                    return VerifyResult(
+                        success=False, outcome="build_failed",
+                        build_attempts=consecutive_build_failures,
+                        iterations=iterations,
+                        error=(
+                            "build still broken after wiping the CMake "
+                            f"cache: {marker}"
+                        ),
+                        cost_usd=cost_total, new_head=_head_sha(repo_path),
+                    )
+                reconfigured = True
+                # Environment fault: refund the attempt.
+                consecutive_build_failures -= 1
+                console.print(
+                    f"    [yellow]↻ {marker} — wiping the CMake cache and "
+                    "rebuilding[/yellow]"
+                )
+                wipe_cmake_cache(repo_path, config.ai_resolve.build_dir)
+                continue
             if marker and marker.startswith("CANNOT FIX"):
                 return VerifyResult(
                     success=False, outcome="build_failed",

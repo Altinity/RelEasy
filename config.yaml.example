@@ -79,6 +79,7 @@ notifications:
 #   # extra_args: []
 #   timeout_seconds: 7200
 #   build_command: cd build && ninja
+#   build_dir: build                # CMake cache wiped here on a configure failure
 #   deterministic_build: true       # AI resolves; RelEasy builds + runs tests
 #   max_build_attempts: 5
 #   max_verify_resume_attempts: 2   # 0 disables resuming build_failed branches

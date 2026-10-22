@@ -434,6 +434,8 @@ class AIResolveConfig:
     max_dead_end_attempts: int = 2
     timeout_seconds: int = 7200
     build_command: str = "cd build && ninja"
+    # Repo-relative build dir whose CMake cache is wiped on a configure failure.
+    build_dir: str = "build"
     # True: AI resolves only, RelEasy builds/tests and loops build fixes.
     # False: single-session resolve+build.
     deterministic_build: bool = True
@@ -961,6 +963,7 @@ def load_config(config_path: Path | None = None) -> Config:
         ),
         timeout_seconds=int(ai_raw.get("timeout_seconds", ai_d.timeout_seconds)),
         build_command=ai_raw.get("build_command", ai_d.build_command),
+        build_dir=ai_raw.get("build_dir", ai_d.build_dir),
         deterministic_build=bool(
             ai_raw.get("deterministic_build", ai_d.deterministic_build)
         ),
