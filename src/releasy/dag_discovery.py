@@ -601,10 +601,28 @@ def run_discover_deps(
                                     f"  [dim]· {unit_id}: pulled upstream "
                                     f"prereq {new_cu.unit_id}[/dim]"
                                 )
+                        excluded = [
+                            u for u in fb.external_prereq_urls
+                            if u not in pulled and any(
+                                same_pr_url(u, e)
+                                for e in config.pr_sources.exclude_prs
+                            )
+                        ]
                         unresolved = [
                             u for u in fb.external_prereq_urls
-                            if u not in pulled
+                            if u not in pulled and u not in excluded
                         ]
+                        if excluded:
+                            warnings_acc.append(
+                                f"unit {unit_id!r}: prereq(s) "
+                                f"{', '.join(excluded)} are excluded by the "
+                                "session — the graph cannot order around them"
+                            )
+                            console.print(
+                                f"  [yellow]![/yellow] {unit_id}: "
+                                f"{len(excluded)} prereq(s) excluded by the "
+                                f"session: {', '.join(excluded)}"
+                            )
                         if unresolved:
                             warnings_acc.append(
                                 f"unit {unit_id!r}: prereq(s) "

@@ -750,6 +750,36 @@ def fetch_pr_by_url(
     )
 
 
+def fetch_pr_files(url: str) -> set[str] | None:
+    """Paths a PR touches (both sides of renames); ``None`` if unknown or truncated."""
+    parsed = parse_pr_url(url)
+    if parsed is None:
+        return None
+    token = get_github_token()
+    if not token:
+        log.warning("RELEASY_GITHUB_TOKEN not set — cannot fetch PR files")
+        return None
+    owner, repo, number = parsed
+    try:
+        from github import Github
+
+        pr = Github(token).get_repo(f"{owner}/{repo}").get_pull(number)
+        out: set[str] = set()
+        count = 0
+        for f in pr.get_files():
+            count += 1
+            out.add(f.filename)
+            if f.previous_filename:
+                out.add(f.previous_filename)
+        # The files API stops at 3000 entries.
+        if count < pr.changed_files:
+            return None
+        return out
+    except Exception as exc:
+        log.warning("Failed to fetch files of PR %s: %s", url, exc)
+        return None
+
+
 @dataclass
 class PRComment:
     """One PR comment; ``kind`` is "issue", "review" (body only) or "inline" (diff line)."""

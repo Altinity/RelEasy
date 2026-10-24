@@ -26,9 +26,12 @@ from releasy.git_ops import (
     run_git,
 )
 from releasy.github_ops import (
+    CHERRY_PICK_FROM_RE,
     PRInfo,
     add_issue_comment,
     add_label_to_pr,
+    fetch_pr_by_url,
+    fetch_pr_files,
     get_origin_repo_slug,
     parse_pr_url,
 )
@@ -960,6 +963,96 @@ def _parse_missing_prereqs(output: str) -> tuple[list[str], str | None]:
     return urls, reason
 
 
+def _prereqs_in_base(
+    repo_path: Path, base_ref: str, merge_shas: dict[str, str],
+) -> dict[str, str]:
+    """URL → evidence for PRs (``url → merge SHA``) already on ``base_ref``.
+
+    On base if the merge SHA is an ancestor, or a base commit carries a
+    ``cherry picked from commit <merge SHA>`` footer or a ``Source-PR:`` trailer.
+    """
+    out: dict[str, str] = {}
+    for url, sha in merge_shas.items():
+        res = run_git(
+            ["merge-base", "--is-ancestor", sha, base_ref],
+            repo_path, check=False,
+        )
+        if res.returncode == 0:
+            out[url] = f"merge commit {sha[:10]} is an ancestor"
+    pending = {u: s for u, s in merge_shas.items() if u not in out}
+    if not pending:
+        return out
+
+    # One history walk; --grep only prefilters, the footers are matched below.
+    grep_args = [f"--grep={s}" for s in pending.values()]
+    grep_args += [f"--grep={u}" for u in pending]
+    log_res = run_git(
+        ["log", base_ref, "-F", *grep_args, "--format=%x1e%H%n%B"],
+        repo_path, check=False,
+    )
+    if log_res.returncode != 0:
+        return out
+    sha_to_url = {s: u for u, s in pending.items()}
+    for record in log_res.stdout.split("\x1e"):
+        commit, _, body = record.strip().partition("\n")
+        if not commit:
+            continue
+        for m in CHERRY_PICK_FROM_RE.finditer(body):
+            url = sha_to_url.get(m.group(1).lower())
+            if url and url not in out:
+                out[url] = f"cherry-picked in {commit[:10]}"
+        for line in body.splitlines():
+            if not line.startswith("Source-PR:"):
+                continue
+            for tok in _PR_URL_TOKEN_RE.finditer(line):
+                ref = parse_pr_url(tok.group(0))
+                for url in pending:
+                    if url not in out and parse_pr_url(url) == ref:
+                        out[url] = f"Source-PR trailer in {commit[:10]}"
+    return out
+
+
+def _filter_missing_prereqs(
+    config: Config, repo_path: Path, ctx: AIResolveContext, urls: list[str],
+) -> list[str]:
+    """Drop reported prereqs already on the base branch or touching no conflicted file."""
+    base_ref = f"{config.origin.remote_name}/{ctx.base_branch}"
+    in_base: dict[str, str] = {}
+    if run_git(
+        ["rev-parse", "--verify", "-q", base_ref], repo_path, check=False,
+    ).returncode == 0:
+        merge_shas: dict[str, str] = {}
+        for url in urls:
+            pr = fetch_pr_by_url(config, url, include_closed=True)
+            if pr is None or not pr.merge_commit_sha:
+                continue
+            if run_git(
+                ["cat-file", "-e", pr.merge_commit_sha], repo_path, check=False,
+            ).returncode == 0:
+                merge_shas[url] = pr.merge_commit_sha
+        in_base = _prereqs_in_base(repo_path, base_ref, merge_shas)
+
+    conflicted = set(ctx.conflict_files)
+    kept: list[str] = []
+    for url in urls:
+        if url in in_base:
+            console.print(
+                f"    [dim]· reported prereq {url} dropped: already on "
+                f"{base_ref} ({in_base[url]})[/dim]"
+            )
+            continue
+        if conflicted:
+            files = fetch_pr_files(url)
+            if files is not None and not files & conflicted:
+                console.print(
+                    f"    [dim]· reported prereq {url} dropped: touches none "
+                    "of the conflicted files[/dim]"
+                )
+                continue
+        kept.append(url)
+    return kept
+
+
 def _count_iterations(output: str) -> int | None:
     """Best-effort build-attempt count from Claude's narration; None when unknown."""
     text = _extract_assistant_text(output)
@@ -1349,6 +1442,18 @@ def resolve_with_claude(
     # since the marker can come mid-narration.
     missing_prereq_prs, missing_prereq_note = _parse_missing_prereqs(output)
     if missing_prereq_prs:
+        missing_prereq_prs = _filter_missing_prereqs(
+            config, repo_path, ctx, missing_prereq_prs,
+        )
+        if not missing_prereq_prs:
+            return AIResolveResult(
+                success=False, iterations=iterations,
+                error=(
+                    "claude reported MISSING_PREREQS, but each is already on "
+                    "the base branch or touches no conflicted file"
+                ),
+                cost_usd=cost_usd_total,
+            )
         return AIResolveResult(
             success=False, iterations=iterations,
             error="claude reported MISSING_PREREQS",
