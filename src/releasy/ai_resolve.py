@@ -728,6 +728,8 @@ def _spawn_claude_once(
     env = os.environ.copy()
     # A backgrounded command dies with the `-p` session, before it reports.
     env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
+    # Let a single foreground Bash call (e.g. a full build) run up to 1h.
+    env["BASH_MAX_TIMEOUT_MS"] = "3600000"
 
     # Own process group: no terminal Ctrl-C, and the whole tree can be killed at once.
     proc = subprocess.Popen(
