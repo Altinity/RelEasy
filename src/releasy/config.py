@@ -468,7 +468,7 @@ class AIResolveConfig:
     auto_prereq_label: str = "auto-prereq-added"
     auto_prereq_label_color: str = "0E8A16"
     # Advisory second AI pass auditing the resolution against the source PR.
-    verify_resolution: bool = False
+    verify_resolution: bool = True
     verify_prompt_file: str = "prompts/verify_resolution.md"
     verify_timeout_seconds: int = 1800
     verify_label: str = "ai-needs-verify"

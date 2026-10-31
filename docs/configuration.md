@@ -143,7 +143,7 @@ config dir, falling back to the prompts bundled with releasy.
 | `postcondition_retries` | AI passes to fix a failed content postcondition (`SettingsChangesHistory.cpp` whitelist). | `2` |
 | `warn_on_unfixed_postconditions` | When still failing: keep and flag the resolution (`true`) or discard it (`false`). | `true` |
 | `auto_add_prerequisite_prs` | Auto-add a detected missing prerequisite PR. Bool, or `{enabled, max_prereq_depth, require_origin_prereq_label}`. | `false`, `7`, `true` |
-| `verify_resolution` | Read-only AI audit of each resolution; findings → `verify_label` + comment. | `false` |
+| `verify_resolution` | Read-only AI audit of each resolution; findings → `verify_label` + comment. | `true` |
 | `verify_prompt_file` / `verify_timeout_seconds` | Audit prompt and timeout. | `prompts/verify_resolution.md` / `1800` |
 | `label` / `label_color` | Label on AI-resolved PRs. | `ai-resolved` / `8B5CF6` |
 | `needs_attention_label` / `_color` | Label on partial-group draft PRs. | `ai-needs-attention` / `D93F0B` |

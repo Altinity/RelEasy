@@ -116,7 +116,7 @@ notifications:
 #     enabled: false
 #     max_prereq_depth: 7
 #     require_origin_prereq_label: true
-#   verify_resolution: false        # read-only audit of each resolution
+#   verify_resolution: true         # read-only audit of each resolution
 #   verify_prompt_file: prompts/verify_resolution.md
 #   verify_timeout_seconds: 1800
 #   label: ai-resolved
